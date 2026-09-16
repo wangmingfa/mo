@@ -138,3 +138,6 @@ public/
 # 其他
 *.orig
 *.rej
+
+# WorkBuddy 助手工作数据（本地记忆，不入库）
+.workbuddy/
