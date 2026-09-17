@@ -252,12 +252,70 @@ fn undo_reverts_a_move() {
 
         app.move_selection(&dst).await;
         wait_for(|| moved.exists() && !src.exists()).await;
-        assert!(moved.exists() && !src.exists(), "移动后应出现在目标且原位置消失");
+        assert!(
+            moved.exists() && !src.exists(),
+            "移动后应出现在目标且原位置消失"
+        );
 
         app.undo();
         wait_for(|| src.exists() && !moved.exists()).await;
-        assert!(src.exists() && !moved.exists(), "撤销移动应把文件移回原位置");
+        assert!(
+            src.exists() && !moved.exists(),
+            "撤销移动应把文件移回原位置"
+        );
     });
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&trash);
+}
+
+/// 键盘 ↑↓ 移动焦点：单步移动是单选，Shift（extend=true）是连选。
+#[test]
+fn move_cursor_moves_focus_and_extends_selection() {
+    let base = tree("cursor");
+    let app = AppState::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+        assert_eq!(app.visible_count().await, 3, "base 下应有 3 个可见条目");
+
+        // 没有焦点时 ↓ 聚焦第一项（Finder / Explorer 习惯）。
+        let first = app.move_cursor(1, false).await.expect("应有焦点下标");
+        assert_eq!(first, 0, "无焦点时 ↓ 应聚焦第一项");
+        let ids = app.selection_ids().await;
+        assert_eq!(ids.len(), 1, "单步移动应为单选");
+
+        // ↓ 连选：anchor 到新焦点之间全部选中。
+        let next = app.move_cursor(1, true).await.expect("应有焦点下标");
+        assert_eq!(next, first + 1, "焦点应前进一步");
+        let ids = app.selection_ids().await;
+        assert_eq!(ids.len(), 2, "Shift 连选应选中 2 项");
+
+        // ↑ 单步：回到单选，只剩 1 项。
+        app.move_cursor(-1, false).await;
+        let ids = app.selection_ids().await;
+        assert_eq!(ids.len(), 1, "非 extend 移动应重置为单选");
+
+        // 边界：连续 ↑ 不会越界。
+        for _ in 0..10 {
+            app.move_cursor(-1, false).await;
+        }
+        let first = app.move_cursor(-1, false).await.expect("应有焦点下标");
+        assert_eq!(first, 0, "焦点应停在第一项");
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 侧边栏快捷位置：至少有主目录，且路径都存在。
+#[test]
+fn quick_locations_contains_home_with_existing_paths() {
+    let app = AppState::new();
+    let locs = app.quick_locations();
+    assert!(!locs.is_empty(), "至少应解析出主目录");
+    assert!(
+        locs.iter().any(|(label, _)| label.contains("主目录")),
+        "应包含「主目录」: {locs:?}"
+    );
+    for (label, p) in &locs {
+        assert!(p.exists(), "「{label}」的路径应存在: {}", p.display());
+    }
 }

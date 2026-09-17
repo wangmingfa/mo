@@ -35,10 +35,17 @@ pub fn render(
     summary.push_str(" · ⌘⇧P 命令 · ⌘F 搜索 · Space 预览");
 
     div()
+        .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
-        .p(px(6.0))
-        .bg(gpui_kit::white())
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(crate::theme::container())
+        .border_t_1()
+        .border_color(crate::theme::separator())
+        .text_color(crate::theme::muted())
+        // 测试用（release no-op）：tests/layout.rs 断言状态栏贴着窗口底部
+        .debug_selector(|| "mo-statusbar".to_string())
         .child(text!(summary))
 }

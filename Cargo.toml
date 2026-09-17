@@ -9,6 +9,7 @@ members = [
     "crates/mo-thumbnails",
     "crates/mo-search",
     "crates/mo-preview",
+    "crates/mo-diff",
     "crates/mo-app",
     "crates/mo-ui",
     "crates/mo-bench",
@@ -81,6 +82,7 @@ mo-config = { path = "crates/mo-config" }
 mo-thumbnails = { path = "crates/mo-thumbnails" }
 mo-search = { path = "crates/mo-search" }
 mo-preview = { path = "crates/mo-preview" }
+mo-diff = { path = "crates/mo-diff" }
 mo-app = { path = "crates/mo-app" }
 
 [profile.release]

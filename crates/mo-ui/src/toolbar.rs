@@ -7,11 +7,16 @@ use mo_app::AppState;
 /// 状态变化由事件总线广播，UI 快照在 `RootView` 里统一同步。
 pub fn render(app: &AppState, can_back: bool, can_forward: bool) -> impl IntoElement {
     div()
+        .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
         .p(px(8.0))
-        .bg(gpui_kit::white())
+        .bg(crate::theme::container())
+        .border_b_1()
+        .border_color(crate::theme::separator())
+        // 测试用（release no-op）：tests/layout.rs 断言工具栏只有一行高
+        .debug_selector(|| "mo-toolbar".to_string())
         .child(nav_button("⬅ 后退", can_back, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Back)
@@ -58,6 +63,7 @@ fn spawn_nav(cx: &mut App, app: AppState, nav: Nav) {
 /// 一个可点击的工具栏按钮；`enabled == false` 时置灰且不挂点击回调。
 fn nav_button(label: &'static str, enabled: bool, on_click: impl Fn(&mut App) + 'static) -> Div {
     let mut button = div()
+        .flex()
         .flex_row()
         .items_center()
         .p(px(6.0))

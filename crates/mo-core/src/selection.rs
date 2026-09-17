@@ -39,6 +39,19 @@ impl SelectionModel {
         self.focused = Some(id);
     }
 
+    /// Shift 连选的起点。
+    pub fn anchor(&self) -> Option<FileId> {
+        self.anchor
+    }
+
+    /// 用快照整体替换选择集（UI 从 `AppState` 同步选择时用）。
+    ///
+    /// 只替换 `selected`，不动 anchor / focused——它们描述的是键盘光标语义，
+    /// 不属于「哪些条目被选中」这份事实。
+    pub fn set_from(&mut self, ids: &[FileId]) {
+        self.selected = ids.iter().copied().collect();
+    }
+
     /// 清空选择。
     pub fn clear(&mut self) {
         self.selected.clear();
@@ -77,5 +90,42 @@ impl SelectionModel {
         self.selected = ids.iter().copied().collect();
         self.anchor = ids.first().copied();
         self.focused = ids.last().copied();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::file_id::FileId;
+    use crate::selection::SelectionModel;
+
+    fn id(gen: u64) -> FileId {
+        FileId::new(gen, 1)
+    }
+
+    #[test]
+    fn set_from_replaces_selection_but_keeps_cursor_semantics() {
+        let mut m = SelectionModel::new();
+        m.select(id(1));
+        m.toggle(id(2));
+
+        // 快照里只剩 2：选择集被替换，anchor / focused 不被清除——
+        // 它们描述键盘光标语义，不属于「哪些条目被选中」这份事实。
+        m.set_from(&[id(2)]);
+        assert!(m.is_selected(&id(2)));
+        assert!(!m.is_selected(&id(1)));
+        assert_eq!(m.count(), 1);
+        assert_eq!(m.anchor(), Some(id(1)));
+        assert_eq!(m.focused(), Some(id(2)));
+    }
+
+    #[test]
+    fn anchor_survives_select_and_toggle() {
+        let mut m = SelectionModel::new();
+        assert_eq!(m.anchor(), None);
+        m.select(id(3));
+        assert_eq!(m.anchor(), Some(id(3)));
+        m.toggle(id(4));
+        // toggle 不覆盖已有 anchor（get_or_insert 语义）。
+        assert_eq!(m.anchor(), Some(id(3)));
     }
 }

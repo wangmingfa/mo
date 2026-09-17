@@ -9,10 +9,15 @@ pub fn render(path: &Option<PathBuf>) -> impl IntoElement {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "—".to_string());
     div()
+        .flex()
         .flex_row()
         .items_center()
         .gap(px(4.0))
-        .p(px(6.0))
-        .bg(gpui_kit::white())
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(crate::theme::surface())
+        .border_b_1()
+        .border_color(crate::theme::separator())
+        .text_color(crate::theme::muted())
         .child(text!(format!("📍 {}", label)))
 }

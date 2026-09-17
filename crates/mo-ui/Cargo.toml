@@ -15,5 +15,11 @@ mo-app.workspace = true
 mo-operations.workspace = true
 mo-search.workspace = true
 mo-preview.workspace = true
+mo-diff.workspace = true
 gpui-kit.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# `test-support` 打开 GPUI 的 headless 测试通道（TestAppContext / debug_bounds）：
+# 不依赖真实窗口即可验证布局，见 tests/layout.rs。
+gpui-kit = { workspace = true, features = ["test-support"] }

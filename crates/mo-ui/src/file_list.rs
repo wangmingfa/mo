@@ -62,6 +62,7 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             let Some(entry) = view.window.get(offset) else {
                 rows.push(
                     div()
+                        .flex()
                         .flex_row()
                         .items_center()
                         .w_full()
@@ -76,29 +77,46 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             let entity_click = entity.clone();
 
             let mut row = div()
+                .flex()
                 .flex_row()
                 .items_center()
                 .w_full()
                 .h(px(24.0))
-                .p(px(4.0))
+                .px(px(4.0))
                 .bg(if selected {
-                    gpui_kit::blue()
+                    crate::theme::selected_bg()
                 } else {
-                    gpui_kit::white()
+                    crate::theme::surface()
                 });
+
+            if !selected {
+                // fluent `hover` 在 `InteractiveElement` 上，`Div` 实现了它。
+                row = row.hover(|s| s.bg(crate::theme::hover_bg()));
+            }
 
             // `Div` 只实现 `InteractiveElement`（提供 `interactivity()`），
             // fluent `on_click` 在 `StatefulInteractiveElement`（Div 未实现），
             // 因此点击回调走 imperative API。
             row.interactivity().on_click(move |_, _window, cx| {
-                entity_click.update(cx, |v, cx| {
+                // 本地立即反馈，再异步同步 app 侧（app 侧是唯一事实来源）。
+                let app = entity_click.update(cx, |v, _cx| {
                     v.selection.toggle(id);
-                    cx.notify();
+                    v.app.clone()
                 });
+                cx.spawn(async move |_cx| {
+                    app.toggle(id).await;
+                })
+                .detach();
             });
 
             rows.push(row.child(crate::file_item::view(entry, selected)));
         }
         rows
     })
+    // ⚠️ 必需：`uniform_list` 的列表项只在 prepaint 阶段渲染，布局阶段 taffy
+    // 看到的是「没有子节点」的元素，身高算出来是 0。不显式给它确定高度
+    // （flex_1 / size_full / h(...)），整个文件列表就会被压成 0 高。
+    .flex_1()
+    // 测试用：让 tests/layout.rs 能读到这个元素的实际尺寸（release 下 no-op）。
+    .debug_selector(|| "mo-file-list".to_string())
 }

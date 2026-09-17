@@ -10,6 +10,7 @@ mod file_list;
 mod progress_panel;
 mod sidebar;
 mod status_bar;
+mod theme;
 mod toolbar;
 
 pub use app::RootView;

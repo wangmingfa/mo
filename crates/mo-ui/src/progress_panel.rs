@@ -7,7 +7,7 @@ use mo_operations::{OperationHandle, OperationStatus};
 /// 文件操作全部在后台执行，UI 不等待：这里显示每个操作的描述、进度与取消入口。
 /// 数据来自 `OperationManager::snapshot()`，由事件总线驱动刷新。
 pub fn render(ops: &[OperationHandle], app: &AppState) -> impl IntoElement {
-    let mut panel = div().flex_col().w_full();
+    let mut panel = div().flex().flex_col().w_full();
 
     if ops.is_empty() {
         return panel;
@@ -30,6 +30,7 @@ pub fn render(ops: &[OperationHandle], app: &AppState) -> impl IntoElement {
         };
 
         let mut row = div()
+            .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))

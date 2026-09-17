@@ -1,0 +1,137 @@
+//! headless 布局验证（不需要真实窗口 / GPU）。
+//!
+//! 这一层专门守住两个 GPUI 坑，它们都曾让界面「一片空白」：
+//!
+//! 1. **`flex_row()` / `flex_col()` 不设置 `display`**。
+//!    GPUI 的 `Style::default().display` 是 `Block`，而 `flex_row()` / `flex_col()`
+//!    只设置 `flex-direction`。不额外调用 `.flex()`，容器就是 block——
+//!    `flex_1()` / `items_center()` / `gap()` / `justify_*` 全部静默失效。
+//!    （gpui-component 的 `h_flex()` / `v_flex()` 会一并设置，但 gpui 0.3.5 没有。）
+//! 2. **`uniform_list` 不会自己撑高**。它的行只在 prepaint 阶段渲染，布局阶段
+//!    taffy 看到的是一个没有子节点的元素，身高算出来是 0，必须由调用方给出
+//!    确定高度（`flex_1()` / `size_full()` / `h(...)`）。
+//!
+//! `debug_selector` 只在 test / `test-support` 构建里生效，release 下是 no-op。
+
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{px, size, Bounds, Pixels, Size, TestAppContext, VisualTestContext, WindowHandle};
+use mo_app::AppState;
+use mo_ui::RootView;
+
+/// 以指定窗口尺寸启动一个 headless 窗口，返回可查询布局的上下文与窗口句柄。
+fn open_app(
+    window_size: Size<Pixels>,
+    cx: &mut TestAppContext,
+) -> (VisualTestContext, WindowHandle<RootView>) {
+    let app = AppState::new();
+    let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    // Home 目录是异步加载的；这里只关心布局，跑一轮让首帧画出来即可。
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    (vcx, window)
+}
+
+fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
+    cx.debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} 没有出现在渲染帧里（debug_selector 未生效？）"))
+}
+
+/// 文件列表必须吃满中央区的剩余高度——它没有自我撑高的能力。
+#[gpui_kit::test]
+fn file_list_fills_the_central_area(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let list = bounds(&mut cx, "mo-file-list");
+
+    assert!(
+        list.size.height > px(300.),
+        "文件列表只有 {} 高（窗口 700）：uniform_list 需要调用方给出确定高度",
+        list.size.height
+    );
+    assert!(
+        list.size.width > px(300.),
+        "文件列表宽度异常：{}",
+        list.size.width
+    );
+}
+
+/// 高度应当由「窗口剩余空间」驱动，而不是某个写死的值。
+#[gpui_kit::test]
+fn file_list_height_tracks_the_window(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(400.)), cx);
+
+    let list = bounds(&mut cx, "mo-file-list");
+
+    assert!(
+        list.size.height > px(200.),
+        "窗口 400 高时文件列表高度只有 {}",
+        list.size.height
+    );
+    assert!(
+        list.size.height < px(400.),
+        "文件列表高度 {} 超过了窗口高度：它没有让位于工具栏 / 状态栏",
+        list.size.height
+    );
+}
+
+/// 侧边栏与文件列表必须左右并排（block 布局下它们会变成上下堆叠，列表随即被压成 0 高）。
+#[gpui_kit::test]
+fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let sidebar = bounds(&mut cx, "mo-sidebar");
+    let center = bounds(&mut cx, "mo-center");
+    let list = bounds(&mut cx, "mo-file-list");
+
+    assert_eq!(sidebar.origin.x, px(0.), "侧边栏不在最左侧");
+    assert_eq!(
+        center.origin.x,
+        sidebar.origin.x + sidebar.size.width,
+        "中央区没有紧贴侧边栏右侧：center.x={} sidebar={:?}",
+        center.origin.x,
+        sidebar
+    );
+    assert_eq!(
+        center.origin.y, sidebar.origin.y,
+        "中央区与侧边栏没有落在同一行：center.y={} sidebar.y={}",
+        center.origin.y, sidebar.origin.y
+    );
+    assert_eq!(
+        center.size.height, sidebar.size.height,
+        "中央区与侧边栏高度不一致"
+    );
+    assert_eq!(
+        list.size.height, center.size.height,
+        "文件列表没有吃满中央区高度（过滤条未显示时二者应当相等）"
+    );
+}
+
+/// 工具栏应当只有一行；状态栏应当贴着窗口底部，中央区正好顶到状态栏。
+#[gpui_kit::test]
+fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let toolbar = bounds(&mut cx, "mo-toolbar");
+    let list = bounds(&mut cx, "mo-file-list");
+    let status = bounds(&mut cx, "mo-statusbar");
+
+    assert!(
+        toolbar.size.height < px(100.),
+        "工具栏高 {}：按钮被竖着堆成了多行（flex_row 没生效？）",
+        toolbar.size.height
+    );
+    assert_eq!(
+        status.origin.y + status.size.height,
+        px(700.),
+        "状态栏没有贴着窗口底部：{:?}",
+        status
+    );
+    assert_eq!(
+        list.origin.y + list.size.height,
+        status.origin.y,
+        "中央区与状态栏之间有多余空白：list={:?} status={:?}",
+        list,
+        status
+    );
+}

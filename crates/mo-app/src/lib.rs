@@ -138,7 +138,9 @@ impl AppState {
             cache,
             watcher: Arc::new(Mutex::new(None)),
             dirty: Arc::new(AtomicBool::new(false)),
-            index: Arc::new(PlMutex::new(FileIndex::open_in_memory().expect("open index"))),
+            index: Arc::new(PlMutex::new(
+                FileIndex::open_in_memory().expect("open index"),
+            )),
             index_stop: Arc::new(AtomicBool::new(false)),
             history: Arc::new(PlMutex::new(Vec::new())),
             trash,
@@ -734,10 +736,7 @@ impl AppState {
 
     /// 查询全局索引（同步、毫秒级）。
     pub fn global_search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
-        self.index
-            .lock()
-            .search(query, limit)
-            .unwrap_or_default()
+        self.index.lock().search(query, limit).unwrap_or_default()
     }
 
     /// 索引中的文件总数。
@@ -750,6 +749,21 @@ impl AppState {
     /// 预览单个文件 / 目录（同步读取，按需提取文本 / 图片路径 / 目录摘要）。
     pub fn preview(&self, path: &Path) -> Result<Preview, MoError> {
         mo_preview::preview_path(path)
+    }
+
+    // ---- 文件 / 文件夹比较 ----
+
+    /// 比较两个条目（自动选择文件比较或树比较）。
+    ///
+    /// 阻塞 IO 在 blocking 池执行，UI 可以在等待期间继续刷新。
+    pub async fn compare_paths(
+        &self,
+        a: PathBuf,
+        b: PathBuf,
+    ) -> Result<mo_diff::Comparison, String> {
+        self.spawn_blocking(move || mo_diff::compare(&a, &b))
+            .await
+            .map_err(|e| format!("比较任务失败：{e}"))?
     }
 
     // ---- 批量操作 ----
@@ -813,7 +827,91 @@ impl AppState {
                 .map(|e| e.id)
                 .collect()
         };
-        self.inner.write().await.selection.select_range(&ids, from, to);
+        self.inner
+            .write()
+            .await
+            .selection
+            .select_range(&ids, from, to);
+    }
+
+    /// 当前选择集的快照（UI 以 app 侧为唯一事实来源，用它回灌本地缓存）。
+    pub async fn selection_ids(&self) -> Vec<FileId> {
+        self.inner
+            .read()
+            .await
+            .selection
+            .selected_ids()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// 键盘 ↑↓ 移动焦点：`step` 为相对位移（-1 / +1），`extend` 为 Shift 连选。
+    ///
+    /// 返回移动后的可见下标（供 UI 滚动跟随 / Enter 打开时定位）。
+    /// 焦点条目基于可见（已过滤 + 已排序）序列，与列表渲染顺序一致。
+    pub async fn move_cursor(&self, step: isize, extend: bool) -> Option<usize> {
+        let ids: Vec<FileId> = {
+            let inner = self.inner.read().await;
+            let dir = inner.directory.as_ref()?;
+            dir.view
+                .visible_indices()
+                .iter()
+                .filter_map(|&i| dir.entries.get(i))
+                .map(|e| e.id)
+                .collect()
+        };
+        if ids.is_empty() {
+            return None;
+        }
+
+        let (focused, anchor) = {
+            let inner = self.inner.read().await;
+            (inner.selection.focused(), inner.selection.anchor())
+        };
+        let cur = focused.and_then(|f| ids.iter().position(|&i| i == f));
+        let next = match cur {
+            Some(i) => (i as isize + step).clamp(0, ids.len() as isize - 1) as usize,
+            // 还没有焦点：↓ 聚焦第一项、↑ 聚焦最后一项（Finder / Explorer 习惯）。
+            None => {
+                if step < 0 {
+                    ids.len() - 1
+                } else {
+                    0
+                }
+            }
+        };
+
+        if extend {
+            let from = anchor
+                .and_then(|a| ids.iter().position(|&i| i == a))
+                .unwrap_or(next);
+            self.select_range(from, next).await;
+        } else {
+            self.select(ids[next]).await;
+        }
+        Some(next)
+    }
+
+    /// 侧边栏快捷访问位置（存在才列出）。
+    pub fn quick_locations(&self) -> Vec<(String, PathBuf)> {
+        let mut out = Vec::new();
+        if let Some(p) = dirs::home_dir() {
+            out.push(("🏠 主目录".to_string(), p));
+        }
+        if let Some(p) = dirs::desktop_dir() {
+            out.push(("🖥 桌面".to_string(), p));
+        }
+        if let Some(p) = dirs::document_dir() {
+            out.push(("📄 文档".to_string(), p));
+        }
+        if let Some(p) = dirs::download_dir() {
+            out.push(("📥 下载".to_string(), p));
+        }
+        if let Some(p) = dirs::picture_dir() {
+            out.push(("🖼 图片".to_string(), p));
+        }
+        out
     }
 
     /// 删除选中（无选中则删除聚焦项）：移入回收站（非永久删除），逐条提交到操作队列。
@@ -859,11 +957,21 @@ impl AppState {
                 CopyOperation::new(id, src.clone(), to.clone())
             };
             let hid = self.submit_operation(op).await;
-            self.record_history(if move_ { "移动" } else { "复制" }, vec![src.clone()], Some(dest.to_path_buf()));
+            self.record_history(
+                if move_ { "移动" } else { "复制" },
+                vec![src.clone()],
+                Some(dest.to_path_buf()),
+            );
             self.push_reversible(if move_ {
-                Reversible::Move { from: src, to: to.clone() }
+                Reversible::Move {
+                    from: src,
+                    to: to.clone(),
+                }
             } else {
-                Reversible::Copy { src, dest: to.clone() }
+                Reversible::Copy {
+                    src,
+                    dest: to.clone(),
+                }
             });
             ids.push(hid);
         }
