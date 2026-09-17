@@ -18,6 +18,16 @@ mo-preview.workspace = true
 mo-diff.workspace = true
 gpui-kit.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+# 运行时设置 macOS Dock 图标（objc 已在依赖树中：cocoa → objc，不引入新外部代码）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2.7"
+
+# objc 0.2 的 class!/msg_send! 宏内部含 `cfg(feature = "cargo-clippy")`，
+# 宏展开到本 crate 时会触发 unexpected_cfgs 告警；这里声明该值为已知，消除误报。
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
 # `test-support` 打开 GPUI 的 headless 测试通道（TestAppContext / debug_bounds）：

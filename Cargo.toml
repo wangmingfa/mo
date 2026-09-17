@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Mo Contributors"]
-rust-version = "1.80"
+rust-version = "1.98.1"
 
 [workspace.dependencies]
 # Async
@@ -88,3 +88,9 @@ mo-app = { path = "crates/mo-app" }
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# 本地补丁：block 0.1.6 上游（SSheldon/rust-block）已停止维护，其 extern static
+# 使用了空枚举类型（uninhabited static，rust-lang/rust#74840），将来会成为硬错误。
+# third_party/block 修复了该写法（符号地址语义不变），替换全部传递依赖（cocoa → gpui）。
+[patch.crates-io]
+block = { path = "third_party/block" }

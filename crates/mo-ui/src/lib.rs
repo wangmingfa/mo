@@ -7,6 +7,7 @@ mod app;
 mod breadcrumb;
 mod file_item;
 mod file_list;
+mod icon;
 mod progress_panel;
 mod sidebar;
 mod status_bar;
@@ -27,6 +28,8 @@ pub fn run() {
     app.spawn_refresh_pump();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        // NSApplication 此时已创建：把嵌入的 PNG 设为 Dock / ⌘Tab 图标。
+        icon::set_dock_icon();
         let app = app.clone();
         cx.spawn(async move |cx| {
             let _window = cx
