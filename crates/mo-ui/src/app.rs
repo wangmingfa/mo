@@ -348,6 +348,31 @@ impl RootView {
             .unwrap_or_default();
     }
 
+    /// 打开一个条目（双击 / Enter 同语义）：目录进入，文件快速预览。
+    ///
+    /// 供 file_list 的双击回调调用——`preview_cache` / `modal` 是私有字段，
+    /// 跨模块访问必须走这个方法。
+    pub(crate) fn open_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if path.is_dir() {
+            let app = self.app.clone();
+            cx.spawn(async move |_weak, _cx| {
+                let _ = app.open_directory(&path).await;
+            })
+            .detach();
+        } else {
+            match self.app.preview(&path) {
+                Ok(pv) => {
+                    self.preview_cache = Some(pv);
+                    self.modal = Modal::QuickLook;
+                }
+                Err(e) => {
+                    self.modal = Modal::Info(format!("无法预览 {path:?}：{e}"));
+                }
+            }
+            cx.notify();
+        }
+    }
+
     /// 应用当前过滤词（输入即过滤）。
     fn apply_filter(&mut self, cx: &mut Context<Self>) {        let query = self.query.trim().to_string();
         let app = self.app.clone();

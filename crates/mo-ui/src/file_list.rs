@@ -73,6 +73,7 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             };
 
             let id = entry.id;
+            let entry_path = entry.path.clone();
             let selected = view.selection.is_selected(&id);
             let entity_click = entity.clone();
 
@@ -97,8 +98,13 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             // `Div` 只实现 `InteractiveElement`（提供 `interactivity()`），
             // fluent `on_click` 在 `StatefulInteractiveElement`（Div 未实现），
             // 因此点击回调走 imperative API。
-            row.interactivity().on_click(move |_, _window, cx| {
-                // 本地立即反馈，再异步同步 app 侧（app 侧是唯一事实来源）。
+            row.interactivity().on_click(move |ev, _window, cx| {
+                // 双击（click_count >= 2）：进入目录 / 预览文件，与 Enter 同语义。
+                if ev.click_count() >= 2 {
+                    entity_click.update(cx, |v, cx| v.open_entry(entry_path.clone(), cx));
+                    return;
+                }
+                // 单击：本地立即反馈，再异步同步 app 侧（app 侧是唯一事实来源）。
                 let app = entity_click.update(cx, |v, _cx| {
                     v.selection.toggle(id);
                     v.app.clone()

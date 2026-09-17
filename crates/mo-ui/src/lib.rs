@@ -36,7 +36,12 @@ pub fn run() {
         // 工具栏左移留出红绿灯位置；AppKit 仍负责顶部条拖拽与双击缩放。
         // 红绿灯垂直位置由 toolbar::TOOLBAR_HEIGHT 推导，保证在工具栏内居中。
         let (tl_x, tl_y) = toolbar::traffic_light_position();
+        // 默认尺寸 1280×800（gpui 缺省 1000×600 对文件管理器太局促）。
         let options = gpui_kit::WindowOptions {
+            window_bounds: Some(gpui_kit::WindowBounds::Windowed(Bounds::new(
+                point(px(80.0), px(60.0)),
+                size(px(1280.0), px(800.0)),
+            ))),
             titlebar: Some(gpui_kit::TitlebarOptions {
                 title: Some("Mo".into()),
                 appears_transparent: true,
