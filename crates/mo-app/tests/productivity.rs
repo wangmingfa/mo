@@ -157,6 +157,53 @@ fn undo_restores_a_deleted_file_from_trash() {
 }
 
 #[test]
+fn trash_list_purge_and_empty() {
+    let base = tree("trash-panel");
+    let trash = trash_root("trash-panel");
+    let app = AppState::with_trash(trash.clone());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+
+        // 删除 beta.log → 进回收站。
+        let entries = app.current_entries().await;
+        let id = entries
+            .iter()
+            .find(|e| e.path == base.join("beta.log"))
+            .unwrap()
+            .id;
+        app.select(id).await;
+        app.delete_selection().await;
+        wait_for(|| app.trash_count() == 1).await;
+        assert_eq!(app.trash_count(), 1);
+        let list = app.trash_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].original, base.join("beta.log"));
+
+        // 永久删除单条。
+        app.purge_trash_entry(list[0].clone());
+        wait_for(|| app.trash_count() == 0).await;
+        assert_eq!(app.trash_count(), 0, "永久删除后回收站应为空");
+
+        // 再删一个后清空。
+        let entries = app.current_entries().await;
+        let id = entries
+            .iter()
+            .find(|e| e.path == base.join("alpha.txt"))
+            .unwrap()
+            .id;
+        app.select(id).await;
+        app.delete_selection().await;
+        wait_for(|| app.trash_count() == 1).await;
+        app.empty_trash();
+        wait_for(|| app.trash_count() == 0).await;
+        assert_eq!(app.trash_count(), 0, "清空后回收站应为空");
+    });
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&trash);
+}
+
+#[test]
 fn undo_reverts_a_copy() {
     let base = tree("undo-copy");
     let trash = trash_root("undo-copy");

@@ -27,6 +27,9 @@ pub enum AppEvent {
     OperationProgress { id: u64, done: u64, total: u64 },
     OperationFinished { id: u64 },
 
+    /// 回收站内容变化（清空 / 永久删除 / 还原）。
+    TrashChanged,
+
     NavigationChanged { path: PathBuf },
 }
 

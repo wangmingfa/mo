@@ -143,6 +143,22 @@ impl Trash {
         self.entries.lock().iter().rev().cloned().collect()
     }
 
+    /// 当前回收站中的条目数。
+    pub fn count(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// 永久删除某一条记录（不还原，直接抹掉文件与索引）。
+    pub fn purge(&self, entry: &TrashEntry) -> Result<()> {
+        // 删除 uuid 隔离目录，连同其中的被回收文件 / 目录。
+        if let Some(id_dir) = entry.trashed.parent() {
+            let _ = std::fs::remove_dir_all(id_dir);
+        }
+        // 兜底（trashed 无父目录等罕见情况）。
+        let _ = std::fs::remove_file(&entry.trashed);
+        self.remove_entry(&entry.id)
+    }
+
     /// 清空回收站（删除所有被回收的文件 + 索引）。
     pub fn empty(&self) -> Result<()> {
         let ids: Vec<String> = self.entries.lock().iter().map(|e| e.id.clone()).collect();
@@ -255,6 +271,23 @@ mod tests {
         assert_eq!(t.list().len(), 2, "应有 2 条记录");
         t.empty().unwrap();
         assert_eq!(t.list().len(), 0, "清空后应为空");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_removes_single_entry_permanently() {
+        let (root, t) = tmp_trash("f");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        file(&a, b"a");
+        file(&b, b"b");
+        t.trash(&a).unwrap();
+        let eb = t.trash(&b).unwrap();
+        assert_eq!(t.count(), 2);
+        t.purge(&eb).unwrap();
+        assert_eq!(t.count(), 1, "永久删除一条后应只剩 1 条");
+        assert!(!eb.trashed.exists(), "被永久删除的文件应不存在");
+        assert!(!a.exists() && t.list()[0].original == a, "另一条应保留");
         let _ = std::fs::remove_dir_all(&root);
     }
 

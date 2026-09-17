@@ -36,7 +36,7 @@ use mo_core::{
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
     CopyOperation, MoveOperation, OperationHandle, OperationManager, RestoreOperation,
-    SharedOperation, Trash, TrashOperation,
+    SharedOperation, Trash, TrashEntry, TrashOperation,
 };
 use mo_preview::Preview;
 use mo_search::{crawl, FileIndex, SearchHit};
@@ -955,6 +955,47 @@ impl AppState {
             });
             self.undo_stack.lock().push(r);
         }
+    }
+
+    // ---- 回收站 ----
+
+    /// 回收站条目快照（最新在前）。
+    pub fn trash_list(&self) -> Vec<TrashEntry> {
+        self.trash.list()
+    }
+
+    /// 回收站条目数。
+    pub fn trash_count(&self) -> usize {
+        self.trash.count()
+    }
+
+    /// 还原一条回收站记录（异步提交 `RestoreOperation`）。
+    pub async fn restore_trash_entry(&self, original: PathBuf) {
+        let id = self.ops.lock().await.next_id();
+        let op = RestoreOperation::new(id, original, self.trash.clone());
+        self.submit_operation(op).await;
+    }
+
+    /// 永久删除某条回收站记录（阻塞 IO 放 blocking 池），完成后广播 `TrashChanged`。
+    pub fn purge_trash_entry(&self, entry: TrashEntry) {
+        let app = self.clone();
+        let bus = self.bus.clone();
+        let trash = self.trash.clone();
+        self.spawn(async move {
+            let _ = app.spawn_blocking(move || trash.purge(&entry)).await;
+            bus.publish(AppEvent::TrashChanged);
+        });
+    }
+
+    /// 清空回收站，完成后广播 `TrashChanged`。
+    pub fn empty_trash(&self) {
+        let app = self.clone();
+        let bus = self.bus.clone();
+        let trash = self.trash.clone();
+        self.spawn(async move {
+            let _ = app.spawn_blocking(move || trash.empty()).await;
+            bus.publish(AppEvent::TrashChanged);
+        });
     }
 
     /// 执行一条可逆操作的正向（inverse=false）或逆向（inverse=true）版本，提交到操作队列。

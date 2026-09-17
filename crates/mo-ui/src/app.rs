@@ -5,7 +5,7 @@ use gpui_kit::*;
 use gpui_kit::component::scroll::ScrollableElement;
 use mo_app::AppState;
 use mo_core::{SelectionModel, SortKey};
-use mo_operations::{HashAlgo, OperationHandle};
+use mo_operations::{HashAlgo, OperationHandle, TrashEntry};
 use mo_preview::Preview;
 use mo_search::SearchHit;
 
@@ -24,6 +24,8 @@ pub(crate) enum Modal {
     GlobalSearch,
     /// 快速预览（空格 Quick Look）。
     QuickLook,
+    /// 回收站面板。
+    Trash,
     /// 纯文本信息（哈希结果 / 提示）。
     Info(String),
 }
@@ -49,6 +51,7 @@ pub(crate) enum CommandId {
     HashSelection,
     Undo,
     Redo,
+    OpenTrash,
 }
 
 struct CmdDef {
@@ -74,6 +77,7 @@ fn commands() -> Vec<CmdDef> {
         CmdDef { id: CommandId::DeleteSelection, title: "删除选中", category: "操作" },
         CmdDef { id: CommandId::Undo, title: "撤销", category: "操作" },
         CmdDef { id: CommandId::Redo, title: "重做", category: "操作" },
+        CmdDef { id: CommandId::OpenTrash, title: "回收站…", category: "操作" },
         CmdDef { id: CommandId::SortName, title: "按名称排序", category: "排序" },
         CmdDef { id: CommandId::SortSize, title: "按大小排序", category: "排序" },
         CmdDef { id: CommandId::SortModified, title: "按修改时间排序", category: "排序" },
@@ -134,6 +138,8 @@ pub struct RootView {
     preview_cache: Option<Preview>,
     /// 已索引文件数（状态栏展示）。
     indexed: usize,
+    /// 回收站条目快照（回收站面板数据源）。
+    trash_entries: Vec<TrashEntry>,
 }
 
 impl RootView {
@@ -158,6 +164,7 @@ impl RootView {
             search_results: Vec::new(),
             preview_cache: None,
             indexed: 0,
+            trash_entries: Vec::new(),
         };
 
         let this = cx.entity().clone();
@@ -193,6 +200,7 @@ impl RootView {
         let can_forward = app.can_go_forward().await;
         let ops = app.operations_snapshot().await;
         let indexed = app.index_count();
+        let trash_entries = app.trash_list();
 
         let range = this.update(cx, |v, _cx| {
             // 切换目录或改过滤词后，旧窗口的下标已失效，直接作废。
@@ -207,6 +215,7 @@ impl RootView {
             v.can_forward = can_forward;
             v.ops = ops;
             v.indexed = indexed;
+            v.trash_entries = trash_entries;
             let len = if v.window.is_empty() {
                 INITIAL_WINDOW
             } else {
@@ -272,6 +281,7 @@ impl Render for RootView {
             Modal::CommandPalette => self.render_command_palette(&entity),
             Modal::GlobalSearch => self.render_global_search(&entity),
             Modal::QuickLook => self.render_quick_look(),
+            Modal::Trash => self.render_trash(),
             Modal::Info(text) => render_info(text),
         };
 
@@ -482,12 +492,71 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
             }
             _ => {}
         },
+        Modal::Trash => match key {
+            "escape" => close_modal(entity, cx),
+            "arrowup" => entity.update(cx, |v, cx| {
+                if v.palette_index > 0 {
+                    v.palette_index -= 1;
+                }
+                cx.notify();
+            }),
+            "arrowdown" => entity.update(cx, |v, cx| {
+                let n = v.trash_entries.len();
+                if n > 0 {
+                    v.palette_index = (v.palette_index + 1).min(n - 1);
+                }
+                cx.notify();
+            }),
+            "enter" => on_trash_restore(entity, cx),
+            "delete" => on_trash_purge(entity, cx),
+            "e" if plain => on_trash_empty(entity, cx),
+            _ => {}
+        },
         Modal::QuickLook | Modal::Info(_) => match key {
             "escape" | " " => close_modal(entity, cx),
             _ => {}
         },
         Modal::None => {}
     }
+}
+
+/// 回收站：还原选中条目。
+fn on_trash_restore(entity: &Entity<RootView>, cx: &mut App) {
+    let (entry, app) = entity.update(cx, |v, cx| {
+        let e = v.trash_entries.get(v.palette_index).cloned();
+        v.palette_index = 0;
+        cx.notify();
+        (e, v.app.clone())
+    });
+    if let Some(e) = entry {
+        cx.spawn(async move |_cx| {
+            app.restore_trash_entry(e.original).await;
+        })
+        .detach();
+    }
+}
+
+/// 回收站：永久删除选中条目。
+fn on_trash_purge(entity: &Entity<RootView>, cx: &mut App) {
+    let (entry, app) = entity.update(cx, |v, cx| {
+        let e = v.trash_entries.get(v.palette_index).cloned();
+        v.palette_index = 0;
+        cx.notify();
+        (e, v.app.clone())
+    });
+    if let Some(e) = entry {
+        app.purge_trash_entry(e);
+    }
+}
+
+/// 回收站：清空。
+fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
+    let app = entity.update(cx, |v, cx| {
+        v.palette_index = 0;
+        cx.notify();
+        v.app.clone()
+    });
+    app.empty_trash();
 }
 
 fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
@@ -531,6 +600,14 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 compute_hash(&app, &this, cx).await;
             })
             .detach();
+        }
+        Some(CommandId::OpenTrash) => {
+            entity.update(cx, |v, cx| {
+                v.trash_entries = v.app.trash_list();
+                v.modal = Modal::Trash;
+                v.palette_index = 0;
+                cx.notify();
+            });
         }
         Some(other) => {
             let this = entity.clone();
@@ -620,8 +697,11 @@ async fn run_command(id: CommandId, app: &AppState) {
         CommandId::StopIndexing => app.stop_indexing(),
         CommandId::Undo => app.undo(),
         CommandId::Redo => app.redo(),
-        // 这三个由面板特殊处理，不会走到这里。
-        CommandId::OpenGlobalSearch | CommandId::QuickLook | CommandId::HashSelection => {}
+        // 这几个由面板特殊处理，不会走到这里。
+        CommandId::OpenGlobalSearch
+        | CommandId::QuickLook
+        | CommandId::HashSelection
+        | CommandId::OpenTrash => {}
     }
 }
 
@@ -799,6 +879,65 @@ impl RootView {
             None => div().child(text!("（无预览）".to_string())),
         };
         modal_card("快速预览", "", body, "Space / Esc 关闭")
+    }
+
+    fn render_trash(&self) -> Div {
+        let idx = self.palette_index;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut body = div()
+            .flex_col()
+            .gap(px(2.0))
+            .overflow_y_scrollbar()
+            .h(px(360.0));
+        for (i, e) in self.trash_entries.iter().enumerate() {
+            let selected = i == idx;
+            let kind = if e.is_dir { "📁" } else { "📄" };
+            let row = div()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .bg(if selected {
+                    gpui_kit::blue()
+                } else {
+                    gpui_kit::white()
+                })
+                .text_color(if selected {
+                    gpui_kit::white()
+                } else {
+                    gpui_kit::black()
+                })
+                .child(text!(kind.to_string()))
+                .child(text!(e.original.to_string_lossy().to_string()))
+                .child(text!(human_ago(e.at, now)));
+            body = body.child(row);
+        }
+        if self.trash_entries.is_empty() {
+            body = body.child(text!("回收站是空的".to_string()));
+        }
+        modal_card(
+            &format!("回收站（{} 项）", self.trash_entries.len()),
+            "",
+            body,
+            "↑↓ 选择 · Enter 还原 · Delete 永久删除 · E 清空 · Esc 关闭",
+        )
+    }
+}
+
+/// 粗略的相对时间（依赖零；用于回收站条目展示）。
+fn human_ago(at: u64, now: u64) -> String {
+    let d = now.saturating_sub(at);
+    if d < 60 {
+        "刚刚".to_string()
+    } else if d < 3600 {
+        format!("{} 分钟前", d / 60)
+    } else if d < 86_400 {
+        format!("{} 小时前", d / 3600)
+    } else {
+        format!("{} 天前", d / 86_400)
     }
 }
 
