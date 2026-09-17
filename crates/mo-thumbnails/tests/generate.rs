@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mo_core::FileId;
 use mo_thumbnails::{ThumbnailCache, DEFAULT_SIZE};
@@ -11,7 +11,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 /// 写一张彩色测试图，返回路径。
-fn write_test_image(dir: &PathBuf, w: u32, h: u32) -> PathBuf {
+fn write_test_image(dir: &Path, w: u32, h: u32) -> PathBuf {
     let path = dir.join("source.png");
     let img = image::RgbImage::from_fn(w, h, |x, y| {
         image::Rgb([(x % 255) as u8, (y % 255) as u8, 96])

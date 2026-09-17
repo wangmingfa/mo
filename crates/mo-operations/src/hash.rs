@@ -3,9 +3,9 @@ use std::io::Read;
 use std::path::Path;
 
 use md5::Md5;
+use mo_core::MoError;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use mo_core::MoError;
 
 /// 支持的哈希算法。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,10 +47,7 @@ pub fn compute_hashes(
     } else {
         None
     };
-    let mut s2 = if algos
-        .iter()
-        .any(|a| matches!(a, HashAlgo::Sha256))
-    {
+    let mut s2 = if algos.iter().any(|a| matches!(a, HashAlgo::Sha256)) {
         Some(Sha256::new())
     } else {
         None
@@ -106,7 +103,10 @@ mod tests {
         let all = [HashAlgo::Md5, HashAlgo::Sha1, HashAlgo::Sha256];
         let out = compute_hashes(&d, &all).unwrap();
         assert_eq!(out[&HashAlgo::Md5], "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(out[&HashAlgo::Sha1], "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            out[&HashAlgo::Sha1],
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(
             out[&HashAlgo::Sha256],
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

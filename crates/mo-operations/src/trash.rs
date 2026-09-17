@@ -298,7 +298,10 @@ mod tests {
         file(&src.join("inner.txt"), b"deep");
         let entry = t.trash(&src).unwrap();
         assert!(entry.is_dir);
-        assert!(entry.trashed.join("inner.txt").exists(), "目录内容应随回收站保留");
+        assert!(
+            entry.trashed.join("inner.txt").exists(),
+            "目录内容应随回收站保留"
+        );
         t.restore(&entry).unwrap();
         assert!(src.join("inner.txt").exists(), "还原后目录内容应回来");
         let _ = std::fs::remove_dir_all(&root);

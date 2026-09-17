@@ -8,3 +8,6 @@ license.workspace = true
 mo-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

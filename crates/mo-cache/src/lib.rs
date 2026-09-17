@@ -45,7 +45,7 @@ impl MetadataCache {
     }
 
     fn init(&self) -> Result<(), MoError> {
-        let conn = self.conn.lock().map_err(|e| re(e))?;
+        let conn = self.conn.lock().map_err(re)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -63,7 +63,7 @@ impl MetadataCache {
 
     /// 写入 / 覆盖一条元数据。
     pub fn put(&self, id: &FileId, m: &FileMetadata) -> Result<(), MoError> {
-        self.put_many(&[(id.clone(), m.clone())])
+        self.put_many(&[(*id, *m)])
     }
 
     /// 批量写入：合并为单个事务，用于打开大目录后一次性落盘。
@@ -71,7 +71,7 @@ impl MetadataCache {
         if items.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().map_err(|e| re(e))?;
+        let mut conn = self.conn.lock().map_err(re)?;
         let tx = conn.transaction().map_err(re)?;
         {
             let mut stmt = tx
@@ -97,7 +97,7 @@ impl MetadataCache {
 
     /// 读取一条元数据（无则返回 `None`）。
     pub fn get(&self, id: &FileId) -> Result<Option<FileMetadata>, MoError> {
-        let conn = self.conn.lock().map_err(|e| re(e))?;
+        let conn = self.conn.lock().map_err(re)?;
         let mut stmt = conn
             .prepare_cached("SELECT size, modified, created, readonly FROM metadata WHERE id = ?1")
             .map_err(re)?;
@@ -117,7 +117,7 @@ impl MetadataCache {
         if ids.is_empty() {
             return Ok(out);
         }
-        let conn = self.conn.lock().map_err(|e| re(e))?;
+        let conn = self.conn.lock().map_err(re)?;
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, size, modified, created, readonly FROM metadata WHERE id = ?1",
@@ -127,7 +127,7 @@ impl MetadataCache {
             let mut rows = stmt.query(params![id.to_string()]).map_err(re)?;
             if let Some(row) = rows.next().map_err(re)? {
                 // id 列在批量查询里位于 0，其余字段整体后移一位。
-                out.insert(id.clone(), row_to_metadata_offset(row)?);
+                out.insert(*id, row_to_metadata_offset(row)?);
             }
         }
         Ok(out)
@@ -135,7 +135,7 @@ impl MetadataCache {
 
     /// 清空全部缓存条目。
     pub fn clear(&self) -> Result<(), MoError> {
-        let conn = self.conn.lock().map_err(|e| re(e))?;
+        let conn = self.conn.lock().map_err(re)?;
         conn.execute("DELETE FROM metadata", []).map_err(re)?;
         Ok(())
     }
@@ -177,7 +177,7 @@ fn row_to_metadata_offset(row: &rusqlite::Row) -> Result<FileMetadata, MoError> 
 /// Mo 的缓存根目录（`<用户缓存目录>/mo`）。
 pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
         .join("mo")
 }
 

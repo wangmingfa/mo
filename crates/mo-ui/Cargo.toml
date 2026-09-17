@@ -26,8 +26,16 @@ objc = "0.2.7"
 
 # objc 0.2 的 class!/msg_send! 宏内部含 `cfg(feature = "cargo-clippy")`，
 # 宏展开到本 crate 时会触发 unexpected_cfgs 告警；这里声明该值为已知，消除误报。
+# 本地 lints：objc 0.2 宏内引用了 `cfg(feature = "cargo_clippy")`，展开到本 crate
+# 触发 unexpected_cfgs 误报，需显式声明。因存在本地 [lints.*] 段无法再继承
+# workspace lints，故把 workspace 的策略（unsafe_code=warn、clippy all=deny）
+# 在此手动复制——改动 workspace lints 时记得同步这里。
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "deny"
 
 [dev-dependencies]
 # `test-support` 打开 GPUI 的 headless 测试通道（TestAppContext / debug_bounds）：

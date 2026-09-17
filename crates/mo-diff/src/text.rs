@@ -10,7 +10,11 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffOp {
     /// 两侧相同的行：旧侧 `old` 起 `count` 行 == 新侧 `new` 起 `count` 行。
-    Equal { old: usize, new: usize, count: usize },
+    Equal {
+        old: usize,
+        new: usize,
+        count: usize,
+    },
     /// 仅旧侧存在的行（被删除）。
     Delete { old: usize, count: usize },
     /// 仅新侧存在的行（新增）。
@@ -159,10 +163,14 @@ fn backtrack(trace: &[Vec<isize>], n: usize, m: usize, maxi: isize) -> Vec<DiffO
         // 再倒退那一步非对角线移动（d == 0 时路径纯对角线，没有这一步）。
         if d > 0 {
             if x == prev_x {
-                steps.push(Step::Insert { new: (y - 1) as usize });
+                steps.push(Step::Insert {
+                    new: (y - 1) as usize,
+                });
                 y -= 1;
             } else {
-                steps.push(Step::Delete { old: (x - 1) as usize });
+                steps.push(Step::Delete {
+                    old: (x - 1) as usize,
+                });
                 x -= 1;
             }
         }
@@ -178,7 +186,11 @@ fn merge_steps(steps: Vec<Step>) -> Vec<DiffOp> {
     for s in steps {
         match s {
             Step::Equal { old, new } => match ops.last_mut() {
-                Some(DiffOp::Equal { old: o, new: w, count }) if *o + *count == old && *w + *count == new => {
+                Some(DiffOp::Equal {
+                    old: o,
+                    new: w,
+                    count,
+                }) if *o + *count == old && *w + *count == new => {
                     *count += 1;
                 }
                 _ => ops.push(DiffOp::Equal { old, new, count: 1 }),

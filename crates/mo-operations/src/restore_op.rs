@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 
 use crate::trash::Trash;
 use crate::trash_op::to_mo;
-use crate::{Operation, OperationStatus, OpInner};
+use crate::{OpInner, Operation, OperationStatus};
 
 /// 从回收站按「原路径」还原最近一条记录（用于撤销「删除」）。
 pub struct RestoreOperation {

@@ -83,7 +83,14 @@ impl FileIndex {
              ON CONFLICT(path) DO UPDATE SET
                name=excluded.name, name_lower=excluded.name_lower, size=excluded.size,
                modified=excluded.modified, is_dir=excluded.is_dir",
-            params![p, name, name_lower, size, modified.unwrap_or(0) as i64, is_dir as i32],
+            params![
+                p,
+                name,
+                name_lower,
+                size,
+                modified.unwrap_or(0) as i64,
+                is_dir as i32
+            ],
         )?;
         Ok(())
     }
@@ -183,12 +190,30 @@ mod tests {
     #[test]
     fn upsert_and_search_by_name() {
         let mut i = idx();
-        i.upsert(std::path::Path::new("/a/Report.md"), "Report.md", 10, None, false)
-            .unwrap();
-        i.upsert(std::path::Path::new("/a/report-final.md"), "report-final.md", 20, None, false)
-            .unwrap();
-        i.upsert(std::path::Path::new("/a/notes.txt"), "notes.txt", 5, None, false)
-            .unwrap();
+        i.upsert(
+            std::path::Path::new("/a/Report.md"),
+            "Report.md",
+            10,
+            None,
+            false,
+        )
+        .unwrap();
+        i.upsert(
+            std::path::Path::new("/a/report-final.md"),
+            "report-final.md",
+            20,
+            None,
+            false,
+        )
+        .unwrap();
+        i.upsert(
+            std::path::Path::new("/a/notes.txt"),
+            "notes.txt",
+            5,
+            None,
+            false,
+        )
+        .unwrap();
         i.upsert(std::path::Path::new("/a/docs"), "docs", 0, None, true)
             .unwrap();
 
@@ -204,10 +229,22 @@ mod tests {
     #[test]
     fn search_is_case_insensitive_and_path_aware() {
         let mut i = idx();
-        i.upsert(std::path::Path::new("/deep/nested/Secret.md"), "Secret.md", 1, None, false)
-            .unwrap();
-        i.upsert(std::path::Path::new("/top/alpha.txt"), "alpha.txt", 1, None, false)
-            .unwrap();
+        i.upsert(
+            std::path::Path::new("/deep/nested/Secret.md"),
+            "Secret.md",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        i.upsert(
+            std::path::Path::new("/top/alpha.txt"),
+            "alpha.txt",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
 
         // 小写查询也能命中大写文件名。
         let hits = i.search("SECRET", 10).unwrap();
@@ -230,8 +267,11 @@ mod tests {
 
         i.upsert(std::path::Path::new("/x/a.md"), "a.md", 1, None, false)
             .unwrap();
-        i.rename(std::path::Path::new("/x/a.md"), std::path::Path::new("/x/b.md"))
-            .unwrap();
+        i.rename(
+            std::path::Path::new("/x/a.md"),
+            std::path::Path::new("/x/b.md"),
+        )
+        .unwrap();
         let hits = i.search("b.md", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, std::path::Path::new("/x/b.md"));

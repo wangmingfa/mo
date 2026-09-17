@@ -16,7 +16,8 @@ fn assert_consistent(diff: &TextDiff, a_lines: usize, b_lines: usize) {
                 // Equal 区块两侧内容必须真的相等。
                 for i in 0..*count {
                     assert_eq!(
-                        diff.a_lines[old + i], diff.b_lines[new + i],
+                        diff.a_lines[old + i],
+                        diff.b_lines[new + i],
                         "Equal 区块内第 {i} 行内容不一致"
                     );
                 }
@@ -38,7 +39,14 @@ fn assert_consistent(diff: &TextDiff, a_lines: usize, b_lines: usize) {
 #[test]
 fn identical_texts_are_one_equal_block() {
     let d = text_diff("a\nb\nc", "a\nb\nc");
-    assert_eq!(d.ops, vec![DiffOp::Equal { old: 0, new: 0, count: 3 }]);
+    assert_eq!(
+        d.ops,
+        vec![DiffOp::Equal {
+            old: 0,
+            new: 0,
+            count: 3
+        }]
+    );
     assert_eq!(d.a_lines.len(), 3);
     assert_eq!(d.b_lines.len(), 3);
     assert_consistent(&d, 3, 3);
@@ -65,9 +73,17 @@ fn insertion_in_middle() {
     assert_eq!(
         d.ops,
         vec![
-            DiffOp::Equal { old: 0, new: 0, count: 1 },
+            DiffOp::Equal {
+                old: 0,
+                new: 0,
+                count: 1
+            },
             DiffOp::Insert { new: 1, count: 1 },
-            DiffOp::Equal { old: 1, new: 2, count: 2 },
+            DiffOp::Equal {
+                old: 1,
+                new: 2,
+                count: 2
+            },
         ]
     );
     assert_consistent(&d, 3, 4);
@@ -79,9 +95,17 @@ fn deletion_in_middle() {
     assert_eq!(
         d.ops,
         vec![
-            DiffOp::Equal { old: 0, new: 0, count: 1 },
+            DiffOp::Equal {
+                old: 0,
+                new: 0,
+                count: 1
+            },
             DiffOp::Delete { old: 1, count: 1 },
-            DiffOp::Equal { old: 2, new: 1, count: 2 },
+            DiffOp::Equal {
+                old: 2,
+                new: 1,
+                count: 2
+            },
         ]
     );
     assert_consistent(&d, 4, 3);
@@ -93,10 +117,18 @@ fn modified_line_is_delete_then_insert() {
     assert_eq!(
         d.ops,
         vec![
-            DiffOp::Equal { old: 0, new: 0, count: 1 },
+            DiffOp::Equal {
+                old: 0,
+                new: 0,
+                count: 1
+            },
             DiffOp::Delete { old: 1, count: 1 },
             DiffOp::Insert { new: 1, count: 1 },
-            DiffOp::Equal { old: 2, new: 2, count: 1 },
+            DiffOp::Equal {
+                old: 2,
+                new: 2,
+                count: 1
+            },
         ]
     );
     assert_consistent(&d, 3, 3);
@@ -118,7 +150,14 @@ fn completely_different_texts() {
 #[test]
 fn trailing_newline_does_not_create_empty_line() {
     let d = text_diff("a\n", "a\n");
-    assert_eq!(d.ops, vec![DiffOp::Equal { old: 0, new: 0, count: 1 }]);
+    assert_eq!(
+        d.ops,
+        vec![DiffOp::Equal {
+            old: 0,
+            new: 0,
+            count: 1
+        }]
+    );
     assert_eq!(d.a_lines, vec!["a".to_string()]);
 }
 
@@ -160,7 +199,11 @@ fn unicode_lines_are_handled() {
     assert_eq!(
         d.ops,
         vec![
-            DiffOp::Equal { old: 0, new: 0, count: 1 },
+            DiffOp::Equal {
+                old: 0,
+                new: 0,
+                count: 1
+            },
             DiffOp::Delete { old: 1, count: 1 },
             DiffOp::Insert { new: 1, count: 1 },
         ]

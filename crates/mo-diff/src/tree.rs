@@ -89,8 +89,7 @@ fn walk(left: &Path, right: &Path, rel: &Path, out: &mut TreeComparison) -> Resu
 
     let mut dirty = false;
     // 并集（BTreeSet 保证有序去重 → 输出确定性）。
-    let names: std::collections::BTreeSet<&String> =
-        ls.keys().chain(rs.keys()).collect();
+    let names: std::collections::BTreeSet<&String> = ls.keys().chain(rs.keys()).collect();
     for name in names {
         let child_rel = rel.join(name);
         let lp = left.join(name);
@@ -122,15 +121,31 @@ fn walk(left: &Path, right: &Path, rel: &Path, out: &mut TreeComparison) -> Resu
                 } else {
                     // 两侧都是文件：逐字节比较。
                     let same = super::files::same_content(&lp, &rp)?;
-                    let status = if same { TreeStatus::Identical } else { TreeStatus::Different };
+                    let status = if same {
+                        TreeStatus::Identical
+                    } else {
+                        TreeStatus::Different
+                    };
                     push(out, &child_rel, status, false, &mut dirty);
                 }
             }
             (true, false) => {
-                push(out, &child_rel, TreeStatus::LeftOnly, lp.is_dir(), &mut dirty);
+                push(
+                    out,
+                    &child_rel,
+                    TreeStatus::LeftOnly,
+                    lp.is_dir(),
+                    &mut dirty,
+                );
             }
             (false, true) => {
-                push(out, &child_rel, TreeStatus::RightOnly, rp.is_dir(), &mut dirty);
+                push(
+                    out,
+                    &child_rel,
+                    TreeStatus::RightOnly,
+                    rp.is_dir(),
+                    &mut dirty,
+                );
             }
             (false, false) => unreachable!(),
         }
@@ -139,13 +154,7 @@ fn walk(left: &Path, right: &Path, rel: &Path, out: &mut TreeComparison) -> Resu
 }
 
 /// 记录一条结果并累计计数；任何非 Identical 记录都让子树变「脏」。
-fn push(
-    out: &mut TreeComparison,
-    rel: &Path,
-    status: TreeStatus,
-    is_dir: bool,
-    dirty: &mut bool,
-) {
+fn push(out: &mut TreeComparison, rel: &Path, status: TreeStatus, is_dir: bool, dirty: &mut bool) {
     match status {
         TreeStatus::Identical => out.identical_files += 1,
         TreeStatus::Different => out.different += 1,
@@ -244,11 +253,7 @@ mod tests {
         assert_eq!(c.right_only, 1);
         assert!(!c.is_identical());
         // 输出按相对路径排序。
-        let rels: Vec<&str> = c
-            .entries
-            .iter()
-            .map(|e| e.rel.to_str().unwrap())
-            .collect();
+        let rels: Vec<&str> = c.entries.iter().map(|e| e.rel.to_str().unwrap()).collect();
         let mut sorted = rels.clone();
         sorted.sort();
         assert_eq!(rels, sorted);

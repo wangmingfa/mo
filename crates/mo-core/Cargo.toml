@@ -13,3 +13,6 @@ serde = { workspace = true, optional = true }
 [features]
 default = []
 serde = ["dep:serde", "uuid/serde"]
+
+[lints]
+workspace = true

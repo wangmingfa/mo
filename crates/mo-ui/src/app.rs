@@ -355,7 +355,7 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| std::env::home_dir())
+        .or_else(std::env::home_dir)
 }
 
 impl Render for RootView {
@@ -769,7 +769,7 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 run_command(other, &app).await;
                 // SelectAll / ClearSelection / Delete 等命令改了 app 侧选择，回灌 UI。
                 pull_selection(&app, &this, cx).await;
-                let _ = this.update(cx, |v, cx| {
+                this.update(cx, |v, cx| {
                     v.modal = Modal::None;
                     v.cmd_query.clear();
                     v.palette_index = 0;
@@ -793,7 +793,7 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
         cx.spawn(async move |cx| {
             if h.kind.is_dir() {
                 let _ = app.open_directory(&h.path).await;
-                let _ = this.update(cx, |v, cx| {
+                this.update(cx, |v, cx| {
                     v.modal = Modal::None;
                     v.search_query.clear();
                     v.search_results.clear();
@@ -802,14 +802,14 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
             } else {
                 match app.preview(&h.path) {
                     Ok(pv) => {
-                        let _ = this.update(cx, |v, cx| {
+                        this.update(cx, |v, cx| {
                             v.preview_cache = Some(pv);
                             v.modal = Modal::QuickLook;
                             cx.notify();
                         });
                     }
                     Err(e) => {
-                        let _ = this.update(cx, |v, cx| {
+                        this.update(cx, |v, cx| {
                             v.modal = Modal::Info(format!("无法预览：{e}"));
                             cx.notify();
                         });
@@ -866,7 +866,7 @@ async fn run_command(id: CommandId, app: &AppState) {
 async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let paths = app.selection_paths().await;
     let Some(p) = paths.into_iter().next() else {
-        let _ = this.update(cx, |v, cx| {
+        this.update(cx, |v, cx| {
             v.modal = Modal::Info("没有选中文件".to_string());
             cx.notify();
         });
@@ -874,14 +874,14 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
     };
     match app.preview(&p) {
         Ok(pv) => {
-            let _ = this.update(cx, |v, cx| {
+            this.update(cx, |v, cx| {
                 v.preview_cache = Some(pv);
                 v.modal = Modal::QuickLook;
                 cx.notify();
             });
         }
         Err(e) => {
-            let _ = this.update(cx, |v, cx| {
+            this.update(cx, |v, cx| {
                 v.modal = Modal::Info(format!("无法预览 {p:?}：{e}"));
                 cx.notify();
             });
@@ -893,7 +893,7 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
 async fn compute_hash(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let paths = app.selection_paths().await;
     if paths.is_empty() {
-        let _ = this.update(cx, |v, cx| {
+        this.update(cx, |v, cx| {
             v.modal = Modal::Info("没有选中文件".to_string());
             cx.notify();
         });
@@ -914,7 +914,7 @@ async fn compute_hash(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
             out.push_str(&format!("…共 {} 个文件，仅显示前 5 个", paths.len()));
         }
     }
-    let _ = this.update(cx, |v, cx| {
+    this.update(cx, |v, cx| {
         v.modal = Modal::Info(out);
         cx.notify();
     });
@@ -924,7 +924,7 @@ async fn compute_hash(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
 async fn run_compare(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let paths = app.selection_paths().await;
     if paths.len() != 2 {
-        let _ = this.update(cx, |v, cx| {
+        this.update(cx, |v, cx| {
             v.modal = Modal::Info(format!(
                 "比较需要恰好选中 2 个条目，当前选中 {} 个。\n\n提示：按住 Shift 或 ⌘A 选择后，在命令面板（⌘⇧P）执行「比较选中的两项」。",
                 paths.len()
@@ -936,14 +936,14 @@ async fn run_compare(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp)
     let (a, b) = (paths[0].clone(), paths[1].clone());
     match app.compare_paths(a, b).await {
         Ok(c) => {
-            let _ = this.update(cx, |v, cx| {
+            this.update(cx, |v, cx| {
                 v.diff_cache = Some(c);
                 v.modal = Modal::Diff;
                 cx.notify();
             });
         }
         Err(e) => {
-            let _ = this.update(cx, |v, cx| {
+            this.update(cx, |v, cx| {
                 v.modal = Modal::Info(format!("比较失败：{e}"));
                 cx.notify();
             });
@@ -954,7 +954,7 @@ async fn run_compare(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp)
 /// 把 app 侧选择快照回灌到 UI 本地缓存（app 侧是唯一事实来源）。
 async fn pull_selection(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let ids = app.selection_ids().await;
-    let _ = this.update(cx, |v, cx| {
+    this.update(cx, |v, cx| {
         v.selection.set_from(&ids);
         cx.notify();
     });
@@ -969,7 +969,7 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
     if p.is_dir() {
         let _ = app.open_directory(&p).await;
     } else if let Ok(pv) = app.preview(&p) {
-        let _ = this.update(cx, |v, cx| {
+        this.update(cx, |v, cx| {
             v.preview_cache = Some(pv);
             v.modal = Modal::QuickLook;
             cx.notify();
@@ -1145,7 +1145,12 @@ impl RootView {
     /// 比较 / diff 模态：文件 → 行级 diff；文件夹 → 树比较清单。
     fn render_diff(&self) -> Div {
         let Some(c) = &self.diff_cache else {
-            return modal_card("比较", "", div().child(text!("（无结果）".to_string())), "Esc 关闭");
+            return modal_card(
+                "比较",
+                "",
+                div().child(text!("（无结果）".to_string())),
+                "Esc 关闭",
+            );
         };
         match c {
             mo_diff::Comparison::Files(f) => self.render_file_diff(f),
@@ -1159,16 +1164,8 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .child(text!(format!(
-                "左：{}（{} 字节）",
-                f.a.display(),
-                f.a_size
-            )))
-            .child(text!(format!(
-                "右：{}（{} 字节）",
-                f.b.display(),
-                f.b_size
-            )));
+            .child(text!(format!("左：{}（{} 字节）", f.a.display(), f.a_size)))
+            .child(text!(format!("右：{}（{} 字节）", f.b.display(), f.b_size)));
 
         match &f.status {
             mo_diff::FileStatus::Identical => {
@@ -1295,11 +1292,7 @@ impl RootView {
                 mo_diff::TreeStatus::LeftOnly => ("◀", crate::theme::accent()),
                 mo_diff::TreeStatus::RightOnly => ("▶", diff_add_fg()),
             };
-            let name = format!(
-                "{}{}",
-                e.rel.display(),
-                if e.is_dir { "/" } else { "" }
-            );
+            let name = format!("{}{}", e.rel.display(), if e.is_dir { "/" } else { "" });
             rows = rows.child(
                 div()
                     .flex()

@@ -172,7 +172,7 @@ pub fn generate_to(src: &Path, dst: &Path, size: u32) -> Result<PathBuf, Thumbna
 /// 默认缩略图缓存目录：`dirs::cache_dir()/mo/thumbs`。
 fn default_thumb_root() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
         .join("mo")
         .join("thumbs")
 }

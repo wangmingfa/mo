@@ -15,6 +15,15 @@ members = [
     "crates/mo-bench",
 ]
 
+# 质量门禁（各 crate 通过 `[lints] workspace = true` 继承）。
+# clippy 全部按 error 处理，防止告警累积；unsafe 仅 mo-ui 的 macOS
+# FFI 层（icon.rs）使用，保持 warn 以便审查每一处。
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "deny"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

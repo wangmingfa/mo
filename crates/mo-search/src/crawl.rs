@@ -23,7 +23,16 @@ pub fn crawl(
     mut on_progress: impl FnMut(usize),
 ) -> anyhow::Result<usize> {
     let mut counted = 0usize;
-    crawl_dir(index, fs, root, 0, max_depth, stop, &mut on_progress, &mut counted)?;
+    crawl_dir(
+        index,
+        fs,
+        root,
+        0,
+        max_depth,
+        stop,
+        &mut on_progress,
+        &mut counted,
+    )?;
     if counted > 0 {
         on_progress(counted);
     }
@@ -63,11 +72,20 @@ fn crawl_dir(
         }
         let _ = index.upsert(&e.path, &e.name, 0, None, e.kind.is_dir());
         *counted += 1;
-        if *counted % 500 == 0 {
+        if (*counted).is_multiple_of(500) {
             on_progress(*counted);
         }
         if e.kind.is_dir() {
-            crawl_dir(index, fs, &e.path, depth + 1, max_depth, stop, on_progress, counted)?;
+            crawl_dir(
+                index,
+                fs,
+                &e.path,
+                depth + 1,
+                max_depth,
+                stop,
+                on_progress,
+                counted,
+            )?;
         }
     }
     Ok(())

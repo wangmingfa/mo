@@ -72,7 +72,7 @@ pub(crate) fn to_dir_error(e: std::io::Error) -> MoError {
 pub(crate) fn file_id_for(path: &Path) -> FileId {
     if let Ok(meta) = std::fs::metadata(path) {
         use std::os::unix::fs::MetadataExt;
-        return FileId::new(meta.dev() as u64, meta.ino() as u128);
+        return FileId::new(meta.dev(), meta.ino() as u128);
     }
     FileId::synthetic(path)
 }

@@ -42,7 +42,7 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             cx.spawn(async move |cx| {
                 let (start, entries) = app.visible_window(r).await;
                 let for_thumbs = entries.clone();
-                let _ = this.update(cx, |v, cx| {
+                this.update(cx, |v, cx| {
                     v.window_start = start;
                     v.window = entries;
                     v.pending = None;

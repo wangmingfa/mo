@@ -7,6 +7,11 @@
 //! * 图标在编译期通过 `include_bytes!` 嵌入，发布单文件二进制时无需携带资源；
 //! * 非 macOS 平台是 no-op；
 //! * 重新生成图标：`python3 scripts/make_icon.py`（见脚本注释）。
+//!
+//! 本模块是**全 workspace 唯一的 unsafe FFI 层**（objc 运行时消息发送），
+//! 故对 `unsafe_code` lint 局部豁免——新 unsafe 代码不允许出现在本模块之外。
+
+#![allow(unsafe_code)]
 
 /// 1024×1024 带透明圆角的应用图标（由 `scripts/make_icon.py` 生成）。
 #[cfg(target_os = "macos")]
@@ -22,6 +27,9 @@ pub fn set_dock_icon() {
 
 #[cfg(target_os = "macos")]
 unsafe fn set_dock_icon_macos() {
+    // SAFETY: 以下所有 msg_send! 均满足 objc 消息发送的前提——
+    // NSApplication 已由 gpui 在主线程创建（本函数只在 application().run
+    // 之后被调用），对象生命周期用 retain/release 手工配对，无悬垂引用。
     use objc::{class, msg_send, runtime::Object, sel, sel_impl};
 
     // PNG 字节 → NSData → NSImage → NSApplication.setApplicationIconImage。

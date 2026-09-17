@@ -12,25 +12,51 @@ use tokio::sync::broadcast;
 /// ```
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    DirectoryChanged { path: PathBuf },
-    EntryCreated { path: PathBuf },
-    EntryDeleted { path: PathBuf },
-    EntryRenamed { from: PathBuf, to: PathBuf },
+    DirectoryChanged {
+        path: PathBuf,
+    },
+    EntryCreated {
+        path: PathBuf,
+    },
+    EntryDeleted {
+        path: PathBuf,
+    },
+    EntryRenamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
 
-    MetadataLoaded { path: PathBuf },
-    ThumbnailLoaded { path: PathBuf },
+    MetadataLoaded {
+        path: PathBuf,
+    },
+    ThumbnailLoaded {
+        path: PathBuf,
+    },
 
     /// 全局搜索索引进度更新（后台爬取时周期性广播）。
-    IndexUpdated { indexed: usize, root: PathBuf },
+    IndexUpdated {
+        indexed: usize,
+        root: PathBuf,
+    },
 
-    OperationStarted { id: u64 },
-    OperationProgress { id: u64, done: u64, total: u64 },
-    OperationFinished { id: u64 },
+    OperationStarted {
+        id: u64,
+    },
+    OperationProgress {
+        id: u64,
+        done: u64,
+        total: u64,
+    },
+    OperationFinished {
+        id: u64,
+    },
 
     /// 回收站内容变化（清空 / 永久删除 / 还原）。
     TrashChanged,
 
-    NavigationChanged { path: PathBuf },
+    NavigationChanged {
+        path: PathBuf,
+    },
 }
 
 /// 进程内事件总线（基于 `tokio::sync::broadcast`）。

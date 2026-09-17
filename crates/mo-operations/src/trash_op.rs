@@ -5,7 +5,7 @@ use mo_core::MoError;
 use parking_lot::Mutex;
 
 use crate::trash::{Trash, TrashError};
-use crate::{Operation, OperationStatus, OpInner};
+use crate::{OpInner, Operation, OperationStatus};
 
 /// 把文件 / 目录移入回收站（而不是永久删除）。
 ///

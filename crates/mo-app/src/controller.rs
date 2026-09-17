@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -25,7 +25,7 @@ impl DirectoryController {
     ///
     /// 元数据加载由 `AppState::load_path` 内部触发（首屏优先），
     /// 这里不再重复调度一次，否则等于把整目录的 stat 跑两遍。
-    pub async fn open(&self, path: &PathBuf) -> Result<()> {
+    pub async fn open(&self, path: &Path) -> Result<()> {
         Ok(self.app.open_directory(path).await?)
     }
 

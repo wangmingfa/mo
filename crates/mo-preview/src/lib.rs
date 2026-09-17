@@ -186,16 +186,22 @@ fn kind_by_ext(path: &Path) -> PreviewKind {
     match ext(path).as_deref() {
         Some("md" | "markdown") => PreviewKind::Markdown,
         Some("json") => PreviewKind::Json,
-        Some("rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" | "java"
-             | "go" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "ini"
-             | "css" | "html" | "htm" | "xml" | "lua" | "rb" | "php" | "sql") => PreviewKind::Code,
+        Some(
+            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" | "java"
+            | "go" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "ini"
+            | "css" | "html" | "htm" | "xml" | "lua" | "rb" | "php" | "sql",
+        ) => PreviewKind::Code,
         _ => PreviewKind::Text,
     }
 }
 
 fn ext(path: &Path) -> Option<String> {
     let e = path.extension()?.to_string_lossy().to_lowercase();
-    if e.is_empty() { None } else { Some(e) }
+    if e.is_empty() {
+        None
+    } else {
+        Some(e)
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +226,10 @@ mod tests {
         let mut j = std::fs::File::create(d.join("data.json")).unwrap();
         j.write_all(b"{\"k\":1}").unwrap();
 
-        assert_eq!(preview_path(&d.join("a.txt")).unwrap().kind, PreviewKind::Text);
+        assert_eq!(
+            preview_path(&d.join("a.txt")).unwrap().kind,
+            PreviewKind::Text
+        );
         let md = preview_path(&d.join("doc.md")).unwrap();
         assert_eq!(md.kind, PreviewKind::Markdown);
         assert!(md.text.unwrap().contains("# Title"));
@@ -249,7 +258,10 @@ mod tests {
         // 写入非法 UTF-8 字节。
         b.write_all(&[0xff, 0xfe, 0xfd]).unwrap();
 
-        assert_eq!(preview_path(&d.join("empty.bin")).unwrap().kind, PreviewKind::Empty);
+        assert_eq!(
+            preview_path(&d.join("empty.bin")).unwrap().kind,
+            PreviewKind::Empty
+        );
         let bin = preview_path(&d.join("blob.bin")).unwrap();
         assert_eq!(bin.kind, PreviewKind::Binary);
     }
