@@ -12,7 +12,8 @@ mod progress_panel;
 mod sidebar;
 mod status_bar;
 mod theme;
-mod toolbar;
+/// 公开仅为测试读取 `TOOLBAR_HEIGHT`（红绿灯居中的依据）。
+pub mod toolbar;
 
 pub use app::RootView;
 
@@ -33,11 +34,13 @@ pub fn run() {
         let app = app.clone();
         // 沉浸式交通灯：隐藏系统标题栏（appears_transparent），内容延伸到窗口顶部，
         // 工具栏左移留出红绿灯位置；AppKit 仍负责顶部条拖拽与双击缩放。
+        // 红绿灯垂直位置由 toolbar::TOOLBAR_HEIGHT 推导，保证在工具栏内居中。
+        let (tl_x, tl_y) = toolbar::traffic_light_position();
         let options = gpui_kit::WindowOptions {
             titlebar: Some(gpui_kit::TitlebarOptions {
                 title: Some("Mo".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(14.0), px(14.0))),
+                traffic_light_position: Some(point(px(tl_x), px(tl_y))),
             }),
             ..Default::default()
         };

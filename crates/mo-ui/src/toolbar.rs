@@ -1,6 +1,23 @@
 use gpui_kit::*;
 use mo_app::AppState;
 
+/// 工具栏固定高度。红绿灯的垂直位置由它推导（见 lib.rs），二者必须一致。
+pub const TOOLBAR_HEIGHT: f32 = 48.0;
+
+/// macOS 红绿灯三键的直径（标准 12pt）。用于推导垂直居中位置。
+pub const TRAFFIC_LIGHT_DIAMETER: f32 = 12.0;
+
+/// 沉浸式红绿灯位置：与固定高度工具栏垂直居中，横向留 14px。
+///
+/// lib.rs 的 `traffic_light_position` 必须使用本值——红绿灯是 AppKit 画的，
+/// 不参与 GPUI 布局，位置错了只能改这里。
+pub fn traffic_light_position() -> (f32, f32) {
+    (
+        14.0,
+        (TOOLBAR_HEIGHT - TRAFFIC_LIGHT_DIAMETER) / 2.0,
+    )
+}
+
 /// 工具栏：后退 / 前进 / 上级 / 刷新。
 ///
 /// 按钮只负责**发命令**（调用 [`AppState`] 的导航方法），不负责刷新列表：
@@ -10,12 +27,13 @@ pub fn render(app: &AppState, can_back: bool, can_forward: bool) -> impl IntoEle
         .flex()
         .flex_row()
         .items_center()
+        // 高度钉死：红绿灯按它垂直居中（见 traffic_light_position），不能随内容漂移。
+        .h(px(TOOLBAR_HEIGHT))
+        .flex_shrink_0()
         .gap(px(8.0))
         // 左侧留出 macOS 沉浸式红绿灯（traffic_light_position x=14 + 三键宽度）。
         .pl(px(80.0))
         .pr(px(8.0))
-        .pt(px(8.0))
-        .pb(px(8.0))
         .bg(crate::theme::container())
         .border_b_1()
         .border_color(crate::theme::separator())

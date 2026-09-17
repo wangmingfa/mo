@@ -107,6 +107,25 @@ fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {
     );
 }
 
+/// 工具栏高度必须钉死在 `TOOLBAR_HEIGHT`——沉浸式红绿灯的垂直居中依赖它。
+#[gpui_kit::test]
+fn toolbar_height_is_pinned_for_traffic_lights(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let toolbar = bounds(&mut cx, "mo-toolbar");
+
+    assert_eq!(
+        toolbar.origin.y,
+        px(0.),
+        "工具栏没有贴着窗口顶部（内容必须延伸到标题栏区域）"
+    );
+    assert_eq!(
+        toolbar.size.height,
+        px(mo_ui::toolbar::TOOLBAR_HEIGHT),
+        "工具栏高度漂移：红绿灯按 TOOLBAR_HEIGHT 居中，二者必须一致"
+    );
+}
+
 /// 工具栏应当只有一行；状态栏应当贴着窗口底部，中央区正好顶到状态栏。
 #[gpui_kit::test]
 fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppContext) {
