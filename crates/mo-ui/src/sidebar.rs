@@ -42,10 +42,12 @@ pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl Into
             .child(text!("快捷访问")),
     );
 
-    for (label, path) in locations {
+    for (ix, (label, path)) in locations.into_iter().enumerate() {
         let is_active = active.as_ref() == Some(&path);
         let app_click = app.clone();
+        // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
         let mut item = div()
+            .id(("sidebar-loc", ix))
             .flex()
             .flex_row()
             .items_center()

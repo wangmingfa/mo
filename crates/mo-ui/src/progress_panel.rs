@@ -30,6 +30,8 @@ pub fn render(ops: &[OperationHandle], app: &AppState) -> impl IntoElement {
         };
 
         let mut row = div()
+            // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
+            .id(("op-row", op.id))
             .flex()
             .flex_row()
             .items_center()

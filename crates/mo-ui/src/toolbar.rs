@@ -52,20 +52,20 @@ pub fn render(
         .border_color(theme::separator())
         // 测试用（release no-op）：tests/layout.rs 断言工具栏只有一行高
         .debug_selector(|| "mo-toolbar".to_string())
-        .child(icon_button(icons::ARROW_LEFT, can_back, {
+        .child(icon_button("nav-back", icons::ARROW_LEFT, can_back, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Back)
         }))
-        .child(icon_button(icons::ARROW_RIGHT, can_forward, {
+        .child(icon_button("nav-forward", icons::ARROW_RIGHT, can_forward, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Forward)
         }))
-        .child(icon_button(icons::ARROW_UP, true, {
+        .child(icon_button("nav-parent", icons::ARROW_UP, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Parent)
         }))
         .child(address_bar(app, entity, path, address_editing, address_input))
-        .child(icon_button(icons::ROTATE_CW, true, {
+        .child(icon_button("nav-refresh", icons::ROTATE_CW, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
@@ -130,6 +130,7 @@ fn address_bar(
             let seg_app = app.clone();
             let seg_path = prefix.clone();
             let mut seg = div()
+                .id(("crumb", i))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -166,12 +167,13 @@ fn address_bar(
     }
 
     // 尾部空白：点击进入编辑态（Win11 行为）。
-    let mut blank = div().flex_1().h_full().min_w(px(24.0));
+    let mut blank = div().id("addr-blank").flex_1().h_full().min_w(px(24.0));
     start_edit_on_click(&mut blank, entity);
     pill = pill.child(blank);
 
     // 铅笔按钮：显式的编辑入口。
     let mut edit_btn = div()
+        .id("addr-edit")
         .flex()
         .items_center()
         .p(px(4.0))
@@ -183,7 +185,9 @@ fn address_bar(
 }
 
 /// 给一个元素挂上「点击进入地址编辑态」的回调。
-fn start_edit_on_click(el: &mut Div, entity: &Entity<RootView>) {
+///
+/// 泛型以同时接受 `Div` 与加了 ID 后的 `Stateful<Div>`。
+fn start_edit_on_click<E: InteractiveElement>(el: &mut E, entity: &Entity<RootView>) {
     let entity = entity.clone();
     el.interactivity().on_click(move |_, _window, cx| {
         entity.update(cx, |v, cx| {
@@ -239,8 +243,17 @@ fn spawn_nav(cx: &mut App, app: AppState, nav: Nav) {
 }
 
 /// 一个纯图标按钮；`enabled == false` 时置灰且不挂点击回调。
-fn icon_button(data: &'static [u8], enabled: bool, on_click: impl Fn(&mut App) + 'static) -> Div {
+///
+/// ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
+/// 无 ID 的裸 div 拿不到 state，on_click 永远不会触发。
+fn icon_button(
+    id: &'static str,
+    data: &'static [u8],
+    enabled: bool,
+    on_click: impl Fn(&mut App) + 'static,
+) -> Stateful<Div> {
     let mut button = div()
+        .id(id)
         .flex()
         .items_center()
         .justify_center()
