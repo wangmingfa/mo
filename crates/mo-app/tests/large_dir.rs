@@ -42,7 +42,11 @@ async fn visible_window_returns_only_requested_range() {
     let app = AppState::new();
     app.open_directory(&dir).await.expect("打开目录失败");
 
-    let (start, entries) = app.visible_window(2..5).await;
+    let (dir_path, start, entries) = app.visible_window(2..5).await;
+    assert_eq!(
+        dir_path, dir,
+        "应返回读取时的目录路径，供 UI 校验目录未切换"
+    );
     assert_eq!(start, 2);
     assert_eq!(entries.len(), 3);
     // 自然序下第 2..5 个可见条目就是 file-2 ~ file-4。

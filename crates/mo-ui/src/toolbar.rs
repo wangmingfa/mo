@@ -56,15 +56,26 @@ pub fn render(
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Back)
         }))
-        .child(icon_button("nav-forward", icons::ARROW_RIGHT, can_forward, {
-            let app = app.clone();
-            move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Forward)
-        }))
+        .child(icon_button(
+            "nav-forward",
+            icons::ARROW_RIGHT,
+            can_forward,
+            {
+                let app = app.clone();
+                move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Forward)
+            },
+        ))
         .child(icon_button("nav-parent", icons::ARROW_UP, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Parent)
         }))
-        .child(address_bar(app, entity, path, address_editing, address_input))
+        .child(address_bar(
+            app,
+            entity,
+            path,
+            address_editing,
+            address_input,
+        ))
         .child(icon_button("nav-refresh", icons::ROTATE_CW, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
@@ -272,8 +283,6 @@ fn icon_button(
             .on_click(move |_, _window, cx| on_click(cx));
         button.child(icon(data, 16.0, theme::text()))
     } else {
-        button
-            .opacity(0.35)
-            .child(icon(data, 16.0, theme::muted()))
+        button.opacity(0.35).child(icon(data, 16.0, theme::muted()))
     }
 }

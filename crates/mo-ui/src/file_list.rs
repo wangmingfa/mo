@@ -24,28 +24,67 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
         let need_end = (range.end + BUFFER).min(count);
 
         // 1) 判断当前窗口是否覆盖可见区，不覆盖则记下要补的范围。
+        //
+        // ⚠️ gpui 的 uniform_list 每帧会用**单行 range** 调用本闭包多次
+        // （request_layout / prepaint 各一次 measure_item，测第 0 行算行高），
+        // 然后才用真实可见区调用一次。这些测量调用绝不能触发补窗副作用：
+        // 否则测量请求（如 0..1）与真实请求（如 102..333）各自 spawn 的 fetch
+        // 落地时互相覆盖 window，形成每帧两个 fetch 交替的 ping-pong 死循环
+        // —— 窗口永远不收敛，可见区一半时间无内容，整屏占位符疯狂闪烁。
+        // 真实可见区至少两行（视口高度 ≥ 2 行），len() <= 1 只可能是测量调用。
         let mut request: Option<(AppState, Range<usize>)> = None;
-        entity.update(cx, |v, _cx| {
-            let covered = !v.window.is_empty()
-                && need_start >= v.window_start
-                && need_end <= v.window_start + v.window.len();
-            if !covered && v.pending.as_ref() != Some(&(need_start..need_end)) {
-                v.pending = Some(need_start..need_end);
-                request = Some((v.app.clone(), need_start..need_end));
-            }
-        });
+        if range.len() > 1 {
+            entity.update(cx, |v, _cx| {
+                let covered = !v.window.is_empty()
+                    && need_start >= v.window_start
+                    && need_end <= v.window_start + v.window.len();
+                if !covered && v.pending.as_ref() != Some(&(need_start..need_end)) {
+                    v.pending = Some(need_start..need_end);
+                    request = Some((v.app.clone(), need_start..need_end));
+                }
+            });
+        }
 
         // 2) 异步补窗口（只取这一屏），顺带为可见条目请求缩略图。
         if let Some((app, r)) = request {
             let this = entity.clone();
             let app_task = app.clone();
+            tracing::info!(
+                target: "mo_ui::window",
+                need = ?r, visible = ?range, "fetch spawn"
+            );
+            let spawned = std::time::Instant::now();
             cx.spawn(async move |cx| {
-                let (start, entries) = app.visible_window(r).await;
+                let (dir_path, start, entries) = app.visible_window(r.clone()).await;
+                let elapsed = spawned.elapsed().as_millis();
                 let for_thumbs = entries.clone();
                 this.update(cx, |v, cx| {
+                    // 取回在途时可能已切换目录：旧目录的快照不能覆盖新目录的窗口。
+                    // 请求本身已随旧目录作废，匹配的 pending 一并清掉，
+                    // 否则新目录若发出同范围请求会被残留的 pending 吞掉。
+                    if v.path.as_deref() != Some(dir_path.as_path()) {
+                        tracing::warn!(
+                            target: "mo_ui::window",
+                            need = ?r, got = ?dir_path, want = ?v.path, "fetch rejected: dir mismatch"
+                        );
+                        if v.pending.as_ref() == Some(&r) {
+                            v.pending = None;
+                        }
+                        return;
+                    }
                     v.window_start = start;
                     v.window = entries;
-                    v.pending = None;
+                    // 只清除与自己请求匹配的 pending：期间用户可能又滚动了、
+                    // 渲染闭包已发出新范围的请求，那个请求不能被吞掉。
+                    let cleared = v.pending.as_ref() == Some(&r);
+                    if cleared {
+                        v.pending = None;
+                    }
+                    tracing::info!(
+                        target: "mo_ui::window",
+                        need = ?r, win_start = start, win_len = v.window.len(),
+                        elapsed_ms = elapsed, cleared_pending = cleared, "fetch done"
+                    );
                     cx.notify();
                 });
                 // 只为进入窗口的条目生成缩略图，绝不「打开目录就全量生成」。
@@ -56,6 +95,17 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
 
         // 3) 渲染：只从窗口快照里取行。
         let view = entity.read(cx);
+        if range
+            .clone()
+            .any(|i| view.window.get(i.wrapping_sub(view.window_start)).is_none())
+        {
+            tracing::debug!(
+                target: "mo_ui::window",
+                range = ?range, win_start = view.window_start,
+                win_len = view.window.len(), pending = ?view.pending,
+                count, "rendering placeholder rows"
+            );
+        }
         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         for i in range.clone() {
             let offset = i.wrapping_sub(view.window_start);
@@ -120,7 +170,10 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
                 .detach();
             });
 
-            rows.push(row.child(crate::file_item::view(entry, selected)).into_any_element());
+            rows.push(
+                row.child(crate::file_item::view(entry, selected))
+                    .into_any_element(),
+            );
         }
         rows
     })

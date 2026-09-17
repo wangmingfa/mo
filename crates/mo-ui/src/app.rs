@@ -190,7 +190,8 @@ fn filtered_commands(q: &str) -> Vec<CommandId> {
 /// 虚拟化解决「渲染多少 element」，窗口懒加载解决「同步多少数据」。
 pub struct RootView {
     pub(crate) app: AppState,
-    path: Option<PathBuf>,
+    /// 当前目录（窗口快照归属校验用：跨目录的取回结果不能互相覆盖）。
+    pub(crate) path: Option<PathBuf>,
     /// 可见条目总数（虚拟化列表的 `item_count`）。
     pub(crate) visible_count: usize,
     /// 窗口快照的起始下标。
@@ -300,9 +301,15 @@ impl RootView {
         // app 侧选择是唯一事实来源；⌘A / 键盘移动等改动都从这里回灌 UI。
         let selection_ids = app.selection_ids().await;
 
-        let Ok(range) = this.update(cx, |v, _cx| {
+        let outcome = this.update(cx, |v, _cx| {
             // 切换目录或改过滤词后，旧窗口的下标已失效，直接作废。
             if v.path != path || v.visible_count != count {
+                tracing::warn!(
+                    target: "mo_ui::window",
+                    ui_path = ?v.path, app_path = ?path,
+                    ui_count = v.visible_count, app_count = count,
+                    "sync invalidated window"
+                );
                 v.window.clear();
                 v.window_start = 0;
                 v.pending = None;
@@ -315,23 +322,40 @@ impl RootView {
             v.indexed = indexed;
             v.trash_entries = trash_entries;
             v.selection.set_from(&selection_ids);
+            // 补窗任务在途时绝不动窗口：若按旧窗口范围重取并清 pending，
+            // 会与 file_list 渲染闭包的补窗任务竞态——重复派发任务、
+            // 窗口被拉回旧范围，滚动时整屏占位符来回闪烁。
+            // 元数据回填的刷新不急于一时：补窗落地后下一轮 sync（120ms 后）自然会刷。
+            if v.pending.is_some() {
+                tracing::debug!(
+                    target: "mo_ui::window",
+                    pending = ?v.pending, win_start = v.window_start,
+                    win_len = v.window.len(), "sync skipped: window fetch in flight"
+                );
+                return None;
+            }
             let len = if v.window.is_empty() {
                 INITIAL_WINDOW
             } else {
                 v.window.len()
             };
-            v.window_start..v.window_start + len
-        }) else {
-            // 视图已销毁，停止同步。
+            Some(v.window_start..v.window_start + len)
+        });
+        let Ok(Some(range)) = outcome else {
+            // 视图已销毁，或补窗任务在途（本轮跳过）。
             return;
         };
 
-        let (start, entries) = app.visible_window(range).await;
+        let (dir_path, start, entries) = app.visible_window(range).await;
         let for_thumbs = entries.clone();
         let _ = this.update(cx, |v, cx| {
+            // 取回在途时可能已切换目录：旧目录的快照不能覆盖新目录的窗口。
+            if v.path.as_deref() != Some(dir_path.as_path()) {
+                return;
+            }
+            // 只更新窗口内容，不碰 pending——pending 只归补窗任务管。
             v.window_start = start;
             v.window = entries;
-            v.pending = None;
             cx.notify();
         });
         // 缩略图只为当前窗口生成。
@@ -374,7 +398,8 @@ impl RootView {
     }
 
     /// 应用当前过滤词（输入即过滤）。
-    fn apply_filter(&mut self, cx: &mut Context<Self>) {        let query = self.query.trim().to_string();
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {
+        let query = self.query.trim().to_string();
         let app = self.app.clone();
         cx.spawn(async move |_weak, _cx| {
             app.set_filter(if query.is_empty() { None } else { Some(query) })

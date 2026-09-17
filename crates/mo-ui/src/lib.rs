@@ -20,8 +20,21 @@ pub use app::RootView;
 use gpui_kit::*;
 use mo_app::AppState;
 
+/// 初始化日志：默认 info 级别输出到 stderr，可用 `RUST_LOG` 覆盖
+/// （如 `RUST_LOG=mo_ui=debug` 诊断窗口懒加载）。需重定向时 `2> /tmp/mo.log`。
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .init();
+}
+
 /// 启动 Mo 图形界面。
 pub fn run() {
+    init_tracing();
     let app = AppState::new();
     // 启动文件监听泵：外部程序增删改文件时做增量更新并广播事件。
     app.spawn_watcher_pump();

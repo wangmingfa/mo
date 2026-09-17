@@ -3,7 +3,7 @@
 //! 用 [`gpui_kit::svg`] 的 `.data()` 直接渲染字节，不依赖 AssetSource；
 //! 颜色跟随元素的 `text_color`（gpui 用文字色作为 SVG 描边色）。
 
-use gpui_kit::{px, svg, Styled, Rgba, Svg};
+use gpui_kit::{px, svg, Rgba, Styled, Svg};
 
 pub const ARROW_LEFT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>"##;
 

@@ -43,12 +43,13 @@ pub fn view(entry: &Entry, _selected: bool) -> impl IntoElement {
     };
 
     row = match &entry.thumbnail {
-        ThumbnailState::Loaded(path) => {
-            row.child(icon_slot(img(path.as_path()).w(px(20.0)).h(px(20.0)).into_any_element()))
-        }
-        ThumbnailState::Loading => {
-            row.child(icon_slot(text!("⏳".to_string()).into_any_element()))
-        }
+        ThumbnailState::Loaded(path) => row.child(icon_slot(
+            img(path.as_path())
+                .w(px(20.0))
+                .h(px(20.0))
+                .into_any_element(),
+        )),
+        ThumbnailState::Loading => row.child(icon_slot(text!("⏳".to_string()).into_any_element())),
         _ => row.child(icon_slot(text!(icon.to_string()).into_any_element())),
     };
 

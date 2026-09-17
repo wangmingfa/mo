@@ -75,3 +75,10 @@
 ## 12. 沉浸式标题栏（appears_transparent）
 
 * **要点**：`TitlebarOptions { appears_transparent: true, traffic_light_position: Some(...) }` 隐藏系统标题栏；内容延伸到窗口顶。工具栏高度必须**钉死常量**（`TOOLBAR_HEIGHT = 48`），红绿灯位置由同一常量推导——否则内容高度浮动，红绿灯永远对不准。
+
+## 13. `uniform_list` 的 items 闭包每帧被调用多次（含单行测量）——副作用会死循环
+
+* **现象**：大目录滚动时列表在「整屏 `…` 占位」与「正常内容」之间疯狂闪烁，永不停止。日志（tracing）显示每帧两个 fetch 交替 spawn：`need=0..101 visible=0..1` 与 `need=102..333 visible=202..233`，各自 done 后互相覆盖 window，永不收敛。
+* **根因**：gpui 的 `uniform_list` **每帧用单行 range 调用 items 闭包多次**来测量行高（`measure_item` 在 request_layout 与 prepaint 各调一次，渲染 `item_to_measure_index..+1` 即默认 `0..1`），之后再以真实可见区调用一次。若 items 闭包里有「判断窗口不覆盖 → spawn 补窗」这类副作用，测量调用发出的请求与真实请求范围不相交，两次 fetch 落地时**先后覆盖同一份 window**，下一帧谁都覆盖不了对方的需求 → ping-pong 死循环。
+* **修法**：`range.len() <= 1` 时跳过所有补窗副作用（不设 pending、不 spawn），只渲染行。真实可见区至少两行，单行 range 只可能是测量调用。核心原则：**items 闭包必须是幂等渲染 + 无跨调用干扰的副作用**；确需副作用时先识别测量调用并跳过。
+* **排查方法**：`RUST_LOG=mo_ui=debug cargo run 2> /tmp/mo.log` 跑一次复现，看 fetch spawn/done 的 need 范围是否每帧重复交替——是，即此坑。

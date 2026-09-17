@@ -1,64 +1,18 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use mo_cache::MetadataCache;
-use mo_core::{Entry, FileId, FileMetadata, MetadataState};
+use mo_core::{Entry, FileId, FileMetadata, MetadataState, Permissions};
 use tokio::sync::Semaphore;
 
 use crate::AppState;
 
-/// 攒够这么多条再一次性提交给 SQLite。
+/// 单批 stat 的条目数。
 ///
-/// 逐条提交时每条都是一次独立事务（一次 fsync），一万条目要几秒；
-/// 批量提交后降到几十毫秒。
-const WRITE_BATCH: usize = 256;
-
-/// 后台「写回缓存」：攒批 + 最后一条完成时收尾。
-///
-/// 与前台逻辑完全解耦——即使缓存写失败也不影响浏览。
-struct WriteBehind {
-    buf: Mutex<Vec<(FileId, FileMetadata)>>,
-    remaining: AtomicUsize,
-    cache: Arc<MetadataCache>,
-}
-
-impl WriteBehind {
-    fn new(cache: Arc<MetadataCache>, total: usize) -> Arc<Self> {
-        Arc::new(Self {
-            buf: Mutex::new(Vec::new()),
-            // 初始为 1：防止 total 为 0 时提前 flush。
-            remaining: AtomicUsize::new(total + 1),
-            cache,
-        })
-    }
-
-    /// 一个条目校验完成。
-    fn finish(&self) {
-        // 先把初始的 +1 抵消掉，再由最后一个完成的任务触发收尾。
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut buf = self.buf.lock().unwrap_or_else(|e| e.into_inner());
-            self.flush(&mut buf);
-        }
-    }
-
-    fn record(&self, id: FileId, meta: FileMetadata) {
-        let mut buf = self.buf.lock().unwrap_or_else(|e| e.into_inner());
-        buf.push((id, meta));
-        if buf.len() >= WRITE_BATCH {
-            self.flush(&mut buf);
-        }
-    }
-
-    fn flush(&self, buf: &mut Vec<(FileId, FileMetadata)>) {
-        if buf.is_empty() {
-            return;
-        }
-        if let Err(e) = self.cache.put_many(buf) {
-            tracing::warn!("元数据缓存写入失败：{e}");
-        }
-        buf.clear();
-    }
-}
+/// 一批 = 一次 blocking 任务、一次状态写锁、一条 SQLite 事务。
+/// 逐条处理时，一万条目就是一万次 spawn + 一万次写锁 + 上万次独立事务（fsync）；
+/// 批量化后全部降两个数量级——这是大目录滚动闪烁修复的核心。
+const STAT_BATCH: usize = 64;
 
 /// 元数据调度器：限流并发 + 可见区优先 + 缓存感知。
 ///
@@ -74,7 +28,7 @@ impl WriteBehind {
 ///
 /// 缓存策略是 **stale-while-revalidate**：
 /// 打开目录时先用缓存值把条目填满（用户立刻看到大小 / 日期），
-/// 再由后台任务逐条 `stat` 校验，只有真正变化时才更新视图并写回缓存。
+/// 再由后台任务逐批 `stat` 校验，只有真正变化时才更新视图并写回缓存。
 #[derive(Clone)]
 pub struct MetadataScheduler {
     semaphore: Arc<Semaphore>,
@@ -82,6 +36,7 @@ pub struct MetadataScheduler {
 
 impl MetadataScheduler {
     pub fn new() -> Self {
+        // 8 批并发 × 64 条 = 至多 512 个 stat 在 blocking 池排队，本地 SSD 毫无压力。
         Self {
             semaphore: Arc::new(Semaphore::new(8)),
         }
@@ -105,17 +60,21 @@ impl MetadataScheduler {
         hits
     }
 
-    /// 为一组条目校验元数据。
+    /// 为一组条目校验元数据（批量版）。
     ///
-    /// `priority` 指定可见区间的下标范围，这些条目会被排到队列最前，
+    /// `priority` 指定可见区间的下标范围，这些条目所在批次会被排到队列最前，
     /// 因此用户当前看到的行总是最先补全——大目录下这一点决定体感。
+    ///
+    /// ⚠️ 必须**批量**处理，不要退化回逐条 spawn：
+    /// 逐条会让 2.7 万个任务挤满仅有的几个 runtime worker（且内含阻塞 stat），
+    /// UI 的窗口取回任务被排到积压后面，滚动时整屏占位符闪烁。
     pub fn load(
         &self,
         app: AppState,
         entries: Vec<Entry>,
         priority: Option<std::ops::Range<usize>>,
     ) {
-        let write = app.cache().map(|c| WriteBehind::new(c, entries.len()));
+        let cache = app.cache();
 
         // 可见区优先：稳定排序，保证区间外的条目仍按原顺序处理。
         let mut ordered: Vec<(usize, Entry)> = entries.into_iter().enumerate().collect();
@@ -123,51 +82,64 @@ impl MetadataScheduler {
             ordered.sort_by_key(|(i, _)| if r.contains(i) { 0usize } else { 1usize });
         }
 
-        for (_, entry) in ordered {
+        for chunk in ordered.chunks(STAT_BATCH) {
             let permit = self.semaphore.clone();
             let app_task = app.clone();
-            let writes = write.clone();
-            let id = entry.id;
-            let path = entry.path.clone();
-            // 缓存 / 上次加载得到的旧值，用于判断「是否真的变了」。
-            let cached = match &entry.metadata {
-                MetadataState::Loaded(m) => Some(*m),
-                _ => None,
-            };
+            let cache_task = cache.clone();
+            // (id, path, 旧值)：旧值用于判断「是否真的变了」，没变就不写锁、不进缓存。
+            let batch: Vec<(FileId, PathBuf, Option<FileMetadata>)> = chunk
+                .iter()
+                .map(|(_, e)| {
+                    let cached = match &e.metadata {
+                        MetadataState::Loaded(m) => Some(*m),
+                        _ => None,
+                    };
+                    (e.id, e.path.clone(), cached)
+                })
+                .collect();
 
             // 走 AppState 自带的 runtime，避免依赖调用方线程的 tokio 上下文。
             app.spawn(async move {
                 let _permit = match permit.acquire().await {
                     Ok(p) => p,
-                    Err(_) => {
-                        if let Some(w) = &writes {
-                            w.finish();
-                        }
-                        return;
-                    }
+                    Err(_) => return,
                 };
-                let fs = app_task.file_system().clone();
-                if let Ok(meta) = fs.metadata(&path).await {
-                    let changed = match &cached {
-                        Some(old) => old != &meta,
-                        None => true,
-                    };
-                    if changed {
-                        app_task.update_metadata(id, meta).await;
-                        if let Some(w) = &writes {
-                            w.record(id, meta);
+                // stat 与 SQLite 写回都是阻塞操作，整批放 blocking 池。
+                let changed = app_task.spawn_blocking(move || {
+                    let mut changed: Vec<(FileId, FileMetadata)> = Vec::new();
+                    for (id, path, cached) in &batch {
+                        let Ok(m) = std::fs::metadata(path) else {
+                            continue;
+                        };
+                        let meta = FileMetadata {
+                            size: m.len(),
+                            modified: m.modified().ok(),
+                            created: m.created().ok(),
+                            permissions: Permissions {
+                                readonly: m.permissions().readonly(),
+                                hidden: false,
+                            },
+                        };
+                        if cached.is_none_or(|old| old != meta) {
+                            changed.push((*id, meta));
                         }
                     }
-                }
-                if let Some(w) = &writes {
-                    w.finish();
+                    if let Some(c) = &cache_task {
+                        if !changed.is_empty() {
+                            if let Err(e) = c.put_many(&changed) {
+                                tracing::warn!("元数据缓存写入失败：{e}");
+                            }
+                        }
+                    }
+                    changed
+                });
+                // 一批只拿一次写锁。
+                if let Ok(changed) = changed.await {
+                    if !changed.is_empty() {
+                        app_task.update_metadata_batch(changed).await;
+                    }
                 }
             });
-        }
-
-        // 抵消 WriteBehind 初始的 +1（此时所有任务都已派生）。
-        if let Some(w) = &write {
-            w.finish();
         }
     }
 }

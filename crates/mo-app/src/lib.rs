@@ -93,7 +93,9 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            // 4 个 worker：大目录回填会产生大量后台任务，
+            // worker 太少时 UI 的窗口取回会排在积压后面（滚动闪烁的成因之一）。
+            .worker_threads(4)
             .enable_all()
             .build()
             .expect("failed to build tokio runtime")
@@ -481,15 +483,19 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// 只取可见区间的条目，返回 `(实际起始下标, 条目)`。
+    /// 只取可见区间的条目，返回 `(读取时的目录路径, 实际起始下标, 条目)`。
     ///
     /// UI 用它做窗口懒加载：滚动到哪取哪，永远不克隆整份列表——
     /// 这是十万级目录仍能保持流畅的前提。
-    pub async fn visible_window(&self, range: Range<usize>) -> (usize, Vec<Entry>) {
+    ///
+    /// 返回路径是为了让调用方落地前校验：取回任务在途时用户可能已切换目录，
+    /// 旧目录的快照绝不能覆盖新目录的窗口。
+    pub async fn visible_window(&self, range: Range<usize>) -> (PathBuf, usize, Vec<Entry>) {
         let inner = self.inner.read().await;
         let Some(dir) = inner.directory.as_ref() else {
-            return (0, Vec::new());
+            return (PathBuf::new(), 0, Vec::new());
         };
+        let dir_path = dir.path.clone();
         let total = dir.visible_count();
         let start = range.start.min(total);
         let end = range.end.min(total);
@@ -499,7 +505,7 @@ impl AppState {
                 out.push(e.clone());
             }
         }
-        (start, out)
+        (dir_path, start, out)
     }
 
     /// UI 报告当前可见范围：元数据与缩略图都据此排优先级。
@@ -553,6 +559,27 @@ impl AppState {
                     self.dirty.store(true, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    /// 用加载完成的元数据**批量**更新条目（一批只拿一次写锁）。
+    ///
+    /// 后台校验按批（`STAT_BATCH`）回填：写锁次数从「每条一次」降到「每批一次」，
+    /// 否则大目录回填期间 UI 的读操作（窗口取回等）会被写锁洪流饿死。
+    pub async fn update_metadata_batch(&self, updates: Vec<(FileId, FileMetadata)>) {
+        let mut inner = self.inner.write().await;
+        let Some(dir) = inner.directory.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        for (id, meta) in updates {
+            if let Some(e) = dir.entry_mut(id) {
+                e.metadata = MetadataState::Loaded(meta);
+                changed = true;
+            }
+        }
+        if changed {
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
