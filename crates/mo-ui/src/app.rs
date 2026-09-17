@@ -420,6 +420,12 @@ impl Render for RootView {
             let plain = !m.control && !m.alt && !m.platform;
 
             // 全局快捷键（任何状态下都可触发）。
+            // ⌘Q：裸二进制没有菜单栏，macOS 收不到系统 terminate，
+            // 自己接住退出键（cx.quit 走 gpui 的正常退出流程）。
+            if platform && key.eq_ignore_ascii_case("q") {
+                cx.quit();
+                return;
+            }
             if platform && shift && key.eq_ignore_ascii_case("p") {
                 entity_key.update(cx, |v, cx| {
                     v.modal = Modal::CommandPalette;
