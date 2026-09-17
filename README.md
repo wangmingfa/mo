@@ -685,6 +685,19 @@ cargo bench                # 性能基准（criterion）
 
 ---
 
+## 📚 devlog —— 开发踩坑日志
+
+[`devlog/`](devlog/) 记录开发过程中**实际踩过、并已定位根因**的坑，每条包含「现象 → 根因 → 修法」，按主题组织：
+
+* [GPUI 布局与交互](devlog/gpui-layout-and-interaction.md)——flex 布局、uniform_list、元素 ID 与点击、双击、快捷键等
+* [macOS 平台层](devlog/macos-platform.md)——红绿灯定位、⌘Q、Dock 图标、objc FFI
+* [构建与依赖](devlog/build-and-lints.md)——future-incompat 补丁、workspace lints
+* [引擎逻辑与测试方法](devlog/engine-testing.md)——headless 布局测试、通用算法陷阱
+
+这类结论从零调试一遍往往要花掉几小时，但写下来只需几分钟——无论是后来的贡献者还是几个月后的自己，遇到同类问题时都可以直接查证。修好新的坑请随手追加到对应主题文件（格式见 [devlog/README.md](devlog/README.md)）。
+
+---
+
 ## 🤝 参与贡献
 
 Mo 是一个开放项目。
