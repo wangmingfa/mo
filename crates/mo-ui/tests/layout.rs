@@ -126,6 +126,21 @@ fn toolbar_height_is_pinned_for_traffic_lights(cx: &mut TestAppContext) {
     );
 }
 
+/// 地址栏已合并进工具栏（Win11 风格单栏）——面包屑必须是工具栏内的一个元素。
+#[gpui_kit::test]
+fn address_bar_lives_inside_the_toolbar(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let toolbar = bounds(&mut cx, "mo-toolbar");
+    let address = cx.debug_bounds("mo-address").expect("地址栏没有渲染");
+
+    assert!(
+        address.origin.y >= toolbar.origin.y
+            && address.origin.y + address.size.height <= toolbar.origin.y + toolbar.size.height,
+        "地址栏不在工具栏垂直范围内：toolbar={toolbar:?} address={address:?}"
+    );
+}
+
 /// 工具栏应当只有一行；状态栏应当贴着窗口底部，中央区正好顶到状态栏。
 #[gpui_kit::test]
 fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppContext) {

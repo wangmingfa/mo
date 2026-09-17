@@ -2,50 +2,51 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
-/// 状态栏：显示条目数量、过滤态、选择数、索引数与当前目录路径。
+/// 状态栏：左侧条目统计，右侧快捷键提示（当前路径在地址栏，不再重复）。
 pub fn render(
     count: usize,
-    path: &Option<PathBuf>,
+    _path: &Option<PathBuf>,
     query: &str,
     selection_count: usize,
     indexed: usize,
     can_undo: bool,
     can_redo: bool,
 ) -> impl IntoElement {
-    let label = path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut summary = if query.is_empty() {
-        format!("{} 项 · {}", count, label)
+    let mut left = if query.is_empty() {
+        format!("{count} 项")
     } else {
-        format!("{} / 匹配「{}」· {}", count, query, label)
+        format!("{count} 项 · 匹配「{query}」")
     };
     if selection_count > 0 {
-        summary.push_str(&format!(" · 已选 {} 项", selection_count));
+        left.push_str(&format!(" · 已选 {selection_count}"));
     }
-    summary.push_str(&format!(" · 已索引 {} 项", indexed));
     if can_undo || can_redo {
-        summary.push_str(&format!(
-            " · {}⌘Z 撤销{}",
-            if can_undo { "" } else { "（无）" },
-            if can_redo { " · ⇧⌘Z 重做" } else { "" }
-        ));
+        left.push_str(" · 可撤销");
     }
-    summary.push_str(" · ⌘⇧P 命令 · ⌘F 搜索 · Space 预览");
+
+    let mut right = format!("已索引 {indexed}");
+    if can_undo || can_redo {
+        right.push_str(" · ⌘Z 撤销");
+        if can_redo {
+            right.push_str(" · ⇧⌘Z 重做");
+        }
+    }
+    right.push_str(" · ⌘⇧P 命令 · Space 预览");
 
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .py(px(6.0))
+        .justify_between()
+        .px(px(10.0))
+        .h(px(26.0))
+        .flex_shrink_0()
         .bg(crate::theme::container())
         .border_t_1()
         .border_color(crate::theme::separator())
         .text_color(crate::theme::muted())
         // 测试用（release no-op）：tests/layout.rs 断言状态栏贴着窗口底部
         .debug_selector(|| "mo-statusbar".to_string())
-        .child(text!(summary))
+        .child(text!(left))
+        .child(text!(right))
 }

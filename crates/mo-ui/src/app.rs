@@ -9,7 +9,7 @@ use mo_operations::{HashAlgo, OperationHandle, TrashEntry};
 use mo_preview::Preview;
 use mo_search::SearchHit;
 
-use crate::{breadcrumb, file_list, progress_panel, sidebar, status_bar, toolbar};
+use crate::{file_list, progress_panel, sidebar, status_bar, toolbar};
 
 /// 首次同步时抓取的窗口大小。
 pub(crate) const INITIAL_WINDOW: usize = 200;
@@ -226,6 +226,10 @@ pub struct RootView {
     trash_entries: Vec<TrashEntry>,
     /// 比较 / diff 结果缓存（比较模态数据源）。
     diff_cache: Option<mo_diff::Comparison>,
+    /// 地址栏是否处于编辑态（Win11 式：点击空白 / 铅笔进入，Esc 退出）。
+    address_editing: bool,
+    /// 地址栏编辑中的文本。
+    address_input: String,
 }
 
 impl RootView {
@@ -252,6 +256,8 @@ impl RootView {
             indexed: 0,
             trash_entries: Vec::new(),
             diff_cache: None,
+            address_editing: false,
+            address_input: String::new(),
         };
 
         let app2 = view.app.clone();
@@ -332,9 +338,18 @@ impl RootView {
         app.thumbs().request(app.clone(), for_thumbs);
     }
 
+    /// 进入地址栏编辑态：用当前完整路径预填输入框（供工具栏点击调用）。
+    pub fn begin_address_edit(&mut self) {
+        self.address_editing = true;
+        self.address_input = self
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+    }
+
     /// 应用当前过滤词（输入即过滤）。
-    fn apply_filter(&mut self, cx: &mut Context<Self>) {
-        let query = self.query.trim().to_string();
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {        let query = self.query.trim().to_string();
         let app = self.app.clone();
         cx.spawn(async move |_weak, _cx| {
             app.set_filter(if query.is_empty() { None } else { Some(query) })
@@ -397,8 +412,15 @@ impl Render for RootView {
             .bg(crate::theme::surface())
             .text_color(crate::theme::text())
             .track_focus(&self.focus)
-            .child(toolbar::render(&self.app, self.can_back, self.can_forward))
-            .child(breadcrumb::render(&self.path))
+            .child(toolbar::render(
+                &self.app,
+                &entity,
+                self.can_back,
+                self.can_forward,
+                &self.path,
+                self.address_editing,
+                &self.address_input,
+            ))
             .child(body)
             .child(progress_panel::render(&self.ops, &self.app))
             .child(status_bar::render(
@@ -463,6 +485,12 @@ impl Render for RootView {
                 } else {
                     app.undo();
                 }
+                return;
+            }
+
+            // 地址栏编辑态：独占普通按键（优先于模态与列表导航）。
+            if entity_key.update(cx, |v, _cx| v.address_editing) {
+                handle_address_key(key, plain, &entity_key, cx);
                 return;
             }
 
@@ -554,6 +582,46 @@ impl Render for RootView {
 }
 
 /// 模态内按键处理（返回是否已被处理）。
+/// 地址栏编辑态的按键：输入 / 退格 / 回车跳转 / Esc 取消。
+fn handle_address_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut App) {
+    match key {
+        "escape" => entity.update(cx, |v, cx| {
+            v.address_editing = false;
+            v.address_input.clear();
+            cx.notify();
+        }),
+        "enter" => {
+            let (app, target) = entity.update(cx, |v, _cx| {
+                v.address_editing = false;
+                let text = v.address_input.trim().to_string();
+                v.address_input.clear();
+                (v.app.clone(), PathBuf::from(text))
+            });
+            if target.as_os_str().is_empty() {
+                return;
+            }
+            cx.spawn(async move |_cx| {
+                if let Err(e) = app.open_directory(&target).await {
+                    eprintln!("打开失败: {e}");
+                }
+            })
+            .detach();
+        }
+        "backspace" => entity.update(cx, |v, cx| {
+            v.address_input.pop();
+            cx.notify();
+        }),
+        k if plain && k.chars().count() == 1 => {
+            let ch = k.chars().next().unwrap();
+            entity.update(cx, |v, cx| {
+                v.address_input.push(ch);
+                cx.notify();
+            });
+        }
+        _ => {}
+    }
+}
+
 fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut App) {
     let modal = entity.update(cx, |v, _cx| v.modal.clone());
     match modal {

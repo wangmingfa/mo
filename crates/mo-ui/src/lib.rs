@@ -4,10 +4,10 @@
 //! [`mo_app::AppState`] 发命令、通过事件总线订阅变化，不直接操作文件系统。
 
 mod app;
-mod breadcrumb;
 mod file_item;
 mod file_list;
 mod icon;
+mod icons;
 mod progress_panel;
 mod sidebar;
 mod status_bar;

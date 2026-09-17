@@ -21,9 +21,10 @@ pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl Into
     let mut panel = div()
         .flex()
         .flex_col()
-        .w(px(200.0))
+        .w(px(188.0))
+        .flex_shrink_0()
         .p(px(8.0))
-        .gap(px(2.0))
+        .gap(px(1.0))
         .bg(crate::theme::container())
         .border_r_1()
         .border_color(crate::theme::separator())
@@ -33,8 +34,10 @@ pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl Into
 
     panel = panel.child(
         div()
-            .px(px(8.0))
-            .pb(px(4.0))
+            .px(px(10.0))
+            .pb(px(6.0))
+            .pt(px(2.0))
+            .text_size(px(11.0))
             .text_color(crate::theme::muted())
             .child(text!("快捷访问")),
     );
@@ -46,9 +49,10 @@ pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl Into
             .flex()
             .flex_row()
             .items_center()
-            .px(px(8.0))
+            .px(px(10.0))
             .py(px(5.0))
             .rounded(px(6.0))
+            .text_size(px(13.0))
             .text_color(if is_active {
                 crate::theme::accent()
             } else {
