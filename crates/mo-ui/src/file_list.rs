@@ -56,7 +56,7 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
 
         // 3) 渲染：只从窗口快照里取行。
         let view = entity.read(cx);
-        let mut rows = Vec::with_capacity(range.len());
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         for i in range.clone() {
             let offset = i.wrapping_sub(view.window_start);
             let Some(entry) = view.window.get(offset) else {
@@ -67,7 +67,8 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
                         .items_center()
                         .w_full()
                         .h(px(24.0))
-                        .child(text!("…".to_string())),
+                        .child(text!("…".to_string()))
+                        .into_any_element(),
                 );
                 continue;
             };
@@ -77,7 +78,11 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
             let selected = view.selection.is_selected(&id);
             let entity_click = entity.clone();
 
+            // ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
+            // 无 ID 的裸 div 拿不到 state，on_click 回调永远不会注册。
+            // 用全列表绝对索引保证滚动后 ID 稳定。
             let mut row = div()
+                .id(("file-row", i))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -115,7 +120,7 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
                 .detach();
             });
 
-            rows.push(row.child(crate::file_item::view(entry, selected)));
+            rows.push(row.child(crate::file_item::view(entry, selected)).into_any_element());
         }
         rows
     })
