@@ -4,18 +4,16 @@ use mo_app::AppState;
 /// 工具栏固定高度。红绿灯的垂直位置由它推导（见 lib.rs），二者必须一致。
 pub const TOOLBAR_HEIGHT: f32 = 48.0;
 
-/// macOS 红绿灯三键的直径（标准 12pt）。用于推导垂直居中位置。
-pub const TRAFFIC_LIGHT_DIAMETER: f32 = 12.0;
+/// macOS 红绿灯标准按钮的 **frame 高度**（可见圆点 12pt 居中于 16pt 模板内）。
+/// gpui 定位的是 frame 原点：按钮中心 = pos.y + frame/2。
+pub const TRAFFIC_LIGHT_FRAME: f32 = 16.0;
 
 /// 沉浸式红绿灯位置：与固定高度工具栏垂直居中，横向留 14px。
 ///
 /// lib.rs 的 `traffic_light_position` 必须使用本值——红绿灯是 AppKit 画的，
 /// 不参与 GPUI 布局，位置错了只能改这里。
 pub fn traffic_light_position() -> (f32, f32) {
-    (
-        14.0,
-        (TOOLBAR_HEIGHT - TRAFFIC_LIGHT_DIAMETER) / 2.0,
-    )
+    (14.0, (TOOLBAR_HEIGHT - TRAFFIC_LIGHT_FRAME) / 2.0)
 }
 
 /// 工具栏：后退 / 前进 / 上级 / 刷新。
