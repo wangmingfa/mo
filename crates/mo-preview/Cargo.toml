@@ -1,0 +1,10 @@
+[package]
+name = "mo-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mo-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "mo-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mo"
+path = "src/main.rs"
+
+[dependencies]
+mo-core.workspace = true
+mo-fs.workspace = true
+mo-app.workspace = true
+mo-operations.workspace = true
+mo-search.workspace = true
+mo-preview.workspace = true
+gpui-kit.workspace = true
+tokio.workspace = true

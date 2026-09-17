@@ -1,0 +1,90 @@
+use std::sync::Arc;
+
+use mo_core::{Entry, ThumbnailState};
+use mo_thumbnails::{ThumbnailCache, DEFAULT_SIZE};
+use tokio::sync::Semaphore;
+
+use crate::AppState;
+
+/// 缩略图调度器：只为**当前可见**的条目生成缩略图。
+///
+/// 缩略图是典型的昂贵任务（解码一张大图可能几十毫秒），因此：
+///   * 只有 UI 报告可见区后才请求，绝不「打开目录就全量生成」；
+///   * 并发受信号量限制（默认 4，解码是 CPU 密集，超过核数只会让列表更卡）；
+///   * 命中磁盘缓存时只是一次 `stat`，直接标记完成，不进后台池；
+///   * 生成过程放在 blocking 池，不占用异步 worker。
+#[derive(Clone)]
+pub struct ThumbnailScheduler {
+    cache: Arc<ThumbnailCache>,
+    semaphore: Arc<Semaphore>,
+    size: u32,
+}
+
+impl ThumbnailScheduler {
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(ThumbnailCache::new()),
+            semaphore: Arc::new(Semaphore::new(4)),
+            size: DEFAULT_SIZE,
+        }
+    }
+
+    /// 指定缓存目录（测试用）。
+    pub fn with_cache(cache: ThumbnailCache) -> Self {
+        Self {
+            cache: Arc::new(cache),
+            semaphore: Arc::new(Semaphore::new(4)),
+            size: DEFAULT_SIZE,
+        }
+    }
+
+    /// 底层磁盘缓存。
+    pub fn cache(&self) -> Arc<ThumbnailCache> {
+        self.cache.clone()
+    }
+
+    /// 为一批条目请求缩略图（fire-and-forget）。
+    ///
+    /// 已经加载 / 正在加载 / 生成失败的条目会被跳过，
+    /// 因此可以放心地在每次滚动时重复调用。
+    pub fn request(&self, app: AppState, entries: Vec<Entry>) {
+        for entry in entries {
+            if !entry.supports_thumbnail() {
+                continue;
+            }
+            if !matches!(entry.thumbnail, ThumbnailState::Idle) {
+                continue;
+            }
+
+            let id = entry.id;
+            let path = entry.path.clone();
+            let cache = self.cache.clone();
+            let semaphore = self.semaphore.clone();
+            let size = self.size;
+            let app_task = app.clone();
+
+            app.spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let handle = app_task.spawn_blocking(move || cache.get_or_create(&id, &path, size));
+                let state = match handle.await {
+                    Ok(Ok(p)) => ThumbnailState::Loaded(p),
+                    Ok(Err(e)) => {
+                        tracing::debug!("缩略图生成失败 {id}：{e}");
+                        ThumbnailState::Failed
+                    }
+                    Err(_) => ThumbnailState::Failed,
+                };
+                app_task.set_thumbnail(id, state).await;
+            });
+        }
+    }
+}
+
+impl Default for ThumbnailScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}

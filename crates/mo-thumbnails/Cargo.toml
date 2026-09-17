@@ -1,0 +1,12 @@
+[package]
+name = "mo-thumbnails"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mo-core.workspace = true
+image.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

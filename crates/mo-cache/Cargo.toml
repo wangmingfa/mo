@@ -1,0 +1,13 @@
+[package]
+name = "mo-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mo-core.workspace = true
+rusqlite.workspace = true
+dirs.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

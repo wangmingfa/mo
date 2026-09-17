@@ -1,0 +1,20 @@
+[package]
+name = "mo-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mo-core.workspace = true
+mo-fs.workspace = true
+mo-operations.workspace = true
+mo-cache.workspace = true
+mo-config.workspace = true
+mo-thumbnails.workspace = true
+mo-search.workspace = true
+mo-preview.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dirs.workspace = true

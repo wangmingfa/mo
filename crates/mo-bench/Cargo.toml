@@ -1,0 +1,26 @@
+[package]
+name = "mo-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mo-core.workspace = true
+mo-fs.workspace = true
+mo-cache.workspace = true
+mo-thumbnails.workspace = true
+criterion.workspace = true
+image.workspace = true
+
+[[bench]]
+name = "directory"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false
+
+[[bench]]
+name = "thumbnail"
+harness = false

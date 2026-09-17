@@ -1,0 +1,84 @@
+//! mo-operations：文件操作层。
+//!
+//! UI 绝不直接调用 `std::fs::copy` 之类，而是发出命令 → `OperationManager`
+//! 把命令变成后台任务，并暴露统一的进度 / 取消 / 暂停 / 恢复能力。
+//!
+//! ```text
+//! UI → Command → OperationManager → OperationQueue → CopyOperation
+//! ```
+
+mod copy;
+mod delete;
+mod fs_util;
+mod hash;
+mod manager;
+mod move_op;
+mod rename;
+mod restore_op;
+mod trash;
+mod trash_op;
+
+pub use copy::CopyOperation;
+pub use delete::DeleteOperation;
+pub use fs_util::{resolve_target, unique_path, ConflictPolicy, Target};
+pub use hash::{compute_hashes, HashAlgo};
+pub use manager::{OperationHandle, OperationManager};
+pub use move_op::MoveOperation;
+pub use rename::RenameOperation;
+pub use restore_op::RestoreOperation;
+pub use trash::{Trash, TrashEntry, TrashError};
+pub use trash_op::TrashOperation;
+
+use mo_core::MoError;
+use std::sync::Arc;
+
+/// 操作状态机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationStatus {
+    Pending,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// 操作共享的可变状态：通过 `Arc<Mutex<OpInner>>` 在内部控制进度 / 取消 / 暂停。
+pub(crate) struct OpInner {
+    pub status: OperationStatus,
+    pub done: u64,
+    pub total: u64,
+    pub cancel: bool,
+    pub pause: bool,
+    pub error: Option<String>,
+}
+
+impl OpInner {
+    pub fn new() -> Self {
+        Self {
+            status: OperationStatus::Pending,
+            done: 0,
+            total: 0,
+            cancel: false,
+            pause: false,
+            error: None,
+        }
+    }
+}
+
+/// 一个文件操作。所有后台任务都实现这个 trait，并拥有：
+/// state / progress / cancel / pause / resume / error。
+pub trait Operation: Send + Sync + 'static {
+    fn id(&self) -> u64;
+    fn describe(&self) -> String;
+    fn status(&self) -> OperationStatus;
+    fn progress(&self) -> (u64, u64);
+    fn cancel(&self);
+    fn pause(&self);
+    fn resume(&self);
+    /// 在后台任务中执行；实现应周期性检查取消标记。
+    fn run(&self) -> Result<(), MoError>;
+}
+
+/// 可被 `OperationManager` 持有的共享操作引用。
+pub type SharedOperation = Arc<dyn Operation>;
