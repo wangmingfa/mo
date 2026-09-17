@@ -31,9 +31,19 @@ pub fn run() {
         // NSApplication 此时已创建：把嵌入的 PNG 设为 Dock / ⌘Tab 图标。
         icon::set_dock_icon();
         let app = app.clone();
+        // 沉浸式交通灯：隐藏系统标题栏（appears_transparent），内容延伸到窗口顶部，
+        // 工具栏左移留出红绿灯位置；AppKit 仍负责顶部条拖拽与双击缩放。
+        let options = gpui_kit::WindowOptions {
+            titlebar: Some(gpui_kit::TitlebarOptions {
+                title: Some("Mo".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.0), px(14.0))),
+            }),
+            ..Default::default()
+        };
         cx.spawn(async move |cx| {
             let _window = cx
-                .open_window(gpui_kit::WindowOptions::default(), move |_, cx| {
+                .open_window(options, move |_, cx| {
                     cx.new(|cx| RootView::new(app.clone(), cx))
                 })
                 .expect("failed to open window");

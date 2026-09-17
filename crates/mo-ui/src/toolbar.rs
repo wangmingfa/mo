@@ -11,7 +11,11 @@ pub fn render(app: &AppState, can_back: bool, can_forward: bool) -> impl IntoEle
         .flex_row()
         .items_center()
         .gap(px(8.0))
-        .p(px(8.0))
+        // 左侧留出 macOS 沉浸式红绿灯（traffic_light_position x=14 + 三键宽度）。
+        .pl(px(80.0))
+        .pr(px(8.0))
+        .pt(px(8.0))
+        .pb(px(8.0))
         .bg(crate::theme::container())
         .border_b_1()
         .border_color(crate::theme::separator())
