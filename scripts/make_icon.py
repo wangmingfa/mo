@@ -20,9 +20,11 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT_PNG = ROOT / "assets" / "icon.png"
 OUT_ICNS = ROOT / "assets" / "Mo.icns"
 
-# Apple Big Sur 风格：squircle 圆角比例约 22.37%，图标本体占画布约 90%。
+# Apple Big Sur 风格：squircle 圆角比例约 22.37%。
+# 内容占比 0.824 = 官方网格 824/1024——占比过大会在 Dock 里
+# 显得比其它应用图标大一圈。
 CORNER_RATIO = 0.2237
-CONTENT_RATIO = 0.90
+CONTENT_RATIO = 0.824
 CANVAS = 1024
 
 # 近白判定：三通道都够亮且彼此接近（灰白，而不是彩色高光）。

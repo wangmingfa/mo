@@ -136,7 +136,10 @@ fn address_bar(
                 .items_center()
                 .gap(px(4.0))
                 .px(px(5.0))
-                .py(px(2.0))
+                // 高度钉死：pill 高 32，段高 24 → hover 底色上下各留 4px，
+                // 不会顶到外框（文字行高会浮动，不定高就会贴边）。
+                .h(px(24.0))
+                .overflow_hidden()
                 .rounded(px(5.0))
                 .flex_shrink_0()
                 .text_color(if is_last {

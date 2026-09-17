@@ -28,10 +28,28 @@ pub fn view(entry: &Entry, _selected: bool) -> impl IntoElement {
         .overflow_hidden()
         .gap(px(6.0));
 
+    // 图标槽位**定宽**：emoji 图标与图片缩略图的自然宽度不同，
+    // 不定宽的话缩略图一加载文件名就会左右抖动。
+    let icon_slot = |child: AnyElement| {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .child(child)
+    };
+
     row = match &entry.thumbnail {
-        ThumbnailState::Loaded(path) => row.child(img(path.as_path()).w(px(20.0)).h(px(20.0))),
-        ThumbnailState::Loading => row.child(text!("⏳".to_string())),
-        _ => row.child(text!(icon.to_string())),
+        ThumbnailState::Loaded(path) => {
+            row.child(icon_slot(img(path.as_path()).w(px(20.0)).h(px(20.0)).into_any_element()))
+        }
+        ThumbnailState::Loading => {
+            row.child(icon_slot(text!("⏳".to_string()).into_any_element()))
+        }
+        _ => row.child(icon_slot(text!(icon.to_string()).into_any_element())),
     };
 
     row = row.child(
