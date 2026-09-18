@@ -45,6 +45,8 @@ pub fn render(
         .border_t_1()
         .border_color(crate::theme::separator())
         .text_color(crate::theme::muted())
+        // 状态栏只有 26px 高，显式压到 11px，避免落到默认字号（约 14px）显得过大。
+        .text_size(px(11.0))
         // 测试用（release no-op）：tests/layout.rs 断言状态栏贴着窗口底部
         .debug_selector(|| "mo-statusbar".to_string())
         .child(text!(left))
