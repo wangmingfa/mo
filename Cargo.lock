@@ -4350,7 +4350,9 @@ name = "mo-ui"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "embed-resource",
  "gpui-kit",
+ "image",
  "mo-app",
  "mo-core",
  "mo-diff",

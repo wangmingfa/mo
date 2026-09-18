@@ -30,3 +30,11 @@
 ## 5. rust-version 声明
 
 * **要点**：workspace `rust-version` 是**最低**构建版本门槛（当前 1.98.1），不锁 toolchain；若需团队/CI 锁同一版本，另加 `rust-toolchain.toml`。
+
+## 6. Windows 任务栏 / 标题栏图标：gpui 只认 exe 里 ID=1 的图标资源
+
+* **现象**：`cargo run` 跑裸 `mo.exe`，Windows 任务栏 / 标题栏 / 资源管理器里都是通用图标（macOS 那边靠 `icon.rs` 运行时 `setApplicationIconImage` 已解决，Windows 无对应入口）。
+* **根因**：gpui 的 Windows 后端注册窗口类时用 `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, …)` 取图标（`gpui-pre-windows/src/platform.rs::load_icon`）。exe 里没有**整数 ID 1** 的 ICON 资源就 `unwrap_or_default()` 成空 HICON，于是全链路回退默认图标。运行期没有从 PNG 设图标的公开 API。
+* **修法**：加 `crates/mo-ui/build.rs`（仅 `cfg(windows)` 生效）：用 workspace 里的 `image`（已含 `png`+`ico` feature）把 `assets/icon.png` 缩放成 16/24/32/48/64/128/256 多帧写成 `.ico`，生成一句 `1 ICON "…"` 的 `.rc`，再用 `embed-resource` 编译并链接（它产出 `mo-icon.lib` 并 `cargo:rustc-link-arg-bins`）。ID 正好是 1，匹配 `load_icon`。build-deps 放 `[target.'cfg(windows)'.build-dependencies]`，非 Windows 不拉这些依赖、脚本 no-op。
+* **注意**：`embed-resource` 靠 `rc.exe`（Windows SDK）编译 `.rc`；找不到会返回 `NotAttempted`——脚本对此只 `cargo:warning` 不阻断构建，`Failed` 才 panic。验证：`[System.Drawing.Icon]::ExtractAssociatedIcon('mo.exe')` 能取到图标即已内嵌。Explorer 的 exe 图标有缓存，可能要重开资源管理器 / 重新固定快捷方式才刷新；运行窗口的任务栏图标重启进程即更新。
+

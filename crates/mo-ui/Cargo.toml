@@ -26,6 +26,12 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"
 
+# 构建期把 assets/icon.png 编成 ID=1 图标资源内嵌进 mo.exe（修 Windows 任务栏图标）。
+# 仅 Windows 需要；image 复用 workspace 配置（含 png 解码 + ico 编码 feature）。
+[target.'cfg(windows)'.build-dependencies]
+image.workspace = true
+embed-resource = "3"
+
 # objc 0.2 的 class!/msg_send! 宏内部含 `cfg(feature = "cargo-clippy")`，
 # 宏展开到本 crate 时会触发 unexpected_cfgs 告警；这里声明该值为已知，消除误报。
 # 本地 lints：objc 0.2 宏内引用了 `cfg(feature = "cargo_clippy")`，展开到本 crate
