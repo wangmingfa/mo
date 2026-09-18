@@ -4349,6 +4349,7 @@ dependencies = [
 name = "mo-ui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui-kit",
  "mo-app",
  "mo-core",

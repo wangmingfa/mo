@@ -1466,18 +1466,15 @@ fn render_top_row(view: &RootView, entity: &Entity<RootView>, is_maximized: bool
 
     if !is_macos {
         // 无系统标题栏：可拖拽空白（吃掉剩余宽度）紧随其后的是贴右缘的窗口控制按钮。
-        row = row.child(toolbar::drag_strip()).child(toolbar::window_controls(is_maximized));
+        row = row
+            .child(toolbar::drag_strip())
+            .child(toolbar::window_controls(is_maximized));
     }
     row
 }
 
 /// 一个窗格：中央浏览区（标签页条已上移到窗口最顶端的 `render_top_row`）。
-fn render_pane(
-    view: &RootView,
-    pane_idx: usize,
-    entity: &Entity<RootView>,
-    available: f32,
-) -> Div {
+fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, available: f32) -> Div {
     let Some(pane) = view.panes.get(pane_idx) else {
         return div();
     };

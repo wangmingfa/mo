@@ -83,6 +83,7 @@ fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {
     let sidebar = bounds(&mut cx, "mo-sidebar");
     let center = bounds(&mut cx, "mo-center");
     let list = bounds(&mut cx, "mo-file-list");
+    let header = bounds(&mut cx, "mo-file-list-header");
 
     assert_eq!(sidebar.origin.x, px(0.), "侧边栏不在最左侧");
     assert_eq!(
@@ -101,9 +102,12 @@ fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {
         center.size.height, sidebar.size.height,
         "中央区与侧边栏高度不一致"
     );
+    // 列表视图 = 固定表头 + 滚动列表，二者合计吃满中央区
+    // （过滤条未显示时）。表头不随内容滚动，所以列表本体比中央区矮一个表头高。
     assert_eq!(
-        list.size.height, center.size.height,
-        "文件列表没有吃满中央区高度（过滤条未显示时二者应当相等）"
+        list.size.height + header.size.height,
+        center.size.height,
+        "表头+列表没有吃满中央区高度：list={list:?} header={header:?} center={center:?}"
     );
 }
 

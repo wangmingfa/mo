@@ -956,19 +956,19 @@ impl AppState {
     pub fn quick_locations(&self) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
         if let Some(p) = dirs::home_dir() {
-            out.push(("🏠 主目录".to_string(), p));
+            out.push(("主目录".to_string(), p));
         }
         if let Some(p) = dirs::desktop_dir() {
-            out.push(("🖥 桌面".to_string(), p));
+            out.push(("桌面".to_string(), p));
         }
         if let Some(p) = dirs::document_dir() {
-            out.push(("📄 文档".to_string(), p));
+            out.push(("文档".to_string(), p));
         }
         if let Some(p) = dirs::download_dir() {
-            out.push(("📥 下载".to_string(), p));
+            out.push(("下载".to_string(), p));
         }
         if let Some(p) = dirs::picture_dir() {
-            out.push(("🖼 图片".to_string(), p));
+            out.push(("图片".to_string(), p));
         }
         out
     }

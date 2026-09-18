@@ -99,10 +99,15 @@ fn cell(
     tab: usize,
     global_idx: usize,
 ) -> Stateful<Div> {
-    let (thumb, icon_name) = match mode {
+    let (thumb, icon_data) = match mode {
         ViewMode::Grid => (36.0, kind_icon(entry)),
         ViewMode::Gallery => (96.0, kind_icon(entry)),
         _ => (36.0, kind_icon(entry)),
+    };
+    let icon_color = if selected {
+        crate::theme::selected_text()
+    } else {
+        crate::theme::text()
     };
 
     let visual: AnyElement = match &entry.thumbnail {
@@ -118,8 +123,7 @@ fn cell(
             .justify_center()
             .w(px(thumb))
             .h(px(thumb))
-            .text_size(px(thumb * 0.6))
-            .child(text!(icon_name.to_string()))
+            .child(crate::icons::icon(icon_data, thumb * 0.6, icon_color).into_any_element())
             .into_any_element(),
     };
 
@@ -242,11 +246,6 @@ fn cell(
         )
 }
 
-fn kind_icon(entry: &Entry) -> &'static str {
-    match entry.kind {
-        mo_core::EntryKind::Directory => "📁",
-        mo_core::EntryKind::File => "📄",
-        mo_core::EntryKind::Symlink => "🔗",
-        mo_core::EntryKind::Other => "❓",
-    }
+fn kind_icon(entry: &Entry) -> &'static [u8] {
+    crate::icons::entry_icon(entry)
 }

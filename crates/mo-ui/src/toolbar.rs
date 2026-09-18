@@ -118,7 +118,11 @@ pub fn window_controls(is_maximized: bool) -> impl IntoElement {
             |w: &mut Window| w.minimize_window(),
         ))
         .child(control_button(
-            if is_maximized { "win-restore" } else { "win-maximize" },
+            if is_maximized {
+                "win-restore"
+            } else {
+                "win-maximize"
+            },
             if is_maximized {
                 icons::WIN_RESTORE
             } else {

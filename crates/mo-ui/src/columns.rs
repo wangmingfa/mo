@@ -127,7 +127,15 @@ fn column_box(
             });
         });
         line = line
-            .child(text!(kind_label(&e.kind).to_string()))
+            .child(crate::icons::icon(
+                crate::icons::icon_for_kind_and_name(e.kind, &e.name),
+                16.0,
+                if selected {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                },
+            ))
             .child(div().flex_1().truncate().child(text!(e.name.clone())));
         body = body.child(line);
     }
@@ -154,13 +162,4 @@ fn column_box(
         );
     }
     col.child(body)
-}
-
-fn kind_label(kind: &EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Directory => "📁",
-        EntryKind::File => "📄",
-        EntryKind::Symlink => "🔗",
-        EntryKind::Other => "❓",
-    }
 }

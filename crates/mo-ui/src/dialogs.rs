@@ -285,12 +285,18 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
         if !active {
             row = row.hover(|s| s.bg(theme::hover_bg()));
         }
-        row =
-            row.child(div().w(px(180.0)).truncate().child(text!(format!(
-                "{} {}",
-                icon_for(u),
-                name
-            ))))
+        row = row
+            .child(
+                div()
+                    .w(px(180.0))
+                    .truncate()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(crate::icons::icon(icon_for(u), 16.0, theme::text()))
+                    .child(text!(name)),
+            )
             .child(
                 div()
                     .w(px(width as f32))
@@ -391,12 +397,9 @@ fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> {
         .child(text!(format!("{}{}", value, if active { "▏" } else { "" })))
 }
 
-fn icon_for(u: &mo_app::DirUsage) -> &'static str {
-    if u.dirs > 0 {
-        "📁"
-    } else {
-        "📄"
-    }
+fn icon_for(_u: &mo_app::DirUsage) -> &'static [u8] {
+    // 磁盘用量对话框逐项都是目录，统一用文件夹图标。
+    crate::icons::FOLDER
 }
 
 fn human_size(size: u64) -> String {

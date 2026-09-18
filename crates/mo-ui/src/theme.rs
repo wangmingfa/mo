@@ -47,6 +47,11 @@ pub fn hover_bg() -> Rgba {
     gpui_kit::rgb(0xf0f0f1)
 }
 
+/// 列表斑马纹（奇数行底色）——Finder 列表视图的交替浅灰，比 surface 略深一档。
+pub fn zebra() -> Rgba {
+    gpui_kit::rgb(0xf7f7f8)
+}
+
 /// 强调色（激活项 / 焦点边框 / 强调文字）——用户指定的中性灰，比 199 淡 10%（RGB 205,205,205）。
 /// 文件列表的**选中高亮**不在其列，仍走 [`selected_bg`] 的蓝。
 pub fn accent() -> Rgba {

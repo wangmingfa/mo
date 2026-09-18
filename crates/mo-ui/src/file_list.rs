@@ -4,6 +4,40 @@ use gpui_kit::*;
 use crate::listing::BUFFER;
 use crate::RootView;
 
+/// Finder 列表视图式表头：名称 | 修改日期 | 大小 | 种类。
+///
+/// 列宽与 [`crate::file_item`] 的数据行共用同一组常量，保证上下对齐；
+/// 左右内边距 = 列表容器 12 + 数据行 4 = 16，与数据行内容起点一致。
+/// 排序暂未接入，表头为纯展示。
+fn header() -> Div {
+    let cell = |w: f32, label: &str| {
+        div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .w(px(w))
+            .flex_shrink_0()
+            .child(text!(label.to_string()))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(26.0))
+        .px(px(16.0))
+        .gap(px(8.0))
+        .bg(crate::theme::container())
+        .border_b_1()
+        .border_color(crate::theme::separator())
+        .text_size(px(11.0))
+        .text_color(crate::theme::muted())
+        .debug_selector(|| "mo-file-list-header".to_string())
+        .child(div().flex_1().child(text!("名称".to_string())))
+        .child(cell(crate::file_item::DATE_W, "修改日期"))
+        .child(cell(crate::file_item::SIZE_W, "大小"))
+        .child(cell(crate::file_item::KIND_W, "种类"))
+}
+
 /// 把本地选择变化同步到 `AppState` 的动作。
 ///
 /// 本地 `panel.selection` 立即反馈渲染，远端 `app` 侧是操作（复制 / 移动 / 删除）
@@ -99,8 +133,11 @@ pub fn render(
                 .w_full()
                 .h(px(24.0))
                 .px(px(4.0))
+                // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹。
                 .bg(if selected {
                     crate::theme::selected_bg()
+                } else if i % 2 == 1 {
+                    crate::theme::zebra()
                 } else {
                     crate::theme::surface()
                 });
@@ -226,12 +263,22 @@ pub fn render(
 
     // 滚动条作为兄弟节点覆盖在列表右侧（容器 relative），
     // 与 gpui-component List 的做法一致：overlay 而非挤压内容宽度。
+    // 表头固定在滚动区上方，不随内容滚动（Finder 列表视图行为）。
     div()
         .relative()
         .flex()
         .flex_col()
         .flex_1()
         .min_w_0()
-        .child(list)
-        .child(Scrollbar::vertical(scroll))
+        .child(header())
+        .child(
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(list)
+                .child(Scrollbar::vertical(scroll)),
+        )
 }

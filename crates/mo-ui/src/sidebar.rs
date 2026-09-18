@@ -57,6 +57,7 @@ pub fn render(
             .flex()
             .flex_row()
             .items_center()
+            .gap(px(8.0))
             .px(px(10.0))
             .py(px(5.0))
             .rounded(px(6.0))
@@ -80,7 +81,14 @@ pub fn render(
             .detach();
         });
 
-        panel = panel.child(item.child(text!(label)));
+        panel = panel.child(
+            item.child(crate::icons::icon(
+                crate::icons::quick_access_icon(&label),
+                16.0,
+                crate::theme::text(),
+            ))
+            .child(text!(label)),
+        );
     }
 
     // 书签区（`~/Library/Application Support/mo/config.json` 里的
@@ -114,6 +122,7 @@ pub fn render(
             .flex()
             .flex_row()
             .items_center()
+            .gap(px(8.0))
             .px(px(10.0))
             .py(px(5.0))
             .rounded(px(6.0))
@@ -147,7 +156,15 @@ pub fn render(
             e.update(cx, |_, cx| cx.notify());
         });
 
-        panel = panel.child(item.child(text!(label)).child(remove));
+        panel = panel.child(
+            item.child(crate::icons::icon(
+                crate::icons::FOLDER,
+                16.0,
+                crate::theme::text(),
+            ))
+            .child(text!(label))
+            .child(remove),
+        );
     }
 
     panel

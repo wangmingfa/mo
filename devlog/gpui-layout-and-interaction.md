@@ -128,4 +128,17 @@
 * **toolbar.rs**：`drag_strip()` / `window_controls()` 提到 `pub` 供顶部行复用；`control_button` 仍私有。
 * **测试**：`toolbar_height_is_pinned_for_traffic_lights` 改断言 `mo-toprow`（y=0、高 48）；其余 layout 测试（地址栏在工具栏内、状态栏贴底、侧栏左置）不受影响，地址栏仍在 `mo-toolbar`（第二行）内。
 * ⚠️ 真实窗口下 macOS 红绿灯对齐、Win/Linux 拖拽条命中区只过了 headless 布局测试，没在沙箱里点过——需本机 `cargo run` 验收。
-EOF\necho done
+
+## 17. 列表视图改版：Finder 式表头 + 斑马纹 + 四列布局
+
+* **参考**：macOS Finder 列表视图截图——列头（名称/修改日期/大小/种类，右对齐固定宽列）、全宽蓝色选中、交替行底色。
+* **结构**（`file_list.rs`）：
+  * 新增 `header()`：26px 表头（`mo-file-list-header`），`container()` 底 + 底部分隔线、11px 灰字；列宽与数据行共用常量、左右内边距 16（=列表容器 12 + 行 4）对齐数据行内容起点；表头固定在滚动区上方，不随内容滚动。排序尚未接入（纯展示）。
+  * `render()` 返回值改为「表头 + （relative 容器：uniform_list + Scrollbar overlay）」两层；滚动区高度因此比中央区矮一个表头。
+  * 斑马纹：未选中行按全局奇偶交替 `zebra()`（新增主题色 0xf7f7f8），选中行仍 `selected_bg()` 蓝底白字。
+* **数据行**（`file_item.rs`）改为四列：名称（flex_1 + truncate）| 修改日期 | 大小 | 种类（三列固定宽 `DATE_W=150`/`SIZE_W=80`/`KIND_W=100`、右对齐、12px 灰字/选中白字，共用 `meta_cell` 闭包；debug selector `mo-date-cell`/`mo-size-cell`/`mo-kind-cell`）。
+  * 修改日期：`FileMetadata.modified: Option<SystemTime>` → chrono Local `%Y年%m月%d日 %H:%M`（mo-ui 新增 `chrono` 依赖，workspace 统一声明，`default-features=false` + `clock`）。未就绪留空、失败显示 —。
+  * 种类：`kind_label()` 按扩展名归类（PNG/JPEG 图像、视频、音频、PDF 文稿、Word/Excel/PPT、Markdown/文本、归档、源代码、App/DMG 等，兜底「EXT 文件」/「文档」），与 icons.rs 的图标分类一致。
+  * 加载占位从 ⏳ emoji 改为空白槽（延续去 emoji 方向）。
+* **测试**：`size_column_is_pinned_to_the_right_edge` 重写为 `meta_columns_are_pinned_right_and_aligned`（种类列贴右缘、大小/日期列向左各隔 8px gap、列宽不被压缩）；layout 集成测试 `sidebar_sits_left_of_the_file_list` 改断言「表头+列表 = 中央区高度」。
+* 坑：并行发的两个 Edit 第二个常不落盘（layout.rs 两处编辑只生效一处），需单独重发并回读验证。
