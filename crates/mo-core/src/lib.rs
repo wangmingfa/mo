@@ -32,4 +32,4 @@ pub use metadata::{FileMetadata, Permissions};
 pub use navigation::{Location, NavigationState};
 pub use rename::{is_noop, plan_batch_rename, RenameSpec};
 pub use selection::SelectionModel;
-pub use view::{DirectoryView, SortKey};
+pub use view::{DirectoryView, SortDir, SortKey};

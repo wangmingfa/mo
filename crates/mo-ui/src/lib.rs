@@ -11,6 +11,7 @@ mod file_list;
 mod grid;
 mod icon;
 mod icons;
+mod list_columns;
 mod listing;
 mod panel;
 mod progress_panel;

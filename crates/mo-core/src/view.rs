@@ -14,6 +14,34 @@ pub enum SortKey {
     Kind,
 }
 
+/// 排序方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    pub fn flipped(self) -> Self {
+        match self {
+            SortDir::Asc => SortDir::Desc,
+            SortDir::Desc => SortDir::Asc,
+        }
+    }
+
+    /// 每个排序键的「自然」方向：首次点击该列表头时用这个。
+    ///
+    /// 名称 / 种类从小到大，大小 / 修改时间从大到小——与访达 / 资源管理器的
+    /// 默认观感一致（点击同一个表头再来一次就翻转）。
+    pub fn natural_for(key: SortKey) -> Self {
+        match key {
+            SortKey::Name | SortKey::Kind => SortDir::Asc,
+            SortKey::Size | SortKey::Modified => SortDir::Desc,
+        }
+    }
+}
+
 /// 目录视图：排序 + 名称过滤后的**可见索引**。
 ///
 /// 大目录优化的关键之一：过滤 / 排序不复制条目，只维护一份 `Vec<usize>`
@@ -24,6 +52,7 @@ pub enum SortKey {
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryView {
     sort: SortKey,
+    sort_dir: SortDir,
     /// 过滤词（小写后的子串匹配）。`None` 表示不过滤。
     filter: Option<String>,
     /// `entries` 中可见条目的下标，顺序即展示顺序。
@@ -37,6 +66,10 @@ impl DirectoryView {
 
     pub fn sort(&self) -> SortKey {
         self.sort
+    }
+
+    pub fn sort_dir(&self) -> SortDir {
+        self.sort_dir
     }
 
     pub fn filter(&self) -> Option<&str> {
@@ -67,11 +100,10 @@ impl DirectoryView {
         self.visible.get(i).copied()
     }
 
-    /// 设置排序方式并重建索引。
-    pub fn set_sort(&mut self, sort: SortKey, entries: &[Entry]) {
-        if self.sort != sort {
-            self.sort = sort;
-        }
+    /// 设置排序方式（键 + 方向）并重建索引。
+    pub fn set_sort(&mut self, sort: SortKey, dir: SortDir, entries: &[Entry]) {
+        self.sort = sort;
+        self.sort_dir = dir;
         self.rebuild(entries);
     }
 
@@ -105,30 +137,29 @@ impl DirectoryView {
         }
 
         let sort = self.sort;
+        let dir = self.sort_dir;
         self.visible.sort_by(|&a, &b| {
             let ea = &entries[a];
             let eb = &entries[b];
-            // 目录永远排在前。
+            // 目录永远排在前（不受排序方向影响，与访达一致）。
             match (ea.kind.is_dir(), eb.kind.is_dir()) {
                 (true, false) => return std::cmp::Ordering::Less,
                 (false, true) => return std::cmp::Ordering::Greater,
                 _ => {}
             }
-            match sort {
+            // 主键按「升序」比较，再由方向翻转；次序键（名称）恒升序，
+            // 这样降序时同值条目仍是自然顺序，而不是被一起倒过来。
+            let primary = match sort {
                 SortKey::Name => natural_cmp(&ea.name, &eb.name),
-                SortKey::Size => eb
-                    .size_or_zero()
-                    .cmp(&ea.size_or_zero())
-                    .then_with(|| natural_cmp(&ea.name, &eb.name)),
-                SortKey::Modified => eb
-                    .modified_or_zero()
-                    .cmp(&ea.modified_or_zero())
-                    .then_with(|| natural_cmp(&ea.name, &eb.name)),
-                SortKey::Kind => ea
-                    .extension()
-                    .cmp(&eb.extension())
-                    .then_with(|| natural_cmp(&ea.name, &eb.name)),
-            }
+                SortKey::Size => ea.size_or_zero().cmp(&eb.size_or_zero()),
+                SortKey::Modified => ea.modified_or_zero().cmp(&eb.modified_or_zero()),
+                SortKey::Kind => ea.extension().cmp(&eb.extension()),
+            };
+            let primary = match dir {
+                SortDir::Asc => primary,
+                SortDir::Desc => primary.reverse(),
+            };
+            primary.then_with(|| natural_cmp(&ea.name, &eb.name))
         });
     }
 }

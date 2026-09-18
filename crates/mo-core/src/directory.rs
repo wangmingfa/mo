@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::entry::Entry;
 use crate::file_id::FileId;
-use crate::view::{DirectoryView, SortKey};
+use crate::view::{DirectoryView, SortDir, SortKey};
 
 /// 目录的唯一 ID（复用 `FileId`）。
 pub type DirectoryId = FileId;
@@ -107,9 +107,9 @@ impl Directory {
         self.view.set_filter(query, &self.entries);
     }
 
-    /// 设置排序方式。
-    pub fn set_sort(&mut self, key: SortKey) {
-        self.view.set_sort(key, &self.entries);
+    /// 设置排序方式（键 + 方向）。
+    pub fn set_sort(&mut self, key: SortKey, dir: SortDir) {
+        self.view.set_sort(key, dir, &self.entries);
     }
 
     /// 可见条目数量（虚拟化列表用它作 `item_count`）。

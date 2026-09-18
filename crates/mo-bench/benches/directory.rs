@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use mo_core::{Directory, Entry, EntryKind, FileId, SortKey};
+use mo_core::{Directory, Entry, EntryKind, FileId, SortDir, SortKey};
 use mo_fs::{FileSystem, LocalFileSystem};
 
 /// 造一个包含 `n` 个文件的临时目录（只创建空文件，避免受磁盘写入速度干扰）。
@@ -64,7 +64,7 @@ fn bench_sort(c: &mut Criterion) {
                 b.iter(|| {
                     let mut dir = Directory::new(FileId::new(1, 1), PathBuf::from("/tmp"));
                     dir.set_entries(entries.clone());
-                    dir.set_sort(*key);
+                    dir.set_sort(*key, SortDir::Asc);
                     dir.visible_count()
                 });
             },

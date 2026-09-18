@@ -348,6 +348,37 @@ pub struct RootView {
     pub(crate) usage: Vec<mo_app::DirUsage>,
     /// 进行中的拖拽（鼠标按下时记录、抬起时结算）。
     pub(crate) drag: Option<DragState>,
+    /// 列表视图的列布局（顺序 + 宽度），表头与数据行共用。
+    pub(crate) cols: crate::list_columns::ColumnLayout,
+    /// 进行中的表头操作（调宽 / 调序）。
+    pub(crate) header_drag: Option<HeaderDrag>,
+    /// 表头各列的**真实** bounds（prepaint 回写），拖动落点判定用。
+    pub(crate) header_cells: Vec<(crate::list_columns::ColId, Bounds<Pixels>)>,
+    /// `header_cells` 属于哪个 (窗格, 标签页)——分栏时避免用错窗格的 bounds。
+    pub(crate) header_cells_owner: (usize, usize),
+}
+
+/// 一次表头拖动：要么在调列宽，要么在调列序。
+pub(crate) enum HeaderDrag {
+    /// 拖列**分隔线**（画在 `col` 的左缘）。
+    ///
+    /// `anchor` 是按下那一刻两侧列的宽度快照：拖动中按「相对按下点的总位移」
+    /// 一次性重算两侧宽度，而不是逐帧增量——增量叠加钳制会把分隔线拖偏
+    /// （触到宽度上下限后继续拖，再松回来时线回不到鼠标下）。
+    Resizing {
+        col: crate::list_columns::ColId,
+        start_x: f32,
+        anchor: crate::list_columns::DividerAnchor,
+    },
+    /// 拖列头本身：`moved` 为真才算拖列，否则抬起时按点击（切换排序）处理。
+    Reordering {
+        pane: usize,
+        tab: usize,
+        col: crate::list_columns::ColId,
+        start_x: f32,
+        cur_x: f32,
+        moved: bool,
+    },
 }
 
 /// 一次拖拽：从哪个窗格的哪个标签页拖出了哪些路径。
@@ -381,6 +412,10 @@ impl RootView {
             archive_name: String::new(),
             usage: Vec::new(),
             drag: None,
+            cols: crate::list_columns::ColumnLayout::new(),
+            header_drag: None,
+            header_cells: Vec::new(),
+            header_cells_owner: (0, 0),
         };
 
         let weak = cx.entity().downgrade();
@@ -877,6 +912,181 @@ impl RootView {
         self.drag = Some(DragState { pane, tab, paths });
     }
 
+    // ------------------------------------------------------- 列表表头交互
+
+    /// prepaint 回写：记下这个窗格 / 标签页表头各列的真实 bounds。
+    pub(crate) fn set_header_cells(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        cells: Vec<(crate::list_columns::ColId, Bounds<Pixels>)>,
+    ) {
+        // 分栏时两个窗格都会回写：只认最后画的那个，落点判定前先核对归属。
+        self.header_cells = cells;
+        self.header_cells_owner = (pane, tab);
+    }
+
+    /// 在列头上按下：准备拖列（抬起时若没移动，就当成点击 → 切换排序）。
+    ///
+    /// 已有拖拽态（分隔条先写入了 `Resizing`）时不覆盖——分隔条是列头的子节点，
+    /// 事件内层先派发。
+    pub(crate) fn header_mouse_down_cell(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        col: crate::list_columns::ColId,
+        x: f32,
+    ) {
+        if self.header_drag.is_none() {
+            self.header_drag = Some(HeaderDrag::Reordering {
+                pane,
+                tab,
+                col,
+                start_x: x,
+                cur_x: x,
+                moved: false,
+            });
+        }
+    }
+
+    /// 在列**分隔线**上按下：开始调列宽。
+    ///
+    /// 分隔线画在某一列的左缘，`col` 是它**右侧**的那一列；两侧的起始宽度由
+    /// [`crate::list_columns::ColumnLayout::divider_anchor`] 取（弹性列不参与，
+    /// 排在第一位的列没有分隔线 → 不会进入这里，因为那样也渲染不出把手）。
+    pub(crate) fn header_mouse_down_divider(&mut self, col: crate::list_columns::ColId, x: f32) {
+        let Some(anchor) = self.cols.divider_anchor(col) else {
+            return;
+        };
+        self.header_drag = Some(HeaderDrag::Resizing {
+            col,
+            start_x: x,
+            anchor,
+        });
+    }
+
+    /// 表头内鼠标移动：调列宽即时生效；拖列只更新「是否真的移动了」。
+    ///
+    /// 返回是否需要重绘（调列宽要重绘，分隔线才会跟着鼠标走）。
+    pub(crate) fn header_mouse_move(&mut self, x: f32) -> bool {
+        match &mut self.header_drag {
+            Some(HeaderDrag::Resizing {
+                start_x, anchor, ..
+            }) => {
+                let (sx, anchor) = (*start_x, *anchor);
+                let widths = crate::list_columns::divider_resize(anchor, x - sx);
+                self.cols.set_widths(&widths);
+                true
+            }
+            Some(HeaderDrag::Reordering {
+                start_x,
+                cur_x,
+                moved,
+                ..
+            }) => {
+                *cur_x = x;
+                if (x - *start_x).abs() > file_list::DRAG_THRESHOLD {
+                    *moved = true;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 表头内抬起：结算这次操作——没移动=点击排序，移动了=调整列序。
+    pub(crate) fn header_mouse_up(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.header_drag.take() else {
+            return;
+        };
+        let HeaderDrag::Reordering {
+            pane,
+            tab,
+            col,
+            moved,
+            ..
+        } = drag
+        else {
+            // 调列宽在移动过程中已即时生效；这里只需重绘一次，
+            // 让分隔线从「拖动中」的加粗态回到常态。
+            cx.notify();
+            return;
+        };
+        if !moved {
+            self.toggle_sort(pane, tab, col, cx);
+            return;
+        }
+        let Some(to) = self.header_drop_index(pane, tab, x) else {
+            return;
+        };
+        if let Some(from) = self.cols.index_of(col) {
+            if self.cols.move_col(from, to) {
+                cx.notify();
+            }
+        }
+    }
+
+    /// 拖列落点：指针落在哪一列的中线之前，就插到那一列前面。
+    ///
+    /// ⚠️ 用 prepaint 回写的真实 bounds（名称列弹性，宽度算不出来），
+    /// 并核对 bounds 的归属窗格——分栏时两个窗格都会回写同一份缓存。
+    fn header_drop_index(&self, pane: usize, tab: usize, x: f32) -> Option<usize> {
+        if self.header_cells_owner != (pane, tab) || self.header_cells.is_empty() {
+            return None;
+        }
+        let centers: Vec<f32> = self
+            .header_cells
+            .iter()
+            .map(|(_, b)| f32::from(b.origin.x) + f32::from(b.size.width) / 2.0)
+            .collect();
+        crate::list_columns::drop_index(&centers, x)
+    }
+
+    /// 正在被拖动换位的列（渲染时给这一列加高亮反馈）。
+    pub(crate) fn dragging_column(&self) -> Option<crate::list_columns::ColId> {
+        match &self.header_drag {
+            Some(HeaderDrag::Reordering {
+                col, moved: true, ..
+            }) => Some(*col),
+            _ => None,
+        }
+    }
+
+    /// 正在被拖动的那条列分隔线（它右侧的那一列）——渲染时把线画粗、加深。
+    pub(crate) fn resizing_divider(&self) -> Option<crate::list_columns::ColId> {
+        match &self.header_drag {
+            Some(HeaderDrag::Resizing { col, .. }) => Some(*col),
+            _ => None,
+        }
+    }
+
+    /// 点击表头：切换排序。同一列再点翻转方向，换列则用该列的自然方向。
+    pub(crate) fn toggle_sort(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        col: crate::list_columns::ColId,
+        cx: &mut Context<Self>,
+    ) {
+        let key = col.sort_key();
+        let Some(p) = self.panel_at_mut(pane, tab) else {
+            return;
+        };
+        let next = if p.sort.0 == key {
+            (key, p.sort.1.flipped())
+        } else {
+            (key, mo_core::SortDir::natural_for(key))
+        };
+        p.sort = next;
+        let app = p.app.clone();
+        // 排序在 app 侧重建可见索引并广播 DirectoryChanged，UI 由 sync_panel 回灌。
+        cx.spawn(async move |_weak, _cx| {
+            app.set_sort(next.0, next.1).await;
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// 鼠标在某个文件行上抬起：拖到目录行才算放下，否则继续冒泡给窗格。
     ///
     /// 事件顺序是「行 → 窗格」，所以行处理不了时把拖拽状态放回去，
@@ -1027,6 +1237,7 @@ async fn sync_panel(
 ) {
     let path = app.current_path().await;
     let count = app.visible_count().await;
+    let sort = app.sort().await;
     let can_back = app.can_go_back().await;
     let can_forward = app.can_go_forward().await;
     let ops = app.operations_snapshot().await;
@@ -1058,6 +1269,7 @@ async fn sync_panel(
         }
         p.path = path;
         p.visible_count = count;
+        p.sort = sort;
         p.can_back = can_back;
         p.can_forward = can_forward;
         p.ops = ops;
@@ -1505,6 +1717,12 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                     tab_idx,
                     panel.visible_count,
                     &panel.scroll,
+                    file_list::ListChrome {
+                        cols: &view.cols,
+                        sort: panel.sort,
+                        dragging: view.dragging_column(),
+                        resizing: view.resizing_divider(),
+                    },
                 )
                 .into_any_element(),
                 ViewMode::Columns => {
@@ -2264,6 +2482,17 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
     }
 }
 
+/// 命令面板里的排序命令：与点表头同语义——同列再点翻转方向，换列用自然方向。
+async fn sort_via_command(app: &AppState, key: SortKey) {
+    let (cur, dir) = app.sort().await;
+    let dir = if cur == key {
+        dir.flipped()
+    } else {
+        mo_core::SortDir::natural_for(key)
+    };
+    app.set_sort(key, dir).await;
+}
+
 /// 执行一个「运行即关闭」类命令。
 async fn run_command(id: CommandId, app: &AppState) {
     match id {
@@ -2284,10 +2513,10 @@ async fn run_command(id: CommandId, app: &AppState) {
         CommandId::DeleteSelection => {
             app.delete_selection().await;
         }
-        CommandId::SortName => app.set_sort(SortKey::Name).await,
-        CommandId::SortSize => app.set_sort(SortKey::Size).await,
-        CommandId::SortModified => app.set_sort(SortKey::Modified).await,
-        CommandId::SortKind => app.set_sort(SortKey::Kind).await,
+        CommandId::SortName => sort_via_command(app, SortKey::Name).await,
+        CommandId::SortSize => sort_via_command(app, SortKey::Size).await,
+        CommandId::SortModified => sort_via_command(app, SortKey::Modified).await,
+        CommandId::SortKind => sort_via_command(app, SortKey::Kind).await,
         CommandId::IndexCurrent => {
             if let Some(p) = app.current_path().await {
                 app.index_root(p, 0);

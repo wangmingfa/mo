@@ -1,41 +1,212 @@
 use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
+use mo_core::{SortDir, SortKey};
 
+use crate::list_columns::{ColId, ColumnLayout};
 use crate::listing::BUFFER;
 use crate::RootView;
 
-/// Finder 列表视图式表头：名称 | 修改日期 | 大小 | 种类。
+/// 表头单元格之间的水平间距（必须与数据行的 `gap` 一致，否则列会错位）。
+pub(crate) const HEADER_GAP: f32 = 8.0;
+
+/// 拖动超过这么多像素才算「拖动列」，否则算「点了一下表头」。
+pub(crate) const DRAG_THRESHOLD: f32 = 4.0;
+
+/// 列分隔线的**命中区**宽度：线本身只有 1px，靠它才抓得住。
+const DIVIDER_HIT_W: f32 = 7.0;
+/// 分隔线的常态线宽 / 拖动中的线宽。
+const DIVIDER_W: f32 = 1.0;
+const DIVIDER_W_ACTIVE: f32 = 2.0;
+/// 分隔线的高度：表头 26px 里上下各留 6px 间距，线不顶边（命中区仍满高）。
+const DIVIDER_H: f32 = 14.0;
+
+/// Finder 列表视图式表头：列序 / 列宽全部来自 `cols`。
 ///
-/// 列宽与 [`crate::file_item`] 的数据行共用同一组常量，保证上下对齐；
-/// 左右内边距 = 列表容器 12 + 数据行 4 = 16，与数据行内容起点一致。
-/// 排序暂未接入，表头为纯展示。
-fn header() -> Div {
-    let cell = |w: f32, label: &str| {
-        div()
-            .flex()
-            .flex_row()
-            .justify_end()
-            .w(px(w))
-            .flex_shrink_0()
-            .child(text!(label.to_string()))
-    };
-    div()
+/// 三种交互：
+/// * **点击**列头 → 切换排序（同一列再点一次翻转升降序）；
+/// * **拖动**列头 → 调整列顺序；
+/// * **拖动**列间的分隔线（每列左缘那条竖线，光标变 ⇔）→ 调整列宽。
+///
+/// ⚠️ 名称列是弹性列，首帧渲染前它的实际宽度是未知的，所以拖动落点判定
+/// 依赖 `on_children_prepainted` 回写到 `RootView.header_cells` 的真实 bounds
+/// （上一帧的值，拖动态下足够准）。
+pub(crate) fn header(
+    entity: &Entity<RootView>,
+    pane: usize,
+    tab: usize,
+    cols: &ColumnLayout,
+    sort: (SortKey, SortDir),
+    dragging: Option<ColId>,
+    resizing: Option<ColId>,
+) -> impl IntoElement {
+    let order = cols.order.clone();
+    // ⚠️ 两层结构不是冗余：`on_children_prepainted` 只存在于 `Div` 上，
+    // 而带 `.id()` 的元素会变成 `Stateful<Div>`（拿不到该方法）。
+    // 于是外层的 Stateful 行负责鼠标事件，内层的裸 Div 负责 Cells 的测量。
+    // 单元格上的事件依旧冒泡到外层，不影响三种交互。
+    let mut outer = div()
+        .id("mo-file-list-header")
+        .relative()
         .flex()
         .flex_row()
         .items_center()
         .h(px(26.0))
         .px(px(16.0))
-        .gap(px(8.0))
         .bg(crate::theme::container())
         .border_b_1()
         .border_color(crate::theme::separator())
         .text_size(px(11.0))
         .text_color(crate::theme::muted())
-        .debug_selector(|| "mo-file-list-header".to_string())
-        .child(div().flex_1().child(text!("名称".to_string())))
-        .child(cell(crate::file_item::DATE_W, "修改日期"))
-        .child(cell(crate::file_item::SIZE_W, "大小"))
-        .child(cell(crate::file_item::KIND_W, "种类"))
+        .debug_selector(|| "mo-file-list-header".to_string());
+
+    // 拖动过程与收尾都放在表头行这一层：指针在表头内任意位置移动 / 抬起
+    // 都能收到事件（单元格只负责「按下时记录起点」）。
+    let entity_move = entity.clone();
+    outer.interactivity().on_mouse_move(move |ev, _window, cx| {
+        let x = f32::from(ev.position.x);
+        entity_move.update(cx, |v, cx| {
+            if v.header_mouse_move(x) {
+                cx.notify();
+            }
+        });
+    });
+    let entity_up = entity.clone();
+    outer
+        .interactivity()
+        .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
+            let x = f32::from(ev.position.x);
+            entity_up.update(cx, |v, cx| v.header_mouse_up(x, cx));
+        });
+
+    // 内层：单元格容器，prepaint 时把每列真实 bounds 写回 RootView。
+    let entity_paint = entity.clone();
+    let order_for_paint = order.clone();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .h_full()
+        .min_w_0()
+        .gap(px(HEADER_GAP))
+        .on_children_prepainted(move |bounds, _window, cx| {
+            let cells: Vec<(ColId, Bounds<Pixels>)> =
+                order_for_paint.iter().copied().zip(bounds).collect();
+            entity_paint.update(cx, |v, _cx| v.set_header_cells(pane, tab, cells));
+        });
+
+    for (i, col) in order.iter().copied().enumerate() {
+        let sorted = sort.0 == col.sort_key();
+        let mut cell = div()
+            .id(("mo-header-cell", i))
+            .relative()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .h_full()
+            .flex_shrink_0()
+            .rounded(px(3.0))
+            .debug_selector(move || format!("mo-header-cell-{}", col_key(col)))
+            .hover(|s| s.bg(crate::theme::hover_bg()));
+        // 正在被拖动换位的那一列：常亮底色 + 深色字，让用户知道「搬的是它」。
+        if dragging == Some(col) {
+            cell = cell
+                .bg(crate::theme::hover_bg())
+                .text_color(crate::theme::text());
+        }
+        cell = if col.is_flex() {
+            // 弹性列不设 min_w：数据行的名称列同样没有下限，
+            // 两边收缩规则必须一致，否则窄窗格下表头与数据行会错位。
+            cell.flex_1().min_w(px(0.0))
+        } else {
+            cell.w(px(cols.width(col)))
+        };
+        if col.is_right_aligned() {
+            cell = cell.justify_end();
+        }
+        cell = cell.child(text!(col.title().to_string()));
+        if sorted {
+            // 排序指示箭头：升序 ↑、降序 ↓（与数据行同色，不额外抢眼）。
+            cell = cell.child(crate::icons::icon(
+                if sort.1 == SortDir::Asc {
+                    crate::icons::ARROW_UP
+                } else {
+                    crate::icons::ARROW_DOWN
+                },
+                10.0,
+                crate::theme::text(),
+            ));
+        }
+
+        // 按下列头 = 可能要拖列（收尾时若没移动就是点击排序）。
+        // ⚠️ 顺序敏感：分隔条是单元格的子节点，内层先派发并写入 Resizing，
+        // 这里再判断已有拖拽态就不再覆盖，避免调整列宽被误当成拖列。
+        let entity_cell = entity.clone();
+        cell.interactivity()
+            .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+                let x = f32::from(ev.position.x);
+                entity_cell.update(cx, |v, _cx| v.header_mouse_down_cell(pane, tab, col, x));
+            });
+
+        // 分隔线挂在**左缘**（第一列没有）：4 列就有 3 条线，
+        // 「名称 | 修改日期」这条也在——挂在右缘的方案里它是缺的。
+        // 线本身常显（拖动的把手必须先看得见），外圈 7px 是命中区。
+        if i > 0 {
+            let active = resizing == Some(col);
+            let line_w = if active { DIVIDER_W_ACTIVE } else { DIVIDER_W };
+            let line_color = if active {
+                crate::theme::muted()
+            } else {
+                crate::theme::divider()
+            };
+            let entity_divider = entity.clone();
+            let mut divider = div()
+                .id(("mo-header-divider", i))
+                .absolute()
+                .top(px(0.0))
+                // 间隙中心 = 本列左缘 - HEADER_GAP/2，命中区以它为对称轴居中。
+                .left(px(-(HEADER_GAP / 2.0 + DIVIDER_HIT_W / 2.0)))
+                .h_full()
+                .w(px(DIVIDER_HIT_W))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::ResizeLeftRight)
+                .debug_selector(move || format!("mo-header-divider-{}", col_key(col)));
+            divider
+                .interactivity()
+                .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+                    let x = f32::from(ev.position.x);
+                    // 按下即重绘一次：分隔线切到「拖动中」的加粗态。
+                    entity_divider.update(cx, |v, cx| {
+                        v.header_mouse_down_divider(col, x);
+                        cx.notify();
+                    });
+                });
+            // 线体本身上下内缩、不顶边；命中区（divider）仍是满高，
+            // 视觉上更轻，抓取手感不受影响。
+            let line = div()
+                .w(px(line_w))
+                .h(px(DIVIDER_H))
+                .bg(line_color)
+                .debug_selector(move || format!("mo-header-divider-line-{}", col_key(col)));
+            cell = cell.child(divider.child(line));
+        }
+        row = row.child(cell);
+    }
+    outer.child(row)
+}
+
+/// 列的可读键名（仅用于 debug selector / 测试定位）。
+pub(crate) fn col_key(col: ColId) -> &'static str {
+    match col {
+        ColId::Name => "name",
+        ColId::Date => "date",
+        ColId::Size => "size",
+        ColId::Kind => "kind",
+    }
 }
 
 /// 把本地选择变化同步到 `AppState` 的动作。
@@ -65,15 +236,42 @@ enum SelSync {
 /// 覆盖层（它实现了 `ScrollbarHandle`）。handle 由面板持有——
 /// 每帧新建会把滚动位置清零。
 ///
+/// 列表视图的「外壳」状态：列布局 + 排序 + 正在拖动的列。
+///
+/// 打包传递而不是逐个当参数：`render` 已经有 5 个位置参数，再加 3 个会撞上
+/// clippy 的 `too_many_arguments`。
+pub struct ListChrome<'a> {
+    pub cols: &'a ColumnLayout,
+    pub sort: (SortKey, SortDir),
+    /// 正在被拖动换位的列（整列高亮）。
+    pub dragging: Option<ColId>,
+    /// 正在被拖动的那条列分隔线（右侧的那一列）——加粗显示。
+    pub resizing: Option<ColId>,
+}
+
 /// `pane` / `tab` 指明渲染的是哪个标签页：多标签页与分栏共享同一个实现。
+/// `chrome` 是列布局（顺序 + 宽度）与排序态，表头与数据行共用，
+/// 用户拖列 / 点表头后下一帧即生效。
 pub fn render(
     entity: &Entity<RootView>,
     pane: usize,
     tab: usize,
     count: usize,
     scroll: &UniformListScrollHandle,
+    chrome: ListChrome<'_>,
 ) -> impl IntoElement {
     let entity = entity.clone();
+    let header = header(
+        &entity,
+        pane,
+        tab,
+        chrome.cols,
+        chrome.sort,
+        chrome.dragging,
+        chrome.resizing,
+    );
+    // 数据行用的列布局：克隆一份小结构（4 个列 + 4 个宽度），每帧成本可忽略。
+    let row_cols = chrome.cols.clone();
     let list = uniform_list("mo-file-list", count, move |range, _window, cx| {
         let need_start = range.start.saturating_sub(BUFFER);
         let need_end = (range.end + BUFFER).min(count);
@@ -244,8 +442,10 @@ pub fn render(
                 .map(|p| p.app.clone())
                 .and_then(|app| app.tag_of(&entry.path));
             rows.push(
-                row.child(crate::file_item::view(entry, selected, tag_color))
-                    .into_any_element(),
+                row.child(crate::file_item::view(
+                    entry, selected, tag_color, &row_cols,
+                ))
+                .into_any_element(),
             );
         }
         rows
@@ -270,7 +470,7 @@ pub fn render(
         .flex_col()
         .flex_1()
         .min_w_0()
-        .child(header())
+        .child(header)
         .child(
             div()
                 .relative()

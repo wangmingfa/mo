@@ -2,17 +2,21 @@ use gpui_kit::*;
 use mo_core::{Entry, EntryKind, MetadataState, ThumbnailState};
 use std::time::SystemTime;
 
-/// 右侧三列的固定宽度（表头与数据行共用，保证列对齐）。
-pub const DATE_W: f32 = 150.0;
-pub const SIZE_W: f32 = 80.0;
-pub const KIND_W: f32 = 100.0;
+use crate::list_columns::{ColId, ColumnLayout};
 
 /// 单个文件 / 文件夹行的纯展示（不含交互；交互在 `file_list` 中处理）。
 ///
-/// Finder 列表视图式四列：名称（弹性）| 修改日期 | 大小 | 种类（均右对齐固定宽）。
+/// 列顺序 / 宽度全部取自 `layout`（表头与数据行共用同一份，保证上下对齐）：
+/// 名称列弹性可伸缩，其余列固定宽右对齐。用户拖动表头改列宽 / 列顺序后，
+/// 数据行下一帧就跟着变——渲染逻辑里没有任何写死的列序。
 /// 缩略图来自 `mo-thumbnails` 生成的磁盘缓存；GPUI 可以直接从文件路径加载图片，
 /// 因此这里只需把缓存路径交给 `img()`——领域层不必知道任何 UI 类型。
-pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElement {
+pub fn view(
+    entry: &Entry,
+    selected: bool,
+    tag: Option<String>,
+    layout: &ColumnLayout,
+) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
     let icon_color = if selected {
@@ -22,8 +26,8 @@ pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElem
     };
 
     // ⚠️ `flex_1()` 不是装饰：`file_list` 的行容器是 `w_full()` + `items_center()`，
-    // 里面的元素默认按**内容宽度**收缩。少了它，这一行就只有「图标 + 文件名 + 大小」
-    // 那么宽，右侧的列会紧贴着文件名参差不齐，而不是对齐成固定列。
+    // 里面的元素默认按**内容宽度**收缩。少了它，这一行就只有内容那么宽，
+    // 右侧的列会紧贴着文件名参差不齐，而不是对齐成固定列。
     //
     // `overflow_hidden()` 也不是装饰：flex item 的自动最小尺寸是 min-content
     // （也就是完整文件名的宽度），长文件名会把右侧列顶出行外。
@@ -50,22 +54,34 @@ pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElem
             .child(child)
     };
 
-    row = match &entry.thumbnail {
-        ThumbnailState::Loaded(path) => row.child(icon_slot(
+    // 图标 + 颜色标签 + 文件名打包成「名称列」——列可以拖到任意位置，
+    // 图标始终跟着文件名走（不会跟列序脱节）。
+    let mut name_cell = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .flex_1()
+        .overflow_hidden();
+
+    name_cell = match &entry.thumbnail {
+        ThumbnailState::Loaded(path) => name_cell.child(icon_slot(
             img(path.as_path())
                 .w(px(20.0))
                 .h(px(20.0))
                 .into_any_element(),
         )),
-        ThumbnailState::Loading => row.child(icon_slot(text!("".to_string()).into_any_element())),
-        _ => row.child(icon_slot(
+        ThumbnailState::Loading => {
+            name_cell.child(icon_slot(text!("".to_string()).into_any_element()))
+        }
+        _ => name_cell.child(icon_slot(
             crate::icons::icon(icon_data, 16.0, icon_color).into_any_element(),
         )),
     };
 
     // 颜色标签（Finder 式）：有标签时文件名前显示一个色点。
     if let Some(color) = tag {
-        row = row.child(
+        name_cell = name_cell.child(
             div()
                 .w(px(8.0))
                 .h(px(8.0))
@@ -75,7 +91,7 @@ pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElem
         );
     }
 
-    row = row.child(
+    name_cell = name_cell.child(
         div()
             .flex_1()
             // 文件名过长时省略号截断（`truncate` = overflow_hidden + nowrap + ellipsis），
@@ -90,25 +106,6 @@ pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElem
             })
             .child(text!(entry.name.clone())),
     );
-
-    // 右侧三列统一 12px：元数据列比文件名淡一档，视觉层次与 Finder 一致。
-    let meta_color = if selected {
-        crate::theme::selected_text()
-    } else {
-        crate::theme::muted()
-    };
-    let meta_cell = |w: f32, label: String, selector: &'static str| {
-        div()
-            .flex()
-            .flex_row()
-            .justify_end()
-            .w(px(w))
-            .flex_shrink_0()
-            .text_size(px(12.0))
-            .text_color(meta_color)
-            .debug_selector(move || selector.to_string())
-            .child(text!(label))
-    };
 
     // 修改日期：后台加载未就绪时留空，加载失败显示 —。
     let date = match &entry.metadata {
@@ -125,11 +122,47 @@ pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElem
         MetadataState::Failed(_) => "—".to_string(),
     };
 
-    row.child(meta_cell(DATE_W, date, "mo-date-cell"))
-        .child(
-            meta_cell(SIZE_W, size, "mo-size-cell"), // 测试用（release no-op）：本文件单测断言这一列的位置
-        )
-        .child(meta_cell(KIND_W, kind_label(entry), "mo-kind-cell"))
+    // 右侧元数据列统一 12px：比文件名淡一档，视觉层次与 Finder 一致。
+    let meta_color = if selected {
+        crate::theme::selected_text()
+    } else {
+        crate::theme::muted()
+    };
+    let meta_cell = |col: ColId, label: String, selector: &'static str| {
+        let w = layout.width(col);
+        let mut cell = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .w(px(w))
+            .flex_shrink_0()
+            .overflow_hidden()
+            .text_size(px(12.0))
+            .text_color(meta_color)
+            // 测试用（release no-op）：本文件单测断言这些列的位置
+            .debug_selector(move || selector.to_string());
+        // 文本过长（列被拖窄）时截断，而不是溢出到相邻列。
+        cell = cell.child(div().truncate().child(text!(label)));
+        cell
+    };
+
+    // 按布局里的列序拼装：名称列弹性，其余固定宽。
+    // （`Div` 不是 `Clone`，所以名称列用 `Option` 交出唯一那份。）
+    let mut name_cell = Some(name_cell);
+    for col in &layout.order {
+        let cell: AnyElement = match col {
+            ColId::Name => name_cell
+                .take()
+                .expect("名称列在列序里只会出现一次")
+                .into_any_element(),
+            ColId::Date => meta_cell(*col, date.clone(), "mo-date-cell").into_any_element(),
+            ColId::Size => meta_cell(*col, size.clone(), "mo-size-cell").into_any_element(),
+            ColId::Kind => meta_cell(*col, kind_label(entry), "mo-kind-cell").into_any_element(),
+        };
+        row = row.child(cell);
+    }
+    row
 }
 
 /// 本地时间格式化，Finder 中文样式：`2026年4月21日 10:33`。
@@ -207,7 +240,7 @@ mod tests {
     // 会把 gpui 的 `test` 属性宏一起带进来，遮蔽内置的 `#[test]`
     // （表现是 "recursion limit reached while expanding `#[test]`"）。
     use super::view;
-    use super::{DATE_W, KIND_W, SIZE_W};
+    use crate::list_columns::{ColId, ColumnLayout};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         div, px, size, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
@@ -229,7 +262,7 @@ mod tests {
                 .h(px(24.0))
                 .p(px(4.0))
                 .debug_selector(|| "mo-probe-row".to_string())
-                .child(view(&self.0, false, None))
+                .child(view(&self.0, false, None, &ColumnLayout::default()))
         }
     }
 
@@ -263,6 +296,7 @@ mod tests {
     /// 在 crate 内部展开会因宏递归爆栈（集成测试不受影响）。
     #[test]
     fn meta_columns_are_pinned_right_and_aligned() {
+        let layout = ColumnLayout::default();
         for name in [
             "a.txt",
             "a-very-long-file-name-that-would-push-the-columns-away.txt",
@@ -285,11 +319,15 @@ mod tests {
                 row.origin.x + row.size.width - px(4.),
                 "「{name}」的种类列没有贴在行右缘：row={row:?} kind={kind:?}"
             );
-            assert_eq!(kind.size.width, px(KIND_W), "种类列宽度被压缩了");
+            assert_eq!(
+                kind.size.width,
+                px(layout.width(ColId::Kind)),
+                "种类列宽度被压缩了"
+            );
             // 大小列在种类列左侧，间距 8（行 gap）。
             assert_eq!(
                 cell.size.width,
-                px(SIZE_W),
+                px(layout.width(ColId::Size)),
                 "「{name}」的大小列宽度被压缩了"
             );
             assert_eq!(
@@ -298,12 +336,53 @@ mod tests {
                 "「{name}」大小列与种类列间距不对：cell={cell:?} kind={kind:?}"
             );
             // 日期列在大小列左侧，同样间距 8。
-            assert_eq!(date.size.width, px(DATE_W), "日期列宽度被压缩了");
+            assert_eq!(
+                date.size.width,
+                px(layout.width(ColId::Date)),
+                "日期列宽度被压缩了"
+            );
             assert_eq!(
                 date.origin.x + date.size.width + px(8.),
                 cell.origin.x,
                 "「{name}」日期列与大小列间距不对：date={date:?} cell={cell:?}"
             );
+        }
+    }
+
+    /// 数据行按布局里的列序渲染：把「种类」调到最前，它就该出现在行首。
+    #[test]
+    fn columns_follow_layout_order() {
+        let mut layout = ColumnLayout::default();
+        assert!(layout.move_col(3, 0), "把种类列拖到最前");
+
+        let mut cx = TestAppContext::single();
+        let window = cx.open_window(size(px(600.), px(200.)), |_, _cx| {
+            OrderProbe(entry_named("a.txt"), layout.clone())
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), &cx);
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let kind = cx.debug_bounds("mo-kind-cell").expect("种类列没有渲染");
+        let date = cx.debug_bounds("mo-date-cell").expect("日期列没有渲染");
+        assert!(
+            kind.origin.x < date.origin.x,
+            "种类列没有被排到日期列前面：kind={kind:?} date={date:?}"
+        );
+    }
+
+    /// 复刻数据行容器，但用自定义列布局。
+    struct OrderProbe(Entry, ColumnLayout);
+
+    impl Render for OrderProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .h(px(24.0))
+                .p(px(4.0))
+                .child(view(&self.0, false, None, &self.1))
         }
     }
 }

@@ -142,3 +142,61 @@
   * 加载占位从 ⏳ emoji 改为空白槽（延续去 emoji 方向）。
 * **测试**：`size_column_is_pinned_to_the_right_edge` 重写为 `meta_columns_are_pinned_right_and_aligned`（种类列贴右缘、大小/日期列向左各隔 8px gap、列宽不被压缩）；layout 集成测试 `sidebar_sits_left_of_the_file_list` 改断言「表头+列表 = 中央区高度」。
 * 坑：并行发的两个 Edit 第二个常不落盘（layout.rs 两处编辑只生效一处），需单独重发并回读验证。
+
+## 18. 列表表头三件套：拖宽 / 拖序 / 点击排序
+
+* **需求**：参考访达列表视图，表头支持 (1) 拖分隔条调列宽、(2) 拖列头调列序、(3) 点表头切排序。
+* **列模型**（新模块 `list_columns.rs`，不依赖 GPUI，可直接单测）：
+  * `ColId{Name,Date,Size,Kind}` → 表头文案 / 排序键 / 默认宽 / 是否弹性 / 对齐方式；
+  * `ColumnLayout{order: Vec<ColId>, widths: [f32;4]}`：`set_width` 把宽度钳在 60..=420，`move_col(from,to)` 越界或原地都是 no-op；
+  * `drop_index(centers, x)`：纯函数，按各列**中点**算拖放落点（把判定从渲染代码里抽出来就是为了可测）。
+* **排序方向**（`mo-core`）：`SortKey` 之外新增 `SortDir{Asc,Desc}`，`SortDir::natural_for(key)` 给出各列的自然方向（名称/种类升序，大小/修改时间降序）。比较器改成「**目录恒在前** → 主键按升序比较 → 方向翻转 → 名称恒升序兜底」，避免降序时同值条目连次序键一起倒过来。`Directory::set_sort(key, dir)`、`AppState::set_sort(key, dir)` / 新增 `AppState::sort()` 供 UI 画箭头；命令面板的 4 个排序命令改为 `sort_via_command`（同列翻转、换列取自然方向）。
+* **表头实现**（`file_list.rs::header`）：
+  * ⚠️ 两层结构：`on_children_prepainted` 只在 `Div` 上有，而带 `.id()` 的元素会变成 `Stateful<Div>` —— 于是外层 Stateful 行挂鼠标事件、内层裸 Div 负责测量并回写 `RootView.header_cells`（列真实 bounds，名称列弹性所以拿不到宽度，只能靠回写）。
+  * **点击 vs 拖列**：不依赖 `on_click`（它与 `on_mouse_up` 的派发先后不可靠），统一在表头行的 `on_mouse_up` 里结算——位移 ≤ 4px 当点击（切排序），否则按 `drop_index` 换列序；被拖动的那列常亮底色。
+  * **调列宽**：分隔条是列头单元格的子节点（`absolute`、6px 宽、`ResizeLeftRight` 光标），内层先派发写入 `Resizing`，外层列头的 `on_mouse_down` 见已有拖拽态就不覆盖。
+  * 弹性列（名称）不挂分隔条、不设 `min_w`，与数据行的收缩规则保持一致，窄窗格下才不会错位。
+* **数据行**（`file_item.rs::view` 新增 `layout` 参数）：按 `layout.order` 拼列；图标 + 颜色标签 + 文件名打包进「名称列」，列怎么拖图标都跟着文件名走。`file_list::render` 用 `ListChrome{cols, sort, dragging}` 打包传参（8 个参数会撞 clippy `too_many_arguments`）。
+* **测试**：`list_columns` 5 个单测（默认布局 / 钳制 / move_col no-op / 排序键映射 / 落点）；`mo-core` 新增 2 个（方向翻转且目录恒在前、自然方向）；`file_item` 新增 `columns_follow_layout_order`（把种类列拖到最前，行内顺序跟着变）。
+* ⚠️ GPUI 0.3.5 没有鼠标事件模拟 API，三种拖动交互只有纯逻辑单测 + headless 布局测试，真实拖拽手感需本机 `cargo run` 验收。
+
+## 19. 列表表头：可见的列分隔线（可拖调宽）
+
+* **需求**：表头把每列的分隔线画出来，并让这条线本身成为调列宽的把手。
+* **原来为什么看不见**：分隔条是 6px 宽的**透明**命中区（挂在列头**右缘**），既没有颜色，
+  也没有「名称 | 修改日期」那一条（名称列是弹性列，右缘把手被跳过了）。
+* **分隔线挂在「列的左缘」**（第一条不需要）：
+  * 4 列 → 3 条线，`名称|修改日期` 这条也在；
+  * 线本身常显（1px、`theme::divider()`=0xc8c8cc），外圈 7px 是命中区
+    （`left = -(HEADER_GAP/2 + 7/2)`，即命中区以两列间隙的中线为对称轴）；
+  * 拖动中：线加粗到 2px + 转 `muted()`，松开复原（`RootView::resizing_divider()`）。
+* **调宽的方向语义**（`list_columns::divider_resize`，纯函数 + 单测）：
+  * 规则是「**左列变宽 dx、右列变窄 dx**」——两侧同时动，被拖的那条线才严格跟着鼠标。
+  * 只改一侧不行：布局里恒有一个弹性列吃剩余空间，固定宽列的**远侧**边被容器边缘钉死，
+    单边改宽度只会让它不动的那条边挪位，线反而不动。
+  * 两侧共用**同一个钳制后的位移**：各自独立钳制的话，一侧触上下限时另一侧还在动，线会偏。
+  * 弹性列（名称）不能设固定宽 → 它那一侧交给邻居独自承担，线依然跟着鼠标
+    （弹性列吃/吐剩余空间，边界正好由邻居宽度决定）。所以第一列是弹性列时，
+    拖 `名称|修改日期` 的实际效果就是「名称变宽」。
+  * `DividerAnchor`（按下瞬间的两侧宽度快照）+ 按**总位移**重算（不是逐帧增量）：
+    增量叠加钳制会在触限后把线拖偏。
+* **坑**：表头内层行原来没有 `h_full()`，`items_center` 让它的高度变成内容高（18px），
+  于是分隔线只有 18px、撑不满表头 → 补 `h_full()` 后是 25px（表头 26px 减去 1px 底边框）。
+* **测试**：`list_columns` 新增 4 个（锚点跳过首列/弹性列、对称改宽、单侧兜底、共用钳制）；
+  `layout.rs` 新增 `header_dividers_sit_between_columns`——断言 3 条线都渲染出来、
+  中心落在两列间隙的中线上、且贯穿表头高度（第一列左侧不许有）。
+* ⚠️ 仍是 headless 布局测试 + 纯逻辑单测；真实拖拽手感（7px 命中区宽度是否好抓）需本机验收。
+
+## 20. 表头分隔线的视觉微调：浅一档 + 不顶边
+
+* **反馈**：19 条的分隔线「稍微灰一点」、上下不要顶边要留间距。
+* **线的颜色**：`theme::divider()` 0xc8c8cc → **0xd6d6da**（浅一档）。表头底是 `container()`
+  (0xf6f6f7)，分隔线同时是拖动把手——太深抢眼，只留克制的浅浅一条。
+* **垂直内缩**：新增 `DIVIDER_H = 14.0`（表头 26px，上下各留 6px）。**只有看得见的线体**
+  改成固定高 14px；**命中区（`mo-header-divider-*`，7px 宽）仍然 `h_full()`**——
+  视觉变轻但「抓取」的命中面积不变，手感不受影响。
+* **可测性**：线体单独挂 debug selector `mo-header-divider-line-{col}`（原来只能测命中区）。
+* **测试**：`header_dividers_sit_between_columns` 扩展——除原有的「落在两列间隙中线、
+  命中区贯穿表头高度」外，新增「线体上下 inset ≥ 1px（不顶边）」+「上下 inset 对称（垂直居中）」。
+  坑：`TestWindowExt::debug_bounds` 只吃 `&'static str`，运行时拼的 String 会 `E0597`
+  报生命周期不够 —— 选择器要写成字面量。

@@ -75,6 +75,82 @@ fn file_list_height_tracks_the_window(cx: &mut TestAppContext) {
     );
 }
 
+/// 表头每两列之间都要有一条**可见**的分隔线，位置落在两列间隙的中线上。
+///
+/// 这条线同时是列宽的拖动把手：它必须真的画出来（曾经只有 1px 不可见的命中区），
+/// 而且必须正好卡在列间隙里，不能压在列头文字上。
+#[gpui_kit::test]
+fn header_dividers_sit_between_columns(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let header = bounds(&mut cx, "mo-file-list-header");
+    let center = |b: &Bounds<Pixels>| f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+
+    let name = bounds(&mut cx, "mo-header-cell-name");
+    let date = bounds(&mut cx, "mo-header-cell-date");
+    let size = bounds(&mut cx, "mo-header-cell-size");
+    let kind = bounds(&mut cx, "mo-header-cell-kind");
+
+    assert!(
+        cx.debug_bounds("mo-header-divider-name").is_none(),
+        "第一列左侧不该有分隔线"
+    );
+
+    // 默认列序：名称 | 修改日期 | 大小 | 种类 → 三条线。
+    for (selector, line_selector, left, right) in [
+        (
+            "mo-header-divider-date",
+            "mo-header-divider-line-date",
+            name,
+            date,
+        ),
+        (
+            "mo-header-divider-size",
+            "mo-header-divider-line-size",
+            date,
+            size,
+        ),
+        (
+            "mo-header-divider-kind",
+            "mo-header-divider-line-kind",
+            size,
+            kind,
+        ),
+    ] {
+        let divider = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} 没有渲染：分隔线不可见就等于没有把手"));
+        let gap_mid =
+            (f32::from(left.origin.x) + f32::from(left.size.width) + f32::from(right.origin.x))
+                / 2.0;
+        assert!(
+            (center(&divider) - gap_mid).abs() <= 0.51,
+            "{selector} 不在两列间隙的中线上：divider={divider:?} left={left:?} right={right:?}"
+        );
+        assert!(
+            divider.origin.y == header.origin.y
+                && divider.size.height >= header.size.height - px(1.),
+            "{selector} 的命中区没有贯穿表头高度（去掉底边框那 1px）：divider={divider:?} header={header:?}"
+        );
+
+        // 看得见的那条线体：上下要留出间距（不顶边），且在命中区内垂直居中。
+        let line = cx
+            .debug_bounds(line_selector)
+            .unwrap_or_else(|| panic!("{line_selector} 没有渲染：分隔线不可见"));
+        let top_inset = f32::from(line.origin.y - divider.origin.y);
+        let bottom_inset =
+            f32::from(divider.origin.y + divider.size.height - line.origin.y - line.size.height);
+        assert!(
+            top_inset >= 1.0 && bottom_inset >= 1.0,
+            "{line_selector} 的线体顶边了（上下要留间距）：top={top_inset} bottom={bottom_inset}"
+        );
+        assert!(
+            (top_inset - bottom_inset).abs() <= 0.51,
+            "{line_selector} 的线体没有垂直居中：top={top_inset} bottom={bottom_inset}"
+        );
+    }
+}
+
 /// 侧边栏与文件列表必须左右并排（block 布局下它们会变成上下堆叠，列表随即被压成 0 高）。
 #[gpui_kit::test]
 fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {

@@ -52,6 +52,14 @@ pub fn zebra() -> Rgba {
     gpui_kit::rgb(0xf7f7f8)
 }
 
+/// 列表表头的列分隔线。
+///
+/// 比 [`separator`] 深一档：分隔线要贴在 [`container`] 底的表头上「看得见」，
+/// 但它同时是列宽的拖动把手，太深又会喧宾夺主——所以只取一个克制的浅灰。
+pub fn divider() -> Rgba {
+    gpui_kit::rgb(0xd6d6da)
+}
+
 /// 强调色（激活项 / 焦点边框 / 强调文字）——用户指定的中性灰，比 199 淡 10%（RGB 205,205,205）。
 /// 文件列表的**选中高亮**不在其列，仍走 [`selected_bg`] 的蓝。
 pub fn accent() -> Rgba {

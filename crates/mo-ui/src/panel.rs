@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use gpui_kit::UniformListScrollHandle;
 use mo_app::AppState;
-use mo_core::{Entry, LightEntry, SelectionModel};
+use mo_core::{Entry, LightEntry, SelectionModel, SortDir, SortKey};
 use mo_operations::OperationHandle;
 
 /// 面板的呈现方式。
@@ -111,6 +111,9 @@ pub(crate) struct Panel {
     pub columns: Vec<ColumnData>,
     /// 列视图正在读盘：避免每帧重复发起加载任务。
     pub column_busy: bool,
+    /// 当前排序方式（键 + 方向），来自 `AppState` 的最近一次同步。
+    /// 表头据此画排序指示箭头；点击表头改的也是它（随后回灌 app）。
+    pub sort: (SortKey, SortDir),
 }
 
 /// 列视图的一列。
@@ -142,6 +145,7 @@ impl Panel {
             address_input: String::new(),
             columns: Vec::new(),
             column_busy: false,
+            sort: (SortKey::Name, SortDir::Asc),
         }
     }
 

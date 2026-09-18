@@ -178,3 +178,77 @@ async fn event_bus_publish_subscribe() {
         _ => panic!("unexpected event"),
     }
 }
+
+// ---------------------------------------------------------------- 排序方向
+
+/// 造一个带大小的文件条目（排序测试用）。
+fn sort_entry(name: &str, size: u64, dir: bool) -> Entry {
+    let mut e = Entry::new(
+        fid(size as u128 + 1),
+        name.to_string(),
+        if dir {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        },
+        Path::new("/tmp").join(name),
+    );
+    e.metadata = MetadataState::Loaded(FileMetadata {
+        size,
+        modified: None,
+        created: None,
+        permissions: Permissions::default(),
+    });
+    e
+}
+
+fn names(view: &DirectoryView, entries: &[Entry]) -> Vec<String> {
+    view.visible_indices()
+        .iter()
+        .map(|i| entries[*i].name.clone())
+        .collect()
+}
+
+/// 方向必须真的翻转，且**目录恒在前**（不受方向影响，与访达一致）。
+#[test]
+fn sort_direction_flips_within_kind_and_keeps_dirs_first() {
+    let entries = vec![
+        sort_entry("b.txt", 300, false),
+        sort_entry("a.txt", 100, false),
+        sort_entry("zdir", 0, true),
+        sort_entry("adir", 0, true),
+    ];
+    let mut view = DirectoryView::new();
+
+    view.set_sort(SortKey::Name, SortDir::Asc, &entries);
+    assert_eq!(
+        names(&view, &entries),
+        vec!["adir", "zdir", "a.txt", "b.txt"],
+        "名称升序：目录在前、各自按名升序"
+    );
+
+    view.set_sort(SortKey::Name, SortDir::Desc, &entries);
+    assert_eq!(
+        names(&view, &entries),
+        vec!["zdir", "adir", "b.txt", "a.txt"],
+        "名称降序：目录仍在前（组内也倒序），文件倒序"
+    );
+
+    view.set_sort(SortKey::Size, SortDir::Desc, &entries);
+    assert_eq!(
+        names(&view, &entries),
+        vec!["adir", "zdir", "b.txt", "a.txt"],
+        "大小降序：目录仍在前"
+    );
+}
+
+/// 首次点击表头用「自然方向」：名称 / 种类升序，大小 / 修改时间降序。
+#[test]
+fn natural_sort_direction_matches_finder() {
+    assert_eq!(SortDir::natural_for(SortKey::Name), SortDir::Asc);
+    assert_eq!(SortDir::natural_for(SortKey::Kind), SortDir::Asc);
+    assert_eq!(SortDir::natural_for(SortKey::Size), SortDir::Desc);
+    assert_eq!(SortDir::natural_for(SortKey::Modified), SortDir::Desc);
+    assert_eq!(SortDir::Asc.flipped(), SortDir::Desc);
+    assert_eq!(SortDir::Desc.flipped(), SortDir::Asc);
+}

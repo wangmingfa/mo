@@ -31,7 +31,7 @@ use std::time::Duration;
 use mo_cache::MetadataCache;
 use mo_core::{
     AppEvent, Directory, Entry, EventBus, FileId, FileMetadata, LightEntry, MetadataState, MoError,
-    NavigationState, SelectionModel, SortKey, ThumbnailState,
+    NavigationState, SelectionModel, SortDir, SortKey, ThumbnailState,
 };
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
@@ -556,15 +556,28 @@ impl AppState {
         self.publish_dir_changed().await;
     }
 
-    /// 设置排序方式。
-    pub async fn set_sort(&self, key: SortKey) {
+    /// 设置排序方式（键 + 方向）。
+    pub async fn set_sort(&self, key: SortKey, dir: SortDir) {
         {
             let mut inner = self.inner.write().await;
-            if let Some(dir) = inner.directory.as_mut() {
-                dir.set_sort(key);
+            if let Some(dir_state) = inner.directory.as_mut() {
+                dir_state.set_sort(key, dir);
             }
         }
         self.publish_dir_changed().await;
+    }
+
+    /// 当前排序方式（键 + 方向）；没有目录时为默认值。
+    ///
+    /// UI 用它给列表头画排序指示箭头。
+    pub async fn sort(&self) -> (SortKey, SortDir) {
+        self.inner
+            .read()
+            .await
+            .directory
+            .as_ref()
+            .map(|d| (d.view.sort(), d.view.sort_dir()))
+            .unwrap_or_default()
     }
 
     /// 当前是否处于过滤态（UI 用它显示「清除过滤」入口）。
