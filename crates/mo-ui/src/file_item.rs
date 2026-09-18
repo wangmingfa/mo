@@ -143,7 +143,11 @@ pub fn view(
             // 测试用（release no-op）：本文件单测断言这些列的位置
             .debug_selector(move || selector.to_string());
         // 文本过长（列被拖窄）时截断，而不是溢出到相邻列。
-        cell = cell.child(div().truncate().child(text!(label)));
+        // ⚠️ `text!` 宏会按调用点位置生成元素 ID；本闭包对同一行渲染 3 次
+        // （日期 / 大小 / 种类），若不显式给 ID，三段文本会得到完全相同的
+        // 元素 ID 路径 → 相同的 a11y NodeId → 开启辅助功能时触发
+        // "Duplicate a11y node id" panic。用每列唯一的 selector 作 ID。
+        cell = cell.child(div().truncate().child(text!(id = selector, label)));
         cell
     };
 

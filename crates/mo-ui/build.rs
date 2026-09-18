@@ -9,8 +9,6 @@
 //!
 //! 非 Windows 平台本脚本是 no-op（图标资源段也不作为依赖参与编译）。
 
-use std::{env, fs, path::PathBuf};
-
 fn main() {
     // 源图或本脚本变化时重跑。
     println!("cargo:rerun-if-changed=../../assets/icon.png");

@@ -140,6 +140,8 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         body = body
             .child(
                 div()
+                    // ⚠️ 循环体里的同站点 text! 需要唯一 ID 链（防重复 a11y 节点）。
+                    .id(format!("rn-label-{idx}"))
                     .text_size(px(12.0))
                     .text_color(theme::muted())
                     .child(text!(label.to_string())),
@@ -160,6 +162,8 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         let active = view.form_index == idx;
         body = body.child(
             div()
+                // ⚠️ 循环体里的同站点 text! 需要唯一 ID 链（防重复 a11y 节点）。
+                .id(format!("rn-toggle-{idx}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -180,9 +184,11 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         .gap(px(2.0))
         .overflow_y_scrollbar()
         .h(px(200.0));
-    for (old, new) in names.iter().zip(preview.iter()).take(12) {
+    for (i, (old, new)) in names.iter().zip(preview.iter()).take(12).enumerate() {
         list = list.child(
             div()
+                // ⚠️ 循环行需要唯一 ID（防重复 a11y 节点）。
+                .id(format!("rn-prev-{i}"))
                 .flex()
                 .flex_row()
                 .gap(px(8.0))
@@ -241,8 +247,15 @@ pub fn archive(view: &RootView, _entity: &Entity<RootView>) -> Div {
             true,
             "archive-name".to_string(),
         ));
-    for n in names.iter().take(8) {
-        body = body.child(div().text_size(px(12.0)).truncate().child(text!(n.clone())));
+    for (i, n) in names.iter().take(8).enumerate() {
+        // ⚠️ 循环行需要唯一 ID（防重复 a11y 节点）。
+        body = body.child(
+            div()
+                .id(format!("arch-name-{i}"))
+                .text_size(px(12.0))
+                .truncate()
+                .child(text!(n.clone())),
+        );
     }
     modal_card("压缩", "", body, "输入文件名 · Enter 执行 · Esc 取消")
 }

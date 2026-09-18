@@ -2177,7 +2177,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             .flex_1()
             // 测试用（release no-op）：tests/layout.rs 断言中央区位置与尺寸。
             .debug_selector(|| "mo-center".to_string())
-            .child(filter_bar(&panel.query))
+            .child(filter_bar(&panel.query, pane_idx))
             .child(match panel.view_mode {
                 ViewMode::List => file_list::render(
                     entity,
@@ -3104,7 +3104,10 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
 }
 
 /// 过滤条：显示当前关键词与提示。
-fn filter_bar(query: &str) -> impl IntoElement {
+///
+/// `pane` 用于生成唯一元素 ID：分栏时每个窗格各渲染一份本条，
+/// `text!` 按调用点生成 ID，若无唯一 ID 链会产生重复的 a11y NodeId。
+fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
     if query.is_empty() {
         return div().h(px(0.0));
     }
@@ -3119,11 +3122,11 @@ fn filter_bar(query: &str) -> impl IntoElement {
         .border_b_1()
         .border_color(theme::separator())
         .text_color(theme::accent())
-        .child(text!(format!("🔍 {}", query)))
+        .child(text!(id = format!("filter-q-{pane}"), format!("🔍 {}", query)))
         .child(
             div()
                 .text_color(theme::muted())
-                .child(text!("（Esc 清除）".to_string())),
+                .child(text!(id = format!("filter-esc-{pane}"), "（Esc 清除）".to_string())),
         )
 }
 
@@ -3143,6 +3146,7 @@ impl RootView {
             let def = commands().into_iter().find(|c| c.id == *id).unwrap();
             let selected = i == idx;
             let row = div()
+                .id(format!("cmd-row-{i}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3184,6 +3188,7 @@ impl RootView {
         for (i, hit) in self.search_results.iter().enumerate() {
             let selected = i == idx;
             let row = div()
+                .id(format!("search-row-{i}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3262,6 +3267,7 @@ impl RootView {
             let selected = i == idx;
             let kind = if e.is_dir { "📁" } else { "📄" };
             let row = div()
+                .id(format!("trash-row-{i}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3356,6 +3362,7 @@ impl RootView {
                                     &td.a_lines[old + i],
                                     diff_eq_bg(),
                                     crate::theme::text(),
+                                    shown,
                                 ));
                                 shown += 1;
                             }
@@ -3372,6 +3379,7 @@ impl RootView {
                                     &td.a_lines[old + i],
                                     diff_del_bg(),
                                     diff_del_fg(),
+                                    shown,
                                 ));
                                 shown += 1;
                             }
@@ -3388,6 +3396,7 @@ impl RootView {
                                     &td.b_lines[new + i],
                                     diff_add_bg(),
                                     diff_add_fg(),
+                                    shown,
                                 ));
                                 shown += 1;
                             }
@@ -3435,7 +3444,7 @@ impl RootView {
             .gap(px(1.0))
             .overflow_y_scrollbar()
             .h(px(360.0));
-        for e in &t.entries {
+        for (i, e) in t.entries.iter().enumerate() {
             let (label, fg) = match e.status {
                 mo_diff::TreeStatus::Identical => ("＝", crate::theme::muted()),
                 mo_diff::TreeStatus::Different => ("≠", diff_del_fg()),
@@ -3445,6 +3454,8 @@ impl RootView {
             let name = format!("{}{}", e.rel.display(), if e.is_dir { "/" } else { "" });
             rows = rows.child(
                 div()
+                    // ⚠️ 无 ID 的循环行会让同站点 text! 产生重复 a11y 节点。
+                    .id(format!("tree-diff-row-{i}"))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -3537,9 +3548,13 @@ fn diff_row(
     content: &str,
     bg: gpui_kit::Rgba,
     fg: gpui_kit::Rgba,
-) -> Div {
+    seq: usize,
+) -> Stateful<Div> {
     let num = |n: Option<usize>| n.map(|v| (v + 1).to_string()).unwrap_or_default();
     div()
+        // ⚠️ diff 行数以千计且都出自同一 `text!` 站点：每行必须有唯一 ID，
+        // 否则辅助功能开启时同一行的四段文本共享 NodeId → panic。
+        .id(format!("diff-line-{seq}"))
         .flex()
         .flex_row()
         .items_center()

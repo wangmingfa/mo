@@ -45,7 +45,9 @@ pub(crate) fn header(
     // 于是外层的 Stateful 行负责鼠标事件，内层的裸 Div 负责 Cells 的测量。
     // 单元格上的事件依旧冒泡到外层，不影响三种交互。
     let mut outer = div()
-        .id("mo-file-list-header")
+        // ⚠️ 分栏时两个窗格各渲染一份表头：ID 必须带 pane/tab，
+        // 否则两份表头下的文本会得到相同的 a11y NodeId。
+        .id(format!("mo-file-list-header-{pane}-{tab}"))
         .relative()
         .flex()
         .flex_row()
@@ -98,7 +100,7 @@ pub(crate) fn header(
     for (i, col) in order.iter().copied().enumerate() {
         let sorted = sort.0 == col.sort_key();
         let mut cell = div()
-            .id(("mo-header-cell", i))
+            .id(format!("mo-header-cell-{pane}-{tab}-{i}"))
             .relative()
             .flex()
             .flex_row()
@@ -162,7 +164,7 @@ pub(crate) fn header(
             };
             let entity_divider = entity.clone();
             let mut divider = div()
-                .id(("mo-header-divider", i))
+                .id(format!("mo-header-divider-{pane}-{tab}-{i}"))
                 .absolute()
                 .top(px(0.0))
                 // 间隙中心 = 本列左缘 - HEADER_GAP/2，命中区以它为对称轴居中。
@@ -301,8 +303,14 @@ pub fn render(
         for i in range.clone() {
             let offset = i.wrapping_sub(panel.window_start);
             let Some(entry) = panel.window.get(offset) else {
+                // ⚠️ 占位行也要有元素 ID：`uniform_list` 的列表项没有逐项 ID，
+                // 而可见区通常同时有多条占位行；`text!` 按调用点生成 ID，
+                // 不给行 ID 的话它们会共享同一条元素 ID 路径 → 相同的
+                // a11y NodeId → 辅助功能开启时 panic（启动时快照未回填
+                // 满屏占位行，正是崩溃现场）。
                 rows.push(
                     div()
+                        .id(format!("file-ph-{pane}-{tab}-{i}"))
                         .flex()
                         .flex_row()
                         .items_center()

@@ -66,7 +66,14 @@ pub fn render(
                 ));
             }
             if any_missing {
-                row = row.child(div().flex_1().child(text!("…".to_string())));
+                // ⚠️ 占位文本要有唯一 ID：多个行同时缺数据时，
+                // 同一 `text!` 站点会渲染多次，无 ID 会产生重复 a11y 节点。
+                row = row.child(
+                    div()
+                        .id(format!("grid-ph-{pane}-{tab}-{r}"))
+                        .flex_1()
+                        .child(text!("…".to_string())),
+                );
             }
             rows.push(row.into_any_element());
         }

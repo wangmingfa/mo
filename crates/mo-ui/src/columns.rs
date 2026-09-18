@@ -56,8 +56,12 @@ fn column_box(
     tab: usize,
     index: usize,
     data: &ColumnData,
-) -> Div {
+) -> Stateful<Div> {
     let mut col = div()
+        // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
+        // 列容器必须有唯一 ID，否则同一 `text!` 站点在各列重复出现时
+        // 会产生重复的 a11y NodeId。
+        .id(format!("col-box-{pane}-{tab}-{index}"))
         .flex()
         .flex_col()
         .w(px(COLUMN_WIDTH))
