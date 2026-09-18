@@ -8,6 +8,8 @@
 //! 这里补上该资源即可，无需改动运行期代码。
 //!
 //! 非 Windows 平台本脚本是 no-op（图标资源段也不作为依赖参与编译）。
+#[cfg(windows)]
+use std::{env, fs, path::PathBuf};
 
 fn main() {
     // 源图或本脚本变化时重跑。
