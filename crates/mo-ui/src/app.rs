@@ -2037,7 +2037,8 @@ impl Render for RootView {
                     })
                     .detach();
                 }
-                " " if plain => {
+                "space" if plain => {
+                    tracing::info!("[kbd] 命中空格分支 → open_quick_look");
                     let app = entity_key.update(cx, |v, _cx| v.app());
                     let this = entity_key.clone();
                     cx.spawn(async move |cx| {
@@ -2077,6 +2078,7 @@ impl Render for RootView {
                 }
                 k if plain && k.chars().count() == 1 => {
                     let ch = k.chars().next().unwrap();
+                    tracing::info!("[kbd] 命中 type-to-filter 兜底分支 ch={:?}", ch);
                     entity_key.update(cx, |v, cx| {
                         v.panel_mut().query.push(ch);
                         v.apply_filter(cx);
@@ -2459,7 +2461,7 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
                 }
                 cx.notify();
             }),
-            " " => entity.update(cx, |v, cx| {
+            "space" => entity.update(cx, |v, cx| {
                 if let Some(p) = v.prop.as_mut() {
                     p.toggle_bit();
                 }
@@ -2497,7 +2499,7 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
                 v.form_index = (v.form_index + 1).min(5);
                 cx.notify();
             }),
-            " " => entity.update(cx, |v, cx| {
+            "space" => entity.update(cx, |v, cx| {
                 match v.form_index {
                     4 => v.rename_spec.use_index = !v.rename_spec.use_index,
                     5 => v.rename_spec.keep_extension = !v.rename_spec.keep_extension,
@@ -2592,7 +2594,7 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
             _ => {}
         },
         Modal::QuickLook | Modal::Diff | Modal::Info(_) => match key {
-            "escape" | " " => close_modal(entity, cx),
+            "escape" | "space" => close_modal(entity, cx),
             _ => {}
         },
         Modal::None => {}

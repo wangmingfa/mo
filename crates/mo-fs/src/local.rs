@@ -1,5 +1,7 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Path};
+#[cfg(target_os = "windows")]
+use std::path::{PathBuf};
 
 use async_trait::async_trait;
 use mo_core::{FileMetadata, MoError, Permissions};
