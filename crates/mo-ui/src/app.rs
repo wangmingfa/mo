@@ -1168,6 +1168,7 @@ impl Render for RootView {
                 panel.address_editing,
                 &panel.address_input,
                 panel.view_mode,
+                window.is_maximized(),
             ))
             .child(body)
             .child(progress_panel::render(&ops, &app))

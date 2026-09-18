@@ -107,4 +107,12 @@
   2. `app.select_range(from,to)` **只 insert 不清空**，且 `from/to` 是 `dir.view.visible_indices()` 的全局可见下标——所以连选同步到 app 侧前要先 `clear_selection()`，否则 app 选区会累积、导致后续复制 / 移动选错文件。
 * **架构提醒**：`sync_panel` 每 ~120ms 用 `app.selection_ids()` 回灌 `panel.selection`（`set_from`），app 才是最终事实来源。本地 `panel.selection` 的改动只是 ≤120ms 的即时反馈，真正的语义修正落在对 `app` 的 `select/toggle/select_range` 调用上。
 * `SelectionModel` 增加 `set_anchor()`；新增 4 个回归测试（含 `select` 替换、`set_anchor` 不动选区、Shift 连选保留锚点）。
-EOF\necho done
+
+## 16. Windows 顶栏自绘窗口控制按钮（最小化 / 最大化 / 关闭）
+
+* **现象**：Windows 下顶栏没有最小化 / 最大化 / 关闭三键。
+* **根因**：`lib.rs` 里 `TitlebarOptions.appears_transparent: true` 是**无条件**设的，而 Windows 侧 `hide_title_bar = appears_transparent`（见 `gpui-pre-windows/window.rs`）——系统标题栏被隐藏了，却没有自绘的 CSD（客户区装饰），于是三键缺失。
+* **修法**：三键各 `.id(..)` 后打 `.window_control_area(WindowControlArea::{Min,Max,Close})`。Windows 会把它映射成 `HTMINBUTTON/HTMAXBUTTON/HTCLOSE`，**点击、双击、Win11 贴边分屏吸附全交系统**，所以 Windows 上**不要**再挂 `on_click`（非客户区点击根本不进 GPUI 回调）。Linux 无对应命中区，用 `on_click` 调 `window.minimize_window()/zoom_window()/remove_window()` 兜底；macOS 走原生红绿灯，不渲染这组按钮。
+* **顺带**：Windows 顶栏左内边距从为红绿灯预留的 80px 降到 12px；`is_maximized` 由 `RootView::render` 传入以在「最大化 / 还原」图标间切换（系统改状态会触发 resize → 重绘）。
+* **踩过的弯路**：一开始还想给顶栏加 `.window_control_area(Drag)` 做拖拽。教训——命中测试回调 `for (area,hitbox) in window_control_hitboxes { if mouse_hit_test.ids.contains(hitbox.id) { return Some(area) } }`，而 `mouse_hit_test.ids` 含**祖先**命中框，所以 Drag 矩形一旦与任何可点击控件几何重叠，重叠处就一律判成标题栏、子控件收不到点击。Drag 区必须是与交互控件严格不重叠的纯空白条带；本例顶栏被地址栏 flex_1 铺满、没有安全空白，遂放弃拖拽，只保留三键。
+

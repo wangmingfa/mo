@@ -27,6 +27,9 @@ pub fn traffic_light_position() -> (f32, f32) {
 ///
 /// 按钮只负责**发命令**（调用 [`AppState`] 的导航方法），不负责刷新列表：
 /// 状态变化由事件总线广播，UI 快照在 `RootView` 里统一同步。
+///
+/// Windows / Linux 下没有系统标题栏（`appears_transparent`），因此在右侧补一组
+/// 自绘的窗口控制按钮（详见文末）。macOS 保持原生红绿灯，本函数在其上不做附加改动。
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     app: &AppState,
@@ -37,8 +40,11 @@ pub fn render(
     address_editing: bool,
     address_input: &str,
     view_mode: ViewMode,
+    is_maximized: bool,
 ) -> impl IntoElement {
-    div()
+    let is_macos = cfg!(target_os = "macos");
+
+    let bar = div()
         .flex()
         .flex_row()
         .items_center()
@@ -46,9 +52,10 @@ pub fn render(
         // 高度钉死：红绿灯按它垂直居中（见 traffic_light_position），不能随内容漂移。
         .h(px(TOOLBAR_HEIGHT))
         .flex_shrink_0()
-        // 左侧留出 macOS 沉浸式红绿灯（traffic_light_position x=14 + 三键宽度）。
-        .pl(px(80.0))
-        .pr(px(8.0))
+        // 左侧：macOS 留出沉浸式红绿灯（x=14 + 三键宽度），其余平台只需常规边距。
+        .pl(if is_macos { px(80.0) } else { px(12.0) })
+        // 右侧：Windows / Linux 的控制按钮要贴到窗口右缘，故不留边距。
+        .pr(if is_macos { px(8.0) } else { px(0.0) })
         .bg(theme::container())
         .border_b_1()
         .border_color(theme::separator())
@@ -83,9 +90,115 @@ pub fn render(
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
         // 视图模式：点击在列表 / 网格 / 画廊 / 列视图之间循环。
-        .child(view_mode_button(view_mode, entity))
+        .child(view_mode_button(view_mode, entity));
+
+    if is_macos {
         // 视觉配平：右侧留白与左侧间距一致。
-        .child(div().w(px(4.0)))
+        return bar.child(div().w(px(4.0)));
+    }
+
+    // 非 macOS：地址栏 flex_1 已铺到右缘，控制按钮贴最右侧紧随其后。
+    bar.child(window_controls(is_maximized))
+}
+
+/// 右缘的窗口控制按钮：最小化 / 最大化（或还原）/ 关闭。
+fn window_controls(is_maximized: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h_full()
+        .child(control_button(
+            "win-minimize",
+            icons::WIN_MINIMIZE,
+            WindowControlArea::Min,
+            false,
+            |w: &mut Window| w.minimize_window(),
+        ))
+        .child(control_button(
+            if is_maximized { "win-restore" } else { "win-maximize" },
+            if is_maximized {
+                icons::WIN_RESTORE
+            } else {
+                icons::WIN_MAXIMIZE
+            },
+            WindowControlArea::Max,
+            false,
+            |w: &mut Window| w.zoom_window(),
+        ))
+        .child(control_button(
+            "win-close",
+            icons::WIN_CLOSE,
+            WindowControlArea::Close,
+            true,
+            |w: &mut Window| w.remove_window(),
+        ))
+}
+
+/// 一个窗口控制按钮。
+///
+/// - Windows：打 [`WindowControlArea`]，点击由系统按 `HTMINBUTTON/HTMAXBUTTON/HTCLOSE`
+///   原生处理（含 Win11 贴边分屏吸附），故**不挂 `on_click`**（非客户区点击不会走到这里）。
+/// - Linux：无对应命中区，退回到 `on_click` 手动调用窗口动作。
+/// - 悬停高亮两种平台都由 GPUI 的 `.hover()` 自绘；关闭键悬停变红。
+fn control_button(
+    id: &'static str,
+    data: &'static [u8],
+    area: WindowControlArea,
+    close: bool,
+    action: impl Fn(&mut Window) + 'static,
+) -> Stateful<Div> {
+    let mut button = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(46.0))
+        .h_full()
+        .flex_shrink_0()
+        .text_color(theme::text());
+
+    // hover / 按压底色单独给一档更明显的中性灰（全局 theme::hover_bg 与工具栏底色
+    // 太接近，几乎看不出）；关闭键沿用 Win11 红，并按压态再压深一档。
+    button = if close {
+        button
+            .hover(|s| s.bg(rgb(0xc42b1c)).text_color(rgb(0xffffff)))
+            .active(|s| s.bg(rgb(0xb0251a)).text_color(rgb(0xffffff)))
+    } else {
+        button
+            .hover(|s| s.bg(rgb(0xe2e2e5)))
+            .active(|s| s.bg(rgb(0xd0d0d4)))
+    };
+
+    if cfg!(target_os = "windows") {
+        button = button.window_control_area(area);
+    } else if cfg!(target_os = "linux") {
+        button
+            .interactivity()
+            .on_click(move |_, window, _cx| action(window));
+    }
+
+    button.child(Glyph(data))
+}
+
+/// 继承按钮 `text_color` 绘制的图标。
+///
+/// gpui 的 `svg()` 不自动继承文字色（`style.text.color` 为空即不绘制），但父 div
+/// 计算后的文字样式（含 `.hover()` 覆盖）会在绘制子元素前压入窗口的 text_style 栈。
+/// 这里在 render 时读取 `window.text_style().color` 显式赋给 SVG——与 `gpui_component::Icon`
+/// 同法。于是关闭键 hover 时父级把前景设为白，✕ 便随之变白；常态则继承深色前景。
+#[derive(IntoElement)]
+struct Glyph(&'static [u8]);
+
+impl RenderOnce for Glyph {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        svg()
+            .data(self.0)
+            .w(px(16.0))
+            .h(px(16.0))
+            .text_color(window.text_style().color)
+    }
 }
 
 /// 地址栏：面包屑模式（每段可点击跳转）⇄ 编辑模式（整行输入路径）。
