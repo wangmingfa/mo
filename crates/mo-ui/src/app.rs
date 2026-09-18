@@ -475,16 +475,26 @@ impl RootView {
         .detach();
     }
 
-    /// 关闭标签页（最后一个标签页保留：关掉就没有浏览区了）。
-    pub(crate) fn close_tab(&mut self, pane_idx: usize, tab_idx: usize) {
+    /// 关闭标签页。
+    ///
+    /// 返回 `true` 表示已触发退出应用（关掉的是整个应用最后一个标签页）。
+    /// 单窗格下关掉唯一标签页 → 退出；分栏下某窗格还有别的标签页时，不允许把该窗格清空。
+    pub(crate) fn close_tab(&mut self, pane_idx: usize, tab_idx: usize, cx: &mut App) -> bool {
         let Some(pane) = self.panes.get_mut(pane_idx) else {
-            return;
+            return false;
         };
         if pane.tabs.len() <= 1 {
-            return;
+            // 这是该窗格最后一个标签页：仅在「整个应用再无其它标签页」时退出应用。
+            let total: usize = self.panes.iter().map(|p| p.tabs.len()).sum();
+            if total <= 1 {
+                cx.quit();
+                return true;
+            }
+            return false;
         }
         pane.tabs.remove(tab_idx);
         pane.active = pane.active.min(pane.tabs.len() - 1);
+        false
     }
 
     /// 切入指定窗格的指定标签页（顺带把该窗格设为焦点）。
@@ -1107,8 +1117,6 @@ impl Render for RootView {
         } else {
             1
         };
-        // 只有「存在多个标签页或处于分栏」时才显示标签条：单标签页保持原来的干净外观。
-        let show_tab_bar = self.split || self.panes.first().is_some_and(|p| p.tabs.len() > 1);
         // 每个窗格可用的横向宽度：网格 / 画廊按它算列数（uniform_list 必须先知道行数）。
         let viewport_w = window.viewport_size().width.to_f64() as f32;
         let per_pane_w = ((viewport_w - SIDEBAR_WIDTH) / visible_panes as f32 - 24.0).max(160.0);
@@ -1128,7 +1136,7 @@ impl Render for RootView {
                     ));
                 self.ensure_columns(cx);
                 for i in 0..visible_panes {
-                    row = row.child(render_pane(self, i, &entity, show_tab_bar, per_pane_w));
+                    row = row.child(render_pane(self, i, &entity, per_pane_w));
                 }
                 row
             }
@@ -1159,6 +1167,8 @@ impl Render for RootView {
             .bg(theme::surface())
             .text_color(theme::text())
             .track_focus(&self.focus)
+            // 最顶部一行：标签页条 +（Win/Linux）窗口控制按钮，与 macOS 红绿灯同高同行。
+            .child(render_top_row(self, &entity, window.is_maximized()))
             .child(toolbar::render(
                 &app,
                 &entity,
@@ -1168,7 +1178,6 @@ impl Render for RootView {
                 panel.address_editing,
                 &panel.address_input,
                 panel.view_mode,
-                window.is_maximized(),
             ))
             .child(body)
             .child(progress_panel::render(&ops, &app))
@@ -1247,8 +1256,9 @@ impl Render for RootView {
                 entity_key.update(cx, |v, cx| {
                     let pane = v.active_pane;
                     let tab = v.pane().active;
-                    v.close_tab(pane, tab);
-                    cx.notify();
+                    if !v.close_tab(pane, tab, cx) {
+                        cx.notify();
+                    }
                 });
                 return;
             }
@@ -1419,12 +1429,53 @@ impl Render for RootView {
     }
 }
 
-/// 一个窗格：标签条（按需）+ 中央浏览区。
+/// 窗口最顶端一行：标签页条（每个窗格一组）+（Win/Linux）窗口控制按钮。
+///
+/// 高度钉死 `TOOLBAR_HEIGHT`，让 macOS 原生红绿灯（`traffic_light_position` 按 48 推导）
+/// 与此行垂直居中对齐——所以这一行必须是窗口最顶端、且正好 48px 高。交通灯与窗口控制
+/// 按钮都和标签页落在同一行（Win11 资源管理器风格）。
+fn render_top_row(view: &RootView, entity: &Entity<RootView>, is_maximized: bool) -> Div {
+    let is_macos = cfg!(target_os = "macos");
+    let visible_panes = if view.split && view.panes.len() > 1 {
+        2
+    } else {
+        1
+    };
+    // 始终显示标签条（含单标签页场景，仿 Win11 资源管理器）。
+    let show_tab_bar = true;
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(toolbar::TOOLBAR_HEIGHT))
+        .flex_shrink_0()
+        // macOS 左侧留出沉浸式红绿灯（x=14 + 三键宽度）。
+        .pl(if is_macos { px(80.0) } else { px(0.0) })
+        .bg(theme::container())
+        .border_b_1()
+        .border_color(theme::separator())
+        // 测试用（release no-op）：tests/layout.rs 断言此行贴顶且高 48px（红绿灯对齐）。
+        .debug_selector(|| "mo-toprow".to_string());
+
+    if show_tab_bar {
+        for i in 0..visible_panes {
+            row = row.child(render_tab_bar(view, i, entity).flex_1().min_w_0());
+        }
+    }
+
+    if !is_macos {
+        // 无系统标题栏：可拖拽空白（吃掉剩余宽度）紧随其后的是贴右缘的窗口控制按钮。
+        row = row.child(toolbar::drag_strip()).child(toolbar::window_controls(is_maximized));
+    }
+    row
+}
+
+/// 一个窗格：中央浏览区（标签页条已上移到窗口最顶端的 `render_top_row`）。
 fn render_pane(
     view: &RootView,
     pane_idx: usize,
     entity: &Entity<RootView>,
-    tab_bar: bool,
     available: f32,
 ) -> Div {
     let Some(pane) = view.panes.get(pane_idx) else {
@@ -1441,9 +1492,6 @@ fn render_pane(
     });
     if pane_idx > 0 {
         col = col.border_l_1().border_color(theme::separator());
-    }
-    if tab_bar {
-        col = col.child(render_tab_bar(view, pane_idx, entity));
     }
     let mut col = col.child(
         div()
@@ -1503,12 +1551,12 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
         .flex_row()
         .items_center()
         .gap(px(2.0))
-        .h(px(30.0))
-        .flex_shrink_0()
+        .h_full()
         .px(px(8.0))
-        .bg(theme::container())
-        .border_b_1()
-        .border_color(theme::separator());
+        .bg(theme::container());
+    if pane_idx > 0 {
+        bar = bar.border_l_1().border_color(theme::separator());
+    }
 
     for (i, tab) in pane.tabs.iter().enumerate() {
         let is_active = i == active_tab;
@@ -1518,16 +1566,18 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .h(px(22.0))
-            .px(px(8.0))
-            .rounded(px(6.0))
-            .text_size(px(12.0))
-            .max_w(px(180.0))
+            .h(px(30.0))
+            .px(px(10.0))
+            .rounded(px(7.0))
+            .text_size(px(12.5))
+            .max_w(px(200.0))
             .overflow_hidden()
+            // 无边框：纯靠底色区分。当前标签用激活灰（accent）与未激活浅灰区分；
+            // 蓝底只留给文件列表的选中高亮（selected_bg）。
             .bg(if is_active {
-                theme::surface()
+                theme::accent()
             } else {
-                theme::container()
+                theme::hover_bg()
             })
             .text_color(if is_active {
                 theme::text()
@@ -1535,7 +1585,7 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
                 theme::muted()
             });
         if !is_active {
-            item = item.hover(|s| s.bg(theme::hover_bg()));
+            item = item.hover(|s| s.bg(theme::separator()));
         }
         let switch_entity = entity.clone();
         item.interactivity().on_click(move |_, _window, cx| {
@@ -1552,21 +1602,22 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
                 .child(text!(tab.title())),
         );
 
-        if pane.tabs.len() > 1 {
+        {
             let close_entity = entity.clone();
             let mut close = div()
                 .id(format!("tab-close-{pane_idx}-{i}"))
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(14.0))
+                .size(px(16.0))
                 .rounded(px(4.0))
                 .text_color(theme::muted())
                 .hover(|s| s.bg(theme::hover_bg()));
             close.interactivity().on_click(move |_, _window, cx| {
                 close_entity.update(cx, |v, cx| {
-                    v.close_tab(pane_idx, i);
-                    cx.notify();
+                    if !v.close_tab(pane_idx, i, cx) {
+                        cx.notify();
+                    }
                 });
             });
             item = item.child(close.child(text!("✕".to_string())));
@@ -1580,7 +1631,7 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
         .flex()
         .items_center()
         .justify_center()
-        .size(px(22.0))
+        .size(px(26.0))
         .rounded(px(6.0))
         .text_color(theme::muted())
         .hover(|s| s.bg(theme::hover_bg()));
@@ -2008,13 +2059,16 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         Some(CommandId::CloseTab) => {
             entity.update(cx, |v, cx| {
                 let (pane, tab) = (v.active_pane, v.panes.get(v.active_pane).map(|p| p.active));
+                let mut quitting = false;
                 if let Some(tab) = tab {
-                    v.close_tab(pane, tab);
+                    quitting = v.close_tab(pane, tab, cx);
                 }
                 v.modal = Modal::None;
                 v.cmd_query.clear();
                 v.palette_index = 0;
-                cx.notify();
+                if !quitting {
+                    cx.notify();
+                }
             });
         }
         Some(CommandId::ToggleSplit) => {

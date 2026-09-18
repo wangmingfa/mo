@@ -107,22 +107,22 @@ fn sidebar_sits_left_of_the_file_list(cx: &mut TestAppContext) {
     );
 }
 
-/// 工具栏高度必须钉死在 `TOOLBAR_HEIGHT`——沉浸式红绿灯的垂直居中依赖它。
+/// 顶部行（标签页条所在行）高度必须钉死在 `TOOLBAR_HEIGHT`——沉浸式红绿灯的垂直居中依赖它。
 #[gpui_kit::test]
 fn toolbar_height_is_pinned_for_traffic_lights(cx: &mut TestAppContext) {
     let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
 
-    let toolbar = bounds(&mut cx, "mo-toolbar");
+    let toprow = bounds(&mut cx, "mo-toprow");
 
     assert_eq!(
-        toolbar.origin.y,
+        toprow.origin.y,
         px(0.),
-        "工具栏没有贴着窗口顶部（内容必须延伸到标题栏区域）"
+        "顶部行没有贴着窗口顶部（内容必须延伸到标题栏区域，红绿灯才能与标签页同行）"
     );
     assert_eq!(
-        toolbar.size.height,
+        toprow.size.height,
         px(mo_ui::toolbar::TOOLBAR_HEIGHT),
-        "工具栏高度漂移：红绿灯按 TOOLBAR_HEIGHT 居中，二者必须一致"
+        "顶部行高度漂移：红绿灯按 TOOLBAR_HEIGHT 居中，二者必须一致"
     );
 }
 

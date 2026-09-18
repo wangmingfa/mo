@@ -5,7 +5,7 @@ use mo_core::{Entry, MetadataState, ThumbnailState};
 ///
 /// 缩略图来自 `mo-thumbnails` 生成的磁盘缓存；GPUI 可以直接从文件路径加载图片，
 /// 因此这里只需把缓存路径交给 `img()`——领域层不必知道任何 UI 类型。
-pub fn view(entry: &Entry, _selected: bool, tag: Option<String>) -> impl IntoElement {
+pub fn view(entry: &Entry, selected: bool, tag: Option<String>) -> impl IntoElement {
     let icon = match entry.kind {
         mo_core::EntryKind::Directory => "📁",
         mo_core::EntryKind::File => "📄",
@@ -71,6 +71,12 @@ pub fn view(entry: &Entry, _selected: bool, tag: Option<String>) -> impl IntoEle
             // 文件名过长时省略号截断（`truncate` = overflow_hidden + nowrap + ellipsis），
             // 防止长名把右侧大小列顶出去。
             .truncate()
+            // 选中时整行是 Finder 蓝底，文字改白以保证对比度。
+            .text_color(if selected {
+                crate::theme::selected_text()
+            } else {
+                crate::theme::text()
+            })
             .child(text!(entry.name.clone())),
     );
 
@@ -87,7 +93,11 @@ pub fn view(entry: &Entry, _selected: bool, tag: Option<String>) -> impl IntoEle
             .flex_row()
             .justify_end()
             .w(px(80.0))
-            .text_color(crate::theme::muted())
+            .text_color(if selected {
+                crate::theme::selected_text()
+            } else {
+                crate::theme::muted()
+            })
             // 测试用（release no-op）：本文件单测断言这一列贴在行右缘
             .debug_selector(|| "mo-size-cell".to_string())
             .child(text!(size)),

@@ -116,3 +116,16 @@
 * **顺带**：Windows 顶栏左内边距从为红绿灯预留的 80px 降到 12px；`is_maximized` 由 `RootView::render` 传入以在「最大化 / 还原」图标间切换（系统改状态会触发 resize → 重绘）。
 * **踩过的弯路**：一开始还想给顶栏加 `.window_control_area(Drag)` 做拖拽。教训——命中测试回调 `for (area,hitbox) in window_control_hitboxes { if mouse_hit_test.ids.contains(hitbox.id) { return Some(area) } }`，而 `mouse_hit_test.ids` 含**祖先**命中框，所以 Drag 矩形一旦与任何可点击控件几何重叠，重叠处就一律判成标题栏、子控件收不到点击。Drag 区必须是与交互控件严格不重叠的纯空白条带；本例顶栏被地址栏 flex_1 铺满、没有安全空白，遂放弃拖拽，只保留三键。
 
+
+## 16. 标签页条上移到窗口最顶端，与交通灯 / 窗口控制按钮同行（Win11 风格）
+
+* **需求**：标签页要从地址栏下方移到最顶行，且 macOS 红绿灯 / Win·Linux 的最小化最大化关闭按钮要和标签页落在**同一行**。
+* **关键约束**：macOS 红绿灯是 AppKit 画的，位置由 `toolbar::traffic_light_position()` 按 `TOOLBAR_HEIGHT = 48` 推导（`lib.rs` 里 `appears_transparent + traffic_light_position`）。要让红绿灯与标签页垂直居中，顶部那一行**必须正好 48px 且在窗口最顶端**——所以不能直接把标签条塞进原来的 48px 工具栏，而是新建一行 `render_top_row`（高度 `TOOLBAR_HEIGHT`）作为 root 的第一个 child。
+* **结构变化**（`app.rs`）：
+  * 新增 `render_top_row()`：macOS 左留 80px（给红绿灯）→ 每窗格一条 `render_tab_bar`（分栏时并排、各 `flex_1`）→ Win/Linux 追加 `drag_strip()` + `window_controls()`。
+  * `toolbar::render()` 删掉 `is_maximized` 参数和红绿灯 80px 边距、窗口控制按钮，只留导航 + 地址栏 + 刷新 + 视图模式（第二行）。
+  * `render_pane()` 去掉标签条参数（标签条不再嵌在窗格里），`render_tab_bar()` 高度改 `h_full()` 填满 48px 行，分栏时第二个窗格左侧加分隔线。
+* **toolbar.rs**：`drag_strip()` / `window_controls()` 提到 `pub` 供顶部行复用；`control_button` 仍私有。
+* **测试**：`toolbar_height_is_pinned_for_traffic_lights` 改断言 `mo-toprow`（y=0、高 48）；其余 layout 测试（地址栏在工具栏内、状态栏贴底、侧栏左置）不受影响，地址栏仍在 `mo-toolbar`（第二行）内。
+* ⚠️ 真实窗口下 macOS 红绿灯对齐、Win/Linux 拖拽条命中区只过了 headless 布局测试，没在沙箱里点过——需本机 `cargo run` 验收。
+EOF\necho done

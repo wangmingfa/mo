@@ -101,7 +101,11 @@ fn column_box(
             } else {
                 theme::surface()
             })
-            .text_color(theme::text());
+            .text_color(if selected {
+                theme::selected_text()
+            } else {
+                theme::text()
+            });
         if !selected {
             line = line.hover(|s| s.bg(theme::hover_bg()));
         }

@@ -28,8 +28,8 @@ pub fn traffic_light_position() -> (f32, f32) {
 /// 按钮只负责**发命令**（调用 [`AppState`] 的导航方法），不负责刷新列表：
 /// 状态变化由事件总线广播，UI 快照在 `RootView` 里统一同步。
 ///
-/// Windows / Linux 下没有系统标题栏（`appears_transparent`），因此在右侧补一组
-/// 自绘的窗口控制按钮（详见文末）。macOS 保持原生红绿灯，本函数在其上不做附加改动。
+/// 窗口控制按钮（最小化 / 最大化 / 关闭）与 macOS 红绿灯已上移到 `RootView` 的
+/// 顶部标签页行（`render_top_row`），本函数只负责导航 + 地址栏这一行。
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     app: &AppState,
@@ -40,22 +40,16 @@ pub fn render(
     address_editing: bool,
     address_input: &str,
     view_mode: ViewMode,
-    is_maximized: bool,
 ) -> impl IntoElement {
-    let is_macos = cfg!(target_os = "macos");
-
-    let bar = div()
+    div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(4.0))
-        // 高度钉死：红绿灯按它垂直居中（见 traffic_light_position），不能随内容漂移。
         .h(px(TOOLBAR_HEIGHT))
         .flex_shrink_0()
-        // 左侧：macOS 留出沉浸式红绿灯（x=14 + 三键宽度），其余平台只需常规边距。
-        .pl(if is_macos { px(80.0) } else { px(12.0) })
-        // 右侧：Windows / Linux 的控制按钮要贴到窗口右缘，故不留边距。
-        .pr(if is_macos { px(8.0) } else { px(0.0) })
+        .pl(px(8.0))
+        .pr(px(8.0))
         .bg(theme::container())
         .border_b_1()
         .border_color(theme::separator())
@@ -90,19 +84,26 @@ pub fn render(
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
         // 视图模式：点击在列表 / 网格 / 画廊 / 列视图之间循环。
-        .child(view_mode_button(view_mode, entity));
+        .child(view_mode_button(view_mode, entity))
+}
 
-    if is_macos {
-        // 视觉配平：右侧留白与左侧间距一致。
-        return bar.child(div().w(px(4.0)));
-    }
-
-    // 非 macOS：地址栏 flex_1 已铺到右缘，控制按钮贴最右侧紧随其后。
-    bar.child(window_controls(is_maximized))
+/// 顶栏里一段可拖拽的空白条带（仅 Windows / Linux 使用）。
+///
+/// 给它打 [`WindowControlArea::Drag`]：Windows 命中测试返回 `HTCAPTION`，
+/// 按住即可拖动窗口、双击最大化 / 还原，均交系统处理。⚠️ 该矩形必须与任何可点击
+/// 控件互不重叠——否则重叠处被判成标题栏、子控件收不到点击（命中测试按祖先优先）。
+pub fn drag_strip() -> impl IntoElement {
+    div()
+        .id("titlebar-drag")
+        .h_full()
+        .min_w(px(24.0))
+        .flex_grow(1.0)
+        .flex_basis(px(0.0))
+        .window_control_area(WindowControlArea::Drag)
 }
 
 /// 右缘的窗口控制按钮：最小化 / 最大化（或还原）/ 关闭。
-fn window_controls(is_maximized: bool) -> impl IntoElement {
+pub fn window_controls(is_maximized: bool) -> impl IntoElement {
     div()
         .flex()
         .flex_row()

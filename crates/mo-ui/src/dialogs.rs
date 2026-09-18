@@ -68,9 +68,15 @@ pub fn properties(view: &RootView, entity: &Entity<RootView>) -> Div {
             .justify_center()
             .size(px(22.0))
             .rounded(px(4.0))
-            .text_color(if on { theme::accent() } else { theme::muted() })
+            .text_color(if active {
+                theme::text()
+            } else if on {
+                theme::accent()
+            } else {
+                theme::muted()
+            })
             .bg(if active {
-                theme::selected_bg()
+                theme::accent()
             } else {
                 theme::surface()
             })
@@ -159,10 +165,11 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
                 .items_center()
                 .gap(px(6.0))
                 .bg(if active {
-                    theme::selected_bg()
+                    theme::accent()
                 } else {
                     theme::surface()
                 })
+                .text_color(theme::text())
                 .child(text!(format!("[{}] {}", if on { "x" } else { " " }, label))),
         );
     }
@@ -270,10 +277,11 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
             .items_center()
             .gap(px(8.0))
             .bg(if active {
-                theme::selected_bg()
+                theme::accent()
             } else {
                 theme::surface()
-            });
+            })
+            .text_color(theme::text());
         if !active {
             row = row.hover(|s| s.bg(theme::hover_bg()));
         }
@@ -328,10 +336,11 @@ pub fn tags(entity: &Entity<RootView>, view: &RootView) -> Div {
             .p(px(4.0))
             .rounded(px(4.0))
             .bg(if active {
-                theme::selected_bg()
+                theme::accent()
             } else {
                 theme::surface()
-            });
+            })
+            .text_color(theme::text());
         if !active {
             row = row.hover(|s| s.bg(theme::hover_bg()));
         }

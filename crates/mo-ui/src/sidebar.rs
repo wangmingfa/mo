@@ -61,14 +61,10 @@ pub fn render(
             .py(px(5.0))
             .rounded(px(6.0))
             .text_size(px(13.0))
-            .text_color(if is_active {
-                crate::theme::accent()
-            } else {
-                crate::theme::text()
-            });
+            .text_color(crate::theme::text());
 
         if is_active {
-            item = item.bg(crate::theme::selected_bg());
+            item = item.bg(crate::theme::accent());
         } else {
             item = item.hover(|s| s.bg(crate::theme::hover_bg()));
         }
@@ -122,13 +118,9 @@ pub fn render(
             .py(px(5.0))
             .rounded(px(6.0))
             .text_size(px(13.0))
-            .text_color(if is_active {
-                crate::theme::accent()
-            } else {
-                crate::theme::text()
-            });
+            .text_color(crate::theme::text());
         if is_active {
-            item = item.bg(crate::theme::selected_bg());
+            item = item.bg(crate::theme::accent());
         } else {
             item = item.hover(|s| s.bg(crate::theme::hover_bg()));
         }

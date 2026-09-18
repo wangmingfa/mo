@@ -31,9 +31,15 @@ pub fn separator() -> Rgba {
     gpui_kit::rgb(0xe8e8ea)
 }
 
-/// 选中行底色（柔和蓝）。
+/// 选中行底色——用户指定的蓝（RGB 41,99,217）。
+/// 配合 [`selected_text`] 白字使用，保证选中高亮下的对比度。
 pub fn selected_bg() -> Rgba {
-    gpui_kit::rgb(0xe1ecfb)
+    gpui_kit::rgb(0x2963d9)
+}
+
+/// 选中行上的文字色（饱和蓝底用白字，保证对比度，对齐 Finder）。
+pub fn selected_text() -> Rgba {
+    gpui_kit::rgb(0xffffff)
 }
 
 /// 悬停行 / 按钮底色（中性灰，极简风：悬停不带色相）。
@@ -41,7 +47,8 @@ pub fn hover_bg() -> Rgba {
     gpui_kit::rgb(0xf0f0f1)
 }
 
-/// 强调色（当前聚焦侧边栏项等）。
+/// 强调色（激活项 / 焦点边框 / 强调文字）——用户指定的中性灰，比 199 淡 10%（RGB 205,205,205）。
+/// 文件列表的**选中高亮**不在其列，仍走 [`selected_bg`] 的蓝。
 pub fn accent() -> Rgba {
-    gpui_kit::rgb(0x2a63d9)
+    gpui_kit::rgb(0xcdcdcd)
 }

@@ -221,7 +221,11 @@ fn cell(
             div()
                 .w_full()
                 .text_size(px(12.0))
-                .text_color(crate::theme::text())
+                .text_color(if selected {
+                    crate::theme::selected_text()
+                } else {
+                    crate::theme::text()
+                })
                 .overflow_hidden()
                 .truncate()
                 .child(text!(entry.name.clone())),
@@ -229,7 +233,11 @@ fn cell(
         .child(
             div()
                 .text_size(px(11.0))
-                .text_color(crate::theme::muted())
+                .text_color(if selected {
+                    crate::theme::selected_text()
+                } else {
+                    crate::theme::muted()
+                })
                 .child(text!(sub)),
         )
 }
