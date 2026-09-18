@@ -93,3 +93,18 @@
   * 窗格容器上抬起 → `drop_on_pane()`：跨窗格时落到该窗格的当前目录。
 * **关键点**：事件是「内层 → 外层」冒泡，所以**行先于窗格**执行；行处理不了时必须把状态放回去，否则窗格级永远收不到。另外按住 ⌥ 抬起来切换「复制 / 移动」语义（`ev.modifiers.alt`）。
 * **副作用提醒**：外部文件拖入（OS → 应用）在本代框架下做不了，README 里不要写「支持从 Finder 拖入」。
+
+## 15. 鼠标单击选择语义修错了：普通点击应是「单选替换」而不是「追加」
+
+* **现象**：不按修饰键单击多个文件，前面选中的不会被取消——全是累加。
+* **根因**：`file_list.rs` / `grid.rs` 的 `on_click` 对**每一次**单击都调 `selection.toggle(id)`，从不判断修饰键。`toggle` 是「在现有选区上切换」，所以越点越多。
+* **修法**：单击按修饰键分流，对齐 Finder / 资源管理器：
+  * 无修饰 → `select(id)`（清空再单选）；
+  * cmd/ctrl → `toggle(id)`（在选区上增删）；`ClickEvent` 跨平台主键是 `ev.modifiers().platform`（macOS=Cmd），再 OR 上 `ev.modifiers().control` 让 Windows/Linux 的 Ctrl 也生效；
+  * shift → 从 `anchor` 连选到点击项：`clear()` + `select_range()` + `set_anchor()`（锚点要保留为起点，否则下一次 Shift 会以终点为基准）。
+* **两个 gpui 0.3.5 的坑**：
+  1. `ClickEvent` 没有 `modifiers` **字段**，只有 `modifiers()` **方法**（和 `MouseUpEvent.modifiers` 字段不是一回事，拖拽读的是后者）；
+  2. `app.select_range(from,to)` **只 insert 不清空**，且 `from/to` 是 `dir.view.visible_indices()` 的全局可见下标——所以连选同步到 app 侧前要先 `clear_selection()`，否则 app 选区会累积、导致后续复制 / 移动选错文件。
+* **架构提醒**：`sync_panel` 每 ~120ms 用 `app.selection_ids()` 回灌 `panel.selection`（`set_from`），app 才是最终事实来源。本地 `panel.selection` 的改动只是 ≤120ms 的即时反馈，真正的语义修正落在对 `app` 的 `select/toggle/select_range` 调用上。
+* `SelectionModel` 增加 `set_anchor()`；新增 4 个回归测试（含 `select` 替换、`set_anchor` 不动选区、Shift 连选保留锚点）。
+EOF\necho done

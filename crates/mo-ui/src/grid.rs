@@ -10,6 +10,13 @@ use mo_core::{Entry, MetadataState, ThumbnailState};
 
 use crate::listing::{self, row_height, BUFFER};
 use crate::panel::ViewMode;
+
+/// 把本地选择变化同步到 `AppState` 的动作（语义同 `file_list`）。
+enum SelSync {
+    Select(mo_core::FileId),
+    Toggle(mo_core::FileId),
+    Range(usize, usize),
+}
 use crate::RootView;
 
 pub fn render(
@@ -55,6 +62,7 @@ pub fn render(
                     &entity_c,
                     pane,
                     tab,
+                    idx,
                 ));
             }
             if any_missing {
@@ -89,6 +97,7 @@ fn cell(
     entity: &Entity<RootView>,
     pane: usize,
     tab: usize,
+    global_idx: usize,
 ) -> Stateful<Div> {
     let (thumb, icon_name) = match mode {
         ViewMode::Grid => (36.0, kind_icon(entry)),
@@ -150,17 +159,61 @@ fn cell(
             click_entity.update(cx, |v, cx| v.open_entry(entry_path.clone(), cx));
             return;
         }
-        let Some(app) = click_entity.update(cx, |v, _cx| {
+        // 修饰键决定选择语义：无修饰 = 单选替换；cmd/ctrl = 切换多选；shift = 连选。
+        let mods = ev.modifiers();
+        let multi = mods.platform || mods.control;
+        let shift = mods.shift;
+
+        let Some((app, sync)) = click_entity.update(cx, |v, _cx| {
             let p = v.panel_at_mut(pane, tab)?;
-            p.selection.toggle(id);
-            Some(p.app.clone())
+            if shift {
+                let ordered: Vec<mo_core::FileId> = p.window.iter().map(|e| e.id).collect();
+                let clicked = ordered.iter().position(|x| *x == id)?;
+                if let Some(a) = p.selection.anchor() {
+                    if let Some(ai) = ordered.iter().position(|x| *x == a) {
+                        p.selection.clear();
+                        p.selection.select_range(&ordered, ai, clicked);
+                        p.selection.set_anchor(a);
+                        return Some((
+                            p.app.clone(),
+                            SelSync::Range(p.window_start + ai, global_idx),
+                        ));
+                    }
+                }
+                p.selection.select(id);
+                Some((p.app.clone(), SelSync::Select(id)))
+            } else if multi {
+                p.selection.toggle(id);
+                Some((p.app.clone(), SelSync::Toggle(id)))
+            } else {
+                p.selection.select(id);
+                Some((p.app.clone(), SelSync::Select(id)))
+            }
         }) else {
             return;
         };
-        cx.spawn(async move |_cx| {
-            app.toggle(id).await;
-        })
-        .detach();
+
+        match sync {
+            SelSync::Select(id) => {
+                cx.spawn(async move |_cx| {
+                    app.select(id).await;
+                })
+                .detach();
+            }
+            SelSync::Toggle(id) => {
+                cx.spawn(async move |_cx| {
+                    app.toggle(id).await;
+                })
+                .detach();
+            }
+            SelSync::Range(from, to) => {
+                cx.spawn(async move |_cx| {
+                    app.clear_selection().await;
+                    app.select_range(from, to).await;
+                })
+                .detach();
+            }
+        }
     });
 
     c.child(visual)

@@ -4,6 +4,19 @@ use gpui_kit::*;
 use crate::listing::BUFFER;
 use crate::RootView;
 
+/// 把本地选择变化同步到 `AppState` 的动作。
+///
+/// 本地 `panel.selection` 立即反馈渲染，远端 `app` 侧是操作（复制 / 移动 / 删除）
+/// 的唯一事实来源，因此每一项本地改动都要异步回灌一次。
+enum SelSync {
+    /// 单选替换。
+    Select(mo_core::FileId),
+    /// cmd/ctrl 切换这一项。
+    Toggle(mo_core::FileId),
+    /// shift 连选：`from`/`to` 为可见列表的全局下标。
+    Range(usize, usize),
+}
+
 /// 文件列表：`UniformList` 虚拟化 + 窗口懒加载。
 ///
 /// 两层机制缺一不可：
@@ -106,18 +119,67 @@ pub fn render(
                     entity_click.update(cx, |v, cx| v.open_entry(entry_path.clone(), cx));
                     return;
                 }
-                // 单击：本地立即反馈，再异步同步 app 侧（app 侧是唯一事实来源）。
-                let Some((app, selected_app)) = entity_click.update(cx, |v, _cx| {
+                // 修饰键决定选择语义（Finder / 资源管理器一致）：
+                // 无修饰 = 单选替换；cmd/ctrl = 切换多选；shift = 从锚点连选。
+                let mods = ev.modifiers();
+                let multi = mods.platform || mods.control;
+                let shift = mods.shift;
+
+                let Some((app, sync)) = entity_click.update(cx, |v, _cx| {
                     let p = v.panel_at_mut(pane, tab)?;
-                    p.selection.toggle(id);
-                    Some((p.app.clone(), id))
+                    if shift {
+                        // 以锚点为起点延伸到点击项；锚点缺失则退化为单选。
+                        let ordered: Vec<mo_core::FileId> = p.window.iter().map(|e| e.id).collect();
+                        let clicked = ordered.iter().position(|x| *x == id)?;
+                        if let Some(a) = p.selection.anchor() {
+                            if let Some(ai) = ordered.iter().position(|x| *x == a) {
+                                p.selection.clear();
+                                p.selection.select_range(&ordered, ai, clicked);
+                                p.selection.set_anchor(a);
+                                return Some((
+                                    p.app.clone(),
+                                    SelSync::Range(p.window_start + ai, p.window_start + clicked),
+                                ));
+                            }
+                        }
+                        p.selection.select(id);
+                        Some((p.app.clone(), SelSync::Select(id)))
+                    } else if multi {
+                        // cmd/ctrl 点击：在现有选择上切换这一项。
+                        p.selection.toggle(id);
+                        Some((p.app.clone(), SelSync::Toggle(id)))
+                    } else {
+                        // 普通点击：单选替换，取消其余选中。
+                        p.selection.select(id);
+                        Some((p.app.clone(), SelSync::Select(id)))
+                    }
                 }) else {
                     return;
                 };
-                cx.spawn(async move |_cx| {
-                    app.toggle(selected_app).await;
-                })
-                .detach();
+
+                match sync {
+                    SelSync::Select(id) => {
+                        cx.spawn(async move |_cx| {
+                            app.select(id).await;
+                        })
+                        .detach();
+                    }
+                    SelSync::Toggle(id) => {
+                        cx.spawn(async move |_cx| {
+                            app.toggle(id).await;
+                        })
+                        .detach();
+                    }
+                    SelSync::Range(from, to) => {
+                        cx.spawn(async move |_cx| {
+                            // select_range 只 insert 不清空，连选前先清掉旧选区，
+                            // 否则 app 侧选择会累积、导致后续复制 / 移动选错文件。
+                            app.clear_selection().await;
+                            app.select_range(from, to).await;
+                        })
+                        .detach();
+                    }
+                }
             });
 
             // 拖拽：按下记源、抬起结算。跨窗格拖拽落在别处时由窗格级兜底。

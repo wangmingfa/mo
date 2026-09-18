@@ -44,6 +44,15 @@ impl SelectionModel {
         self.anchor
     }
 
+    /// 显式设置 Shift 连选的锚点（只改锚点，不动选择集本身）。
+    ///
+    /// 连选时先 `clear()` 再 `select_range()`，锚点会被一并清掉；
+    /// 但下一次 Shift 点击应以「最初那次单击」为起点而非终点，
+    /// 所以连选结束后要把锚点恢复回去。
+    pub fn set_anchor(&mut self, id: FileId) {
+        self.anchor = Some(id);
+    }
+
     /// 用快照整体替换选择集（UI 从 `AppState` 同步选择时用）。
     ///
     /// 只替换 `selected`，不动 anchor / focused——它们描述的是键盘光标语义，
@@ -127,5 +136,48 @@ mod tests {
         m.toggle(id(4));
         // toggle 不覆盖已有 anchor（get_or_insert 语义）。
         assert_eq!(m.anchor(), Some(id(3)));
+    }
+
+    /// 回归：普通 `select` 必须替换旧选区，而不是累加。
+    /// 这是鼠标「不按修饰键单击」应有的语义——之前误用 `toggle` 导致
+    /// 点一个反而把前面的都留着。
+    #[test]
+    fn select_replaces_previous_selection() {
+        let mut m = SelectionModel::new();
+        m.toggle(id(1));
+        m.toggle(id(2));
+        assert_eq!(m.count(), 2);
+        m.select(id(3));
+        assert_eq!(m.count(), 1);
+        assert!(m.is_selected(&id(3)));
+        assert!(!m.is_selected(&id(1)));
+        assert!(!m.is_selected(&id(2)));
+    }
+
+    /// 回归：`set_anchor` 只改锚点、不动已选集合（Shift 连选后需要保留起点）。
+    #[test]
+    fn set_anchor_keeps_selection() {
+        let mut m = SelectionModel::new();
+        m.select(id(5));
+        m.set_anchor(id(9));
+        assert_eq!(m.anchor(), Some(id(9)));
+        assert!(m.is_selected(&id(5)));
+        assert_eq!(m.count(), 1);
+    }
+
+    /// Shift 连选：清空后取一段，锚点仍保留为起点（下一次 Shift 仍以它为基准）。
+    #[test]
+    fn shift_range_keeps_anchor_as_start() {
+        let ordered: Vec<FileId> = (1..=5).map(id).collect();
+        let mut m = SelectionModel::new();
+        m.select(id(2)); // 起点 = 2，anchor = 2
+        let anchor = m.anchor().unwrap();
+        m.clear();
+        m.select_range(&ordered, 1, 4); // 连选 2..5
+        m.set_anchor(anchor); // 恢复起点
+        assert_eq!(m.count(), 4);
+        assert!(m.is_selected(&id(2)));
+        assert!(m.is_selected(&id(5)));
+        assert_eq!(m.anchor(), Some(id(2)));
     }
 }
