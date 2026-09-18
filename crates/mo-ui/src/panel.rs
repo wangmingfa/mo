@@ -160,9 +160,24 @@ impl Panel {
         }
     }
 
-    /// 标签页标题：当前目录名；尚未加载时为「新标签页」。
+    /// 标签页标题：当前目录名；「此电脑」虚拟根显示固定名；尚未加载时为「新标签页」。
     pub fn title(&self) -> String {
         match &self.path {
+            // 空路径 = 「此电脑」盘符列表（见 mo-fs 的 list_drives）。
+            Some(p) if p.as_os_str().is_empty() => "此电脑".to_string(),
+            // 盘符根（C:\）没有 file_name：剥掉尾部分隔符显示「C:」。
+            // unix 根 `/` 剥完为空，回退显示原样。
+            Some(p) if p.parent().is_none_or(|parent| parent == p) => {
+                let trimmed = p
+                    .to_string_lossy()
+                    .trim_end_matches(['\\', '/'])
+                    .to_string();
+                if trimmed.is_empty() {
+                    "/".to_string()
+                } else {
+                    trimmed
+                }
+            }
             Some(p) => p
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())

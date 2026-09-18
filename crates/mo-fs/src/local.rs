@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use mo_core::{FileMetadata, MoError, Permissions};
@@ -18,6 +18,11 @@ impl FileSystem for LocalFileSystem {
     }
 
     fn read_dir_blocking(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+        // 「此电脑」虚拟根：**空路径**是保留哨兵，代表盘符列表（见 `list_drives`）。
+        // 真实文件系统里不可能出现空路径目录，不会与用户数据冲突。
+        if path.as_os_str().is_empty() {
+            return list_drives(path);
+        }
         let mut out = Vec::new();
         let mut rd = std::fs::read_dir(path).map_err(to_dir_error)?;
         while let Some(entry) = rd.next().transpose().map_err(to_dir_error)? {
@@ -89,5 +94,69 @@ fn unix_mode(m: &std::fs::Metadata) -> u32 {
     {
         let _ = m;
         0
+    }
+}
+
+/// 「此电脑」虚拟目录：枚举本机盘符（Windows）。
+///
+/// 标准库没有逻辑盘符 API，这里直接探测 `A:\`..`Z:\` 中实际存在的
+/// 目录根（26 次 stat，成本可忽略）。名称是「C:」这类盘符标签，
+/// 路径是真实盘符根，后续进入 / 监听 / 元数据都走既有真实路径链路。
+#[cfg(target_os = "windows")]
+fn list_drives(_path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+    let mut out = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if !root.is_dir() {
+            continue;
+        }
+        let name = format!("{}:", letter as char);
+        let id = file_id_for(&root);
+        out.push(ReadDirEntry::new(id, name, mo_core::EntryKind::Directory, root));
+    }
+    // 探测顺序天然按字母序。
+    Ok(out)
+}
+
+/// 非 Windows 没有「此电脑」入口（面包屑不会生成空路径段），防御性报错。
+#[cfg(not(target_os = "windows"))]
+fn list_drives(_path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+    Err(MoError::Other("此电脑视图仅在 Windows 上可用".into()))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    /// 空路径哨兵必须列出真实存在的盘符：至少有 C:，且每条都是目录、
+    /// 指向真实存在的盘符根。
+    #[test]
+    fn empty_path_lists_existing_drives() {
+        let entries = LocalFileSystem
+            .read_dir_blocking(Path::new(""))
+            .expect("「此电脑」枚举不应失败");
+        assert!(!entries.is_empty(), "本机至少应有一个可用盘符");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, {
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted
+        });
+        for e in &entries {
+            assert!(e.kind.is_dir(), "{e:?} 应是目录");
+            assert!(e.path.is_dir(), "{e:?} 指向的盘符根应真实存在");
+        }
+        assert!(
+            entries.iter().any(|e| e.name == "C:"),
+            "常规 Windows 环境必有 C:：{names:?}"
+        );
+    }
+
+    /// 盘符根目录照常走真实读取链路，不受哨兵影响。
+    #[test]
+    fn drive_root_still_reads_normally() {
+        LocalFileSystem
+            .read_dir_blocking(Path::new("C:\\"))
+            .expect("读取 C:\\ 不应失败");
     }
 }

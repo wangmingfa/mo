@@ -289,6 +289,14 @@ impl AppState {
     pub async fn open_parent(&self) -> Result<(), MoError> {
         let current = self.inner.read().await.navigation.current.clone();
         if let Some(p) = current {
+            // Windows：盘符根（C:\）的上一级是「此电脑」虚拟根（空路径哨兵，
+            // 见 mo-fs 的 list_drives），与资源管理器行为一致。
+            #[cfg(target_os = "windows")]
+            if !p.as_os_str().is_empty()
+                && p.parent().is_none_or(|parent| parent == p)
+            {
+                return self.open_directory(Path::new("")).await;
+            }
             if let Some(parent) = p.parent() {
                 if !parent.as_os_str().is_empty() {
                     return self.open_directory(parent).await;

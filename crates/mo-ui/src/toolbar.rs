@@ -258,7 +258,7 @@ fn address_bar(
     if let Some(p) = path {
         let segs = segments(p);
         let n = segs.len();
-        for (i, (label, prefix, is_home)) in segs.into_iter().enumerate() {
+        for (i, (label, prefix)) in segs.into_iter().enumerate() {
             let is_last = i + 1 == n;
             if i > 0 {
                 pill = pill.child(icon(icons::CHEVRON_RIGHT, 12.0, theme::muted()));
@@ -296,11 +296,8 @@ fn address_bar(
                 .detach();
             });
 
-            seg = if is_home {
-                seg.child(icon(icons::HOUSE, 14.0, theme::muted()))
-            } else {
-                seg.child(text!(label))
-            };
+            // 段一律显示原始名称文本（不再给 Home 段换房子图标）。
+            seg = seg.child(text!(label));
             pill = pill.child(seg);
         }
     }
@@ -334,23 +331,50 @@ fn start_edit_on_click<E: InteractiveElement>(el: &mut E, entity: &Entity<RootVi
     });
 }
 
-/// 把路径拆成可点击的层级段：`(显示名, 前缀路径, 是否 Home)`。
-fn segments(path: &Path) -> Vec<(String, PathBuf, bool)> {
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
+/// 把路径拆成可点击的层级段：`(显示名, 前缀路径)`。
+///
+/// Windows 的层级与资源管理器一致：**此电脑 › 盘符 › 各级目录**——
+/// * 首段固定「此电脑」，指向空路径哨兵（mo-fs 据此列盘符，见
+///   `LocalFileSystem::read_dir_blocking`）；
+/// * `Component::Prefix`（`C:`）与紧跟的 `RootDir` 合并为一段
+///   「C:」（前缀路径归一为 `C:\`），否则会把 macOS 的根标签
+///   「Mac」错误地混进 Windows 路径里。
+///
+/// macOS 维持原样：根目录 `/` 显示为「Mac」。
+fn segments(path: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
+
+    // 「此电脑」是 Windows 面包屑的固定第一级。
+    #[cfg(target_os = "windows")]
+    out.push(("此电脑".to_string(), PathBuf::new()));
+
     let mut prefix = PathBuf::new();
-    for comp in path.components() {
-        if comp.as_os_str() == "/" {
-            prefix.push("/");
-        } else {
-            prefix.push(comp);
+    let mut comps = path.components().peekable();
+    while let Some(comp) = comps.next() {
+        match comp {
+            // 盘符前缀（含 UNC）：与紧随的根分隔符合并成一段。
+            std::path::Component::Prefix(_) => {
+                prefix.push(comp.as_os_str());
+                if matches!(comps.peek(), Some(std::path::Component::RootDir)) {
+                    comps.next();
+                    // 「C:」单独作为前缀是「相对当前目录」语义（join 会得 C:Users），
+                    // 必须带上根分隔符归一成「C:\」。
+                    prefix.push(std::path::MAIN_SEPARATOR.to_string());
+                }
+                let label = comp.as_os_str().to_string_lossy().to_string();
+                out.push((label, prefix.clone()));
+            }
+            // unix 根：保持历史行为（根 = Mac）。
+            std::path::Component::RootDir => {
+                prefix.push("/");
+                out.push(("Mac".to_string(), prefix.clone()));
+            }
+            c => {
+                prefix.push(comp);
+                let label = c.as_os_str().to_string_lossy().to_string();
+                out.push((label, prefix.clone()));
+            }
         }
-        let label = match comp {
-            std::path::Component::RootDir => "Mac".to_string(),
-            c => c.as_os_str().to_string_lossy().to_string(),
-        };
-        let is_home = home.as_ref().is_some_and(|h| h == &prefix);
-        out.push((label, prefix.clone(), is_home));
     }
     out
 }
