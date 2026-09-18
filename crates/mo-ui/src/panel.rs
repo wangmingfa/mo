@@ -12,7 +12,8 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use gpui_kit::UniformListScrollHandle;
+use gpui_kit::component::input::InputState;
+use gpui_kit::{Entity, Subscription, UniformListScrollHandle};
 use mo_app::AppState;
 use mo_core::{Entry, LightEntry, SelectionModel, SortDir, SortKey};
 use mo_operations::OperationHandle;
@@ -103,10 +104,19 @@ pub(crate) struct Panel {
     pub can_forward: bool,
     /// 呈现方式（列表 / 网格 / 画廊 / 列视图）。
     pub view_mode: ViewMode,
-    /// 地址栏是否处于编辑态（Win11 式：点击空白 / 铅笔进入，Esc 退出）。
+    /// 地址栏是否处于编辑态（Win11 式：点击空白 / 铅笔进入，Esc / 失焦退出）。
     pub address_editing: bool,
-    /// 地址栏编辑中的文本。
-    pub address_input: String,
+    /// 地址栏的**真实**文本输入状态（首次进入编辑时懒创建，之后复用）。
+    ///
+    /// 用框架的 `InputState` 而不是自绘一个「字符串 + 假光标」：选区、光标定位、
+    /// 双击选词、⌘A、剪切 / 复制 / 粘贴、撤销、中文输入法全部由它提供，
+    /// 自绘方案（只支持追加字符 + 退格）连「选中一段路径」都做不到。
+    pub address: Option<Entity<InputState>>,
+    /// `address` 的事件订阅句柄。
+    ///
+    /// ⚠️ 必须持有：gpui 的 `Subscription` 一旦 drop 就退订，
+    /// 那样回车 / 失焦事件就再也收不到了。
+    pub address_sub: Option<Subscription>,
     /// 列视图的各列数据（仅 `ViewMode::Columns` 下使用）。
     pub columns: Vec<ColumnData>,
     /// 列视图正在读盘：避免每帧重复发起加载任务。
@@ -142,7 +152,8 @@ impl Panel {
             can_forward: false,
             view_mode: ViewMode::default(),
             address_editing: false,
-            address_input: String::new(),
+            address: None,
+            address_sub: None,
             columns: Vec::new(),
             column_busy: false,
             sort: (SortKey::Name, SortDir::Asc),

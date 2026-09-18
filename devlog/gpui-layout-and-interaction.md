@@ -200,3 +200,135 @@
   命中区贯穿表头高度」外，新增「线体上下 inset ≥ 1px（不顶边）」+「上下 inset 对称（垂直居中）」。
   坑：`TestWindowExt::debug_bounds` 只吃 `&'static str`，运行时拼的 String 会 `E0597`
   报生命周期不够 —— 选择器要写成字面量。
+
+## 21. 地址栏换成框架的真实输入框（修「编辑时无法选中文本」）
+
+* **根因**：地址栏的「编辑态」从来不是输入框，而是一段自绘文本——
+  `toolbar.rs::address_bar` 在 editing 时渲染 `text!(format!("{input}▏"))`，
+  光标是**拼在字符串末尾的字面量 `▏`**；按键由全局 `on_key_down` 里的
+  `handle_address_key` 处理，只会「追加 1 个字符 / `pop()` 退格 / Enter / Esc」。
+  没有 caret 下标、没有选区模型、没有鼠标事件 → 点选 / 拖选 / ⌘A 一概不存在，
+  连「把光标点到中间」都做不到。
+* **改为**接入 gpui-component 的 `Input` + `InputState`（已随 gpui-kit 默认
+  feature 进依赖，`gpui_kit::init` 里已调过 `gpui_component::init`）：
+  选区 / 光标 / 双击选词 / ⌘A / 剪切复制粘贴 / 撤销 / 中文输入法全部自带。
+* **状态**（`panel.rs`）：`address_input: String` → `address: Option<Entity<InputState>>`
+  + `address_sub: Option<Subscription>`。**一个面板一个输入状态**（分栏时两个窗格
+  互不串味），首次进入编辑时懒创建——`Panel::new` 拿不到 `window`，
+  而 `InputState::new(window, cx)` 需要它。⚠️ 订阅句柄**必须持有**：
+  `Subscription` 一 drop 就退订，回车 / 失焦事件就再也收不到。
+* **进入编辑**（`RootView::begin_address_edit(window, cx)`）：预填当前完整路径 →
+  `focus` → `select_all`。全选是 Finder / Win11 的行为，直接敲字即可替换。
+* **事件**（`cx.subscribe_in`）：`PressEnter` → `submit_address`（跳转 + 把焦点
+  还给根视图，否则上下键 / 输入即过滤一直收不到）；`Blur` → `end_address_edit`。
+* **按键链路**（关键）：gpui 的 `dispatch_key_event` 是**先派发 key binding 的
+  action、再跑 bubble 阶段的 `on_key_down`**（`window.rs` 里 `match_result.bindings`
+  循环先于 `finish_dispatch_key_event`）。而输入组件把退格 / 方向键 / ⌘A / ⌘C⌘X⌘V /
+  ⌘Z / Enter 全注册成了 action，**在绑定阶段就被消费**，根本到不了全局监听器——
+  所以不会「双份生效」。全局监听器里那段地址分支因此只剩两件事：Esc（输入组件
+  的 `escape` 在 `clean_on_escape=false` 时会 `cx.propagate()` 放行）→ 退出编辑；
+  其余一律 return 放行给输入组件（**必须整段 return**，否则「输入即过滤」
+  和上下键导航会跟着一起触发）。删掉了 `handle_address_key`。
+* **配色桥接**（`lib.rs::sync_component_theme`）：`Input` 的选区 / 光标 / 前景色
+  全取自 gpui-component 的 `Theme` 全局，不覆盖就会在自绘的极简配色里冒出一套
+  shadcn 默认色。用 `Theme::global_mut(cx)` 覆盖 selection（那抹蓝 + 30% 透明）、
+  caret、foreground、muted_foreground、border。
+* **样式**：`Input::new(state).appearance(false).bordered(false).small()
+  .text_size(px(13.0)).p(px(0.0))`——外框 / 底色 / 圆角仍由工具栏的胶囊画，
+  只把输入框摆进去；`small()` 是 24px 高（与面包屑段一致）。
+* **测试**（`app.rs` 新增 `mod tests`）：进入编辑 → 路径预填 + 整条全选；
+  Esc / 失焦退出编辑；再次进入复用同一个实体。测试里**真的 `render_frame`** 一帧
+  ——输入框的绘制路径（Theme 全局、点击/选区 overlay）只有画出来才暴露问题。
+  * ⚠️ 坑 1：**crate 内测试不能 `use super::*`**——app.rs 顶层有 `use gpui_kit::*`，
+    会把 gpui 的 `test` 属性宏引进来顶掉内置 `#[test]`，展开时撞递归上限。
+  * ⚠️ 坑 2：测试里要手动 `cx.update(gpui_kit::init)`，否则
+    `no state of type gpui_component::theme::Theme exists`。
+  * ⚠️ 坑 3：`panel.path` 由异步回灌填充，headless 下不稳定 → 测试里直接摆 path，
+    只测「预填 + 全选」这段自己的接线（集成测试版本已放弃）。
+* **既有抖动（非本次引入）**：单独跑某个 layout 用例时会随机撞
+  「Detected activity on thread `tokio-rt-worker` ... Your test is not deterministic」
+  ——`AppState::new()` 起的 tokio worker 撞上 gpui 的 test scheduler 线程断言。
+  HEAD 上同样 4/5 命中，全套跑则稳定通过。要根治得让 mo-app 在测试构建下不起
+  运行时（或把 worker 收进可控线程），暂未处理。
+
+## 22. 右键上下文菜单（文件 / 文件夹 / 空白处）
+
+* **需求**：给文件与文件夹补上右键菜单。
+* **新模块 `crates/mo-ui/src/context_menu.rs`**（不碰文件系统，纯「模型 + 渲染」）：
+  * `ContextMenu{x, y, target: Option<PathBuf>, is_dir, selected, paths}`——
+    菜单**不持有业务状态**，只记「在哪儿弹的、对着谁、当时选中了哪些」；
+  * `items(&menu) -> Vec<MenuItem>`（纯函数，单测覆盖）按上下文推导条目：
+    空白处 → 目录级（新建文件夹 / 粘贴 / 全选 / 刷新 / 在终端中打开 / 显示简介）；
+    条目 → 打开（目录「打开」、文件「快速查看」）+ 目录专属的「在新标签页 / 分栏中打开」
+    + 重命名 / 创建副本 / 复制 / 剪切 / 拷贝路径 / 移到废纸篓 / 压缩…(+归档才有「解压」)
+    + 计算哈希 / 比较（恰好 2 项）/ 标签 / 显示简介 /（目录）磁盘用量 + 在终端中打开。
+  * `MenuAction` 枚举把 22 个动作与 UI 解耦；`render()` 只负责画；
+    真正干活的是 `RootView::run_menu_action`——把动作翻译成**既有**的 `AppState`
+    调用或既有模态，菜单层不新增业务逻辑。
+* **定位**：菜单是**根容器的绝对定位子节点**，根容器从 `(0,0)` 铺满窗口，所以鼠标
+  事件的坐标直接当偏移用（与表头拖拽落点判定同一套坐标）。`render()` 里按
+  `viewport_size` 钳一次：先按「鼠标右下」放，超出右 / 下边就贴边（`MENU_W=232`，
+  `panel_height()` 把分隔线一起算进去，算错会被切一截）。
+  * ⚠️ 根容器必须 `relative()`，否则绝对定位子节点会掉到别处甚至挤动 flex 布局
+    （`context_menu_renders_at_the_pointer_without_disturbing_layout` 守这条）。
+  * 面板挂 `.occlude()` 截断命中链，防止点菜单穿到下面的文件行；
+    `.on_mouse_down_out()` 点外面即关（不用额外全屏遮罩层）。
+* **右键的三个落点**：
+  * 文件列表行（`file_list.rs`）、网格单元（`grid.rs`）、分栏行（`columns.rs`）：
+    `on_mouse_down(MouseButton::Right)` → `open_context_menu(Some((path, is_dir)), …)`
+    + `cx.stop_propagation()`；
+  * 窗格空白（`app.rs::render_pane`）→ `open_context_menu(None, …)`（目录级菜单）。
+    条目上的右键已经 `stop_propagation` 消化掉，不会冒泡到这里。
+* **右键要顺带「选中这一项」**（Finder 行为）：右击未选中的条目时，先同步写进
+  `panel.selection` 并发一个异步 `app.select(id)`，否则菜单里的「移到废纸篓」
+  会去删**旧选区**。同时按 `pane` 把 `active_pane` 切过去（分栏时重命名 / 属性
+  读的都是 `active_pane`）。
+  * ⚠️ **选中路径快照**：`ContextMenu.paths` 在打开菜单那一刻就按可见顺序固化。
+    开模态的动作（重命名 / 压缩 / 创建副本 / 拷贝路径）若去读 app 的选择，
+    就要赌上面那个异步任务已经跑完——带快照就没有竞态。
+* **既有函数加 target 参数**（都在 `None` 时保持旧行为：选中项的第一个 / 当前目录）：
+  `open_properties(cx, Option<PathBuf>)`、`analyze_disk_usage(cx, Option<PathBuf>)`、
+  `open_archive(cx, Option<Vec<PathBuf>>)`、`open_batch_rename(cx, Option<Vec<PathBuf>>)`、
+  `toggle_split(cx, Option<PathBuf>)`。空白处右键点「显示简介」必须看**当前目录**，
+  不能捡旧选区。
+* **`mo-app` 新增两个能力**：
+  * `duplicate_paths(paths)`：同目录就地复制。**不走 `transfer`**——那是「目标目录
+    + 沿用原名」，源与目标同目录时沿用原名会覆盖源文件，目标名必须先
+    `unique_path()` 去重；
+  * `create_folder(dir, name)`：先判存在再决定是否去重。`unique_path()` 总是从 ` 2`
+    起编号，直接拿它会把本来不冲突的名字变成「新建文件夹 2」。
+* **Esc**：右键菜单开着时 Esc 先关菜单（`had_menu` 判断后再 `return`），其余按键
+  继续走正常路由——菜单不该像模态那样吃掉方向键 / 输入即过滤。
+* **测试**：`context_menu` 5 个（空白只有目录级动作 / 目录有开变体无解压 /
+  归档才有解压 / 条目随选中数变化 / 高度含分隔线）；`app.rs` 3 个（落点=鼠标位置
+  且不挤动列表、右下角钳回视口、条目菜单比空白长 + Esc 关闭语义）。
+* ⚠️ 仍是 headless 布局测试 + 纯逻辑单测；真实右键手感与「新建文件夹后是否进
+  内联改名」这类交互细节需本机 `cargo run` 验收（当前新建后只 refresh，不自动进改名）。
+
+## 23. 右键菜单补「新建文本文件」
+
+* **需求**：右键菜单里增加新建文本的功能（原菜单只有「新建文件夹」）。
+* **缺的那一层是文件系统**：`mo-fs::FileSystem` trait 一直只有 `create_dir`，
+  没有任何「写」的能力（UI 不允许直接碰 `std::fs`），所以先在 trait 上补
+  `write_file(path, contents)`，由 `LocalFileSystem` 实现。
+  * ⚠️ 用 `OpenOptions::create_new(true)` 而**不是** `std::fs::write`：后者在目标
+    已存在时静默覆盖——新建文件是数据丢失入口，宁可报错。去重是调用方的责任。
+* **`mo-app` 新增 `create_file(dir, name)`**（`name` 为空时用「新建文本.txt」），
+  返回真实路径。顺手把 `create_folder` 里那段「**先判存在再决定是否去重**」的逻辑
+  抽成 `AppState::free_path(dir, name, fallback)` 给两者共用——`unique_path` 总是
+  从 ` 2` 起编号，无条件调用会把本来不冲突的名字变成「新建文件夹 2」，这条坑只有
+  一处实现才不会再踩。
+* **菜单**（`context_menu.rs`）：`MenuAction` 加 `NewFile`；空白处菜单在「新建文件夹」
+  正下方插「新建文本文件」——**同一组、中间不加分隔线**（分隔线留给下面的「粘贴」）。
+  条目级菜单（对着文件 / 文件夹右键）**不加**这两项新建，与 Windows 资源管理器一致。
+* **UI 落点**：`app.rs` 把原来内联在 `A::NewFolder` 分支里的 spawn 块抽成
+  `create_entry(NewEntry, cx)`（`NewEntry{Folder, File}`），两种新建共用一条路径
+  （取当前目录 → 异步创建 → `refresh()` → 失败弹 `Modal::Info`），错误文案也统一成
+  「新建{文件夹|文本文件}失败：…」。建完只 refresh，**不自动进内联改名**（与文件夹一致）。
+* **测试**：
+  * `context_menu` 新增 `new_items_share_one_group`（两项相邻、均可用、新建项无分隔线
+    而「粘贴」有），`blank_area_shows_directory_level_actions_only` 与
+    `panel_height_accounts_for_separators`（7 项 / 3 条线）同步更新；
+  * `mo-app/tests/productivity.rs` 新增 `create_file_is_empty_and_never_overwrites`——
+    新文件为空、重名序号插在**扩展名之前**（`新建文本 2.txt`）、已有文件内容原封不动、
+    空白名字回落到默认名、以及「名字不冲突时不平白加序号」。

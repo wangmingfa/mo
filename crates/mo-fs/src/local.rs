@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -52,6 +53,16 @@ impl FileSystem for LocalFileSystem {
 
     async fn create_dir(&self, path: &Path) -> Result<(), MoError> {
         std::fs::create_dir_all(path).map_err(MoError::Io)
+    }
+
+    async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
+        // 用 `create_new` 而不是 `std::fs::write`：后者会**静默覆盖**已存在的文件。
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(MoError::Io)?;
+        f.write_all(contents).map_err(MoError::Io)
     }
 
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {

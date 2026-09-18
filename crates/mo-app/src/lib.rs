@@ -1018,6 +1018,59 @@ impl AppState {
         self.transfer(paths, dest, move_).await
     }
 
+    /// 在同一目录内就地复制一批路径（Finder 的「复制」语义：`a.txt` → `a 2.txt`）。
+    ///
+    /// 不走 [`AppState::transfer`]：那里是「目标目录 + 沿用原名」，而这里源与目标同目录，
+    /// 沿用原名会**覆盖源文件**——目标名必须先去重。
+    pub async fn duplicate_paths(&self, paths: Vec<PathBuf>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for src in paths {
+            let to = mo_operations::unique_path(&src);
+            let id = self.ops.lock().await.next_id();
+            let op: SharedOperation = CopyOperation::new(id, src.clone(), to.clone());
+            let hid = self.submit_operation(op).await;
+            self.record_history("复制", vec![src.clone()], None);
+            self.push_reversible(Reversible::Copy { src, dest: to });
+            ids.push(hid);
+        }
+        ids
+    }
+
+    /// 在 `dir` 下解析出一个**不冲突**的新名字（仅算路径，不落盘）。
+    ///
+    /// `name` 为空时用 `fallback`。注意**先判断目标是否存在再决定是否去重**：
+    /// [`mo_operations::unique_path`] 总是从 ` 2` 起编号，直接拿它会把一个
+    /// 本来不冲突的名字变成「新建文件夹 2」。
+    fn free_path(dir: &Path, name: &str, fallback: &str) -> PathBuf {
+        let name = name.trim();
+        let name = if name.is_empty() { fallback } else { name };
+        let base = dir.join(name);
+        if base.exists() {
+            mo_operations::unique_path(&base)
+        } else {
+            base
+        }
+    }
+
+    /// 在 `dir` 下新建文件夹，返回创建出的**真实路径**（重名时加序号，不覆盖）。
+    ///
+    /// `name` 为空时用「新建文件夹」。
+    pub async fn create_folder(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
+        let target = Self::free_path(dir, name, "新建文件夹");
+        self.fs.create_dir(&target).await?;
+        Ok(target)
+    }
+
+    /// 在 `dir` 下新建**空文本文件**，返回创建出的**真实路径**（重名时加序号）。
+    ///
+    /// `name` 为空时用「新建文本.txt」。目标名同样走 [`AppState::free_path`] 去重，
+    /// 底层 `write_file` 用的是 `create_new`——即便去重算错也不会覆盖已有文件。
+    pub async fn create_file(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
+        let target = Self::free_path(dir, name, "新建文本.txt");
+        self.fs.write_file(&target, b"").await?;
+        Ok(target)
+    }
+
     /// 把一批路径复制 / 移动到 `dest`（拖拽与剪贴板粘贴的公共实现）。
     ///
     /// 与 [`AppState::copy_selection`] 的区别：这里不读取当前选择，

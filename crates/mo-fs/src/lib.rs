@@ -10,6 +10,7 @@
 //!     async fn read_dir(&self, path) -> Vec<ReadDirEntry>;
 //!     async fn metadata(&self, path) -> FileMetadata;
 //!     async fn create_dir(&self, path);
+//!     async fn write_file(&self, path, contents);
 //!     async fn rename(&self, from, to);
 //! }
 //! ```
@@ -46,6 +47,12 @@ pub trait FileSystem: Send + Sync {
 
     /// 创建目录（含父目录）。
     async fn create_dir(&self, path: &Path) -> Result<(), MoError>;
+
+    /// 创建**新文件**并写入内容。
+    ///
+    /// 目标已存在时必须**失败而不是覆盖**（底层用 `create_new`）：新建文件是
+    /// 数据丢失的入口之一，去重是调用方的责任（见 `mo_operations::unique_path`）。
+    async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError>;
 
     /// 删除文件。
     async fn remove_file(&self, path: &Path) -> Result<(), MoError>;

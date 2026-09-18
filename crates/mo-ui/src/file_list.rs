@@ -437,6 +437,19 @@ pub fn render(
                     });
                 });
 
+            // 右键：对着这一行弹上下文菜单。必须 `stop_propagation`，
+            // 否则事件继续冒泡到窗格容器，菜单会被随即替换成「空白处」版本。
+            let entity_ctx = entity.clone();
+            let ctx_path = entry.path.clone();
+            row.interactivity()
+                .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    entity_ctx.update(cx, |v, cx| {
+                        v.open_context_menu(Some((ctx_path.clone(), is_dir)), x, y, pane, tab, cx);
+                    });
+                    cx.stop_propagation();
+                });
+
             let tag_color = view
                 .panel_at(pane, tab)
                 .map(|p| p.app.clone())

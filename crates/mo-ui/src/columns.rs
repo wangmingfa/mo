@@ -110,6 +110,17 @@ fn column_box(
             line = line.hover(|s| s.bg(theme::hover_bg()));
         }
         let is_dir = matches!(e.kind, EntryKind::Directory);
+        // 右键：对着这一行弹上下文菜单（`stop_propagation` 防止冒泡到窗格容器）。
+        let ctx_entity = entity.clone();
+        let ctx_path = e.path.clone();
+        line.interactivity()
+            .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                ctx_entity.update(cx, |v, cx| {
+                    v.open_context_menu(Some((ctx_path.clone(), is_dir)), x, y, pane, tab, cx);
+                });
+                cx.stop_propagation();
+            });
         let click_entity = entity.clone();
         let entry_path = e.path.clone();
         line.interactivity().on_click(move |ev, _window, cx| {

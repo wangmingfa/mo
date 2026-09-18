@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 
@@ -38,7 +40,7 @@ pub fn render(
     can_forward: bool,
     path: &Option<PathBuf>,
     address_editing: bool,
-    address_input: &str,
+    address: Option<&Entity<InputState>>,
     view_mode: ViewMode,
 ) -> impl IntoElement {
     div()
@@ -72,13 +74,7 @@ pub fn render(
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Parent)
         }))
-        .child(address_bar(
-            app,
-            entity,
-            path,
-            address_editing,
-            address_input,
-        ))
+        .child(address_bar(app, entity, path, address_editing, address))
         .child(icon_button("nav-refresh", icons::ROTATE_CW, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
@@ -206,13 +202,13 @@ impl RenderOnce for Glyph {
     }
 }
 
-/// 地址栏：面包屑模式（每段可点击跳转）⇄ 编辑模式（整行输入路径）。
+/// 地址栏：面包屑模式（每段可点击跳转）⇄ 编辑模式（真实文本输入框）。
 fn address_bar(
     app: &AppState,
     entity: &Entity<RootView>,
     path: &Option<PathBuf>,
     editing: bool,
-    input: &str,
+    input: Option<&Entity<InputState>>,
 ) -> Div {
     let mut pill = div()
         .flex()
@@ -230,25 +226,32 @@ fn address_bar(
         .debug_selector(|| "mo-address".to_string());
 
     if editing {
-        // 编辑态：显示输入中的路径（▏为光标）。
-        let display = if input.is_empty() {
-            "输入路径，回车跳转".to_string()
-        } else {
-            format!("{input}▏")
-        };
-        return pill.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px(px(6.0))
-                .text_color(if input.is_empty() {
-                    theme::muted()
-                } else {
-                    theme::text()
-                })
-                .child(div().flex_1().truncate().child(text!(display))),
-        );
+        // 编辑态交给框架的真实输入框：选区 / 光标定位 / 双击选词 / ⌘A / 剪切复制
+        // 粘贴 / 撤销 / 中文输入法全归它，本层只负责「把它摆进胶囊里」。
+        //
+        // `appearance(false)` + `bordered(false)`：外框、底色、圆角仍由上面的
+        // pill 画，别让输入组件自带的 shadcn 边框叠一层进来。
+        // 尺寸给 `small()`（24px 高，与面包屑段一致）并显式钉死字号 13px，
+        // 与列表 / 侧边栏同号；内边距清零，左右留白交给这一层。
+        let mut area = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .h_full()
+            .min_w(px(0.0))
+            .px(px(6.0));
+        if let Some(state) = input {
+            area = area.child(
+                Input::new(state)
+                    .appearance(false)
+                    .bordered(false)
+                    .small()
+                    .text_size(px(13.0))
+                    .p(px(0.0)),
+            );
+        }
+        return pill.child(area);
     }
 
     // 面包屑模式：一段一个可点击胶囊，中间夹「›」分隔符。
@@ -325,11 +328,9 @@ fn address_bar(
 /// 泛型以同时接受 `Div` 与加了 ID 后的 `Stateful<Div>`。
 fn start_edit_on_click<E: InteractiveElement>(el: &mut E, entity: &Entity<RootView>) {
     let entity = entity.clone();
-    el.interactivity().on_click(move |_, _window, cx| {
-        entity.update(cx, |v, cx| {
-            v.begin_address_edit();
-            cx.notify();
-        });
+    el.interactivity().on_click(move |_, window, cx| {
+        // 创建 / 聚焦输入框需要 `Window`（InputState::new / focus 都要）。
+        entity.update(cx, |v, cx| v.begin_address_edit(window, cx));
     });
 }
 

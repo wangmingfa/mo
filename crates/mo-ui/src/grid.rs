@@ -157,6 +157,19 @@ fn cell(
 
     let id = entry.id;
     let entry_path = entry.path.clone();
+    // 右键：对着这个格子弹上下文菜单。`stop_propagation` 防止继续冒泡到
+    // 窗格容器，把菜单换成「空白处」版本。
+    let ctx_entity = entity.clone();
+    let ctx_path = entry.path.clone();
+    let ctx_is_dir = matches!(entry.kind, mo_core::EntryKind::Directory);
+    c.interactivity()
+        .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            ctx_entity.update(cx, |v, cx| {
+                v.open_context_menu(Some((ctx_path.clone(), ctx_is_dir)), x, y, pane, tab, cx);
+            });
+            cx.stop_propagation();
+        });
     let click_entity = entity.clone();
     c.interactivity().on_click(move |ev, _window, cx| {
         if ev.click_count() >= 2 {

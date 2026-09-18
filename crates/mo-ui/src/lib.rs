@@ -5,6 +5,7 @@
 
 mod app;
 mod columns;
+mod context_menu;
 mod dialogs;
 mod file_item;
 mod file_list;
@@ -38,6 +39,27 @@ fn init_tracing() {
         .init();
 }
 
+/// 让 gpui-component 的 `Theme` 跟随本项目的调色板。
+///
+/// 地址栏用的是框架的 `Input`（见 `toolbar::address_bar`），它的**选区底色、
+/// 光标色、前景色**全部取自 `Theme` 这个全局——不覆盖的话，那块会在
+/// 我们自绘的极简配色里突然冒出一套 shadcn 默认色。
+///
+/// 只覆盖与文本输入有关、且肉眼可见的几项：选区（用文件列表那抹蓝，压到
+/// 30% 透明以免盖住字形）、光标（同蓝）、前景 / 次要前景 / 边框。
+fn sync_component_theme(cx: &mut App) {
+    let t = component::Theme::global_mut(cx);
+    t.selection = {
+        let mut c = Hsla::from(theme::selected_bg());
+        c.a = 0.3;
+        c
+    };
+    t.caret = Hsla::from(theme::selected_bg());
+    t.foreground = Hsla::from(theme::text());
+    t.muted_foreground = Hsla::from(theme::muted());
+    t.border = Hsla::from(theme::divider());
+}
+
 /// 启动 Mo 图形界面。
 pub fn run() {
     init_tracing();
@@ -48,6 +70,8 @@ pub fn run() {
     app.spawn_refresh_pump();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        // 框架组件（地址栏的 Input）的配色对齐到我们自己的调色板。
+        sync_component_theme(cx);
         // NSApplication 此时已创建：把嵌入的 PNG 设为 Dock / ⌘Tab 图标。
         icon::set_dock_icon();
         let app = app.clone();

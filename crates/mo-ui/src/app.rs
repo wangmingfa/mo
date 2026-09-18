@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
@@ -18,6 +19,9 @@ pub(crate) const INITIAL_WINDOW: usize = 200;
 
 /// 侧边栏宽度：网格视图用它推算每个窗格的可用宽度。
 const SIDEBAR_WIDTH: f32 = 188.0;
+
+/// 地址栏编辑态的占位文字（空输入时显示）。
+pub(crate) const ADDRESS_PLACEHOLDER: &str = "输入路径，回车跳转";
 
 /// 当前打开的模态层（占用中央区；Esc 关闭）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +360,8 @@ pub struct RootView {
     pub(crate) header_cells: Vec<(crate::list_columns::ColId, Bounds<Pixels>)>,
     /// `header_cells` 属于哪个 (窗格, 标签页)——分栏时避免用错窗格的 bounds。
     pub(crate) header_cells_owner: (usize, usize),
+    /// 右键上下文菜单（一次只开一个；`None` = 关闭）。
+    pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
 }
 
 /// 一次表头拖动：要么在调列宽，要么在调列序。
@@ -389,6 +395,13 @@ pub(crate) struct DragState {
     pub(crate) paths: Vec<PathBuf>,
 }
 
+/// 「新建」的种类（两种新建流程一致，只有名字与调用的 app 方法不同）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NewEntry {
+    Folder,
+    File,
+}
+
 impl RootView {
     pub fn new(app: AppState, cx: &mut Context<Self>) -> Self {
         let view = Self {
@@ -416,6 +429,7 @@ impl RootView {
             header_drag: None,
             header_cells: Vec::new(),
             header_cells_owner: (0, 0),
+            context_menu: None,
         };
 
         let weak = cx.entity().downgrade();
@@ -557,7 +571,10 @@ impl RootView {
     }
 
     /// 开启 / 关闭双栏分栏：第二窗格按需创建或销毁。
-    pub(crate) fn toggle_split(&mut self, cx: Option<&mut Context<Self>>) {
+    ///
+    /// `start` 为 `Some(path)` 时第二窗格直接从该目录起步（右键「在分栏中打开」），
+    /// 为 `None` 时仍从 Home 起步。
+    pub(crate) fn toggle_split(&mut self, cx: Option<&mut Context<Self>>, start: Option<PathBuf>) {
         self.split = !self.split;
         if self.split && self.panes.len() < 2 {
             let Some(cx) = cx else {
@@ -571,14 +588,52 @@ impl RootView {
             self.panes.push(Pane::new(Panel::new(app.clone())));
             let weak = cx.entity().downgrade();
             cx.spawn(async move |_weak, cx| {
-                // 第二窗格同样从 Home 起步。
-                tab_loop(app, weak, cx, idx, 0, true).await;
+                match start {
+                    // 先打开目标目录再起同步循环，否则首帧会先闪一次 Home。
+                    Some(path) => {
+                        let _ = mo_app::DirectoryController::new(app.clone())
+                            .open(&path)
+                            .await;
+                        tab_loop(app, weak, cx, idx, 0, false).await;
+                    }
+                    // 第二窗格默认从 Home 起步。
+                    None => tab_loop(app, weak, cx, idx, 0, true).await,
+                }
             })
             .detach();
         } else if !self.split && self.panes.len() > 1 {
             self.panes.truncate(1);
             self.active_pane = 0;
         }
+    }
+
+    /// 在 `pane_idx` 新建一个标签页，并**直接打开 `path`**（而不是 Home）。
+    ///
+    /// 与 [`Self::new_tab`] 的唯一区别是初始目录：多标签页的「在新标签页中打开」。
+    pub(crate) fn open_in_new_tab(
+        &mut self,
+        pane_idx: usize,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app = AppState::new();
+        app.spawn_watcher_pump();
+        app.spawn_refresh_pump();
+        let Some(pane) = self.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let tab_idx = pane.tabs.len();
+        pane.tabs.push(Panel::new(app.clone()));
+        pane.active = tab_idx;
+
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_weak, cx| {
+            let _ = mo_app::DirectoryController::new(app.clone())
+                .open(&path)
+                .await;
+            tab_loop(app, weak, cx, pane_idx, tab_idx, false).await;
+        })
+        .detach();
     }
 
     /// 切焦点窗格（分栏时才有意义）。
@@ -597,15 +652,84 @@ impl RootView {
 
     // ------------------------------------------------------------ 面板动作
 
-    /// 进入地址栏编辑态：用当前完整路径预填输入框（供工具栏点击调用）。
-    pub fn begin_address_edit(&mut self) {
-        let p = self.panel_mut();
-        p.address_editing = true;
-        p.address_input = p
+    /// 进入地址栏编辑态：预填当前完整路径，聚焦并**全选**。
+    ///
+    /// 全选是 Finder / Win11 的行为：点一下地址栏就能直接敲新路径覆盖旧的，
+    /// 不必先自己选中（也顺手覆盖了「编辑时想选中文本」这个诉求）。
+    ///
+    /// 输入框用框架的 [`InputState`]（选区 / 光标 / 剪贴板 / 输入法都由它提供），
+    /// 且**一个面板一个**：分栏时两个窗格的地址栏互不串味。
+    pub fn begin_address_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .panel()
             .path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+
+        // 懒创建：`Panel` 构造时拿不到 `window`，第一次进入编辑态才建。
+        if self.panel().address.is_none() {
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder(ADDRESS_PLACEHOLDER));
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |this: &mut Self, state, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.submit_address(state.clone(), window, cx),
+                    // 点到别处（文件行 / 侧边栏）就当放弃这次编辑。
+                    InputEvent::Blur => this.end_address_edit(cx),
+                    InputEvent::Change | InputEvent::Focus => {}
+                },
+            );
+            let p = self.panel_mut();
+            p.address = Some(state);
+            p.address_sub = Some(sub);
+        }
+
+        let state = self.panel().address.clone();
+        self.panel_mut().address_editing = true;
+        if let Some(state) = state {
+            state.update(cx, |s, cx| {
+                s.set_value(text, window, cx);
+                s.focus(window, cx);
+                s.select_all(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// 退出地址栏编辑态。输入状态实体留着，下次进入复用（不重建、不丢历史）。
+    pub(crate) fn end_address_edit(&mut self, cx: &mut Context<Self>) {
+        if self.panel().address_editing {
+            self.panel_mut().address_editing = false;
+            cx.notify();
+        }
+    }
+
+    /// 地址栏回车：按输入的路径跳转，并把键盘焦点还给根视图。
+    ///
+    /// 焦点交还很重要：输入框一直握着焦点的话，上下键 / 输入即过滤这些
+    /// 列表快捷键就一直收不到。
+    fn submit_address(
+        &mut self,
+        state: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = state.read(cx).value().trim().to_string();
+        let app = self.panel().app.clone();
+        self.panel_mut().address_editing = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+        if text.is_empty() {
+            return;
+        }
+        let target = PathBuf::from(text);
+        cx.spawn(async move |_weak, _cx| {
+            if let Err(e) = app.open_directory(&target).await {
+                eprintln!("打开失败: {e}");
+            }
+        })
+        .detach();
     }
 
     /// 打开一个条目（双击 / Enter 同语义）：目录进入，文件快速预览。
@@ -706,20 +830,25 @@ impl RootView {
     }
 
     /// 打开属性面板：取当前聚焦 / 选中项的名称与权限。
-    pub(crate) fn open_properties(&mut self, cx: &mut Context<Self>) {
+    /// 打开「显示简介」。
+    ///
+    /// `target` 为 `Some` 时直接用它（右键菜单对着某个条目 / 目录）；
+    /// 为 `None` 时沿用旧行为：选中项的第一个，没有选中则当前目录。
+    pub(crate) fn open_properties(&mut self, cx: &mut Context<Self>, target: Option<PathBuf>) {
         let app = self.app();
         let Some(path) = self.panel().path.clone() else {
             return;
         };
-        let target = self
-            .panel()
-            .selection
-            .selected_ids()
-            .iter()
-            .next()
-            .and_then(|id| self.panel().window.iter().find(|e| e.id == *id))
-            .map(|e| e.path.clone())
-            .unwrap_or(path.clone());
+        let target = target.unwrap_or_else(|| {
+            self.panel()
+                .selection
+                .selected_ids()
+                .iter()
+                .next()
+                .and_then(|id| self.panel().window.iter().find(|e| e.id == *id))
+                .map(|e| e.path.clone())
+                .unwrap_or(path.clone())
+        });
         let name = target
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -757,50 +886,69 @@ impl RootView {
         cx.notify();
     }
 
-    /// 打开批量重命名：快照当前选中的路径。
-    pub(crate) fn open_batch_rename(&mut self, cx: &mut Context<Self>) {
-        let app = self.app();
-        let this = cx.entity().clone();
-        cx.spawn(async move |_, cx| {
-            let paths = app.selection_paths().await;
-            this.update(cx, |v, cx| {
-                if paths.is_empty() {
-                    v.modal = Modal::Info("没有选中文件".to_string());
-                } else {
-                    v.rename_paths = paths;
-                    v.rename_spec = RenameSpec::default();
-                    v.form_index = 0;
-                    v.modal = Modal::BatchRename;
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+    /// 打开批量重命名：`paths` 为 `None` 时快照当前选中的路径。
+    ///
+    /// 右键菜单会直接传它那一份路径快照——菜单打开时发出的异步选中未必已经
+    /// 落到 `app` 上，而这里要立刻开模态，等不起。
+    pub(crate) fn open_batch_rename(
+        &mut self,
+        cx: &mut Context<Self>,
+        paths: Option<Vec<PathBuf>>,
+    ) {
+        let Some(paths) = paths else {
+            let app = self.app();
+            let this = cx.entity().clone();
+            cx.spawn(async move |_, cx| {
+                let paths = app.selection_paths().await;
+                this.update(cx, |v, cx| v.begin_batch_rename(paths, cx));
+            })
+            .detach();
+            return;
+        };
+        self.begin_batch_rename(paths, cx);
     }
 
-    /// 打开压缩对话框。
-    pub(crate) fn open_archive(&mut self, cx: &mut Context<Self>) {
-        let app = self.app();
-        let this = cx.entity().clone();
-        cx.spawn(async move |_, cx| {
-            let paths = app.selection_paths().await;
-            this.update(cx, |v, cx| {
-                if paths.is_empty() {
-                    v.modal = Modal::Info("没有选中文件".to_string());
-                } else {
-                    let hint = paths
-                        .first()
-                        .and_then(|p| p.file_stem())
-                        .map(|s| format!("{}.zip", s.to_string_lossy()))
-                        .unwrap_or_else(|| "archive.zip".to_string());
-                    v.rename_paths = paths;
-                    v.archive_name = hint;
-                    v.modal = Modal::Archive;
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+    fn begin_batch_rename(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.modal = Modal::Info("没有选中文件".to_string());
+        } else {
+            self.rename_paths = paths;
+            self.rename_spec = RenameSpec::default();
+            self.form_index = 0;
+            self.modal = Modal::BatchRename;
+        }
+        cx.notify();
+    }
+
+    /// 打开压缩对话框（`paths` 语义同 [`Self::open_batch_rename`]）。
+    pub(crate) fn open_archive(&mut self, cx: &mut Context<Self>, paths: Option<Vec<PathBuf>>) {
+        let Some(paths) = paths else {
+            let app = self.app();
+            let this = cx.entity().clone();
+            cx.spawn(async move |_, cx| {
+                let paths = app.selection_paths().await;
+                this.update(cx, |v, cx| v.begin_archive(paths, cx));
+            })
+            .detach();
+            return;
+        };
+        self.begin_archive(paths, cx);
+    }
+
+    fn begin_archive(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.modal = Modal::Info("没有选中文件".to_string());
+        } else {
+            let hint = paths
+                .first()
+                .and_then(|p| p.file_stem())
+                .map(|s| format!("{}.zip", s.to_string_lossy()))
+                .unwrap_or_else(|| "archive.zip".to_string());
+            self.rename_paths = paths;
+            self.archive_name = hint;
+            self.modal = Modal::Archive;
+        }
+        cx.notify();
     }
 
     /// 解压选中的归档到当前目录。
@@ -830,10 +978,12 @@ impl RootView {
         .detach();
     }
 
-    /// 磁盘空间分析：统计当前目录下每个子项的大小。
-    pub(crate) fn analyze_disk_usage(&mut self, cx: &mut Context<Self>) {
+    /// 磁盘空间分析：统计 `root`（缺省为当前目录）下每个子项的大小。
+    ///
+    /// 右键菜单对着某个目录时会传入**那个目录**，而不是当前浏览的目录。
+    pub(crate) fn analyze_disk_usage(&mut self, cx: &mut Context<Self>, root: Option<PathBuf>) {
         let app = self.app();
-        let Some(root) = self.panel().path.clone() else {
+        let Some(root) = root.or_else(|| self.panel().path.clone()) else {
             return;
         };
         self.usage.clear();
@@ -1163,6 +1313,288 @@ impl RootView {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ 右键菜单
+
+    /// 打开右键菜单。
+    ///
+    /// `target` 为 `None` 表示点在空白处（动作对象是**当前目录**）。对着条目右键时，
+    /// 若该条目不在当前选区里，先把它单选下来——与 Finder 一致：右键既是「弹菜单」
+    /// 也是「选中这一项」。少了这一步，菜单里的「移到废纸篓」会去删旧选区。
+    ///
+    /// `(pane, tab)` 是事件来自哪个标签页：分栏时右键必须作用在被点的窗格上，
+    /// 所以这里会顺带把焦点切过去（重命名 / 属性等都读 `active_pane`）。
+    pub(crate) fn open_context_menu(
+        &mut self,
+        target: Option<(PathBuf, bool)>,
+        x: f32,
+        y: f32,
+        pane: usize,
+        tab: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if pane < self.panes.len() {
+            self.active_pane = pane;
+        }
+
+        if let Some((path, _)) = target.as_ref() {
+            let id = self
+                .panel_at(pane, tab)
+                .and_then(|p| p.window.iter().find(|e| e.path == *path).map(|e| e.id));
+            if let Some(id) = id {
+                let already = self
+                    .panel_at(pane, tab)
+                    .is_some_and(|p| p.selection.is_selected(&id));
+                if !already {
+                    if let Some(p) = self.panel_at_mut(pane, tab) {
+                        p.selection.select(id);
+                    }
+                    let app = self
+                        .panel_at(pane, tab)
+                        .map(|p| p.app.clone())
+                        .unwrap_or_else(|| self.app());
+                    cx.spawn(async move |_weak, _cx| {
+                        app.select(id).await;
+                    })
+                    .detach();
+                }
+            }
+        }
+
+        // 目标路径快照：按窗口（可见）顺序取当前选中的那些。
+        // 右击的条目已在上面同步写进 panel.selection，所以这里一定包含它。
+        let paths: Vec<PathBuf> = self
+            .panel_at(pane, tab)
+            .map(|p| {
+                p.window
+                    .iter()
+                    .filter(|e| p.selection.is_selected(&e.id))
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (target_path, is_dir) = match target {
+            Some((p, d)) => (Some(p), d),
+            None => (None, true),
+        };
+        self.context_menu = Some(crate::context_menu::ContextMenu {
+            x,
+            y,
+            target: target_path,
+            is_dir,
+            selected: paths.len(),
+            paths,
+        });
+        cx.notify();
+    }
+
+    /// 关闭右键菜单（点空白 / Esc / 执行完动作）。
+    pub(crate) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 在当前窗格的目录里新建一个条目（文件夹 / 空文本文件）。
+    ///
+    /// 两种新建的流程一模一样（取当前目录 → 异步创建 → 刷新列表），差别只在
+    /// 调哪个 `AppState` 方法，所以合成一处——顺手也把错误文案统一了。
+    fn create_entry(&mut self, kind: NewEntry, cx: &mut Context<Self>) {
+        let Some(dir) = self.panel().path.clone() else {
+            return;
+        };
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let (created, what) = match kind {
+                NewEntry::Folder => (app.create_folder(&dir, "新建文件夹").await, "文件夹"),
+                NewEntry::File => (app.create_file(&dir, "新建文本.txt").await, "文本文件"),
+            };
+            match created {
+                Ok(path) => {
+                    // 建好了：让列表立刻显示（watcher 可能有延迟）。
+                    let _ = app.refresh().await;
+                    tracing::debug!("新建{what}：{}", path.display());
+                }
+                Err(e) => {
+                    let msg = format!("新建{what}失败：{e}");
+                    this.update(cx, |v, cx| {
+                        v.modal = Modal::Info(msg);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 执行一个菜单动作。菜单在此之前就已关闭（动作可能自己开模态）。
+    pub(crate) fn run_menu_action(
+        &mut self,
+        action: crate::context_menu::MenuAction,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::context_menu::MenuAction as A;
+
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let target = menu.target.clone();
+        let is_dir = menu.is_dir;
+
+        match action {
+            A::Open => {
+                if let Some(p) = target {
+                    self.open_entry(p, cx);
+                }
+            }
+            A::QuickLook => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    open_quick_look(&app, &this, cx).await;
+                })
+                .detach();
+            }
+            A::OpenInNewTab => {
+                if let Some(p) = target {
+                    let pane = self.active_pane;
+                    self.open_in_new_tab(pane, p, cx);
+                }
+            }
+            A::OpenInSplit => {
+                if let Some(p) = target {
+                    // 已经分栏时不再重复开，只把目标目录开在第二窗格。
+                    if self.split && self.panes.len() > 1 {
+                        let app = self
+                            .panes
+                            .get(1)
+                            .map(|pane| pane.panel().app.clone())
+                            .unwrap_or_else(|| self.app());
+                        self.active_pane = 1;
+                        cx.spawn(async move |_weak, _cx| {
+                            let _ = app.open_directory(&p).await;
+                        })
+                        .detach();
+                    } else {
+                        self.toggle_split(Some(cx), Some(p));
+                    }
+                }
+            }
+            A::Rename => self.open_batch_rename(cx, Some(menu.paths.clone())),
+            A::Duplicate => {
+                let app = self.app();
+                let paths = menu.paths.clone();
+                cx.spawn(async move |_weak, _cx| {
+                    app.duplicate_paths(paths).await;
+                })
+                .detach();
+            }
+            A::Copy => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.copy_selection_to_clipboard().await;
+                })
+                .detach();
+            }
+            A::Cut => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.cut_selection_to_clipboard().await;
+                })
+                .detach();
+            }
+            A::Paste => {
+                let dest = self.panel().path.clone();
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    let _ = app.paste_clipboard(dest).await;
+                })
+                .detach();
+            }
+            A::CopyPath => {
+                // 路径是普通文本，直接进系统剪贴板（不经过内部文件剪贴板）。
+                if !menu.paths.is_empty() {
+                    let text = menu
+                        .paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            A::Trash => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.delete_selection().await;
+                })
+                .detach();
+            }
+            A::NewFolder => self.create_entry(NewEntry::Folder, cx),
+            A::NewFile => self.create_entry(NewEntry::File, cx),
+            A::Compress => self.open_archive(cx, Some(menu.paths.clone())),
+            A::Extract => self.extract_selected(cx),
+            A::Hash => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    compute_hash(&app, &this, cx).await;
+                })
+                .detach();
+            }
+            A::Compare => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    run_compare(&app, &this, cx).await;
+                })
+                .detach();
+            }
+            A::Tags => {
+                self.form_index = 0;
+                self.modal = Modal::Tags;
+            }
+            // 空白处右键 = 简介当前目录；对着条目 = 简介那个条目。
+            A::Properties => {
+                let t = target.clone().or_else(|| self.panel().path.clone());
+                self.open_properties(cx, t);
+            }
+            // 对着目录右键 = 分析**那个目录**；空白处则分析当前目录。
+            A::DiskUsage => self.analyze_disk_usage(cx, target.filter(|_| is_dir)),
+            A::OpenTerminal => self.open_terminal_in(cx, target.filter(|_| is_dir)),
+            A::Refresh => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    let _ = app.refresh().await;
+                })
+                .detach();
+            }
+            A::SelectAll => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    app.select_all_visible().await;
+                    pull_selection(&app, &this, cx).await;
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「在终端中打开」：`dir` 为 `None` 时用当前目录。
+    fn open_terminal_in(&mut self, cx: &mut Context<Self>, dir: Option<PathBuf>) {
+        let app = self.app();
+        let dir = dir.or_else(|| self.panel().path.clone());
+        let Some(dir) = dir else {
+            return;
+        };
+        if let Err(e) = app.open_terminal(&dir) {
+            self.modal = Modal::Info(format!("打开终端失败：{e}"));
+            cx.notify();
+        }
+    }
+
     /// 应用当前过滤词（输入即过滤），作用于当前焦点标签页。
     fn apply_filter(&mut self, cx: &mut Context<Self>) {
         let query = self.panel().query.trim().to_string();
@@ -1376,6 +1808,8 @@ impl Render for RootView {
             .flex()
             .flex_col()
             .size_full()
+            // 右键菜单是绝对定位的浮层，需要一个定位上下文（否则会去找更外层）。
+            .relative()
             .bg(theme::surface())
             .text_color(theme::text())
             .track_focus(&self.focus)
@@ -1388,7 +1822,7 @@ impl Render for RootView {
                 panel.can_forward,
                 &panel.path,
                 panel.address_editing,
-                &panel.address_input,
+                panel.address.as_ref(),
                 panel.view_mode,
             ))
             .child(body)
@@ -1410,6 +1844,21 @@ impl Render for RootView {
             let platform = m.platform;
             let shift = m.shift;
             let plain = !m.control && !m.alt && !m.platform;
+
+            // 右键菜单开着时 Esc 先关菜单（其余按键继续走正常路由，
+            // 菜单不该像模态那样吃掉方向键 / 输入即过滤）。
+            if key == "escape" {
+                let had_menu = entity_key.update(cx, |v, cx| {
+                    let had = v.context_menu.is_some();
+                    if had {
+                        v.close_context_menu(cx);
+                    }
+                    had
+                });
+                if had_menu {
+                    return;
+                }
+            }
 
             // 全局快捷键（任何状态下都可触发）。
             // ⌘Q：裸二进制没有菜单栏，macOS 收不到系统 terminate，
@@ -1486,7 +1935,7 @@ impl Render for RootView {
             // ⌘⇧D：双栏分栏开关（第二窗格按需创建）。
             if platform && shift && key.eq_ignore_ascii_case("d") {
                 entity_key.update(cx, |v, cx| {
-                    v.toggle_split(Some(cx));
+                    v.toggle_split(Some(cx), None);
                     cx.notify();
                 });
                 return;
@@ -1505,10 +1954,10 @@ impl Render for RootView {
                 });
                 return;
             }
-            // ⌘I：属性与权限面板。
+            // ⌘I：属性与权限面板（对着选中项，没有选中则当前目录）。
             if platform && key.eq_ignore_ascii_case("i") {
                 entity_key.update(cx, |v, cx| {
-                    v.open_properties(cx);
+                    v.open_properties(cx, None);
                     cx.notify();
                 });
                 return;
@@ -1548,9 +1997,15 @@ impl Render for RootView {
                 return;
             }
 
-            // 地址栏编辑态：独占普通按键（优先于模态与列表导航）。
+            // 地址栏编辑态：按键基本都归地址栏的真实输入组件——它把退格 / 方向键 /
+            // ⌘A / ⌘C⌘X⌘V / ⌘Z / 回车都注册成了 action，**在绑定阶段就被消费掉**
+            // （早于本监听器），根本到不了这里。所以这里只兜住没被它消费的那几个：
+            // Esc 退出编辑；字符 / 输入法组合一律放行给输入组件。
+            // ⚠️ 整段 return 是必要的：否则「输入即过滤」「上下键导航」会跟着一起触发。
             if entity_key.update(cx, |v, _cx| v.panel().address_editing) {
-                handle_address_key(key, plain, &entity_key, cx);
+                if key == "escape" {
+                    entity_key.update(cx, |v, cx| v.end_address_edit(cx));
+                }
                 return;
             }
 
@@ -1635,6 +2090,19 @@ impl Render for RootView {
         // 让焦点落在本视图上，否则按键不会派发到这里。
         if !self.focus.is_focused(window) {
             cx.focus_self(window);
+        }
+
+        // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
+        // 用窗口坐标直接当偏移量——根容器从 (0, 0) 铺满窗口，两者同一套坐标系。
+        if let Some(menu) = self.context_menu.clone() {
+            let items = crate::context_menu::items(&menu);
+            let vs = window.viewport_size();
+            root = root.child(crate::context_menu::render(
+                &menu,
+                &items,
+                (vs.width.to_f64() as f32, vs.height.to_f64() as f32),
+                &entity,
+            ));
         }
 
         root
@@ -1752,6 +2220,17 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             drop_entity.update(cx, |v, cx| v.drop_on_pane(pane_idx, alt, cx));
         });
 
+    // 空白处右键：弹「目录级」菜单（新建 / 粘贴 / 刷新 / 全选…）。
+    // 条目上的右键已经在行内消化掉并 `stop_propagation`，不会走到这里。
+    let ctx_entity = entity.clone();
+    col.interactivity()
+        .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            ctx_entity.update(cx, |v, cx| {
+                v.open_context_menu(None, x, y, pane_idx, tab_idx, cx);
+            });
+        });
+
     col
 }
 
@@ -1860,48 +2339,6 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
 }
 
 /// 模态内按键处理（返回是否已被处理）。
-/// 地址栏编辑态的按键：输入 / 退格 / 回车跳转 / Esc 取消。
-fn handle_address_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut App) {
-    match key {
-        "escape" => entity.update(cx, |v, cx| {
-            let p = v.panel_mut();
-            p.address_editing = false;
-            p.address_input.clear();
-            cx.notify();
-        }),
-        "enter" => {
-            let (app, target) = entity.update(cx, |v, _cx| {
-                let p = v.panel_mut();
-                p.address_editing = false;
-                let text = p.address_input.trim().to_string();
-                p.address_input.clear();
-                (p.app.clone(), PathBuf::from(text))
-            });
-            if target.as_os_str().is_empty() {
-                return;
-            }
-            cx.spawn(async move |_cx| {
-                if let Err(e) = app.open_directory(&target).await {
-                    eprintln!("打开失败: {e}");
-                }
-            })
-            .detach();
-        }
-        "backspace" => entity.update(cx, |v, cx| {
-            v.panel_mut().address_input.pop();
-            cx.notify();
-        }),
-        k if plain && k.chars().count() == 1 => {
-            let ch = k.chars().next().unwrap();
-            entity.update(cx, |v, cx| {
-                v.panel_mut().address_input.push(ch);
-                cx.notify();
-            });
-        }
-        _ => {}
-    }
-}
-
 fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut App) {
     let modal = entity.update(cx, |v, _cx| v.modal.clone());
     match modal {
@@ -2288,7 +2725,7 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::ToggleSplit) => {
             entity.update(cx, |v, cx| {
-                v.toggle_split(Some(cx));
+                v.toggle_split(Some(cx), None);
                 v.modal = Modal::None;
                 v.cmd_query.clear();
                 v.palette_index = 0;
@@ -2335,21 +2772,21 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::Properties) => {
             entity.update(cx, |v, cx| {
-                v.open_properties(cx);
+                v.open_properties(cx, None);
                 v.cmd_query.clear();
                 v.palette_index = 0;
             });
         }
         Some(CommandId::BatchRename) => {
             entity.update(cx, |v, cx| {
-                v.open_batch_rename(cx);
+                v.open_batch_rename(cx, None);
                 v.cmd_query.clear();
                 v.palette_index = 0;
             });
         }
         Some(CommandId::CreateArchive) => {
             entity.update(cx, |v, cx| {
-                v.open_archive(cx);
+                v.open_archive(cx, None);
                 v.cmd_query.clear();
                 v.palette_index = 0;
             });
@@ -2363,7 +2800,7 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::DiskUsage) => {
             entity.update(cx, |v, cx| {
-                v.analyze_disk_usage(cx);
+                v.analyze_disk_usage(cx, None);
                 v.cmd_query.clear();
                 v.palette_index = 0;
             });
@@ -3279,4 +3716,234 @@ fn commit_archive(entity: &Entity<RootView>, cx: &mut App) {
     })
     .detach();
     close_modal(entity, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    // ⚠️ 这里**不能** `use super::*`：app.rs 顶层有 `use gpui_kit::*`，
+    // 会把 gpui 的 `test` 属性宏一起引进来，把内置的 `#[test]` 顶掉，
+    // 展开时直接撞递归上限（`recursion limit reached while expanding #[test]`）。
+    use std::path::PathBuf;
+
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{px, TestAppContext};
+    use mo_app::AppState;
+
+    use super::RootView;
+
+    /// 进入地址栏编辑态：路径要**预填**，且内容要**整条被选中**。
+    ///
+    /// 守的是最初的诉求「地址栏编辑时无法选中文本」。旧实现是自绘的
+    /// 「字符串 + 假光标 `▏`」，只有追加字符与退格——没有光标下标、没有选区，
+    /// 点选 / 拖选 / ⌘A 全都不存在。现在换成框架的真实输入框，进入编辑时
+    /// 按 Finder 行为全选整条路径，直接敲字即可替换。
+    ///
+    /// 路径直接摆好而不是真去导航：`panel.path` 由异步回灌填充，headless 下
+    /// 不稳定；这里要测的是「拿 path 去预填 + 全选」这段我们自己的接线。
+    /// 用普通 `#[test]`：`#[gpui_kit::test]` 在 crate 内部展开会宏递归爆栈
+    /// （集成测试不受影响，见 `file_item.rs` 的同类注释）。
+    #[test]
+    fn address_edit_prefills_and_selects_the_whole_path() {
+        let mut cx = TestAppContext::single();
+        // 框架的 `InputState` 依赖 gpui-component 的 Theme 全局
+        // （生产环境由 `run()` 里的 `gpui_kit::init` 注册），测试里补上。
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let state = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                v.panel_mut().path = Some(PathBuf::from("/tmp/mo-address-test"));
+                v.begin_address_edit(window, cx);
+                v.panel()
+                    .address
+                    .clone()
+                    .expect("进入编辑态后应当已经建好输入框")
+            })
+        });
+
+        // **真的渲染一帧**：输入框的绘制路径（Theme 全局、点击/选区 overlay 等）
+        // 只有画出来才会暴露问题，只查状态不算数。
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let (value, selected) = cx.update(|_window, cx| {
+            let s = state.read(cx);
+            (s.value().to_string(), s.selected_value().to_string())
+        });
+
+        assert_eq!(value, "/tmp/mo-address-test", "地址栏没有预填当前路径");
+        assert_eq!(
+            selected, value,
+            "进入编辑态应当整条路径全选（选中能力就在这里）：value={value:?} selected={selected:?}"
+        );
+    }
+
+    /// Esc 与失焦都要退出编辑态（面包屑才回得来）。
+    #[test]
+    fn address_edit_ends_on_escape_and_blur() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let (after_enter, after_escape) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                v.begin_address_edit(window, cx);
+                let entered = v.panel().address_editing;
+                v.end_address_edit(cx);
+                (entered, v.panel().address_editing)
+            })
+        });
+        assert!(after_enter, "begin_address_edit 没有把面板切到编辑态");
+        assert!(!after_escape, "end_address_edit 没有退出编辑态");
+
+        // 再次进入必须复用同一个输入状态实体（不重建、不丢历史）。
+        let (first, second) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                v.begin_address_edit(window, cx);
+                let a = v.panel().address.clone();
+                v.end_address_edit(cx);
+                v.begin_address_edit(window, cx);
+                (a, v.panel().address.clone())
+            })
+        });
+        assert_eq!(first.map(|e| e.entity_id()), second.map(|e| e.entity_id()));
+    }
+
+    /// 右键菜单：浮层落点必须就是鼠标位置，并且**不能挤动**根容器的 flex 布局。
+    ///
+    /// 菜单是根容器的绝对定位子节点。绝对定位在 flex 容器里应当完全脱离文档流；
+    /// 一旦定位上下文没建好（根容器缺 `relative()`），它就会掉到别处，甚至参与
+    /// 布局把文件列表压小——这条测试同时守住这两点。
+    #[test]
+    fn context_menu_renders_at_the_pointer_without_disturbing_layout() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|window, cx| window.render_frame(cx));
+        let list_before = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_context_menu(None, 240.0, 300.0, 0, 0, cx)
+            });
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let menu = cx
+            .debug_bounds("mo-context-menu")
+            .expect("右键菜单没有渲染出来");
+        assert!(
+            (f32::from(menu.origin.x) - 240.0).abs() < 1.0
+                && (f32::from(menu.origin.y) - 300.0).abs() < 1.0,
+            "菜单没有落在鼠标位置上：menu={menu:?}（期望 240,300）"
+        );
+        assert_eq!(
+            menu.size.width,
+            px(crate::context_menu::MENU_W),
+            "菜单宽度被压缩了"
+        );
+        assert!(
+            menu.size.height > px(0.0),
+            "菜单高度为 0：条目没有渲染（绝对定位的高度塌了？）"
+        );
+
+        // 第一条菜单项要真的画出来了（否则菜单只是个空壳）。
+        assert!(
+            cx.debug_bounds("mo-ctx-label-0").is_some(),
+            "菜单第一项没有渲染"
+        );
+
+        let list_after = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+        assert_eq!(
+            list_before, list_after,
+            "右键菜单挤动了文件列表：绝对定位浮层不应当影响根容器的 flex 布局"
+        );
+    }
+
+    /// 贴着右下角打开时，菜单必须被钳回视口内（否则会被窗口边缘切掉）。
+    #[test]
+    fn context_menu_is_clamped_inside_the_viewport() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let (vw, vh) = cx.update(|window, _cx| {
+            let s = window.viewport_size();
+            (s.width.to_f64() as f32, s.height.to_f64() as f32)
+        });
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                // 故意越过右下角。
+                v.open_context_menu(None, vw - 2.0, vh - 2.0, 0, 0, cx);
+            });
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let menu = cx
+            .debug_bounds("mo-context-menu")
+            .expect("右键菜单没有渲染");
+        assert!(
+            f32::from(menu.origin.x + menu.size.width) <= vw,
+            "菜单右侧被切出视口：menu={menu:?} viewport={vw}x{vh}"
+        );
+        assert!(
+            f32::from(menu.origin.y + menu.size.height) <= vh,
+            "菜单底部被切出视口：menu={menu:?} viewport={vw}x{vh}"
+        );
+    }
+
+    /// 条目菜单比空白菜单长（多了打开 / 重命名 / 废纸篓…），且 Esc 能关掉。
+    #[test]
+    fn entry_menu_has_more_items_and_escape_closes_it() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let blank_h = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_context_menu(None, 100.0, 100.0, 0, 0, cx);
+                v.context_menu
+                    .as_ref()
+                    .map(|m| crate::context_menu::items(m).len())
+            })
+        });
+        let entry_items = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_context_menu(
+                    Some((PathBuf::from("/tmp/a.zip"), false)),
+                    100.0,
+                    100.0,
+                    0,
+                    0,
+                    cx,
+                );
+                crate::context_menu::items(v.context_menu.as_ref().unwrap()).len()
+            })
+        });
+
+        assert!(
+            entry_items > blank_h.unwrap(),
+            "条目菜单项数应当多于空白菜单：{entry_items} vs {blank_h:?}"
+        );
+
+        // Esc 走的是按键路由，这里直接验证关闭语义（按键分发在 headless 下不派发）。
+        let closed = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.close_context_menu(cx);
+                v.context_menu.is_none()
+            })
+        });
+        assert!(closed, "close_context_menu 没有清掉菜单");
+    }
 }

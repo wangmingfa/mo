@@ -319,3 +319,48 @@ fn quick_locations_contains_home_with_existing_paths() {
         assert!(p.exists(), "「{label}」的路径应存在: {}", p.display());
     }
 }
+
+/// 新建文本文件（右键菜单「新建文本文件」的落点）。
+///
+/// 三条不变量：新文件是**空的**；重名时加序号且序号插在**扩展名前**；
+/// 已有文件的内容**绝不**被动到（去重 + 底层 `create_new` 双保险）。
+#[test]
+fn create_file_is_empty_and_never_overwrites() {
+    let base = tree("newfile");
+    let app = AppState::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let first = app.create_file(&base, "新建文本.txt").await.unwrap();
+        assert_eq!(first.file_name().unwrap(), "新建文本.txt");
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"",
+            "新建的文本文件应当是空的"
+        );
+
+        // 重名 → 序号插在扩展名之前（`新建文本 2.txt`，而不是 `新建文本.txt 2`）。
+        let second = app.create_file(&base, "新建文本.txt").await.unwrap();
+        assert_eq!(second.file_name().unwrap(), "新建文本 2.txt");
+
+        // 手工往第一个文件里写点东西，再新建：它必须原封不动。
+        std::fs::write(&first, b"keep me").unwrap();
+        let third = app.create_file(&base, "新建文本.txt").await.unwrap();
+        assert_eq!(third.file_name().unwrap(), "新建文本 3.txt");
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"keep me",
+            "新建操作把已有文件覆盖了"
+        );
+
+        // 名字为空 / 全是空白 → 回落到默认名，而不是建一个叫 "   " 的文件。
+        let blank = app.create_file(&base, "   ").await.unwrap();
+        assert_eq!(blank.file_name().unwrap(), "新建文本 4.txt");
+
+        // 名字本来不冲突时不要平白加序号（`unique_path` 总从 2 起编号，
+        // 若无条件调用，首次新建就会变成「新建文件夹 2」）。
+        let dir = app.create_folder(&base, "").await.unwrap();
+        assert_eq!(dir.file_name().unwrap(), "新建文件夹");
+        assert!(dir.is_dir());
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
