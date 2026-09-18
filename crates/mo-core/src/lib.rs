@@ -15,6 +15,7 @@ pub mod event;
 pub mod file_id;
 pub mod metadata;
 pub mod navigation;
+pub mod rename;
 pub mod selection;
 pub mod view;
 
@@ -23,11 +24,12 @@ mod tests;
 
 pub use command::FileCommand;
 pub use directory::{Directory, DirectoryError, DirectoryId};
-pub use entry::{Entry, EntryKind, MetadataState, ThumbnailState};
+pub use entry::{Entry, EntryKind, LightEntry, MetadataState, ThumbnailState};
 pub use error::MoError;
 pub use event::{AppEvent, EventBus};
 pub use file_id::FileId;
 pub use metadata::{FileMetadata, Permissions};
 pub use navigation::{Location, NavigationState};
+pub use rename::{is_noop, plan_batch_rename, RenameSpec};
 pub use selection::SelectionModel;
 pub use view::{DirectoryView, SortKey};

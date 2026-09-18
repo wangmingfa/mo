@@ -619,19 +619,19 @@ cargo bench                # 性能基准（criterion）
 * [x] 基础文件操作
 * [x] 基础 UI
 * [x] 鼠标交互
-* [ ] 键盘交互（当前支持输入即过滤；方向键选择、快捷键待补）
-* [ ] ✨ 多标签页
-* [ ] ✨ 双栏 / 多窗格分栏视图
+* [x] 键盘交互（方向键选择 / Shift 连选、输入即过滤、⌘A 全选、⌘Z 撤销、⌘⇧P 命令面板）
+* [x] ✨ 多标签页（⌘T 新建、⌘W 关闭、⌘⇧[ / ⌘⇧] 切换）
+* [x] ✨ 双栏 / 多窗格分栏视图（⌘⇧D 开关，⌘⇧← / ⌘⇧→ 切换焦点）
 * [x] ✨ 前进 / 后退 历史导航
-* [ ] ✨ 书签 / 收藏夹 / 快速访问
+* [x] ✨ 书签 / 收藏夹 / 快速访问（侧边栏快捷位置 + 书签区，命令面板增删）
 * [x] ✨ 地址栏 / 面包屑路径导航
-* [ ] ✨ 多种视图模式（列表 / 网格 / 列视图 / 画廊）
-* [ ] ✨ 拖拽操作（含跨窗格拖拽）
-* [ ] ✨ 符号链接 / 软硬链接管理
-* [ ] ✨ 文件 / 文件夹属性与权限编辑
+* [x] ✨ 多种视图模式（列表 / 网格 / 列视图 / 画廊，⌘1..4 切换）
+* [x] ✨ 拖拽操作（拖到目录行复制；跨窗格拖到目标窗格；按住 ⌥ 改为移动）
+* [x] ✨ 符号链接 / 软硬链接管理（命令面板创建，硬链接仅文件，可撤销）
+* [x] ✨ 文件 / 文件夹属性与权限编辑（⌘I：名称 + 九位权限位）
 * [x] ✨ 回收站（移到废纸篓，而非永久删除）
-* [ ] ✨ 批量重命名
-* [ ] ✨ 压缩 / 解压（zip / 7z / tar 创建与解压）
+* [x] ✨ 批量重命名（查找替换 / 前后缀 / 序号，带实时预览）
+* [x] ✨ 压缩 / 解压（zip / tar / tar.gz 创建与解压；7z 不自带编码器，未支持）
 
 ### 第二阶段：性能
 
@@ -655,10 +655,10 @@ cargo bench                # 性能基准（criterion）
 * [x] 撤销 / 重做（⌘Z / ⇧⌘Z，操作历史驱动，移动 / 复制 / 删除均可逆）
 * [x] ✨ 快速预览（空格 Quick Look）
 * [x] ✨ 文件 / 文件夹比较（含 diff）
-* [ ] ✨ 终端集成（在当前目录打开终端）
+* [x] ✨ 终端集成（在当前目录打开终端：macOS iTerm / Terminal，Linux 六种终端，Windows cmd）
 * [x] ✨ 计算哈希 / 校验和（MD5 / SHA-1 / SHA-256，流式分块）
-* [ ] ✨ 磁盘空间分析 / 存储可视化
-* [ ] ✨ 文件标签 / 颜色标签
+* [x] ✨ 磁盘空间分析（当前目录子项递归统计，按大小排序）
+* [x] ✨ 文件标签 / 颜色标签（七色，列表显示色点，配置持久化）
 
 ### 第四阶段：自定义
 
@@ -692,9 +692,35 @@ cargo bench                # 性能基准（criterion）
 * [GPUI 布局与交互](devlog/gpui-layout-and-interaction.md)——flex 布局、uniform_list、元素 ID 与点击、双击、快捷键等
 * [macOS 平台层](devlog/macos-platform.md)——红绿灯定位、⌘Q、Dock 图标、objc FFI
 * [构建与依赖](devlog/build-and-lints.md)——future-incompat 补丁、workspace lints
+* [异步与运行时](devlog/async-runtime.md)——后台任务洪泛饿死 UI、取数落地前的有效性校验
 * [引擎逻辑与测试方法](devlog/engine-testing.md)——headless 布局测试、通用算法陷阱
 
 这类结论从零调试一遍往往要花掉几小时，但写下来只需几分钟——无论是后来的贡献者还是几个月后的自己，遇到同类问题时都可以直接查证。修好新的坑请随手追加到对应主题文件（格式见 [devlog/README.md](devlog/README.md)）。
+
+---
+
+## 🚀 发布版本
+
+版本号唯一真源是根 `Cargo.toml` 的 `[workspace.package].version`（各 crate 都是 `version.workspace = true`），发布只需一条命令：
+
+```bash
+./scripts/release-tag.sh patch          # 或 minor / major / 显式 x.y.z
+```
+
+脚本会依次：更新版本号 → 跑质量门禁（fmt / clippy / test，可用 `--skip-checks` 跳过）→ 提交 → 打 annotated tag → 推送。加 `--no-push` 则只在本机打 tag，自己确认后再推。
+
+tag 推送后 [`.github/workflows/release.yml`](.github/workflows/release.yml) 自动运行，为每个平台打包并创建 GitHub Release：
+
+| 平台 | 目标 | 产物 |
+| --- | --- | --- |
+| macOS | `aarch64-apple-darwin` / `x86_64-apple-darwin` | `Mo-<version>-<target>.zip`（内含可直接运行的 `Mo.app`） |
+| Linux | `x86_64-unknown-linux-gnu` | `Mo-<version>-<target>.tar.gz`（内含 `mo` 二进制） |
+| Windows | `x86_64-pc-windows-msvc` | `Mo-<version>-<target>.zip`（内含 `mo.exe`） |
+
+Release 里附带 `SHA256SUMS.txt`，release notes 由 GitHub 自动生成。也可以在 Actions 面板手动 Run workflow 并指定 tag 重新发布。
+
+> ⚠️ macOS 已本地验证；Linux / Windows 侧编译**尚未验证**，首次跑可能需要补齐系统依赖（详见 workflow 内注释）。
+> macOS 产出的应用包目前**没有签名与公证**，首次打开需右键 → 打开。
 
 ---
 
@@ -724,4 +750,4 @@ Mo 是一个开放项目。
 
 ## 📄 License
 
-本项目基于 [MIT License](https://opensource.org/licenses/MIT) 开源。
+本项目基于 [MIT License](LICENSE) 开源。

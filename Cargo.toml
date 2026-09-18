@@ -66,6 +66,12 @@ parking_lot = "0.12"
 # 用户目录（缓存 / 配置存放位置），跨平台
 dirs = "5"
 
+# 归档（压缩 / 解压）
+zip = "0.6"
+tar = "0.4"
+flate2 = "1"
+walkdir = "2"
+
 # 缩略图解码
 image = { version = "0.25", default-features = false, features = [
     "jpeg",

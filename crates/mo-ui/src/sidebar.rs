@@ -3,11 +3,17 @@ use std::path::Path;
 use gpui_kit::*;
 use mo_app::AppState;
 
+use crate::RootView;
+
 /// 侧边栏：快捷访问 / 书签。
 ///
 /// 位置由 [`AppState::quick_locations`] 提供（基于 `dirs` 解析，存在才显示），
 /// 点击即跳转；当前所在位置高亮（含子目录内）。
-pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl IntoElement {
+pub fn render(
+    app: &AppState,
+    current: &Option<std::path::PathBuf>,
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
     let locations = app.quick_locations();
     // 当前位置落在哪个快捷位置里（取匹配最深的一个）。
     let active = current.as_deref().and_then(|cur| {
@@ -79,6 +85,77 @@ pub fn render(app: &AppState, current: &Option<std::path::PathBuf>) -> impl Into
         });
 
         panel = panel.child(item.child(text!(label)));
+    }
+
+    // 书签区（`~/Library/Application Support/mo/config.json` 里的
+    // `sidebar_bookmarks`，命令面板「添加 / 移除书签」维护）。
+    let bookmarks = app.bookmarks();
+    if !bookmarks.is_empty() {
+        panel = panel.child(
+            div()
+                .px(px(10.0))
+                .pb(px(6.0))
+                .pt(px(10.0))
+                .text_size(px(11.0))
+                .text_color(crate::theme::muted())
+                .child(text!("书签")),
+        );
+    }
+    for (ix, path) in bookmarks.into_iter().enumerate() {
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let is_active = current.as_deref() == Some(path.as_path());
+        let app_click = app.clone();
+        let app_del = app.clone();
+        let entity_del = entity.clone();
+        let target = path.clone();
+        let del = path.clone();
+
+        let mut item = div()
+            .id(format!("sidebar-bm-{ix}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(if is_active {
+                crate::theme::accent()
+            } else {
+                crate::theme::text()
+            });
+        if is_active {
+            item = item.bg(crate::theme::selected_bg());
+        } else {
+            item = item.hover(|s| s.bg(crate::theme::hover_bg()));
+        }
+        item.interactivity().on_click(move |_, _window, cx| {
+            let app = app_click.clone();
+            let target = target.clone();
+            cx.spawn(async move |_cx| {
+                let _ = app.open_directory(&target).await;
+            })
+            .detach();
+        });
+
+        // 移除按钮：常显但弱化，避免为「悬停才出现」再引入一套 hover 状态。
+        let mut remove = div()
+            .id(format!("sidebar-bm-del-{ix}"))
+            .ml_auto()
+            .pl(px(6.0))
+            .text_size(px(12.0))
+            .text_color(crate::theme::muted())
+            .child(text!("✕".to_string()));
+        remove.interactivity().on_click(move |_, _window, cx| {
+            app_del.remove_bookmark(&del);
+            let e = entity_del.clone();
+            e.update(cx, |_, cx| cx.notify());
+        });
+
+        panel = panel.child(item.child(text!(label)).child(remove));
     }
 
     panel

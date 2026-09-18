@@ -30,13 +30,13 @@ use std::time::Duration;
 
 use mo_cache::MetadataCache;
 use mo_core::{
-    AppEvent, Directory, Entry, EventBus, FileId, FileMetadata, MetadataState, MoError,
+    AppEvent, Directory, Entry, EventBus, FileId, FileMetadata, LightEntry, MetadataState, MoError,
     NavigationState, SelectionModel, SortKey, ThumbnailState,
 };
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
-    CopyOperation, MoveOperation, OperationHandle, OperationManager, RestoreOperation,
-    SharedOperation, Trash, TrashEntry, TrashOperation,
+    CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle, OperationManager,
+    RenameOperation, RestoreOperation, SharedOperation, Trash, TrashEntry, TrashOperation,
 };
 use mo_preview::Preview;
 use mo_search::{crawl, FileIndex, SearchHit};
@@ -81,6 +81,8 @@ pub struct AppState {
     undo_stack: Arc<PlMutex<Vec<Reversible>>>,
     /// 重做栈：被撤销的操作暂存于此，重做后回到撤销栈。
     redo_stack: Arc<PlMutex<Vec<Reversible>>>,
+    /// 应用内剪贴板（⌘C / ⌘X / ⌘V 的文件复制与剪切）。
+    clipboard: Arc<Mutex<Option<Clipboard>>>,
 }
 
 /// Mo 的后台 runtime：进程级共享，永不释放。
@@ -148,6 +150,7 @@ impl AppState {
             trash,
             undo_stack: Arc::new(PlMutex::new(Vec::new())),
             redo_stack: Arc::new(PlMutex::new(Vec::new())),
+            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -514,6 +517,35 @@ impl AppState {
     }
 
     /// 设置名称过滤（快速搜索）。`None` 或空白表示不过滤。
+    /// 读取一个目录的轻量条目列表（列视图用）。
+    ///
+    /// 与 `load_path` 不同：它**不动主目录模型**（导航栈 / 选择 / 监听目标），
+    /// 只是给 UI 的一列提供名字与类型。读盘仍是阻塞 IO，走 blocking 池。
+    pub async fn list_dir(&self, path: &Path) -> Result<Vec<LightEntry>, MoError> {
+        let fs = self.fs.clone();
+        let p = path.to_path_buf();
+        let raw = self
+            .spawn_blocking(move || fs.read_dir_blocking(&p))
+            .await
+            .map_err(|e| MoError::Other(format!("列视图读取目录的任务失败：{e}")))??;
+        let mut out: Vec<LightEntry> = raw
+            .into_iter()
+            .map(|r| LightEntry {
+                name: r.name,
+                kind: r.kind,
+                path: r.path,
+            })
+            .collect();
+        // 目录在前、其余按名称（与列表视图的默认顺序一致）。
+        out.sort_by(|a, b| {
+            b.kind
+                .is_dir()
+                .cmp(&a.kind.is_dir())
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(out)
+    }
+
     pub async fn set_filter(&self, query: Option<String>) {
         {
             let mut inner = self.inner.write().await;
@@ -970,6 +1002,15 @@ impl AppState {
 
     async fn duplicate_selection(&self, dest: &Path, move_: bool) -> Vec<u64> {
         let paths = self.selection_paths().await;
+        self.transfer(paths, dest, move_).await
+    }
+
+    /// 把一批路径复制 / 移动到 `dest`（拖拽与剪贴板粘贴的公共实现）。
+    ///
+    /// 与 [`AppState::copy_selection`] 的区别：这里不读取当前选择，
+    /// 而是用调用方给的一批路径——拖拽时拖的可能是「选中集合」，
+    /// 也可能只是鼠标下那一行。
+    pub async fn transfer(&self, paths: Vec<PathBuf>, dest: &Path, move_: bool) -> Vec<u64> {
         let mut ids = Vec::new();
         for src in paths {
             let name = src
@@ -1206,5 +1247,406 @@ pub struct HistoryEntry {
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------- 标签与书签
+
+/// 可用标签颜色（Finder 标签 nc 七色）。
+pub const TAG_COLORS: [(&str, &str); 7] = [
+    ("red", "红"),
+    ("orange", "橙"),
+    ("yellow", "黄"),
+    ("green", "绿"),
+    ("blue", "蓝"),
+    ("purple", "紫"),
+    ("gray", "灰"),
+];
+
+/// 客户端剪贴板：记住一批路径以及「剪切（移动）」还是「复制」。
+///
+/// 与系统剪贴板无关：这里只在同一应用内传递文件引用，
+/// 粘贴时才真正落到操作队列（见 [`AppState::paste_clipboard`]）。
+#[derive(Debug, Clone)]
+pub struct Clipboard {
+    pub paths: Vec<PathBuf>,
+    /// true = 剪切（粘贴后移动），false = 复制。
+    pub cut: bool,
+}
+
+/// 磁盘用量的一行结果（某个子树的汇总）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirUsage {
+    pub path: PathBuf,
+    /// 递归总大小（字节）。
+    pub size: u64,
+    pub files: usize,
+    pub dirs: usize,
+}
+
+impl AppState {
+    /// 配置文件路径（`~/Library/Application Support/mo/config.json` 等）。
+    fn config_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("mo")
+            .join("config.json")
+    }
+
+    /// 读取配置；读不到就用默认配置（缓存不可用不影响启动）。
+    pub fn config(&self) -> mo_config::Config {
+        mo_config::Config::load(&Self::config_path()).unwrap_or_default()
+    }
+
+    fn save_config(&self, cfg: &mo_config::Config) {
+        if let Err(e) = cfg.save(&Self::config_path()) {
+            tracing::warn!("配置保存失败：{e}");
+        }
+    }
+
+    /// 侧边栏书签（含用户自己加的，去重且只保留仍在的目录）。
+    pub fn bookmarks(&self) -> Vec<PathBuf> {
+        self.config()
+            .sidebar_bookmarks
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// 加入书签（已在列表里则不重复添加）。
+    pub fn add_bookmark(&self, path: PathBuf) {
+        let mut cfg = self.config();
+        let s = path.to_string_lossy().to_string();
+        if cfg.sidebar_bookmarks.contains(&s) {
+            return;
+        }
+        cfg.sidebar_bookmarks.push(s);
+        self.save_config(&cfg);
+    }
+
+    /// 移除书签。
+    pub fn remove_bookmark(&self, path: &Path) {
+        let mut cfg = self.config();
+        let s = path.to_string_lossy().to_string();
+        cfg.sidebar_bookmarks.retain(|b| b != &s);
+        self.save_config(&cfg);
+    }
+
+    /// 全部标签：`路径 → 颜色名`。
+    pub fn tags(&self) -> std::collections::HashMap<PathBuf, String> {
+        self.config()
+            .tags
+            .iter()
+            .map(|(k, v)| (PathBuf::from(k), v.clone()))
+            .collect()
+    }
+
+    /// 给一个路径设置颜色标签；颜色名为空表示清除标签。
+    /// 查某个路径的颜色标签（没有则 `None`），供列表渲染色点。
+    pub fn tag_of(&self, path: &Path) -> Option<String> {
+        let key = path.to_string_lossy().to_string();
+        self.config()
+            .tags
+            .get(&key)
+            .cloned()
+            .filter(|c| !c.is_empty())
+    }
+
+    pub fn set_tag(&self, path: PathBuf, color: String) {
+        let mut cfg = self.config();
+        let key = path.to_string_lossy().to_string();
+        if color.is_empty() {
+            cfg.tags.remove(&key);
+        } else {
+            cfg.tags.insert(key, color);
+        }
+        self.save_config(&cfg);
+    }
+
+    /// 在当前目录打开终端（平台差异见实现）。
+    ///
+    /// 各平台的候选终端按优先级排列，逐个尝试直到 `spawn` 成功；
+    /// 全部失败时带上最后一个 OS 错误，方便排查「装了终端但拉不起来」。
+    pub fn open_terminal(&self, dir: &Path) -> Result<(), MoError> {
+        let plans = terminal_plans(dir);
+        let mut last = None;
+        for (prog, args) in plans {
+            match std::process::Command::new(&prog).args(&args).spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(MoError::Other(format!(
+            "未能打开终端：{}",
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "没有可用的终端程序".to_string())
+        )))
+    }
+}
+
+/// 各平台打开终端的候选命令（程序 + 参数），按优先级排列。
+///
+/// macOS 先检查 `.app` 是否真的存在，避免 `open -a iTerm` 在未安装时
+/// 静默弹出「找不到应用」的系统对话框。
+fn terminal_plans(dir: &Path) -> Vec<(String, Vec<String>)> {
+    let dir = dir.display().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        ["iTerm", "Terminal"]
+            .into_iter()
+            .filter(|app| {
+                let p1 = format!("/Applications/{app}.app");
+                let p2 = format!("/System/Applications/{app}.app");
+                std::path::Path::new(&p1).exists() || std::path::Path::new(&p2).exists()
+            })
+            .map(|app| {
+                (
+                    "open".to_string(),
+                    vec!["-a".to_string(), app.to_string(), dir.clone()],
+                )
+            })
+            .collect()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        vec![(
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                "cmd".to_string(),
+                "/K".to_string(),
+                "cd".to_string(),
+                "/D".to_string(),
+                dir,
+            ],
+        )]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        [
+            "x-terminal-emulator",
+            "gnome-terminal",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "xterm",
+        ]
+        .into_iter()
+        .map(|t| (t.to_string(), Vec::new()))
+        .collect()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = dir;
+        Vec::new()
+    }
+}
+
+impl AppState {
+    // ------------------------------------------------------------ 客户端剪贴板
+
+    /// 把当前选择复制进内部剪贴板（`cut = false`）。
+    pub async fn copy_selection_to_clipboard(&self) {
+        let paths = self.selection_paths().await;
+        if paths.is_empty() {
+            return;
+        }
+        *self.clipboard.lock().await = Some(Clipboard { paths, cut: false });
+    }
+
+    /// 把当前选择**剪切**进内部剪贴板（`cut = true`）。
+    pub async fn cut_selection_to_clipboard(&self) {
+        let paths = self.selection_paths().await;
+        if paths.is_empty() {
+            return;
+        }
+        *self.clipboard.lock().await = Some(Clipboard { paths, cut: true });
+    }
+
+    /// 粘贴：`dest` 为空时粘贴到当前目录。
+    pub async fn paste_clipboard(&self, dest: Option<PathBuf>) -> Vec<u64> {
+        let clip = self.clipboard.lock().await.clone();
+        let Some(clip) = clip else {
+            return Vec::new();
+        };
+        let dest = match dest.or(self.current_path().await) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let ids = if clip.cut {
+            // 逐个源项移动到目标目录下的同名位置，并记入历史 / 撤销栈，
+            // 这样「剪切 → 粘贴」也能被 ⌘Z 撤销（与 UI 里的移动走同一路径）。
+            let mut ids = Vec::new();
+            for src in &clip.paths {
+                let name = src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let to = dest.join(name);
+                let id = self.ops.lock().await.next_id();
+                let op: SharedOperation = MoveOperation::new(id, src.clone(), to.clone());
+                ids.push(self.submit_operation(op).await);
+                self.record_history("移动", vec![src.clone()], Some(dest.clone()));
+                self.push_reversible(Reversible::Move {
+                    from: src.clone(),
+                    to: to.clone(),
+                });
+            }
+            ids
+        } else {
+            self.copy_selection(&dest).await
+        };
+        // 剪切是一次性消耗品：粘贴后清空，避免二次粘贴重复执行。
+        if clip.cut {
+            *self.clipboard.lock().await = None;
+        }
+        ids
+    }
+
+    /// 磁盘用量分析：统计 `root` 的**每个直接子目录**的递归大小。
+    ///
+    /// 递归全在 blocking 池里完成——几万个文件的深度遍历若在 async worker
+    /// 上做，会把 UI 的补窗任务排在后面（大目录滚动闪烁就是这么来的）。
+    pub async fn analyze_usage(&self, root: PathBuf) -> Result<Vec<DirUsage>, MoError> {
+        let entries = self.list_dir(&root).await.unwrap_or_default();
+        let roots: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
+        self.spawn_blocking(move || {
+            let mut out = Vec::with_capacity(roots.len());
+            for p in roots {
+                let mut usage = DirUsage {
+                    path: p.clone(),
+                    size: 0,
+                    files: 0,
+                    dirs: 0,
+                };
+                if p.is_dir() {
+                    sum_dir(&p, &mut usage);
+                } else if let Ok(meta) = std::fs::metadata(&p) {
+                    usage.size = meta.len();
+                    usage.files = 1;
+                }
+                out.push(usage);
+            }
+            out.sort_by_key(|u| std::cmp::Reverse(u.size));
+            Ok(out)
+        })
+        .await
+        .map_err(|e| MoError::Other(format!("磁盘分析的后台任务失败：{e}")))?
+    }
+}
+
+/// 递归累加一个目录的大小（符号链接不跟随，避免环）。
+fn sum_dir(path: &Path, usage: &mut DirUsage) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            usage.dirs += 1;
+            sum_dir(&entry.path(), usage);
+        } else {
+            usage.files += 1;
+            usage.size += meta.len();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 新增能力入口
+
+impl AppState {
+    /// 创建链接：`link` 是指向 `target` 的链接路径。
+    /// 为当前选中项在同目录创建软 / 硬链接（`-符号链接` / `-硬链接` 后缀）。
+    ///
+    /// 硬链接对目录无效，失败项跳过；返回成功创建的个数。
+    pub async fn create_links(&self, hard: bool) -> usize {
+        let paths = self.selection_paths().await;
+        let suffix = if hard { "硬链接" } else { "符号链接" };
+        let mut ok = 0usize;
+        for src in paths {
+            let Some(parent) = src.parent().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let link = match src.extension() {
+                Some(ext) => {
+                    let stem = src
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    parent.join(format!("{stem}-{suffix}.{}", ext.to_string_lossy()))
+                }
+                None => parent.join(format!("{name}-{suffix}")),
+            };
+            if link.exists() {
+                continue;
+            }
+            self.create_link(src, link, hard).await;
+            ok += 1;
+        }
+        ok
+    }
+
+    pub async fn create_link(&self, target: PathBuf, link: PathBuf, hard: bool) -> u64 {
+        let id = self.ops.lock().await.next_id();
+        let kind = if hard {
+            LinkKind::Hardlink
+        } else {
+            LinkKind::Symlink
+        };
+        self.submit_operation(LinkOperation::new(id, target, link, kind))
+            .await
+    }
+
+    /// 修改权限位（如 0o644）；阻塞调用走 blocking 池。
+    pub async fn set_permissions(&self, path: PathBuf, mode: u32) -> Result<(), MoError> {
+        self.spawn_blocking(move || mo_operations::set_permissions(&path, mode))
+            .await
+            .map_err(|e| MoError::Other(format!("权限修改任务失败：{e}")))?
+    }
+
+    /// 批量重命名：`pairs` 为 (原路径, 新路径)，逐个提交重命名操作。
+    ///
+    /// 逆操作是「把新名改回旧名」，因此每一种情况都能被 ⌘Z 撤销。
+    pub async fn rename_many(&self, pairs: Vec<(PathBuf, PathBuf)>) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for (from, to) in pairs {
+            if from == to {
+                continue;
+            }
+            let id = self.ops.lock().await.next_id();
+            let op = RenameOperation::new(id, from.clone(), to.clone());
+            ids.push(self.submit_operation(op).await);
+            self.record_history("重命名", vec![from.clone()], Some(to.clone()));
+            self.push_reversible(Reversible::Move {
+                from: to.clone(),
+                to: from.clone(),
+            });
+        }
+        ids
+    }
+
+    /// 压缩：把 `sources` 打包到 `dest`（格式按后缀推断）。
+    pub async fn create_archive(
+        &self,
+        dest: PathBuf,
+        sources: Vec<PathBuf>,
+    ) -> Result<(), MoError> {
+        self.spawn_blocking(move || mo_operations::create_archive(&dest, &sources))
+            .await
+            .map_err(|e| MoError::Other(format!("压缩任务失败：{e}")))?
+    }
+
+    /// 解压：把 `archive` 解到 `dest`，返回解出的条目数。
+    pub async fn extract_archive(&self, archive: PathBuf, dest: PathBuf) -> Result<usize, MoError> {
+        self.spawn_blocking(move || mo_operations::extract_archive(&archive, &dest))
+            .await
+            .map_err(|e| MoError::Other(format!("解压任务失败：{e}")))?
     }
 }

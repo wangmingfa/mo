@@ -45,6 +45,7 @@ impl FileSystem for LocalFileSystem {
             permissions: Permissions {
                 readonly: m.permissions().readonly(),
                 hidden: false,
+                mode: unix_mode(&m),
             },
         })
     }
@@ -63,5 +64,19 @@ impl FileSystem for LocalFileSystem {
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
         std::fs::rename(from, to).map_err(MoError::Io)
+    }
+}
+
+/// 取 unix 权限位（低 9 位）；非 unix 平台返回 0。
+fn unix_mode(m: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        0
     }
 }

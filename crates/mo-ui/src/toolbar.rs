@@ -4,6 +4,7 @@ use gpui_kit::*;
 use mo_app::AppState;
 
 use crate::icons::{self, icon};
+use crate::panel::ViewMode;
 use crate::theme;
 use crate::RootView;
 
@@ -35,6 +36,7 @@ pub fn render(
     path: &Option<PathBuf>,
     address_editing: bool,
     address_input: &str,
+    view_mode: ViewMode,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -80,6 +82,8 @@ pub fn render(
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
+        // 视图模式：点击在列表 / 网格 / 画廊 / 列视图之间循环。
+        .child(view_mode_button(view_mode, entity))
         // 视觉配平：右侧留白与左侧间距一致。
         .child(div().w(px(4.0)))
 }
@@ -285,4 +289,29 @@ fn icon_button(
     } else {
         button.opacity(0.35).child(icon(data, 16.0, theme::muted()))
     }
+}
+
+/// 视图模式按钮：显示当前模式名，点击切到下一个模式。
+fn view_mode_button(mode: ViewMode, entity: &Entity<RootView>) -> Stateful<Div> {
+    let next = mode.next();
+    let mut button = div()
+        .id("view-mode")
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(8.0))
+        .h(px(28.0))
+        .rounded(px(6.0))
+        .flex_shrink_0()
+        .text_size(px(12.0))
+        .text_color(theme::muted())
+        .hover(|s| s.bg(theme::hover_bg()));
+    let cycle = entity.clone();
+    button.interactivity().on_click(move |_, _window, cx| {
+        cycle.update(cx, |v, cx| {
+            v.panel_mut().view_mode = next;
+            cx.notify();
+        });
+    });
+    button.child(text!(mode.label().to_string()))
 }

@@ -5,7 +5,7 @@ use mo_core::{Entry, MetadataState, ThumbnailState};
 ///
 /// 缩略图来自 `mo-thumbnails` 生成的磁盘缓存；GPUI 可以直接从文件路径加载图片，
 /// 因此这里只需把缓存路径交给 `img()`——领域层不必知道任何 UI 类型。
-pub fn view(entry: &Entry, _selected: bool) -> impl IntoElement {
+pub fn view(entry: &Entry, _selected: bool, tag: Option<String>) -> impl IntoElement {
     let icon = match entry.kind {
         mo_core::EntryKind::Directory => "📁",
         mo_core::EntryKind::File => "📄",
@@ -52,6 +52,18 @@ pub fn view(entry: &Entry, _selected: bool) -> impl IntoElement {
         ThumbnailState::Loading => row.child(icon_slot(text!("⏳".to_string()).into_any_element())),
         _ => row.child(icon_slot(text!(icon.to_string()).into_any_element())),
     };
+
+    // 颜色标签（Finder 式）：有标签时文件名前显示一个色点。
+    if let Some(color) = tag {
+        row = row.child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .flex_shrink_0()
+                .rounded(px(4.0))
+                .bg(crate::dialogs::tag_color(&color)),
+        );
+    }
 
     row = row.child(
         div()
@@ -124,7 +136,7 @@ mod tests {
                 .h(px(24.0))
                 .p(px(4.0))
                 .debug_selector(|| "mo-probe-row".to_string())
-                .child(view(&self.0, false))
+                .child(view(&self.0, false, None))
         }
     }
 

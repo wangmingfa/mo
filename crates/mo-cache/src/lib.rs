@@ -151,6 +151,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> Result<FileMetadata, MoError> {
         modified: from_secs(modified),
         created: from_secs(created),
         permissions: Permissions {
+            mode: 0,
             readonly: readonly != 0,
             hidden: false,
         },
@@ -168,6 +169,7 @@ fn row_to_metadata_offset(row: &rusqlite::Row) -> Result<FileMetadata, MoError> 
         modified: from_secs(modified),
         created: from_secs(created),
         permissions: Permissions {
+            mode: 0,
             readonly: readonly != 0,
             hidden: false,
         },

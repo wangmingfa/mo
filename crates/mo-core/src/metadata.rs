@@ -19,4 +19,6 @@ pub struct FileMetadata {
 pub struct Permissions {
     pub readonly: bool,
     pub hidden: bool,
+    /// unix 权限位（低 9 位，如 0o644）；非 unix 平台恒为 0。
+    pub mode: u32,
 }

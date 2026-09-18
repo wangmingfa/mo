@@ -32,6 +32,7 @@ fn make_items(n: usize) -> Vec<(FileId, FileMetadata)> {
                     permissions: Permissions {
                         readonly: false,
                         hidden: false,
+                        mode: 0o644,
                     },
                 },
             )

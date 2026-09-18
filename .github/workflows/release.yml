@@ -1,0 +1,161 @@
+# Mo 发布流水线：打 tag → 各平台打包 → 创建 GitHub Release。
+#
+# 触发方式（二选一）：
+#   1. 本地跑 scripts/release-tag.sh 创建并推送 tag（如 v0.1.0），自动触发本流程；
+#   2. GitHub Actions 面板手动 Run workflow，填要发布的 tag。
+#
+# 产物命名：Mo-<version>-<target>.zip / .tar.gz，macOS 产出的是可直接运行的
+# Mo.app 应用包（内容放在 zip 里）。签名与公证尚未接入，见 README 的发布小节。
+#
+# ⚠️ 平台状态：macOS 是本地验证过的；Linux / Windows 侧 GPUI 有官方平台后端，
+# 但本项目在这两个系统上**尚未验证过编译**，首次跑可能因为缺系统依赖失败。
+# 失败时看对应 job 日志补齐依赖即可（Linux 最可能需要补 X11/Wayland dev 包）。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的 tag（如 v0.1.0）
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # dispatch 时 GITHUB_REF_NAME 是分支名，因此统一走这个表达式取 tag。
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      # 一个平台失败不影响其它平台出包（发布 job 会明确看到哪些产物缺失）。
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            format: app
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            format: app
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            format: bin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            format: bin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: meta
+        shell: bash
+        run: |
+          version="${TAG#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "package=Mo-${version}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      - name: 安装 Rust toolchain（stable + 目标平台）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # GPUI 在 Linux 上需要 X11 / Wayland / 音频等系统库。
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libx11-dev libxcb1-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libasound2-dev libudev-dev libvulkan1
+
+      - name: 构建 release 二进制
+        # --locked：依赖版本由已入库的 Cargo.lock 锁定，产物可复现。
+        # 若这里报 "the lock file needs to be updated"，说明 Cargo.lock 与
+        # Cargo.toml 不同步，本地跑一次 cargo metadata 后重新提交即可。
+        run: cargo build --release --locked --package mo-ui --target ${{ matrix.target }}
+
+      # ---- macOS：打成可直接运行的 Mo.app（二进制 + Info.plist + icns）----
+      - name: 打包 macOS 应用包
+        if: matrix.format == 'app'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          dist="${{ github.workspace }}/dist"
+          app="$dist/Mo.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Resources"
+          cp "target/$target/release/mo" "$app/MacOS/mo"
+          cp assets/Mo.icns "$app/Resources/Mo.icns"
+          # Info.plist 模板里用 __VERSION__ 占位，打包时替换成真实版本号。
+          # 之所以用模板文件而不是 heredoc：heredoc 的结束符必须顶格，
+          # 而 YAML 的 block scalar 要求正文全部缩进，两者无法同时满足。
+          cp assets/macos/Info.plist "$app/Info.plist"
+          sed -i.bak "s/__VERSION__/${{ steps.meta.outputs.version }}/g" "$app/Info.plist"
+          rm -f "$app/Info.plist.bak"
+          cd "$dist"
+          zip -q -r -y "${{ github.workspace }}/${{ steps.meta.outputs.package }}.zip" Mo.app
+
+      # ---- Linux：二进制打进 tar.gz ----
+      - name: 打包 Linux 压缩包
+        if: runner.os == 'Linux'
+        run: tar czf "${{ steps.meta.outputs.package }}.tar.gz" -C target/${{ matrix.target }}/release mo
+
+      # ---- Windows：PowerShell 打 zip ----
+      - name: 打包 Windows 压缩包
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path target/${{ matrix.target }}/release/mo.exe `
+            -DestinationPath "${{ steps.meta.outputs.package }}.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package }}
+          path: ${{ steps.meta.outputs.package }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 下载全部平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd artifacts
+          sha256sum ./* > SHA256SUMS.txt
+          ls -la
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Mo ${{ env.TAG }}
+          files: |
+            artifacts/*
+          generate_release_notes: true

@@ -1,12 +1,8 @@
-use std::ops::Range;
-
+use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
-use mo_app::AppState;
 
+use crate::listing::BUFFER;
 use crate::RootView;
-
-/// 可见区上下各多取这么多行：滚动时不会频繁出现占位，又不会一次抓太多。
-const BUFFER: usize = 100;
 
 /// 文件列表：`UniformList` 虚拟化 + 窗口懒加载。
 ///
@@ -17,99 +13,49 @@ const BUFFER: usize = 100;
 ///   虚拟化的收益会被全部吃掉。
 ///
 /// 滚出窗口的行先显示占位，异步取回后自动补上。
-pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
+///
+/// 滚动条：`UniformListScrollHandle` 同时驱动滚轮与 `Scrollbar::vertical`
+/// 覆盖层（它实现了 `ScrollbarHandle`）。handle 由面板持有——
+/// 每帧新建会把滚动位置清零。
+///
+/// `pane` / `tab` 指明渲染的是哪个标签页：多标签页与分栏共享同一个实现。
+pub fn render(
+    entity: &Entity<RootView>,
+    pane: usize,
+    tab: usize,
+    count: usize,
+    scroll: &UniformListScrollHandle,
+) -> impl IntoElement {
     let entity = entity.clone();
-    uniform_list("mo-file-list", count, move |range, _window, cx| {
+    let list = uniform_list("mo-file-list", count, move |range, _window, cx| {
         let need_start = range.start.saturating_sub(BUFFER);
         let need_end = (range.end + BUFFER).min(count);
 
-        // 1) 判断当前窗口是否覆盖可见区，不覆盖则记下要补的范围。
-        //
-        // ⚠️ gpui 的 uniform_list 每帧会用**单行 range** 调用本闭包多次
-        // （request_layout / prepaint 各一次 measure_item，测第 0 行算行高），
-        // 然后才用真实可见区调用一次。这些测量调用绝不能触发补窗副作用：
-        // 否则测量请求（如 0..1）与真实请求（如 102..333）各自 spawn 的 fetch
-        // 落地时互相覆盖 window，形成每帧两个 fetch 交替的 ping-pong 死循环
-        // —— 窗口永远不收敛，可见区一半时间无内容，整屏占位符疯狂闪烁。
-        // 真实可见区至少两行（视口高度 ≥ 2 行），len() <= 1 只可能是测量调用。
-        let mut request: Option<(AppState, Range<usize>)> = None;
-        if range.len() > 1 {
-            entity.update(cx, |v, _cx| {
-                let covered = !v.window.is_empty()
-                    && need_start >= v.window_start
-                    && need_end <= v.window_start + v.window.len();
-                if !covered && v.pending.as_ref() != Some(&(need_start..need_end)) {
-                    v.pending = Some(need_start..need_end);
-                    request = Some((v.app.clone(), need_start..need_end));
-                }
-            });
-        }
-
-        // 2) 异步补窗口（只取这一屏），顺带为可见条目请求缩略图。
-        if let Some((app, r)) = request {
-            let this = entity.clone();
-            let app_task = app.clone();
-            tracing::info!(
-                target: "mo_ui::window",
-                need = ?r, visible = ?range, "fetch spawn"
-            );
-            let spawned = std::time::Instant::now();
-            cx.spawn(async move |cx| {
-                let (dir_path, start, entries) = app.visible_window(r.clone()).await;
-                let elapsed = spawned.elapsed().as_millis();
-                let for_thumbs = entries.clone();
-                this.update(cx, |v, cx| {
-                    // 取回在途时可能已切换目录：旧目录的快照不能覆盖新目录的窗口。
-                    // 请求本身已随旧目录作废，匹配的 pending 一并清掉，
-                    // 否则新目录若发出同范围请求会被残留的 pending 吞掉。
-                    if v.path.as_deref() != Some(dir_path.as_path()) {
-                        tracing::warn!(
-                            target: "mo_ui::window",
-                            need = ?r, got = ?dir_path, want = ?v.path, "fetch rejected: dir mismatch"
-                        );
-                        if v.pending.as_ref() == Some(&r) {
-                            v.pending = None;
-                        }
-                        return;
-                    }
-                    v.window_start = start;
-                    v.window = entries;
-                    // 只清除与自己请求匹配的 pending：期间用户可能又滚动了、
-                    // 渲染闭包已发出新范围的请求，那个请求不能被吞掉。
-                    let cleared = v.pending.as_ref() == Some(&r);
-                    if cleared {
-                        v.pending = None;
-                    }
-                    tracing::info!(
-                        target: "mo_ui::window",
-                        need = ?r, win_start = start, win_len = v.window.len(),
-                        elapsed_ms = elapsed, cleared_pending = cleared, "fetch done"
-                    );
-                    cx.notify();
-                });
-                // 只为进入窗口的条目生成缩略图，绝不「打开目录就全量生成」。
-                app_task.thumbs().request(app_task.clone(), for_thumbs);
-            })
-            .detach();
-        }
+        // 1) 保证窗口覆盖可见区，不覆盖则异步补窗（内部会跳过行的测量调用）。
+        crate::listing::ensure_window(&entity, pane, tab, need_start, need_end, &range, cx);
 
         // 3) 渲染：只从窗口快照里取行。
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         let view = entity.read(cx);
-        if range
-            .clone()
-            .any(|i| view.window.get(i.wrapping_sub(view.window_start)).is_none())
-        {
+        let Some(panel) = view.panel_at(pane, tab) else {
+            return rows;
+        };
+        if range.clone().any(|i| {
+            panel
+                .window
+                .get(i.wrapping_sub(panel.window_start))
+                .is_none()
+        }) {
             tracing::debug!(
                 target: "mo_ui::window",
-                range = ?range, win_start = view.window_start,
-                win_len = view.window.len(), pending = ?view.pending,
+                pane, tab, range = ?range, win_start = panel.window_start,
+                win_len = panel.window.len(), pending = ?panel.pending,
                 count, "rendering placeholder rows"
             );
         }
-        let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         for i in range.clone() {
-            let offset = i.wrapping_sub(view.window_start);
-            let Some(entry) = view.window.get(offset) else {
+            let offset = i.wrapping_sub(panel.window_start);
+            let Some(entry) = panel.window.get(offset) else {
                 rows.push(
                     div()
                         .flex()
@@ -125,14 +71,15 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
 
             let id = entry.id;
             let entry_path = entry.path.clone();
-            let selected = view.selection.is_selected(&id);
+            let selected = panel.selection.is_selected(&id);
+            let is_dir = entry.kind.is_dir();
             let entity_click = entity.clone();
 
             // ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
             // 无 ID 的裸 div 拿不到 state，on_click 回调永远不会注册。
             // 用全列表绝对索引保证滚动后 ID 稳定。
             let mut row = div()
-                .id(("file-row", i))
+                .id(format!("file-row-{pane}-{tab}-{i}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -160,18 +107,45 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
                     return;
                 }
                 // 单击：本地立即反馈，再异步同步 app 侧（app 侧是唯一事实来源）。
-                let app = entity_click.update(cx, |v, _cx| {
-                    v.selection.toggle(id);
-                    v.app.clone()
-                });
+                let Some((app, selected_app)) = entity_click.update(cx, |v, _cx| {
+                    let p = v.panel_at_mut(pane, tab)?;
+                    p.selection.toggle(id);
+                    Some((p.app.clone(), id))
+                }) else {
+                    return;
+                };
                 cx.spawn(async move |_cx| {
-                    app.toggle(id).await;
+                    app.toggle(selected_app).await;
                 })
                 .detach();
             });
 
+            // 拖拽：按下记源、抬起结算。跨窗格拖拽落在别处时由窗格级兜底。
+            let entity_down = entity.clone();
+            let down_path = entry.path.clone();
+            row.interactivity()
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    entity_down.update(cx, |v, _cx| {
+                        v.begin_drag(pane, tab, down_path.clone(), id);
+                    });
+                });
+            let entity_up = entity.clone();
+            let up_path = entry.path.clone();
+            row.interactivity()
+                .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
+                    // 按住 ⌥（Windows / Linux 上是 Alt）拖 = 移动，否则复制。
+                    let alt = ev.modifiers.alt;
+                    entity_up.update(cx, |v, cx| {
+                        v.drop_on_entry(pane, tab, up_path.clone(), is_dir, alt, cx);
+                    });
+                });
+
+            let tag_color = view
+                .panel_at(pane, tab)
+                .map(|p| p.app.clone())
+                .and_then(|app| app.tag_of(&entry.path));
             rows.push(
-                row.child(crate::file_item::view(entry, selected))
+                row.child(crate::file_item::view(entry, selected, tag_color))
                     .into_any_element(),
             );
         }
@@ -181,6 +155,21 @@ pub fn render(entity: &Entity<RootView>, count: usize) -> impl IntoElement {
     // 看到的是「没有子节点」的元素，身高算出来是 0。不显式给它确定高度
     // （flex_1 / size_full / h(...)），整个文件列表就会被压成 0 高。
     .flex_1()
+    // 列表左右留白：行 hover 背景不顶到窗口边缘（Finder 式呼吸感）。
+    .px(px(12.0))
+    // 滚轮 / 触控板滚动经此 handle 走，滚动条拖动也写回同一 handle。
+    .track_scroll(scroll)
     // 测试用：让 tests/layout.rs 能读到这个元素的实际尺寸（release 下 no-op）。
-    .debug_selector(|| "mo-file-list".to_string())
+    .debug_selector(|| "mo-file-list".to_string());
+
+    // 滚动条作为兄弟节点覆盖在列表右侧（容器 relative），
+    // 与 gpui-component List 的做法一致：overlay 而非挤压内容宽度。
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .child(list)
+        .child(Scrollbar::vertical(scroll))
 }

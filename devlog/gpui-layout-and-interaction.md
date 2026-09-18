@@ -82,3 +82,14 @@
 * **根因**：gpui 的 `uniform_list` **每帧用单行 range 调用 items 闭包多次**来测量行高（`measure_item` 在 request_layout 与 prepaint 各调一次，渲染 `item_to_measure_index..+1` 即默认 `0..1`），之后再以真实可见区调用一次。若 items 闭包里有「判断窗口不覆盖 → spawn 补窗」这类副作用，测量调用发出的请求与真实请求范围不相交，两次 fetch 落地时**先后覆盖同一份 window**，下一帧谁都覆盖不了对方的需求 → ping-pong 死循环。
 * **修法**：`range.len() <= 1` 时跳过所有补窗副作用（不设 pending、不 spawn），只渲染行。真实可见区至少两行，单行 range 只可能是测量调用。核心原则：**items 闭包必须是幂等渲染 + 无跨调用干扰的副作用**；确需副作用时先识别测量调用并跳过。
 * **排查方法**：`RUST_LOG=mo_ui=debug cargo run 2> /tmp/mo.log` 跑一次复现，看 fetch spawn/done 的 need 范围是否每帧重复交替——是，即此坑。
+
+## 14. gpui 0.3.5 没有原生拖放 API —— 拖拽只能自己用鼠标事件拼
+
+* **现象**：想实现「跨窗格拖拽文件」，在 gpui 里找不到 `on_drop` / `on_file_drop` / `DropEvent`，`grep` 整个 `gpui-pre-0.3.5` 源码也没有。
+* **根因**：0.3.5 的交互层只有鼠标 / 键盘事件，没有 drag-and-drop 抽象；系统级文件拖入（从 Finder 拖进来）同样无法接入。
+* **修法**：用 `on_mouse_down` + `on_mouse_up` 自己拼一套**应用内拖拽**：
+  * 行上按下 → `begin_drag()` 记录 `DragState { pane, tab, paths }`（行已选中且多选时拖整个选中集合，否则只拖这一行）；
+  * 行上抬起 → `drop_on_entry()`：目标是目录就复制进去，原地按下抬起视为普通点击直接丢弃，跨窗格但落在非目录行上则**把 DragState 放回去**；
+  * 窗格容器上抬起 → `drop_on_pane()`：跨窗格时落到该窗格的当前目录。
+* **关键点**：事件是「内层 → 外层」冒泡，所以**行先于窗格**执行；行处理不了时必须把状态放回去，否则窗格级永远收不到。另外按住 ⌥ 抬起来切换「复制 / 移动」语义（`ev.modifiers.alt`）。
+* **副作用提醒**：外部文件拖入（OS → 应用）在本代框架下做不了，README 里不要写「支持从 Finder 拖入」。

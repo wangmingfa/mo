@@ -19,6 +19,7 @@ fn meta(size: u64, secs: u64) -> FileMetadata {
         permissions: Permissions {
             readonly: false,
             hidden: false,
+            mode: 0o644,
         },
     }
 }

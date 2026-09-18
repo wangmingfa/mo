@@ -3,6 +3,7 @@
 //! 配置项刻意保持精简，后续随自定义系统扩展（主题、布局、快捷键、预览方式等）。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// 应用配置。
@@ -13,7 +14,11 @@ pub struct Config {
     /// 是否显示隐藏文件。
     pub show_hidden: bool,
     /// 侧边栏书签（路径字符串）。
+    #[serde(default)]
     pub sidebar_bookmarks: Vec<String>,
+    /// 文件标签：路径字符串 → 颜色名（见 `mo_app::TAG_COLORS`）。
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
 }
 
 impl Config {

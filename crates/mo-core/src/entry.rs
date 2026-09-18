@@ -137,3 +137,14 @@ pub fn image_extension(name: &str) -> Option<String> {
     }
     Some(ext.to_ascii_lowercase())
 }
+
+/// 轻量条目：只有 UI 渲染一列所需要的最小信息（列视图用）。
+///
+/// 与 [`Entry`] 的区别：不带 `FileId` / 元数据 / 缩略图状态——
+/// 列视图直接读盘拿名字和类型即可，没必要塞进主目录模型。
+#[derive(Debug, Clone)]
+pub struct LightEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    pub path: PathBuf,
+}
