@@ -15,6 +15,8 @@
 
 mod controller;
 mod metadata;
+/// 系统 shell 集成（默认打开 / 打开方式）。
+pub mod shell;
 mod thumbnail;
 
 pub use controller::DirectoryController;
@@ -292,9 +294,7 @@ impl AppState {
             // Windows：盘符根（C:\）的上一级是「此电脑」虚拟根（空路径哨兵，
             // 见 mo-fs 的 list_drives），与资源管理器行为一致。
             #[cfg(target_os = "windows")]
-            if !p.as_os_str().is_empty()
-                && p.parent().is_none_or(|parent| parent == p)
-            {
+            if !p.as_os_str().is_empty() && p.parent().is_none_or(|parent| parent == p) {
                 return self.open_directory(Path::new("")).await;
             }
             if let Some(parent) = p.parent() {
@@ -304,6 +304,39 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// 用系统默认应用打开文件（资源管理器双击语义）。
+    pub async fn open_with_system(&self, path: &Path) -> Result<(), String> {
+        let p = path.to_path_buf();
+        self.spawn_blocking(move || shell::open_default(&p))
+            .await
+            .map_err(|e| format!("打开任务失败：{e}"))?
+    }
+
+    /// 枚举该文件的「打开方式」候选应用（读注册表，放 blocking 线程）。
+    pub async fn open_with_candidates(&self, path: &Path) -> Vec<shell::OpenWithApp> {
+        let p = path.to_path_buf();
+        self.spawn_blocking(move || shell::open_with_candidates(&p))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 用「打开方式」里选中的应用打开文件。
+    pub async fn open_with_app(&self, path: &Path, progid: &str) -> Result<(), String> {
+        let p = path.to_path_buf();
+        let progid = progid.to_string();
+        self.spawn_blocking(move || shell::open_with_progid(&p, &progid))
+            .await
+            .map_err(|e| format!("打开任务失败：{e}"))?
+    }
+
+    /// 弹出系统的「打开方式」选择对话框。
+    pub async fn open_with_dialog(&self, path: &Path) -> Result<(), String> {
+        let p = path.to_path_buf();
+        self.spawn_blocking(move || shell::open_with_dialog(&p))
+            .await
+            .map_err(|e| format!("打开任务失败：{e}"))?
     }
 
     /// 后退（基于导航栈，只加载不改写历史）。

@@ -20,5 +20,15 @@ anyhow.workspace = true
 tracing.workspace = true
 dirs.workspace = true
 
+# Windows shell 集成（默认打开 / 打开方式）：ShellExecute 系列 FFI + 注册表枚举。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
+winreg = "0.55"
+
 [lints]
 workspace = true

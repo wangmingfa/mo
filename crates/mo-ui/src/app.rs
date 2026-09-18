@@ -362,6 +362,10 @@ pub struct RootView {
     pub(crate) header_cells_owner: (usize, usize),
     /// 右键上下文菜单（一次只开一个；`None` = 关闭）。
     pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
+    /// 「打开方式」二级菜单的候选应用（菜单打开时对文件目标异步查询注册表）。
+    pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
+    /// 「打开方式」二级菜单是否展开（hover 驱动）。
+    pub(crate) ctx_submenu_open: bool,
 }
 
 /// 一次表头拖动：要么在调列宽，要么在调列序。
@@ -430,6 +434,8 @@ impl RootView {
             header_cells: Vec::new(),
             header_cells_owner: (0, 0),
             context_menu: None,
+            open_with_apps: Vec::new(),
+            ctx_submenu_open: false,
         };
 
         let weak = cx.entity().downgrade();
@@ -741,16 +747,15 @@ impl RootView {
             })
             .detach();
         } else {
-            match self.app().preview(&path) {
-                Ok(pv) => {
-                    self.preview_cache = Some(pv);
-                    self.modal = Modal::QuickLook;
+            // 文件：用**系统默认应用**打开（资源管理器双击语义）。预览仍可
+            // 用空格键 / 右键菜单「快速查看」，不再被双击挤占。
+            let app = self.app();
+            cx.spawn(async move |_weak, _cx| {
+                if let Err(e) = app.open_with_system(&path).await {
+                    tracing::warn!("打开 {path:?} 失败：{e}");
                 }
-                Err(e) => {
-                    self.modal = Modal::Info(format!("无法预览 {path:?}：{e}"));
-                }
-            }
-            cx.notify();
+            })
+            .detach();
         }
     }
 
@@ -1379,17 +1384,53 @@ impl RootView {
         self.context_menu = Some(crate::context_menu::ContextMenu {
             x,
             y,
-            target: target_path,
+            target: target_path.clone(),
             is_dir,
             selected: paths.len(),
             paths,
         });
+        self.ctx_submenu_open = false;
+
+        // 文件目标：异步查「打开方式」候选应用（读注册表），回来后二级菜单可用。
+        match target_path.filter(|_| !is_dir) {
+            Some(p) => {
+                self.open_with_apps.clear();
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    let apps = app.open_with_candidates(&p).await;
+                    this.update(cx, |v, cx| {
+                        v.open_with_apps = apps;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            None => self.open_with_apps.clear(),
+        }
         cx.notify();
     }
 
     /// 关闭右键菜单（点空白 / Esc / 执行完动作）。
     pub(crate) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
+            self.ctx_submenu_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 展开「打开方式」二级菜单（hover 触发；已展开则幂等）。
+    pub(crate) fn open_ctx_submenu(&mut self, cx: &mut Context<Self>) {
+        if !self.ctx_submenu_open {
+            self.ctx_submenu_open = true;
+            cx.notify();
+        }
+    }
+
+    /// 收起「打开方式」二级菜单。
+    pub(crate) fn close_ctx_submenu(&mut self, cx: &mut Context<Self>) {
+        if self.ctx_submenu_open {
+            self.ctx_submenu_open = false;
             cx.notify();
         }
     }
@@ -1452,6 +1493,40 @@ impl RootView {
                 let this = cx.entity().clone();
                 cx.spawn(async move |_weak, cx| {
                     open_quick_look(&app, &this, cx).await;
+                })
+                .detach();
+            }
+            A::OpenWith(idx) => {
+                // 用二级菜单里选中的应用打开：ProgID 在候选列表里按序号取。
+                let Some(p) = target else { return };
+                let Some(app_item) = self.open_with_apps.get(idx) else {
+                    return;
+                };
+                let progid = app_item.progid.clone();
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    if let Err(e) = app.open_with_app(&p, &progid).await {
+                        this.update(cx, |v, cx| {
+                            v.modal = Modal::Info(format!("打开失败：{e}"));
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            A::OpenWithOther => {
+                // 系统的「打开方式」选择对话框（openas 动词）。
+                let Some(p) = target else { return };
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    if let Err(e) = app.open_with_dialog(&p).await {
+                        this.update(cx, |v, cx| {
+                            v.modal = Modal::Info(format!("打开失败：{e}"));
+                            cx.notify();
+                        });
+                    }
                 })
                 .detach();
             }
@@ -2097,13 +2172,14 @@ impl Render for RootView {
         // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
         // 用窗口坐标直接当偏移量——根容器从 (0, 0) 铺满窗口，两者同一套坐标系。
         if let Some(menu) = self.context_menu.clone() {
-            let items = crate::context_menu::items(&menu);
+            let items = crate::context_menu::items(&menu, &self.open_with_apps);
             let vs = window.viewport_size();
             root = root.child(crate::context_menu::render(
                 &menu,
                 &items,
                 (vs.width.to_f64() as f32, vs.height.to_f64() as f32),
                 &entity,
+                self.ctx_submenu_open,
             ));
         }
 
@@ -3124,12 +3200,14 @@ fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
         .border_b_1()
         .border_color(theme::separator())
         .text_color(theme::accent())
-        .child(text!(id = format!("filter-q-{pane}"), format!("🔍 {}", query)))
-        .child(
-            div()
-                .text_color(theme::muted())
-                .child(text!(id = format!("filter-esc-{pane}"), "（Esc 清除）".to_string())),
-        )
+        .child(text!(
+            id = format!("filter-q-{pane}"),
+            format!("🔍 {}", query)
+        ))
+        .child(div().text_color(theme::muted()).child(text!(
+            id = format!("filter-esc-{pane}"),
+            "（Esc 清除）".to_string()
+        )))
 }
 
 // ---------- 模态卡片渲染 ----------
@@ -3932,7 +4010,7 @@ mod tests {
                 v.open_context_menu(None, 100.0, 100.0, 0, 0, cx);
                 v.context_menu
                     .as_ref()
-                    .map(|m| crate::context_menu::items(m).len())
+                    .map(|m| crate::context_menu::items(m, &v.open_with_apps).len())
             })
         });
         let entry_items = cx.update(|_window, cx| {
@@ -3945,7 +4023,8 @@ mod tests {
                     0,
                     cx,
                 );
-                crate::context_menu::items(v.context_menu.as_ref().unwrap()).len()
+                crate::context_menu::items(v.context_menu.as_ref().unwrap(), &v.open_with_apps)
+                    .len()
             })
         });
 

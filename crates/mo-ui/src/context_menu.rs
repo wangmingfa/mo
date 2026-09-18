@@ -53,8 +53,12 @@ pub(crate) struct ContextMenu {
 /// 菜单里的一个动作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MenuAction {
-    /// 打开：目录进入，文件快速预览。
+    /// 打开：目录进入，文件用**系统默认应用**打开（与双击同语义）。
     Open,
+    /// 用「打开方式」候选列表里的第 `usize` 个应用打开。
+    OpenWith(usize),
+    /// 弹出系统「打开方式」选择对话框。
+    OpenWithOther,
     /// 在**新标签页**里打开该目录。
     OpenInNewTab,
     /// 在**第二个窗格**里打开该目录（分栏）。
@@ -96,6 +100,9 @@ pub(crate) struct MenuItem {
     pub hint: &'static str,
     pub enabled: bool,
     pub separator_before: bool,
+    /// 二级菜单（「打开方式」的应用列表）。非空时本行 hover 展开，点击动作由
+    /// 子项的 action 承担；本行自身的 action 不执行。
+    pub submenu: Vec<(String, MenuAction)>,
 }
 
 impl MenuItem {
@@ -111,7 +118,13 @@ impl MenuItem {
             hint,
             enabled,
             separator_before: false,
+            submenu: Vec::new(),
         }
+    }
+
+    fn with_submenu(mut self, submenu: Vec<(String, MenuAction)>) -> Self {
+        self.submenu = submenu;
+        self
     }
 
     fn separated(mut self) -> Self {
@@ -136,7 +149,8 @@ fn looks_like_archive(path: &std::path::Path) -> bool {
 ///
 /// 空白处（`target == None`）给的是「目录级」动作（新建 / 粘贴 / 刷新 / 全选），
 /// 对着条目给的是「条目级」动作，并按类型 / 选中数裁剪掉不合理的项。
-pub(crate) fn items(menu: &ContextMenu) -> Vec<MenuItem> {
+/// `open_with` 是「打开方式」的候选应用列表（文件才有；在菜单打开时异步查询）。
+pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]) -> Vec<MenuItem> {
     let Some(target) = menu.target.as_ref() else {
         // ------------------------------------------------ 空白处：目录级动作
         // 空白处：目录级动作。两个「新建」同组（中间不隔线）。
@@ -155,18 +169,27 @@ pub(crate) fn items(menu: &ContextMenu) -> Vec<MenuItem> {
     let multi = menu.selected > 1;
     let mut out = Vec::new();
 
-    // 打开
-    let open_label = if is_dir { "打开" } else { "快速查看" };
+    // 打开（目录进入；文件用系统默认应用，与双击一致）
     out.push(MenuItem::new(
-        if is_dir {
-            MenuAction::Open
-        } else {
-            MenuAction::QuickLook
-        },
-        open_label,
-        if is_dir { "↩" } else { "␣" },
+        MenuAction::Open,
+        "打开",
+        if is_dir { "↩" } else { "" },
         true,
     ));
+    // 打开方式：仅文件；hover 展开二级菜单（应用列表 + 系统选择对话框）。
+    // 候选未就绪（异步查询中 / 无候选）时只剩「选择其他应用…」。
+    if !is_dir {
+        let mut submenu: Vec<(String, MenuAction)> = open_with
+            .iter()
+            .enumerate()
+            .map(|(i, app)| (app.name.clone(), MenuAction::OpenWith(i)))
+            .collect();
+        submenu.push(("选择其他应用…".to_string(), MenuAction::OpenWithOther));
+        out.push(
+            MenuItem::new(MenuAction::OpenWithOther, "打开方式", "▸", true).with_submenu(submenu),
+        );
+        out.push(MenuItem::new(MenuAction::QuickLook, "快速查看", "␣", true));
+    }
     if is_dir {
         out.push(MenuItem::new(
             MenuAction::OpenInNewTab,
@@ -301,22 +324,67 @@ fn panel_height(items: &[MenuItem]) -> f32 {
 /// 渲染菜单面板。
 ///
 /// `viewport` 是窗口的逻辑尺寸，用于把菜单钳在可见区内。
+/// `submenu_open` 为真时展开「打开方式」的二级菜单（应用列表）。
 pub(crate) fn render(
     menu: &ContextMenu,
     items: &[MenuItem],
     viewport: (f32, f32),
     entity: &Entity<crate::RootView>,
+    submenu_open: bool,
 ) -> impl IntoElement {
     let h = panel_height(items);
     // 钳制：先按「放在鼠标右下」算，再保证右边 / 下边不越界（越界就贴边）。
     let x = menu.x.min(viewport.0 - MENU_W - EDGE).max(EDGE);
     let y = menu.y.min(viewport.1 - h - EDGE).max(EDGE);
 
-    let mut panel = div()
-        .id("mo-context-menu")
+    // 展开行（「打开方式」）在面板内的纵向偏移，与二级菜单面板的高度。
+    let empty_submenu: Vec<(String, MenuAction)> = Vec::new();
+    let (sub_row, sub_items) = items
+        .iter()
+        .enumerate()
+        .find(|(_, it)| !it.submenu.is_empty())
+        .map(|(i, it)| (row_top(items, i), &it.submenu))
+        .unwrap_or((0.0, &empty_submenu));
+    let sub_h = sub_items.len() as f32 * ITEM_H + PAD * 2.0;
+    // 二级菜单贴主菜单右缘；底边越界时向上收。
+    let sub_rel_y = if y + sub_row + sub_h + EDGE > viewport.1 {
+        (viewport.1 - EDGE - sub_h - y).max(0.0)
+    } else {
+        sub_row
+    };
+
+    // ⚠️ 主菜单与二级菜单必须包在同一个 wrapper 里：`on_mouse_down_out`
+    // 按「鼠标是否在本元素 bounds 内」判定，若各自为政，点二级菜单
+    // （在主面板 bounds 外）会把整个菜单关掉。wrapper 的命中区覆盖
+    // 两者并集，点空白处（wrapper 外）才关菜单。
+    let sub_w = if submenu_open { MENU_W } else { 0.0 };
+    let wrap_w = MENU_W + sub_w;
+    let wrap_h = if submenu_open {
+        h.max(sub_rel_y + sub_h)
+    } else {
+        h
+    };
+    let mut wrapper = div()
         .absolute()
         .left(px(x))
         .top(px(y))
+        .w(px(wrap_w))
+        .h(px(wrap_h))
+        // 阻止点击穿透到底下的文件行（空隙区域也会被挡住，可接受）。
+        .occlude()
+        .debug_selector(|| "mo-context-menu-wrap".to_string());
+    let out_entity = entity.clone();
+    wrapper
+        .interactivity()
+        .on_mouse_down_out(move |_ev, _window, cx| {
+            out_entity.update(cx, |v, cx| v.close_context_menu(cx));
+        });
+
+    let mut panel = div()
+        .id("mo-context-menu")
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
         .w(px(MENU_W))
         .flex()
         .flex_col()
@@ -326,20 +394,10 @@ pub(crate) fn render(
         .border_color(theme::divider())
         .rounded(px(8.0))
         .shadow_lg()
-        // 阻止点击穿透到下面的文件行（gpui 靠它截断命中链）。
-        .occlude()
         // 测试用（release no-op）：定位 / 钳制的断言都查这个选择器。
         .debug_selector(|| "mo-context-menu".to_string())
         .text_size(px(13.0))
         .text_color(theme::text());
-
-    // 点到菜单外面就关掉（捕获阶段回调用，不需要额外的全屏遮罩层）。
-    let out_entity = entity.clone();
-    panel
-        .interactivity()
-        .on_mouse_down_out(move |_ev, _window, cx| {
-            out_entity.update(cx, |v, cx| v.close_context_menu(cx));
-        });
 
     for (i, it) in items.iter().enumerate() {
         if it.separator_before {
@@ -389,16 +447,97 @@ pub(crate) fn render(
         if it.enabled {
             let action = it.action;
             let item_entity = entity.clone();
+            let has_submenu = !it.submenu.is_empty();
             row = row.hover(|s| s.bg(theme::hover_bg()));
-            row.interactivity().on_click(move |_ev, _window, cx| {
-                item_entity.update(cx, |v, cx| v.run_menu_action(action, cx));
+            // 二级菜单交互（⚠️ 一行只能挂一次 on_hover，两种情况合并处理）：
+            // hover 到带子菜单的行展开；hover 到其它行收起。离开主菜单
+            // （鼠标进二级菜单）不收起——否则跨面板的间隙会把菜单闪掉；
+            // 菜单关闭 / 执行动作时会一并复位。
+            let hover_entity = entity.clone();
+            row.interactivity().on_hover(move |hovered, _window, cx| {
+                if !*hovered {
+                    return;
+                }
+                hover_entity.update(cx, |v, cx| {
+                    if has_submenu {
+                        v.open_ctx_submenu(cx);
+                    } else {
+                        v.close_ctx_submenu(cx);
+                    }
+                });
             });
+            // 有子菜单的行只负责展开，点击动作由子项承担。
+            if !has_submenu {
+                row.interactivity().on_click(move |_ev, _window, cx| {
+                    item_entity.update(cx, |v, cx| v.run_menu_action(action, cx));
+                });
+            }
         }
 
         panel = panel.child(row);
     }
+    wrapper = wrapper.child(panel);
 
-    panel
+    // 二级菜单面板（「打开方式」应用列表）。
+    if submenu_open && !sub_items.is_empty() {
+        let mut sub_panel = div()
+            .id("mo-context-submenu")
+            .absolute()
+            .left(px(MENU_W))
+            .top(px(sub_rel_y))
+            .w(px(MENU_W))
+            .flex()
+            .flex_col()
+            .py(px(PAD))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::divider())
+            .rounded(px(8.0))
+            .shadow_lg()
+            .occlude()
+            .debug_selector(|| "mo-context-submenu".to_string())
+            .text_size(px(13.0))
+            .text_color(theme::text());
+
+        for (j, (label, action)) in sub_items.iter().enumerate() {
+            let mut item = div()
+                .id(("mo-ctx-subitem", j))
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(ITEM_H))
+                .px(px(10.0))
+                .truncate()
+                .hover(|s| s.bg(theme::hover_bg()))
+                .child(text!(label.clone()));
+            let entity_click = entity.clone();
+            let action = *action;
+            item.interactivity().on_click(move |ev, _window, cx| {
+                // 阻断冒泡：别让 wrapper / 根容器把这次点击当成「关菜单」。
+                cx.stop_propagation();
+                let _ = ev;
+                entity_click.update(cx, |v, cx| v.run_menu_action(action, cx));
+            });
+            sub_panel = sub_panel.child(item);
+        }
+        wrapper = wrapper.child(sub_panel);
+    }
+
+    wrapper
+}
+
+/// 第 `index` 个条目在面板内的纵向偏移（含上方分隔线），二级菜单定位用。
+fn row_top(items: &[MenuItem], index: usize) -> f32 {
+    PAD + items[..index]
+        .iter()
+        .map(|it| {
+            if it.separator_before {
+                ITEM_H + SEP_H
+            } else {
+                ITEM_H
+            }
+        })
+        .sum::<f32>()
 }
 
 #[cfg(test)]
@@ -423,7 +562,7 @@ mod tests {
     }
 
     fn actions(m: &ContextMenu) -> Vec<MenuAction> {
-        items(m).into_iter().map(|i| i.action).collect()
+        items(m, &[]).into_iter().map(|i| i.action).collect()
     }
 
     fn find(list: &[MenuItem], a: MenuAction) -> &MenuItem {
@@ -451,7 +590,7 @@ mod tests {
     /// 两个「新建」必须挨在一起、中间没有分隔线（同属「新建」这一组）。
     #[test]
     fn new_items_share_one_group() {
-        let list = items(&menu(None, true, 0));
+        let list = items(&menu(None, true, 0), &[]);
         let folder = find(&list, MenuAction::NewFolder);
         let file = find(&list, MenuAction::NewFile);
         assert_eq!(folder.label, "新建文件夹");
@@ -494,7 +633,7 @@ mod tests {
     /// （批量重命名对话框与哈希工具本身就支持多项）。
     #[test]
     fn items_track_the_selection_size() {
-        let three = items(&menu(Some("/tmp/a.txt"), false, 3));
+        let three = items(&menu(Some("/tmp/a.txt"), false, 3), &[]);
         assert!(
             find(&three, MenuAction::Rename).enabled,
             "多项应当能批量重命名"
@@ -503,24 +642,80 @@ mod tests {
         assert!(find(&three, MenuAction::Hash).enabled, "多项应当能算哈希");
         assert!(!find(&three, MenuAction::Compare).enabled, "3 项不能比较");
 
-        let two = items(&menu(Some("/tmp/a.txt"), false, 2));
+        let two = items(&menu(Some("/tmp/a.txt"), false, 2), &[]);
         assert!(
             find(&two, MenuAction::Compare).enabled,
             "恰好 2 项时应当可以比较"
         );
 
-        let one = items(&menu(Some("/tmp/a.txt"), false, 1));
+        let one = items(&menu(Some("/tmp/a.txt"), false, 1), &[]);
         assert_eq!(find(&one, MenuAction::Rename).label, "重命名…");
     }
 
     /// 高度要跟着分隔线一起算——钳制用的是它，算错菜单会被切掉一截。
     #[test]
     fn panel_height_accounts_for_separators() {
-        let blank = items(&menu(None, true, 0));
+        let blank = items(&menu(None, true, 0), &[]);
         assert_eq!(blank.len(), 7);
         // 3 条分隔线：paste / select_all / open_terminal 各自上方一条。
         let seps = blank.iter().filter(|i| i.separator_before).count();
         assert_eq!(seps, 3);
         assert_eq!(panel_height(&blank), PAD * 2.0 + ITEM_H * 7.0 + SEP_H * 3.0);
+    }
+
+    /// 文件菜单：第一项是「打开」（系统默认应用，同双击），带「打开方式」
+    /// 二级菜单（候选应用 + 系统选择对话框），「快速查看」仍在但不再占首位。
+    #[test]
+    fn file_menu_has_open_and_open_with_submenu() {
+        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &[]);
+        let open = find(&list, MenuAction::Open);
+        assert_eq!(open.label, "打开");
+
+        let ow = find(&list, MenuAction::OpenWithOther);
+        assert_eq!(ow.label, "打开方式");
+        assert_eq!(ow.hint, "▸");
+        // 无候选时二级菜单也必须有「选择其他应用…」兜底。
+        assert_eq!(
+            ow.submenu.last().map(|(l, _)| l.as_str()),
+            Some("选择其他应用…")
+        );
+
+        // 候选应用按序号进入二级菜单。
+        let apps = vec![
+            mo_app::shell::OpenWithApp {
+                name: "记事本".to_string(),
+                progid: "txtfile".to_string(),
+            },
+            mo_app::shell::OpenWithApp {
+                name: "写字板".to_string(),
+                progid: "AppXxyz".to_string(),
+            },
+        ];
+        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &apps);
+        let ow = find(&list, MenuAction::OpenWithOther);
+        assert_eq!(ow.submenu.len(), 3);
+        assert_eq!(
+            ow.submenu[0],
+            ("记事本".to_string(), MenuAction::OpenWith(0))
+        );
+        assert_eq!(
+            ow.submenu[1],
+            ("写字板".to_string(), MenuAction::OpenWith(1))
+        );
+        assert!(list.iter().any(|i| i.action == MenuAction::QuickLook));
+        assert_ne!(
+            list.first().map(|i| i.action),
+            Some(MenuAction::QuickLook),
+            "「快速查看」不该再是文件菜单第一项"
+        );
+    }
+
+    /// 目录菜单不出现「打开方式 / 快速查看」。
+    #[test]
+    fn directory_menu_has_no_open_with() {
+        let a = actions(&menu(Some("/tmp/dir"), true, 1));
+        assert!(!a.contains(&MenuAction::OpenWithOther));
+        assert!(!a.contains(&MenuAction::QuickLook));
+        assert!(!a.contains(&MenuAction::OpenWith(0)));
     }
 }

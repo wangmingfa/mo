@@ -4231,6 +4231,8 @@ dependencies = [
  "parking_lot",
  "tokio",
  "tracing",
+ "windows-sys 0.52.0",
+ "winreg",
 ]
 
 [[package]]
