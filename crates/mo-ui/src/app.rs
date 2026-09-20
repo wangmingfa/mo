@@ -6001,9 +6001,9 @@ mod tests {
         };
 
         // Ctrl/Cmd+T → tab.new
-        let before = tabs(&mut cx);
+        let before = tabs(cx);
         cx.simulate_keystrokes(&format!("{main}-t"));
-        assert_eq!(tabs(&mut cx), before + 1, "{main}-t 应当新建标签页");
+        assert_eq!(tabs(cx), before + 1, "{main}-t 应当新建标签页");
 
         // Ctrl/Cmd+Shift+P → 命令面板
         cx.simulate_keystrokes(&format!("{main}-shift-p"));
@@ -6018,11 +6018,11 @@ mod tests {
                 v.keymap = crate::keys::Keymap::build(&overrides);
             })
         });
-        let before = tabs(&mut cx);
+        let before = tabs(cx);
         cx.simulate_keystrokes(&format!("{main}-t"));
-        assert_eq!(tabs(&mut cx), before, "改绑后旧键位不该还有反应");
+        assert_eq!(tabs(cx), before, "改绑后旧键位不该还有反应");
         cx.simulate_keystrokes(&format!("{main}-alt-t"));
-        assert_eq!(tabs(&mut cx), before + 1, "新键位应当生效");
+        assert_eq!(tabs(cx), before + 1, "新键位应当生效");
     }
 
     /// 键表要真的驱动按键语义：改绑后旧键位失效、解绑吞键，派发动作可用。

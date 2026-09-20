@@ -679,8 +679,10 @@ mod tests {
     #[test]
     fn platform_modifier_maps_to_control_off_macos() {
         use gpui_kit::{Keystroke, Modifiers};
-        let mut m = Modifiers::default();
-        m.control = true;
+        let m = Modifiers {
+            control: true,
+            ..Default::default()
+        };
         let ks = Keystroke {
             modifiers: m,
             key: "p".to_string(),
