@@ -5570,32 +5570,28 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
                         .child(text!(msg.to_string())),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .child(
-                            div()
-                                .id("notice-ok")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .px(px(18.0))
-                                .h(px(30.0))
-                                .rounded(px(7.0))
-                                // 主色按钮：用品牌蓝 `selected_bg`（`accent` 角色在本主题里是灰）。
-                                .bg(theme::selected_bg())
-                                .text_color(theme::selected_text())
-                                .text_size(px(13.0))
-                                .on_click(move |_, _window, cx| {
-                                    ok_close.update(cx, |v, cx| {
-                                        v.modal = Modal::None;
-                                        v.notice_ok = None;
-                                        cx.notify();
-                                    });
-                                })
-                                .child(text!(ok_label.to_string())),
-                        ),
+                    div().flex().flex_row().justify_end().child(
+                        div()
+                            .id("notice-ok")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .px(px(18.0))
+                            .h(px(30.0))
+                            .rounded(px(7.0))
+                            // 主色按钮：用品牌蓝 `selected_bg`（`accent` 角色在本主题里是灰）。
+                            .bg(theme::selected_bg())
+                            .text_color(theme::selected_text())
+                            .text_size(px(13.0))
+                            .on_click(move |_, _window, cx| {
+                                ok_close.update(cx, |v, cx| {
+                                    v.modal = Modal::None;
+                                    v.notice_ok = None;
+                                    cx.notify();
+                                });
+                            })
+                            .child(text!(ok_label.to_string())),
+                    ),
                 ),
         )
 }

@@ -1,7 +1,7 @@
 use std::io::Write;
-use std::path::{Path};
+use std::path::Path;
 #[cfg(target_os = "windows")]
-use std::path::{PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use mo_core::{FileMetadata, MoError, Permissions};
@@ -114,7 +114,12 @@ fn list_drives(_path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         }
         let name = format!("{}:", letter as char);
         let id = file_id_for(&root);
-        out.push(ReadDirEntry::new(id, name, mo_core::EntryKind::Directory, root));
+        out.push(ReadDirEntry::new(
+            id,
+            name,
+            mo_core::EntryKind::Directory,
+            root,
+        ));
     }
     // 探测顺序天然按字母序。
     Ok(out)

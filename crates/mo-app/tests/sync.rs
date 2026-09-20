@@ -106,4 +106,5 @@ async fn pair_persists_and_plan_executes() {
     assert!(app.sync_target(&src).is_none());
 
     fs::remove_dir_all(&src).ok();
-    fs::remove_dir_all(&dst).ok();}
+    fs::remove_dir_all(&dst).ok();
+}
