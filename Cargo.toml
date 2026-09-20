@@ -106,6 +106,16 @@ mo-app = { path = "crates/mo-app" }
 opt-level = 3
 lto = "thin"
 
+# 开发构建体验：解码类依赖在 debug（无优化）下慢得离谱——实测 image 0.25 /
+# zune-jpeg 解一张 7680×4320 JPEG 要 ~4.0s，而 release 只要 ~0.11s（差 ~37×）。
+# 空格快速预览大图会被这段解码卡住几秒，误以为是产品逻辑问题。
+# 只给这两个包单独开优化，workspace 其余部分的 debug 构建速度不受影响。
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
 # 本地补丁：block 0.1.6 上游（SSheldon/rust-block）已停止维护，其 extern static
 # 使用了空枚举类型（uninhabited static，rust-lang/rust#74840），将来会成为硬错误。
 # third_party/block 修复了该写法（符号地址语义不变），替换全部传递依赖（cocoa → gpui）。

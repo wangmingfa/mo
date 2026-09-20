@@ -102,7 +102,7 @@ impl Render for PreviewWindow {
         let step_root = self.root.clone();
         root.interactivity()
             .on_key_down(move |ev, window, cx| match ev.keystroke.key.as_str() {
-                "escape" | " " => window.remove_window(),
+                "escape" | "space" => window.remove_window(),
                 "up" | "arrowup" | "left" | "arrowleft" => {
                     step_root.update(cx, |v, cx| v.preview_step(-1, cx));
                 }
