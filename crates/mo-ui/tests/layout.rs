@@ -209,6 +209,42 @@ fn toolbar_height_is_pinned_for_traffic_lights(cx: &mut TestAppContext) {
     );
 }
 
+/// 「＋」右侧那截空白必须能拖窗口。
+///
+/// 顶栏是自绘的 48px，而 macOS 的 AppKit 只认原生标题栏那一条带（≈28pt）；
+/// 没有应用层拖拽带时，下半截谁都不管——标签右侧的空白就拖不动窗口。
+/// 这里断言那条带子确实铺在「＋」右侧、且铺满整行高度（直到窗口右缘）。
+#[gpui_kit::test]
+fn titlebar_drag_filler_covers_the_area_right_of_new_tab(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let toprow = bounds(&mut cx, "mo-toprow");
+    let new_tab = bounds(&mut cx, "mo-tab-new");
+    let filler = bounds(&mut cx, "mo-titlebar-drag");
+
+    assert!(
+        filler.origin.x >= new_tab.origin.x + new_tab.size.width,
+        "拖拽带压在了「＋」按钮上：filler={filler:?} new_tab={new_tab:?}"
+    );
+    assert_eq!(
+        filler.origin.y, toprow.origin.y,
+        "拖拽带不在顶栏里：filler={filler:?} toprow={toprow:?}"
+    );
+    assert_eq!(
+        filler.size.height,
+        toprow.size.height - px(1.),
+        "拖拽带没有铺满顶栏内容高度（行高减掉底部那条 1px 分隔线），死区还剩一条：filler={filler:?} toprow={toprow:?}"
+    );
+    // macOS 顶栏右缘没有窗口控制按钮 → 必须一路铺到窗口右缘（右内边距也要吃掉）。
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            filler.origin.x + filler.size.width,
+            toprow.origin.x + toprow.size.width,
+            "拖拽带没铺到窗口右缘，最右那条仍拖不动：filler={filler:?} toprow={toprow:?}"
+        );
+    }
+}
+
 /// 地址栏已合并进工具栏（Win11 风格单栏）——面包屑必须是工具栏内的一个元素。
 #[gpui_kit::test]
 fn address_bar_lives_inside_the_toolbar(cx: &mut TestAppContext) {

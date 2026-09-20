@@ -4,6 +4,9 @@
 //! 独立窗口还能边看预览边操作文件列表。窗口由 [`crate::RootView::show_preview`]
 //! 懒开——已开着就换内容并置前，不重复开第二个。
 //!
+//! 窗口**标题就是文件名**，主体**只有预览内容**——不显示大小、类型、路径这些
+//! 元信息：那些在主窗口里本来就看得见，重复一遍只会挤掉正文。
+//!
 //! 键盘：
 //! * Esc / Space 关闭本窗口（与主窗口的模态习惯一致）；
 //! * ← ↑ / → ↓ 在目录里**逐个切换预览对象**——焦点仍走 app 侧的选择模型，
@@ -39,9 +42,13 @@ impl PreviewWindow {
         }
     }
 
-    /// 换预览内容（窗口复用时）。
-    pub fn set_preview(&mut self, preview: Preview, cx: &mut Context<Self>) {
+    /// 换预览内容（窗口复用 / 方向键翻页时）。
+    ///
+    /// 标题在这里一起改：内容换了标题没换，窗口管理器与 ⌘Tab 里就会指错文件。
+    pub fn set_preview(&mut self, preview: Preview, window: &mut Window, cx: &mut Context<Self>) {
+        let title = preview.title.clone();
         self.preview = preview;
+        window.set_window_title(&title);
         cx.notify();
     }
 }
@@ -51,40 +58,25 @@ impl Render for PreviewWindow {
         let p = self.preview.clone();
         let text = p.text.clone().unwrap_or_default();
 
-        // 主体：图片直接加载原图（gpui 解码，object_fit 默认 Contain 适配
-        // 容器），其余是纯文本。图片容器 flex_1 + min_h_0：没有确定高度时
-        // Contain 无从适配。
-        let body: Div = match p.kind {
+        // 主体只有内容本身：图片直接加载原图（gpui 解码，object_fit 默认
+        // Contain 适配容器），其余是纯文本。图片容器 flex_1 + min_h_0：没有
+        // 确定高度时 Contain 无从适配。文本自己带内边距，图片铺满。
+        let body: AnyElement = match p.kind {
             PreviewKind::Image if p.image.is_some() => div()
                 .flex()
-                .flex_col()
                 .flex_1()
                 .min_h_0()
-                .gap(px(6.0))
-                .child(text!(format!("🖼 {}（{} 字节）", p.title, p.size)))
-                .child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .items_center()
-                        .justify_center()
-                        .child(img(p.image.clone().unwrap()).size_full()),
-                ),
+                .items_center()
+                .justify_center()
+                .child(img(p.image.clone().unwrap()).size_full())
+                .into_any_element(),
             _ => div()
-                .flex()
-                .flex_col()
                 .flex_1()
                 .min_h_0()
-                .gap(px(4.0))
-                .child(text!(format!("{} · {} 字节", p.title, p.size)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scrollbar()
-                        .child(text!(text)),
-                ),
+                .p(px(12.0))
+                .overflow_y_scrollbar()
+                .child(text!(text))
+                .into_any_element(),
         };
 
         let mut root = div()
@@ -92,7 +84,6 @@ impl Render for PreviewWindow {
             .size_full()
             .flex()
             .flex_col()
-            .p(px(12.0))
             .bg(theme::surface())
             .text_color(theme::text())
             .text_size(px(13.0))

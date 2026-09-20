@@ -98,6 +98,44 @@ pub fn drag_strip() -> impl IntoElement {
         .window_control_area(WindowControlArea::Drag)
 }
 
+/// 标签条尾部（「＋」之后）那条占满剩余宽度的拖拽带。
+///
+/// 为什么需要它：顶栏是自绘的 [`TOOLBAR_HEIGHT`] = 48px，但窗口没有开
+/// `WindowOptions::app_owns_titlebar_drag`（默认 `false`），拖拽权仍在 AppKit 手里，
+/// 而 AppKit 只认**原生标题栏那一条带**（macOS ≈ 28pt）。于是 48px 顶栏的下半截
+/// 没人负责拖拽——AppKit 不管、应用层也没接——标签右侧那块空白就此成为死区。
+///
+/// 本函数补上应用层拖拽，按平台分两条路：
+/// - **Windows**：打 [`WindowControlArea::Drag`]（命中测试返回 `HTCAPTION`），
+///   拖拽 / 双击最大化交系统。
+/// - **macOS / Linux**：`WindowControlArea` 无处落地（`gpui-pre-macos` 的
+///   `on_hit_test_window_control` 是空实现），改调 [`Window::start_window_move`]，
+///   内部走 `performWindowDragWithEvent:`，手感与原生标题栏一致。
+///
+/// 上沿那 ~28pt 仍归 AppKit（双击缩放的系统偏好由它判断），这里只补它下面的死区。
+pub fn drag_filler() -> impl IntoElement {
+    let mut filler = div()
+        .id("titlebar-drag-filler")
+        .h_full()
+        .min_w(px(0.0))
+        .flex_grow(1.0)
+        .flex_basis(px(0.0))
+        // 测试用（release no-op）：tests/layout.rs 断言它吃满「＋」右侧的剩余宽度。
+        .debug_selector(|| "mo-titlebar-drag".to_string());
+
+    if cfg!(target_os = "windows") {
+        filler = filler.window_control_area(WindowControlArea::Drag);
+    } else {
+        filler
+            .interactivity()
+            .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
+                window.start_window_move();
+            });
+    }
+
+    filler
+}
+
 /// 右缘的窗口控制按钮：最小化 / 最大化（或还原）/ 关闭。
 pub fn window_controls(is_maximized: bool) -> impl IntoElement {
     div()

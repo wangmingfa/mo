@@ -972,9 +972,12 @@ impl RootView {
     /// 窗口已被用户关掉（`update` 报错）则当作没开重新创建。
     pub(crate) fn show_preview(&mut self, pv: Preview, cx: &mut Context<Self>) {
         if let Some(handle) = self.preview_window {
-            let updated = handle.update(cx, |v, _window, c| v.set_preview(pv.clone(), c));
+            // 复用同一个窗口：换内容（标题在 `set_preview` 里一起改）+ 置前。
+            let updated = handle.update(cx, |v, window, c| {
+                v.set_preview(pv.clone(), window, c);
+                window.activate_window();
+            });
             if updated.is_ok() {
-                let _ = handle.update(cx, |_v, window, _c| window.activate_window());
                 return;
             }
             self.preview_window = None;
@@ -984,7 +987,8 @@ impl RootView {
         let options = WindowOptions {
             window_bounds: Some(bounds),
             titlebar: Some(TitlebarOptions {
-                title: Some("快速预览".into()),
+                // 标题就是文件名：预览窗一多，靠「快速预览」根本分不清哪个是哪个。
+                title: Some(pv.title.clone().into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -3973,7 +3977,9 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
         .items_center()
         .gap(px(2.0))
         .h_full()
-        .px(px(8.0))
+        // 左内边距给标签，右侧**不留**：尾部拖拽带（`drag_filler`）要一直铺到
+        // 窗口右缘，把 48px 顶栏里 AppKit 不管的那半截死区全部吃下。
+        .pl(px(8.0))
         .bg(theme::container());
     if pane_idx > 0 {
         bar = bar.border_l_1().border_color(theme::separator());
@@ -4055,6 +4061,8 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
         .size(px(26.0))
         .rounded(px(6.0))
         .text_color(theme::muted())
+        // 测试用（release no-op）：tests/layout.rs 断言拖拽带在「＋」右侧。
+        .debug_selector(|| "mo-tab-new".to_string())
         .hover(|s| s.bg(theme::hover_bg()));
     new_btn.interactivity().on_click(move |_, _window, cx| {
         new_entity.update(cx, |v, cx| {
@@ -4062,7 +4070,10 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
             cx.notify();
         });
     });
+    // 「＋」右侧的空白铺一条拖拽带：48px 顶栏只有上沿 ~28pt 归 AppKit，
+    // 下面那截原本谁都不管 —— 标签右侧的空白因此拖不动窗口。
     bar.child(new_btn.child(text!("＋".to_string())))
+        .child(toolbar::drag_filler())
 }
 
 /// 当前选中项的扩展名集合（小写、含点），供扩展的 `when_ext` 条件判断。
