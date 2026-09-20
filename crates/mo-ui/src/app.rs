@@ -535,6 +535,9 @@ pub struct RootView {
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
     /// 「打开方式」二级菜单是否展开（hover 驱动）。
     pub(crate) ctx_submenu_open: bool,
+    /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
+    /// 通过 [`RootView::notice_with_ok`] 设置，关闭提示时清回 `None`。
+    pub(crate) notice_ok: Option<String>,
 }
 
 /// 一次表头拖动：要么在调列宽，要么在调列序。
@@ -641,6 +644,7 @@ impl RootView {
             context_menu: None,
             open_with_apps: Vec::new(),
             ctx_submenu_open: false,
+            notice_ok: None,
         };
 
         let weak = cx.entity().downgrade();
@@ -910,6 +914,18 @@ impl RootView {
         cx.notify();
     }
 
+    /// 弹出一条信息提示（带遮罩模态框）。`ok` 为操作按钮文字，`None` = 默认「知道了」。
+    pub(crate) fn notice(
+        &mut self,
+        text: impl Into<String>,
+        ok: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice_ok = ok;
+        self.modal = Modal::Info(text.into());
+        cx.notify();
+    }
+
     /// 退出地址栏编辑态。输入状态实体留着，下次进入复用（不重建、不丢历史）。
     pub(crate) fn end_address_edit(&mut self, cx: &mut Context<Self>) {
         if self.panel().address_editing {
@@ -932,14 +948,32 @@ impl RootView {
         let app = self.panel().app.clone();
         self.panel_mut().address_editing = false;
         window.focus(&self.focus, cx);
-        cx.notify();
+
         if text.is_empty() {
+            cx.notify();
             return;
         }
-        let target = PathBuf::from(text);
-        cx.spawn(async move |_weak, _cx| {
+        let target = PathBuf::from(&text);
+
+        // 先同步判定：路径不存在 / 不是文件夹 → 弹窗提示，且不发起导航
+        // （open_directory 会先把路径写进历史再读盘失败，提前拦下可免污染历史）。
+        if !target.is_dir() {
+            let msg = if target.exists() {
+                format!("「{text}」不是一个文件夹。")
+            } else {
+                format!("找不到「{text}」，请检查路径是否正确。")
+            };
+            self.notice(msg, None, cx);
+            return;
+        }
+
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            // 竞态兜底：判定通过后、真正读盘前被删除 / 无权限等，仍弹窗提示。
             if let Err(e) = app.open_directory(&target).await {
-                eprintln!("打开失败: {e}");
+                let _ = weak.update(cx, |v, cx| {
+                    v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
+                });
             }
         })
         .detach();
@@ -3616,8 +3650,10 @@ impl Render for RootView {
         let per_pane_w = ((viewport_w - sidebar_w) / visible_panes as f32 - 24.0).max(160.0);
 
         // 模态打开时，工具栏 / 状态栏保留，中央区换成模态卡片。
+        // 例外：`Modal::Info` 是带遮罩的提示框，下层内容照常渲染（见文末浮层），
+        // 所以这里与 `None` 一样渲染正常浏览区。
         let body: Div = match &self.modal {
-            Modal::None => {
+            Modal::None | Modal::Info(_) => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
                 if self.ui.sidebar {
@@ -3649,7 +3685,6 @@ impl Render for RootView {
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
-            Modal::Info(text) => render_info(text),
         };
 
         let panel = self.panel();
@@ -3821,6 +3856,17 @@ impl Render for RootView {
         // 立刻收到 Blur → 触发 end_address_edit，表现为「点编辑闪一下又退回显示态」。
         if !self.focus.is_focused(window) && !self.panel().address_editing {
             cx.focus_self(window);
+        }
+
+        // 信息提示：带遮罩的模态框。下层内容照常渲染、透过半透明遮罩可见，但被
+        // `.occlude()` 挡住点不到；居中一张卡片。点遮罩空白 / 操作按钮 / Esc 关闭。
+        // 按钮文字可经 `notice_with_ok` 自定义，默认「知道了」。
+        if let Modal::Info(msg) = self.modal.clone() {
+            let label = self
+                .notice_ok
+                .clone()
+                .unwrap_or_else(|| "知道了".to_string());
+            root = root.child(render_notice_overlay(&msg, &label, &entity));
         }
 
         // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
@@ -4520,6 +4566,7 @@ fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
 fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         v.modal = Modal::None;
+        v.notice_ok = None;
         v.cmd_query.clear();
         v.search_query.clear();
         v.search_results.clear();
@@ -5474,16 +5521,83 @@ pub(crate) fn modal_card(title: &str, input: &str, body: impl IntoElement, hint:
         )
 }
 
-/// 纯文本信息卡片（哈希结果等）。
-fn render_info(text: &str) -> Div {
-    let body = div()
+/// 信息提示的模态框：半透明遮罩 + 居中卡片。
+///
+/// 与旧的「替换中央内容区」式弹窗不同——下层照常渲染、透过遮罩可见，但被
+/// `.occlude()` 挡住，模态期间点不到。点遮罩空白或「知道了」关闭（Esc / 空格
+/// 见 `handle_modal_key`）。正文区限高可滚动，长消息（如哈希结果）不撑破窗口。
+fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -> impl IntoElement {
+    let backdrop_close = entity.clone();
+    let ok_close = entity.clone();
+    div()
+        .id("notice-backdrop")
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
         .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .overflow_y_scrollbar()
-        .h(px(320.0))
-        .child(text!(text.to_string()));
-    modal_card("信息", "", body, "Esc 关闭")
+        .items_center()
+        .justify_center()
+        .bg(gpui_kit::rgb(0x000000).alpha(0.35))
+        .occlude()
+        // 点遮罩空白处关闭。
+        .on_click(move |_, _window, cx| {
+            backdrop_close.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.notice_ok = None;
+                cx.notify();
+            });
+        })
+        .child(
+            div()
+                .id("notice-card")
+                .w(px(440.0))
+                .flex()
+                .flex_col()
+                .gap(px(18.0))
+                .p(px(22.0))
+                .rounded(px(12.0))
+                .bg(theme::surface())
+                .text_color(theme::text())
+                .shadow_lg()
+                // 点卡片本身不冒泡到遮罩，否则点正文会误关。
+                .on_click(|_, _window, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .max_h(px(360.0))
+                        .overflow_y_scrollbar()
+                        .child(text!(msg.to_string())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .child(
+                            div()
+                                .id("notice-ok")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .px(px(18.0))
+                                .h(px(30.0))
+                                .rounded(px(7.0))
+                                // 主色按钮：用品牌蓝 `selected_bg`（`accent` 角色在本主题里是灰）。
+                                .bg(theme::selected_bg())
+                                .text_color(theme::selected_text())
+                                .text_size(px(13.0))
+                                .on_click(move |_, _window, cx| {
+                                    ok_close.update(cx, |v, cx| {
+                                        v.modal = Modal::None;
+                                        v.notice_ok = None;
+                                        cx.notify();
+                                    });
+                                })
+                                .child(text!(ok_label.to_string())),
+                        ),
+                ),
+        )
 }
 
 // ---------- diff 模态辅助 ----------
