@@ -5986,7 +5986,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let app = AppState::new();
         // `add_window_view` 直接给回 VisualTestContext，按键派发用它。
-        let (root, mut cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
         let root = root.clone();
         cx.run_until_parked();
 
