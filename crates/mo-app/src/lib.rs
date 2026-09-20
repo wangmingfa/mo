@@ -1146,6 +1146,9 @@ impl AppState {
         if let Some(p) = dirs::picture_dir() {
             out.push(("图片".to_string(), p));
         }
+        if let Some(p) = dirs::video_dir() {
+            out.push(("影片".to_string(), p));
+        }
         out
     }
 

@@ -154,6 +154,8 @@ pub fn quick_access_icon(label: &str) -> &'static [u8] {
         QA_DOWNLOAD
     } else if label.contains("图片") {
         FILE_IMAGE
+    } else if label.contains("影片") || label.contains("视频") {
+        FILE_VIDEO
     } else {
         FOLDER
     }
