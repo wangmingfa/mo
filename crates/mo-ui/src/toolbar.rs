@@ -340,22 +340,11 @@ fn address_bar(
         }
     }
 
-    // 尾部空白：点击进入编辑态（Win11 行为）。
+    // 尾部空白：点击进入编辑态（Win11 行为）——地址栏唯一的编辑入口，
+    // 不再另设铅笔按钮。
     let mut blank = div().id("addr-blank").flex_1().h_full().min_w(px(24.0));
     start_edit_on_click(&mut blank, entity);
-    pill = pill.child(blank);
-
-    // 铅笔按钮：显式的编辑入口。
-    let mut edit_btn = div()
-        .id("addr-edit")
-        .flex()
-        .items_center()
-        .p(px(4.0))
-        .rounded(px(5.0))
-        .flex_shrink_0()
-        .hover(|s| s.bg(theme::hover_bg()));
-    start_edit_on_click(&mut edit_btn, entity);
-    pill.child(edit_btn.child(icon(icons::PENCIL, 13.0, theme::muted())))
+    pill.child(blank)
 }
 
 /// 给一个元素挂上「点击进入地址编辑态」的回调。

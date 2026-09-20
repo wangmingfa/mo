@@ -20,8 +20,6 @@ pub const ROTATE_CW: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBo
 
 pub const CHEVRON_RIGHT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>"##;
 
-pub const PENCIL: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>"##;
-
 // ---- 窗口控制按钮图标（Win11 风格，24×24、描边 1.5、更细更克制）----
 // 顶栏右侧的最小化 / 最大化 / 还原 / 关闭。刻意用细描边贴近原生观感。
 

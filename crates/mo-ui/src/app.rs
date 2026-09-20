@@ -3817,7 +3817,9 @@ impl Render for RootView {
         });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
-        if !self.focus.is_focused(window) {
+        // ⚠️ 地址栏编辑态例外：此刻焦点应归地址栏输入框。若在这里抢回来，输入框会
+        // 立刻收到 Blur → 触发 end_address_edit，表现为「点编辑闪一下又退回显示态」。
+        if !self.focus.is_focused(window) && !self.panel().address_editing {
             cx.focus_self(window);
         }
 
