@@ -249,6 +249,8 @@ pub struct ListChrome<'a> {
     pub dragging: Option<ColId>,
     /// 正在被拖动的那条列分隔线（右侧的那一列）——加粗显示。
     pub resizing: Option<ColId>,
+    /// 斑马纹开关（配置 `ui.zebra`）。
+    pub zebra: bool,
 }
 
 /// `pane` / `tab` 指明渲染的是哪个标签页：多标签页与分栏共享同一个实现。
@@ -274,6 +276,8 @@ pub fn render(
     );
     // 数据行用的列布局：克隆一份小结构（4 个列 + 4 个宽度），每帧成本可忽略。
     let row_cols = chrome.cols.clone();
+    // 斑马纹开关：`chrome` 借着列布局，`move` 闭包只能带走标量。
+    let zebra = chrome.zebra;
     let list = uniform_list("mo-file-list", count, move |range, _window, cx| {
         let need_start = range.start.saturating_sub(BUFFER);
         let need_end = (range.end + BUFFER).min(count);
@@ -339,10 +343,10 @@ pub fn render(
                 .w_full()
                 .h(px(24.0))
                 .px(px(4.0))
-                // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹。
+                // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
                 .bg(if selected {
                     crate::theme::selected_bg()
-                } else if i % 2 == 1 {
+                } else if zebra && i % 2 == 1 {
                     crate::theme::zebra()
                 } else {
                     crate::theme::surface()

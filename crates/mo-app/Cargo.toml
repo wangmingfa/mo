@@ -17,6 +17,8 @@ mo-diff.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 dirs.workspace = true
 

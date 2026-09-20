@@ -23,6 +23,9 @@ const SIDEBAR_WIDTH: f32 = 188.0;
 /// 地址栏编辑态的占位文字（空输入时显示）。
 pub(crate) const ADDRESS_PLACEHOLDER: &str = "输入路径，回车跳转";
 
+/// 同步计划最多列出这么多项（再多也只报总数，避免一次画几千行）。
+const PLAN_LIMIT: usize = 400;
+
 /// 当前打开的模态层（占用中央区；Esc 关闭）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Modal {
@@ -31,8 +34,6 @@ pub(crate) enum Modal {
     CommandPalette,
     /// 全局搜索。
     GlobalSearch,
-    /// 快速预览（空格 Quick Look）。
-    QuickLook,
     /// 回收站面板。
     Trash,
     /// 文件 / 文件夹比较结果。
@@ -49,6 +50,20 @@ pub(crate) enum Modal {
     Tags,
     /// 纯文本信息（哈希结果 / 提示）。
     Info(String),
+    /// 重复文件查找结果。
+    Duplicates,
+    /// 自动化工作流执行结果。
+    Workflow,
+    /// 文件夹同步（配对 / 计划 / 执行）。
+    Sync,
+    /// 主题选择器（↑↓ 实时预览，Enter 应用并持久化，Esc 还原）。
+    Theme,
+    /// 布局设置器（侧边栏 / 状态栏 / 斑马纹 / 默认视图 / 恢复默认）。
+    Layout,
+    /// 快捷键设置器（可重映射 / 解绑 / 捕获按键）。
+    Keys,
+    /// 扩展管理器（列出已加载的扩展，可启停）。
+    Extensions,
 }
 
 /// 命令面板中的可执行命令。
@@ -91,209 +106,316 @@ pub(crate) enum CommandId {
     ToggleSplit,
     CreateSymlink,
     CreateHardlink,
+    /// 打开主题选择器。
+    ThemePicker,
+    ThemeLight,
+    ThemeDark,
+    ThemeSystem,
+    /// 布局设置器与三条直达开关。
+    LayoutPicker,
+    /// 快捷键设置器。
+    KeysPicker,
+    /// 扩展管理器。
+    ExtensionsPicker,
+    /// 在当前目录查找重复文件。
+    FindDuplicates,
+    /// 文件夹同步面板。
+    FolderSync,
+    /// 用户自定义命令（下标指向 `RootView::user_commands`）。
+    User(usize),
+    /// 自动化工作流（下标指向 `RootView::workflows`）。
+    Workflow(usize),
+    ToggleSidebar,
+    ToggleStatusBar,
+    ToggleZebra,
 }
 
 struct CmdDef {
     id: CommandId,
-    title: &'static str,
-    category: &'static str,
+    title: String,
+    category: String,
 }
 
 /// 命令目录（命令面板的数据源）。
-fn commands() -> Vec<CmdDef> {
-    vec![
+///
+/// `users` 是用户自定义命令，追加在内建命令之后（第四阶段·自定义命令）。
+fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) -> Vec<CmdDef> {
+    let mut out = vec![
         CmdDef {
             id: CommandId::OpenGlobalSearch,
-            title: "全局搜索…",
-            category: "搜索",
+            title: "全局搜索…".to_string(),
+            category: "搜索".to_string(),
         },
         CmdDef {
             id: CommandId::QuickLook,
-            title: "快速预览（Quick Look）",
-            category: "预览",
+            title: "快速预览（Quick Look）".to_string(),
+            category: "预览".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ThemePicker,
+            title: "主题…（浅色 / 深色 / 跟随系统 / 自定义）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ThemeLight,
+            title: "切换到浅色主题".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ThemeDark,
+            title: "切换到深色主题".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ThemeSystem,
+            title: "主题跟随系统外观".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::FolderSync,
+            title: "文件夹同步…（与配对目录双向 / 镜像）".to_string(),
+            category: "工具".to_string(),
+        },
+        CmdDef {
+            id: CommandId::FindDuplicates,
+            title: "查找重复文件…（当前目录）".to_string(),
+            category: "工具".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ExtensionsPicker,
+            title: "扩展…（查看 / 启停已加载的扩展）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::KeysPicker,
+            title: "快捷键…（重映射 / 解绑 / 恢复默认）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::LayoutPicker,
+            title: "布局…（侧边栏 / 状态栏 / 斑马纹 / 默认视图）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ToggleSidebar,
+            title: "显示 / 隐藏侧边栏".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ToggleStatusBar,
+            title: "显示 / 隐藏状态栏".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ToggleZebra,
+            title: "列表斑马纹开关".to_string(),
+            category: "外观".to_string(),
         },
         CmdDef {
             id: CommandId::HashSelection,
-            title: "计算选中文件哈希（MD5/SHA-1/SHA-256）",
-            category: "工具",
+            title: "计算选中文件哈希（MD5/SHA-1/SHA-256）".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::CompareSelection,
-            title: "比较选中的两项（文件 / 文件夹，含 diff）",
-            category: "工具",
+            title: "比较选中的两项（文件 / 文件夹，含 diff）".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::IndexCurrent,
-            title: "索引当前目录（建立全局搜索索引）",
-            category: "搜索",
+            title: "索引当前目录（建立全局搜索索引）".to_string(),
+            category: "搜索".to_string(),
         },
         CmdDef {
             id: CommandId::StopIndexing,
-            title: "停止索引",
-            category: "搜索",
+            title: "停止索引".to_string(),
+            category: "搜索".to_string(),
         },
         CmdDef {
             id: CommandId::Refresh,
-            title: "刷新",
-            category: "导航",
+            title: "刷新".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::Back,
-            title: "后退",
-            category: "导航",
+            title: "后退".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::Forward,
-            title: "前进",
-            category: "导航",
+            title: "前进".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::Parent,
-            title: "上级目录",
-            category: "导航",
+            title: "上级目录".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::SelectAll,
-            title: "全选",
-            category: "选择",
+            title: "全选".to_string(),
+            category: "选择".to_string(),
         },
         CmdDef {
             id: CommandId::ClearSelection,
-            title: "清除选择",
-            category: "选择",
+            title: "清除选择".to_string(),
+            category: "选择".to_string(),
         },
         CmdDef {
             id: CommandId::DeleteSelection,
-            title: "删除选中",
-            category: "操作",
+            title: "删除选中".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::Undo,
-            title: "撤销",
-            category: "操作",
+            title: "撤销".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::Redo,
-            title: "重做",
-            category: "操作",
+            title: "重做".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::OpenTrash,
-            title: "回收站…",
-            category: "操作",
+            title: "回收站…".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::OpenTerminal,
-            title: "在当前目录打开终端",
-            category: "工具",
+            title: "在当前目录打开终端".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::AddBookmark,
-            title: "把当前目录加入书签",
-            category: "导航",
+            title: "把当前目录加入书签".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::RemoveBookmark,
-            title: "把当前目录从书签移除",
-            category: "导航",
+            title: "把当前目录从书签移除".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::Properties,
-            title: "属性与权限…（⌘I）",
-            category: "工具",
+            title: "属性与权限…（⌘I）".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::BatchRename,
-            title: "批量重命名…",
-            category: "工具",
+            title: "批量重命名…".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::CreateArchive,
-            title: "压缩选中项…",
-            category: "工具",
+            title: "压缩选中项…".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::ExtractArchive,
-            title: "解压到当前目录",
-            category: "工具",
+            title: "解压到当前目录".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::DiskUsage,
-            title: "磁盘空间分析…",
-            category: "工具",
+            title: "磁盘空间分析…".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::TagSelection,
-            title: "给选中项设置标签…",
-            category: "工具",
+            title: "给选中项设置标签…".to_string(),
+            category: "工具".to_string(),
         },
         CmdDef {
             id: CommandId::CopyClipboard,
-            title: "复制选中（⌘C）",
-            category: "操作",
+            title: "复制选中（⌘C）".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::CutClipboard,
-            title: "剪切选中（⌘X）",
-            category: "操作",
+            title: "剪切选中（⌘X）".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::PasteClipboard,
-            title: "粘贴到当前目录（⌘V）",
-            category: "操作",
+            title: "粘贴到当前目录（⌘V）".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::NewTab,
-            title: "新建标签页（⌘T）",
-            category: "窗口",
+            title: "新建标签页（⌘T）".to_string(),
+            category: "窗口".to_string(),
         },
         CmdDef {
             id: CommandId::CloseTab,
-            title: "关闭标签页（⌘W）",
-            category: "窗口",
+            title: "关闭标签页（⌘W）".to_string(),
+            category: "窗口".to_string(),
         },
         CmdDef {
             id: CommandId::ToggleSplit,
-            title: "双栏分栏开 / 关（⌘⇧D）",
-            category: "窗口",
+            title: "双栏分栏开 / 关（⌘⇧D）".to_string(),
+            category: "窗口".to_string(),
         },
         CmdDef {
             id: CommandId::CreateSymlink,
-            title: "创建符号链接（同目录）",
-            category: "操作",
+            title: "创建符号链接（同目录）".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::CreateHardlink,
-            title: "创建硬链接（同目录，仅文件）",
-            category: "操作",
+            title: "创建硬链接（同目录，仅文件）".to_string(),
+            category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::SortName,
-            title: "按名称排序",
-            category: "排序",
+            title: "按名称排序".to_string(),
+            category: "排序".to_string(),
         },
         CmdDef {
             id: CommandId::SortSize,
-            title: "按大小排序",
-            category: "排序",
+            title: "按大小排序".to_string(),
+            category: "排序".to_string(),
         },
         CmdDef {
             id: CommandId::SortModified,
-            title: "按修改时间排序",
-            category: "排序",
+            title: "按修改时间排序".to_string(),
+            category: "排序".to_string(),
         },
         CmdDef {
             id: CommandId::SortKind,
-            title: "按类型排序",
-            category: "排序",
+            title: "按类型排序".to_string(),
+            category: "排序".to_string(),
         },
-    ]
+    ];
+    for (i, u) in users.iter().enumerate() {
+        out.push(CmdDef {
+            id: CommandId::User(i),
+            title: u.name.clone(),
+            category: if u.category.trim().is_empty() {
+                "自定义".to_string()
+            } else {
+                u.category.clone()
+            },
+        });
+    }
+    for (i, w) in workflows.iter().enumerate() {
+        out.push(CmdDef {
+            id: CommandId::Workflow(i),
+            title: w.name.clone(),
+            category: "工作流".to_string(),
+        });
+    }
+    out
 }
 
 /// 按查询串过滤命令（大小写不敏感子串匹配）。
-fn filtered_commands(q: &str) -> Vec<CommandId> {
+fn filtered_commands_in(
+    q: &str,
+    users: &[mo_app::UserCommand],
+    workflows: &[mo_app::Workflow],
+) -> Vec<CommandId> {
     let q = q.trim().to_lowercase();
-    commands()
+    commands_in(users, workflows)
         .into_iter()
         .filter(|c| {
             q.is_empty()
@@ -330,8 +452,55 @@ pub struct RootView {
     search_query: String,
     /// 全局搜索结果。
     search_results: Vec<SearchHit>,
-    /// 快速预览缓存。
-    preview_cache: Option<Preview>,
+    /// 快速预览独立窗口（`None` = 未开；已开时复用换内容，不重复开）。
+    preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
+    /// 当前生效的主题名（`light` / `dark` / `system` / 自定义 key）。
+    ///
+    /// 缓存在这里而不是每帧读配置：`AppState::config()` 每次都要读一遍 JSON，
+    /// 渲染帧里读会把主线程吃满。
+    theme_name: String,
+    /// 最近一帧看到的系统外观是否深色（`system` 主题要靠它跟随切换）。
+    appearance_dark: bool,
+    /// 主题选择器的光标位。
+    theme_index: usize,
+    /// 界面布局偏好（侧边栏 / 状态栏 / 斑马纹 / 默认视图），启动时从配置读入。
+    ui: mo_app::UiPrefs,
+    /// 布局设置器的光标位。
+    layout_index: usize,
+    /// 当前键表（默认键位 + 配置覆盖）。
+    keymap: crate::keys::Keymap,
+    /// 快捷键设置器的光标位。
+    keys_index: usize,
+    /// 正在捕获新键位的动作 id（None = 没在捕获）。
+    keys_capturing: Option<&'static str>,
+    /// 用户自定义命令快照（打开命令面板时刷新；下标即 CommandId::User 的参数）。
+    user_commands: Vec<mo_app::UserCommand>,
+    /// 已加载的扩展快照（打开扩展管理器时刷新）。
+    extensions: Vec<mo_app::extensions::Extension>,
+    /// 工作流快照（打开命令面板时刷新；下标即 CommandId::Workflow 的参数）。
+    workflows: Vec<mo_app::Workflow>,
+    /// 工作流是否正在执行。
+    wf_running: bool,
+    /// 取消标志：置位后不再开下一步（当前这一步跑完才停）。
+    wf_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 最近一次工作流的执行结果。
+    wf_report: Option<mo_app::WorkflowReport>,
+    /// 同步：当前选项。
+    sync_opts: mo_operations::SyncOptions,
+    /// 同步：已生成的计划（dry-run 结果）。
+    sync_plan: Option<mo_operations::SyncPlan>,
+    /// 同步：最近一次执行报告。
+    sync_report: Option<mo_operations::SyncReport>,
+    /// 同步：是否正在生成计划 / 执行。
+    sync_busy: bool,
+    /// 扩展管理器的光标位。
+    ext_index: usize,
+    /// 重复文件查找结果（`None` = 还没跑过）。
+    dedup: Option<mo_operations::DedupReport>,
+    /// 重复文件查找是否在跑。
+    dedup_running: bool,
+    /// 取消标志：扫描循环每读一个文件前检查一次。
+    dedup_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 已索引文件数（状态栏展示，取最近一次同步的值）。
     indexed: usize,
     /// 回收站条目快照（回收站面板数据源）。
@@ -408,8 +577,18 @@ enum NewEntry {
 
 impl RootView {
     pub fn new(app: AppState, cx: &mut Context<Self>) -> Self {
+        // 启动即套用持久化主题：此时还没有 Window，先按浅色基底解析系统外观，
+        // 第一帧 render 里的外观跟随逻辑会在拿到真实外观后纠正。
+        let theme_name = app.theme_setting();
+        crate::theme::set(crate::theme::resolve(
+            &theme_name,
+            &app.custom_themes(),
+            false,
+        ));
+        crate::theme::apply_component(cx);
+        let ui = app.ui_prefs();
         let view = Self {
-            panes: vec![Pane::new(Panel::new(app.clone()))],
+            panes: vec![Pane::new(panel_with_prefs(app.clone(), &ui))],
             active_pane: 0,
             split: false,
             focus: cx.focus_handle(),
@@ -418,7 +597,33 @@ impl RootView {
             palette_index: 0,
             search_query: String::new(),
             search_results: Vec::new(),
-            preview_cache: None,
+            preview_window: None,
+            theme_name: theme_name.clone(),
+            appearance_dark: false,
+            // 选择器光标停在当前主题上。
+            theme_index: crate::theme::choices(&app.custom_themes())
+                .iter()
+                .position(|c| *c == theme_name)
+                .unwrap_or(0),
+            ui: app.ui_prefs(),
+            layout_index: 0,
+            keymap: crate::keys::Keymap::build(&app.keybindings()),
+            keys_index: 0,
+            keys_capturing: None,
+            user_commands: Vec::new(),
+            extensions: Vec::new(),
+            ext_index: 0,
+            workflows: Vec::new(),
+            wf_running: false,
+            wf_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wf_report: None,
+            sync_opts: mo_operations::SyncOptions::default(),
+            sync_plan: None,
+            sync_report: None,
+            sync_busy: false,
+            dedup: None,
+            dedup_running: false,
+            dedup_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexed: 0,
             trash_entries: Vec::new(),
             diff_cache: None,
@@ -429,7 +634,7 @@ impl RootView {
             archive_name: String::new(),
             usage: Vec::new(),
             drag: None,
-            cols: crate::list_columns::ColumnLayout::new(),
+            cols: crate::list_columns::ColumnLayout::from_prefs(&app.column_prefs()),
             header_drag: None,
             header_cells: Vec::new(),
             header_cells_owner: (0, 0),
@@ -520,7 +725,7 @@ impl RootView {
             return;
         };
         let tab_idx = pane.tabs.len();
-        pane.tabs.push(Panel::new(app.clone()));
+        pane.tabs.push(panel_with_prefs(app.clone(), &self.ui));
         pane.active = tab_idx;
 
         let weak = cx.entity().downgrade();
@@ -591,7 +796,9 @@ impl RootView {
             app.spawn_watcher_pump();
             app.spawn_refresh_pump();
             let idx = self.panes.len();
-            self.panes.push(Pane::new(Panel::new(app.clone())));
+            let ui = self.ui.clone();
+            self.panes
+                .push(Pane::new(panel_with_prefs(app.clone(), &ui)));
             let weak = cx.entity().downgrade();
             cx.spawn(async move |_weak, cx| {
                 match start {
@@ -629,7 +836,7 @@ impl RootView {
             return;
         };
         let tab_idx = pane.tabs.len();
-        pane.tabs.push(Panel::new(app.clone()));
+        pane.tabs.push(panel_with_prefs(app.clone(), &self.ui));
         pane.active = tab_idx;
 
         let weak = cx.entity().downgrade();
@@ -757,6 +964,1557 @@ impl RootView {
             })
             .detach();
         }
+    }
+
+    /// 在**独立窗口**里快速预览文件。
+    ///
+    /// 已开着预览窗口就只换内容并置前（Quick Look 习惯：连按空格翻文件不叠窗口）；
+    /// 窗口已被用户关掉（`update` 报错）则当作没开重新创建。
+    pub(crate) fn show_preview(&mut self, pv: Preview, cx: &mut Context<Self>) {
+        if let Some(handle) = self.preview_window {
+            let updated = handle.update(cx, |v, _window, c| v.set_preview(pv.clone(), c));
+            if updated.is_ok() {
+                let _ = handle.update(cx, |_v, window, _c| window.activate_window());
+                return;
+            }
+            self.preview_window = None;
+        }
+
+        let bounds = WindowBounds::centered(size(px(680.0), px(520.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(bounds),
+            titlebar: Some(TitlebarOptions {
+                title: Some("快速预览".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let this = cx.entity().clone();
+        // 建窗闭包要把主视图交给 PreviewWindow（方向键回调），单独克隆一份，
+        // 免得 `this` 被移走后拿不到回写句柄。
+        let root_for_window = this.clone();
+        cx.spawn(async move |_weak, cx| {
+            let opened = cx.open_window(options, move |_, cx| {
+                cx.new(|cx| crate::preview::PreviewWindow::new(pv, root_for_window, cx))
+            });
+            match opened {
+                Ok(handle) => {
+                    this.update(cx, |v, _cx| v.preview_window = Some(handle));
+                }
+                Err(e) => {
+                    this.update(cx, |v, cx| {
+                        v.modal = Modal::Info(format!("打开预览窗口失败：{e}"));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 预览窗口里按方向键：移动列表焦点并换预览内容。
+    ///
+    /// 焦点的唯一事实来源仍是 app 侧选择模型，所以这里复用主列表的
+    /// `move_cursor` + `pull_selection`——预览翻文件时，主列表的高亮与
+    /// 滚动同步跟着走（Finder Quick Look 行为）。到边界 `move_cursor`
+    /// 会钳住，重复按键停在同一项上。
+    pub(crate) fn preview_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            if app.move_cursor(step, false).await.is_none() {
+                return; // 空目录：没有可预览的项。
+            }
+            pull_selection(&app, &this, cx).await;
+            let Some(p) = app.selection_paths().await.into_iter().next() else {
+                return;
+            };
+            if let Ok(pv) = app.preview(&p) {
+                this.update(cx, |v, cx| v.show_preview(pv, cx));
+            }
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------------ 主题
+
+    /// 系统外观是否深色。
+    fn system_dark(window: &Window) -> bool {
+        matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        )
+    }
+
+    /// 按当前主题名重解析调色板并落到全局（含 gpui-component 的 Theme）。
+    ///
+    /// 系统外观取 `self.appearance_dark`（每帧 render 校准的缓存），这样主题
+    /// 操作不必到处携带 `Window`——命令面板 / 快捷键 / 鼠标点击共用一条路径。
+    fn repaint_theme(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let name = self.theme_name.clone();
+        let dark = self.appearance_dark;
+        crate::theme::set(crate::theme::resolve(&name, &app.custom_themes(), dark));
+        crate::theme::apply_component(cx);
+        cx.notify();
+    }
+
+    /// 切换主题。`persist` 为真时写回配置（选择器里的实时预览传 false）。
+    pub(crate) fn apply_theme(&mut self, name: &str, persist: bool, cx: &mut Context<Self>) {
+        if persist {
+            self.app().set_theme(name);
+        }
+        self.theme_name = name.to_string();
+        self.repaint_theme(cx);
+    }
+
+    /// 打开主题选择器（光标停在当前主题）。
+    pub(crate) fn open_theme_picker(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let names = crate::theme::choices(&app.custom_themes());
+        self.theme_index = names
+            .iter()
+            .position(|n| *n == self.theme_name)
+            .unwrap_or(0);
+        self.modal = Modal::Theme;
+        cx.notify();
+    }
+
+    /// 主题选择器：↑↓ 移动光标并实时预览（不写配置）。
+    fn theme_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let app = self.app();
+        let names = crate::theme::choices(&app.custom_themes());
+        if names.is_empty() {
+            return;
+        }
+        self.theme_index =
+            (self.theme_index as isize + delta).rem_euclid(names.len() as isize) as usize;
+        self.theme_name = names[self.theme_index].clone();
+        self.repaint_theme(cx);
+    }
+
+    /// 主题选择器：Enter 确认当前项并持久化。
+    fn theme_commit(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let names = crate::theme::choices(&app.custom_themes());
+        if let Some(name) = names.get(self.theme_index).cloned() {
+            app.set_theme(&name);
+            self.theme_name = name;
+        }
+        self.modal = Modal::None;
+        self.repaint_theme(cx);
+    }
+
+    /// 主题选择器：Esc 放弃预览，还原到进入前配置里的主题。
+    fn theme_cancel(&mut self, cx: &mut Context<Self>) {
+        self.theme_name = self.app().theme_setting();
+        self.modal = Modal::None;
+        self.repaint_theme(cx);
+    }
+
+    fn render_theme(&self, entity: &Entity<RootView>) -> Div {
+        let app = self.app();
+        let names = crate::theme::choices(&app.custom_themes());
+        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        for (i, name) in names.iter().enumerate() {
+            let selected = i == self.theme_index;
+            let on_click_theme = name.clone();
+            let mut row = div()
+                .id(format!("theme-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .rounded(px(4.0))
+                .bg(if selected {
+                    crate::theme::selected_bg()
+                } else {
+                    crate::theme::surface()
+                })
+                .text_color(if selected {
+                    crate::theme::selected_text()
+                } else {
+                    crate::theme::text()
+                })
+                .child(text!(crate::theme::label(name)));
+            // 自定义主题额外显示配置里的 key，方便对着 config.json 改。
+            if crate::theme::label(name) != *name {
+                row = row.child(text!(format!("（{name}）")));
+            }
+            if *name == self.theme_name {
+                row = row.child(text!("· 当前".to_string()));
+            }
+            let ent = entity.clone();
+            row.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.apply_theme(&on_click_theme, true, cx));
+            });
+            body = body.child(row);
+        }
+        // 当前调色板的角色色卡：预览时一眼看清每档颜色（也是自定义主题的对照表）。
+        let p = crate::theme::current();
+        let mut swatches = div().flex().flex_row().flex_wrap().gap(px(6.0)).px(px(8.0));
+        for (key, zh) in crate::theme::ROLES {
+            let Some(c) = p.role(key) else { continue };
+            swatches = swatches.child(
+                div()
+                    .id(format!("theme-swatch-{key}"))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(2.0))
+                    .w(px(46.0))
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .h(px(14.0))
+                            .rounded(px(3.0))
+                            .border_1()
+                            .border_color(crate::theme::divider())
+                            .bg(c),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(crate::theme::muted())
+                            .child(text!(zh.to_string())),
+                    ),
+            );
+        }
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .pt(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(crate::theme::muted())
+                        .child(text!("当前调色板".to_string())),
+                )
+                .child(swatches),
+        );
+        modal_card(
+            "主题",
+            "",
+            body,
+            "↑↓ 预览 · Enter 应用 · Esc 还原 · 自定义主题写在 config.json 的 custom_themes",
+        )
+    }
+
+    /// 打开扩展管理器。
+    pub(crate) fn open_extensions_picker(&mut self, cx: &mut Context<Self>) {
+        self.extensions = self.app().extensions();
+        self.ext_index = 0;
+        self.modal = Modal::Extensions;
+        cx.notify();
+    }
+
+    /// 启停某个扩展（写回它自己的清单），随后刷新扩展列表。
+    fn toggle_extension(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(id) = self.extensions.get(i).map(|e| e.manifest.id.clone()) else {
+            return;
+        };
+        let on = !self.extensions.get(i).is_some_and(|e| e.manifest.enabled);
+        if let Err(e) = self.app().set_extension_enabled(&id, on) {
+            self.modal = Modal::Info(format!("切换扩展「{id}」失败：{e}"));
+            cx.notify();
+            return;
+        }
+        self.extensions = self.app().extensions();
+        cx.notify();
+    }
+
+    fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        if self.extensions.is_empty() {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("（还没有扩展）".to_string())),
+            );
+            body = body.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .child(text!(
+                        "把带 manifest.json 的目录放进配置目录下的 extensions/ 即可".to_string()
+                    )),
+            );
+        }
+        for (i, e) in self.extensions.iter().enumerate() {
+            let m = &e.manifest;
+            let selected = i == self.ext_index;
+            let mut row = div()
+                .id(format!("ext-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .rounded(px(4.0))
+                .bg(if selected {
+                    theme::selected_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_color(if selected {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                })
+                .child(text!(format!(
+                    "{}{}（{} 条命令）",
+                    m.name,
+                    if m.version.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", m.version)
+                    },
+                    m.commands.len()
+                )))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(if m.enabled { "已启用" } else { "已停用" })),
+                );
+            let ent = entity.clone();
+            row.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.toggle_extension(i, cx));
+            });
+            body = body.child(row);
+        }
+        modal_card(
+            "扩展",
+            "",
+            body,
+            "↑↓ 选择 · Enter 启用 / 停用 · Esc 关闭 · 扩展=清单+外部程序，不往进程里塞代码",
+        )
+    }
+
+    /// 顺序执行一个工作流（结果进独立模态，逐步回显）。
+    ///
+    /// 步骤本身是外部程序，跑起来可能要几十秒，所以放 blocking 池、UI 不卡；
+    /// 取消语义是「不再开下一步」——中途强杀外部进程既不可靠也容易留下半成品。
+    pub(crate) fn run_workflow_at(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(wf) = self.workflows.get(i).cloned() else {
+            return;
+        };
+        if self.wf_running {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        let ctx = {
+            let panel = self.panel();
+            let selected = panel
+                .window
+                .iter()
+                .filter(|e| panel.selection.is_selected(&e.id))
+                .map(|e| e.path.clone())
+                .collect();
+            mo_app::usercmds::CommandContext {
+                dir: panel.path.clone(),
+                selected,
+            }
+        };
+        self.wf_running = true;
+        self.wf_report = None;
+        self.wf_cancel.store(false, Ordering::Relaxed);
+        self.modal = Modal::Workflow;
+        let app = self.app();
+        let cancel = self.wf_cancel.clone();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let report = app.run_workflow(wf, ctx, cancel).await;
+            this.update(cx, |v, cx| {
+                v.wf_running = false;
+                v.wf_report = Some(report);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 关掉工作流模态；正在跑时 Esc 是「不再继续下一步」。
+    fn workflow_dismiss(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.wf_running {
+            self.wf_cancel.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.modal = Modal::None;
+        self.wf_report = None;
+        cx.notify();
+    }
+
+    fn render_workflow(&self) -> Div {
+        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+        if self.wf_running {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("正在执行…（Esc：不再继续下一步）".to_string())),
+            );
+            return modal_card("自动化工作流", "", body, "执行在后台进行，可以继续浏览");
+        }
+        let Some(r) = self.wf_report.clone() else {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("（还没有执行记录）".to_string())),
+            );
+            return modal_card("自动化工作流", "", body, "Esc 关闭");
+        };
+        let head = if let Some(f) = r.failed_at {
+            format!("「{}」在第 {} 步失败", r.workflow, f + 1)
+        } else if r.cancelled {
+            format!("「{}」已取消", r.workflow)
+        } else if let Some(b) = &r.blocked {
+            format!("「{}」未执行：{b}", r.workflow)
+        } else {
+            format!("「{}」全部 {} 步成功", r.workflow, r.steps.len())
+        };
+        body = body.child(
+            div()
+                .text_color(if r.succeeded() {
+                    theme::text()
+                } else {
+                    diff_del_fg()
+                })
+                .child(text!(head)),
+        );
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
+        for (i, s) in r.steps.iter().enumerate() {
+            let mark = if s.ok() { "✓" } else { "✗" };
+            let mut col = div().flex().flex_col().px(px(6.0)).py(px(3.0));
+            col = col.child(text!(format!("{mark} 第 {} 步  $ {}", i + 1, s.line)));
+            if !s.output.text.trim().is_empty() {
+                col = col.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme::muted())
+                        .child(text!(s.output.text.clone())),
+                );
+            }
+            list = list.child(
+                div()
+                    .id(format!("wf-step-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .rounded(px(4.0))
+                    .bg(if s.ok() {
+                        theme::surface()
+                    } else {
+                        theme::hover_bg()
+                    })
+                    .child(col.flex_1()),
+            );
+        }
+        body = body.child(list);
+        modal_card(
+            "自动化工作流",
+            "",
+            body,
+            "Esc 关闭 · 失败即中止，未跑的步骤不会执行",
+        )
+    }
+
+    // ------------------------------------------------------------ 文件夹同步
+
+    /// 当前目录及其配对目标；没配对、目标已消失、或与源同一个目录都算没有。
+    fn sync_pair(&self) -> Option<(PathBuf, PathBuf)> {
+        let src = self.panel().path.clone()?;
+        let dst = self.app().sync_target(&src)?;
+        if dst.as_os_str().is_empty() || !dst.is_dir() || dst == src {
+            return None;
+        }
+        Some((src, dst))
+    }
+
+    /// 打开同步面板。
+    pub(crate) fn open_sync_picker(&mut self, cx: &mut Context<Self>) {
+        if self.panel().path.is_none() {
+            self.modal = Modal::Info("当前没有可同步的目录".to_string());
+            cx.notify();
+            return;
+        }
+        // 换目录 / 重开面板后旧计划一律作废。
+        self.sync_plan = None;
+        self.sync_report = None;
+        self.sync_busy = false;
+        self.modal = Modal::Sync;
+        cx.notify();
+    }
+
+    /// 把剪贴板里的路径设为当前目录的同步目标。
+    ///
+    /// 用剪贴板而不是自绘输入框：本应用已有「拷贝路径」（⌥⌘C / 右键菜单），
+    /// 在目标目录上拷一次、回来按一下就能配对，比敲一长串绝对路径省事得多。
+    fn set_sync_target_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(src) = self.panel().path.clone() else {
+            return;
+        };
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text().map(|t| t.trim().to_string()))
+        else {
+            self.modal = Modal::Info("剪贴板里没有文本".to_string());
+            cx.notify();
+            return;
+        };
+        if text.is_empty() {
+            self.app().set_sync_target(&src, None);
+            self.sync_plan = None;
+            self.sync_report = None;
+            cx.notify();
+            return;
+        }
+        // 允许「拷贝路径」那种一行一个的多行内容：取第一行作为目录。
+        let first = text.lines().next().unwrap_or("").trim();
+        let dst = PathBuf::from(first);
+        if dst == src {
+            self.modal = Modal::Info("源目录与目标目录不能是同一个".to_string());
+            cx.notify();
+            return;
+        }
+        if !dst.is_dir() {
+            self.modal = Modal::Info(format!(
+                "剪贴板里的路径不是存在的目录（或是文件）：{first}\n\n\
+                 提示：先在目标目录里按 ⌥C「拷贝路径」，再回来点这里。"
+            ));
+            cx.notify();
+            return;
+        }
+        self.app().set_sync_target(&src, Some(&dst));
+        self.sync_plan = None;
+        self.sync_report = None;
+        cx.notify();
+    }
+
+    /// 解除当前目录的配对。
+    fn clear_sync_target(&mut self, cx: &mut Context<Self>) {
+        if let Some(src) = self.panel().path.clone() {
+            self.app().set_sync_target(&src, None);
+        }
+        self.sync_plan = None;
+        self.sync_report = None;
+        cx.notify();
+    }
+
+    /// 生成同步计划（只读，不动任何文件）。
+    pub(crate) fn build_sync_plan(&mut self, cx: &mut Context<Self>) {
+        let Some((src, dst)) = self.sync_pair() else {
+            self.modal =
+                Modal::Info("还没有可用的目标目录：先把它拷贝到剪贴板再点「设为目标」".to_string());
+            cx.notify();
+            return;
+        };
+        if self.sync_busy {
+            return;
+        }
+        self.sync_busy = true;
+        self.sync_plan = None;
+        self.sync_report = None;
+        let opts = self.sync_opts;
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let result = app.sync_plan(src, dst, opts).await;
+            this.update(cx, |v, cx| {
+                v.sync_busy = false;
+                match result {
+                    Ok(p) => v.sync_plan = Some(p),
+                    Err(e) => v.modal = Modal::Info(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 执行计划：复制项就地完成，多余文件交回调用方送回收站。
+    pub(crate) fn execute_sync(&mut self, cx: &mut Context<Self>) {
+        let Some((src, dst)) = self.sync_pair() else {
+            return;
+        };
+        let Some(plan) = self.sync_plan.clone() else {
+            return;
+        };
+        if self.sync_busy || plan.is_empty() {
+            return;
+        }
+        self.sync_busy = true;
+        let trashed = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, mo_operations::SyncAction::TrashInTarget { .. }))
+            .count();
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let (mut report, victims) = app.sync_apply(src, dst, plan).await;
+            if !victims.is_empty() {
+                // 删除一律走回收站：有进度、可撤销，绝不永久删除。
+                app.trash_paths(victims).await;
+            }
+            report.trashed = trashed.saturating_sub(report.errors.len());
+            this.update(cx, |v, cx| {
+                v.sync_busy = false;
+                // 执行完两侧应已一致，计划作废，避免重复点执行。
+                v.sync_plan = None;
+                v.sync_report = Some(report);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 循环切换某个同步选项（方向 / 冲突策略 / 是否清理多余）。
+    fn sync_cycle(&mut self, which: usize, cx: &mut Context<Self>) {
+        use mo_operations::{SyncConflictPolicy as ConflictPolicy, SyncMode};
+        match which {
+            0 => {
+                self.sync_opts.mode = match self.sync_opts.mode {
+                    SyncMode::TwoWay => SyncMode::Mirror,
+                    SyncMode::Mirror => SyncMode::TwoWay,
+                };
+            }
+            1 => {
+                self.sync_opts.conflict = match self.sync_opts.conflict {
+                    ConflictPolicy::NewerWins => ConflictPolicy::KeepBoth,
+                    ConflictPolicy::KeepBoth => ConflictPolicy::Skip,
+                    ConflictPolicy::Skip => ConflictPolicy::NewerWins,
+                };
+            }
+            2 => self.sync_opts.delete_extras = !self.sync_opts.delete_extras,
+            _ => return,
+        }
+        // 选项一变，旧计划就作废：必须重新 dry-run 才允许执行。
+        self.sync_plan = None;
+        self.sync_report = None;
+        cx.notify();
+    }
+
+    /// 一行可点击的设置项。
+    fn sync_row(
+        &self,
+        i: usize,
+        label: &str,
+        value: &str,
+        entity: &Entity<RootView>,
+    ) -> Stateful<Div> {
+        let mut row = div()
+            .id(format!("sync-row-{i}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .px(px(6.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .text_color(theme::text())
+            .hover(|s| s.bg(theme::hover_bg()))
+            .child(text!(label.to_string()))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .truncate()
+                    .child(text!(value.to_string())),
+            );
+        let ent = entity.clone();
+        row.interactivity().on_click(move |_ev, _window, cx| {
+            ent.update(cx, |v, cx| v.sync_cycle(i, cx));
+        });
+        row
+    }
+
+    /// 一个动作按钮。
+    fn sync_button(id: &str, label: &str, accent: bool) -> Stateful<Div> {
+        div()
+            .id(id.to_string())
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .bg(if accent {
+                theme::selected_bg()
+            } else {
+                theme::hover_bg()
+            })
+            .text_color(if accent {
+                theme::selected_text()
+            } else {
+                theme::text()
+            })
+            .child(text!(label.to_string()))
+    }
+
+    fn render_sync(&self, entity: &Entity<RootView>) -> Div {
+        use mo_operations::{SyncConflictPolicy as ConflictPolicy, SyncMode};
+
+        let src = self.panel().path.clone().unwrap_or_default();
+        let paired = self.sync_pair();
+        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .truncate()
+                .child(text!(format!("源：{}", src.display()))),
+        );
+        let target_text = match paired.as_ref() {
+            Some((_, dst)) => format!("目标：{}", dst.display()),
+            None => "目标：未配对（在目标目录按 ⌥⌘C 拷贝路径，再点下面的「设为目标」）".to_string(),
+        };
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .truncate()
+                .child(text!(target_text)),
+        );
+
+        let mode = match self.sync_opts.mode {
+            SyncMode::TwoWay => "双向合并",
+            SyncMode::Mirror => "单向镜像（源 → 目标）",
+        };
+        let conflict = match self.sync_opts.conflict {
+            ConflictPolicy::NewerWins => "较新的覆盖较旧的",
+            ConflictPolicy::KeepBoth => "两边都留（旧版改名保留）",
+            ConflictPolicy::Skip => "跳过，交给人判断",
+        };
+        let extras = if self.sync_opts.mode == SyncMode::Mirror {
+            if self.sync_opts.delete_extras {
+                "目标端多余的移入回收站"
+            } else {
+                "保留目标端多余文件"
+            }
+        } else {
+            "双向合并不删除"
+        };
+        body = body.child(self.sync_row(0, "同步方向", mode, entity));
+        body = body.child(self.sync_row(1, "内容冲突时", conflict, entity));
+        body = body.child(self.sync_row(2, "多余文件", extras, entity));
+
+        // 动作行。
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(6.0))
+            .pt(px(4.0));
+
+        let ent = entity.clone();
+        let mut btn = Self::sync_button("sync-set-target", "设为目标（取剪贴板）", false);
+        btn.interactivity().on_click(move |_ev, _window, cx| {
+            ent.update(cx, |v, cx| v.set_sync_target_from_clipboard(cx));
+        });
+        actions = actions.child(btn);
+
+        if paired.is_some() {
+            let ent = entity.clone();
+            let mut btn = Self::sync_button("sync-clear", "解除配对", false);
+            btn.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.clear_sync_target(cx));
+            });
+            actions = actions.child(btn);
+
+            let ent = entity.clone();
+            let mut btn = Self::sync_button(
+                "sync-plan",
+                if self.sync_busy {
+                    "请稍候…"
+                } else {
+                    "生成计划（只读）"
+                },
+                false,
+            );
+            btn.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.build_sync_plan(cx));
+            });
+            actions = actions.child(btn);
+        }
+        body = body.child(actions);
+
+        if let Some(p) = self.sync_plan.clone() {
+            let ent = entity.clone();
+            let mut run = Self::sync_button("sync-run", "执行同步", true);
+            run.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.execute_sync(cx));
+            });
+            body = body.child(div().flex().flex_row().px(px(6.0)).pt(px(2.0)).child(run));
+            body = body.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .px(px(6.0))
+                    .child(text!(format!(
+                        "计划 {} 项 · 预计传输 {} · {} 项已相同",
+                        p.actions.len(),
+                        crate::file_item::format_size(p.total_bytes()),
+                        p.identical
+                    ))),
+            );
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .px(px(6.0));
+            if p.is_empty() {
+                list = list.child(text!("（两侧已经一致，无需同步）".to_string()));
+            }
+            for (i, a) in p.actions.iter().enumerate().take(PLAN_LIMIT) {
+                list = list.child(
+                    div()
+                        .id(format!("sync-plan-{i}"))
+                        .text_size(px(11.0))
+                        .truncate()
+                        .child(text!(a.describe())),
+                );
+            }
+            if p.actions.len() > PLAN_LIMIT {
+                list = list.child(text!(format!("…共 {} 项", p.actions.len())));
+            }
+            body = body.child(list);
+        } else if let Some(r) = &self.sync_report {
+            body = body.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .px(px(6.0))
+                    .child(text!(format!(
+                        "上次执行：搬运 {} 项 · 回收站 {} 项 · 跳过 {} 项 · 失败 {} 项",
+                        r.copied,
+                        r.trashed,
+                        r.skipped,
+                        r.errors.len()
+                    ))),
+            );
+            for (i, (rel, err)) in r.errors.iter().enumerate().take(20) {
+                body = body.child(
+                    div()
+                        .id(format!("sync-err-{i}"))
+                        .text_size(px(11.0))
+                        .px(px(6.0))
+                        .truncate()
+                        .child(text!(format!("✗ {rel}：{err}"))),
+                );
+            }
+        } else {
+            body = body.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .px(px(6.0))
+                    .child(text!(
+                        "配对 → 生成计划过目 → 才执行。计划阶段不改动任何文件。".to_string()
+                    )),
+            );
+        }
+        modal_card(
+            "文件夹同步",
+            "",
+            body,
+            "计划只读、执行才动手 · 多余文件一律进回收站（⌘Z 可撤销）",
+        )
+    }
+
+    /// 在当前目录发起一次重复文件查找（结果进独立模态）。
+    ///
+    /// 扫描在 blocking 池跑，UI 期间可以继续操作；再按一次取消才停下。
+    pub(crate) fn start_dedup(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.panel().path.clone() else {
+            self.modal = Modal::Info("当前没有可扫描的目录".to_string());
+            cx.notify();
+            return;
+        };
+        if self.dedup_running {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        self.dedup_running = true;
+        self.dedup = None;
+        self.dedup_cancel.store(false, Ordering::Relaxed);
+        self.modal = Modal::Duplicates;
+        let app = self.app();
+        let cancel = self.dedup_cancel.clone();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let report = app.find_duplicates(root, cancel).await;
+            this.update(cx, |v, cx| {
+                v.dedup_running = false;
+                v.dedup = Some(report);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 请求中止正在跑的扫描。
+    fn cancel_dedup(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        self.dedup_cancel.store(true, Ordering::Relaxed);
+        cx.notify();
+    }
+
+    /// 把某一组里除第一份以外的副本移入回收站（可撤销，不永久删除）。
+    fn dedup_trash_group(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(group) = self.dedup.as_ref().and_then(|r| r.groups.get(i)).cloned() else {
+            return;
+        };
+        let victims = group.paths[1..].to_vec();
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            app.trash_paths(victims).await;
+            // 删完把这一组从结果里摘掉，避免用户重复点同一组。
+            this.update(cx, |v, cx| {
+                if let Some(r) = v.dedup.as_mut() {
+                    r.groups.retain(|g| g != &group);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_dedup(&self, entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+        if self.dedup_running {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("正在扫描当前目录…（Esc 取消）".to_string())),
+            );
+            return modal_card("重复文件", "", body, "扫描在后台进行，可以继续浏览");
+        }
+        let Some(report) = self.dedup.clone() else {
+            return modal_card("重复文件", "", body, "还没有结果");
+        };
+        body = body.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .child(text!(format!(
+                    "{} 组重复 · 可回收 {} · 扫描 {} 项（跳过 {}）{}",
+                    report.groups.len(),
+                    crate::file_item::format_size(report.total_wasted()),
+                    report.scanned,
+                    report.skipped,
+                    if report.cancelled { "· 已取消" } else { "" }
+                ))),
+        );
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
+        if report.groups.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(6.0))
+                    .text_color(theme::muted())
+                    .child(text!("（没有发现重复文件）".to_string())),
+            );
+        }
+        for (i, g) in report.groups.iter().enumerate() {
+            let mut col = div().flex().flex_col().px(px(6.0)).py(px(4.0));
+            col = col.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .child(text!(format!(
+                        "{} × {}（可回收 {}）",
+                        crate::file_item::format_size(g.size),
+                        g.paths.len(),
+                        crate::file_item::format_size(g.wasted())
+                    ))),
+            );
+            for (j, p) in g.paths.iter().enumerate() {
+                col = col.child(
+                    div()
+                        .text_size(px(12.0))
+                        .truncate()
+                        // 第一份是「建议保留」，标出来免得用户删错。
+                        .child(text!(format!(
+                            "{} {}",
+                            if j == 0 { "◆" } else { "  " },
+                            p.display()
+                        ))),
+                );
+            }
+            let ent = entity.clone();
+            let mut row = div()
+                .id(format!("dedup-group-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .rounded(px(4.0))
+                .hover(|s| s.bg(theme::hover_bg()))
+                .child(col.flex_1());
+            if g.paths.len() > 1 {
+                let ent2 = ent.clone();
+                let mut btn = div()
+                    .id(format!("dedup-trash-{i}"))
+                    .flex_shrink_0()
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .hover(|s| s.bg(theme::selected_bg()))
+                    .child(text!("删副本".to_string()));
+                btn.interactivity().on_click(move |_ev, _window, cx| {
+                    ent2.update(cx, |v, cx| v.dedup_trash_group(i, cx));
+                });
+                row = row.child(btn);
+            }
+            list = list.child(row);
+        }
+        body = body.child(list);
+        modal_card(
+            "重复文件",
+            "",
+            body,
+            "删副本＝移入回收站（⌘Z 可撤销）· ◆ 为建议保留 · Esc 关闭",
+        )
+    }
+
+    // ------------------------------------------------------------ 快捷键
+
+    /// 执行一个可绑定动作（键表查出来的 id 落到这里）。
+    ///
+    /// 动作 id 与 `keys::BINDINGS` 一一对应；不认识的 id 静默忽略
+    /// （配置里手写的新 id 不该让按键路由崩掉）。
+    pub(crate) fn dispatch_action(&mut self, id: &str, cx: &mut Context<Self>) {
+        let entity = cx.entity().clone();
+        match id {
+            "app.quit" => cx.quit(),
+            "palette.open" => {
+                // 打开面板时刷新一次：用户可能刚改过配置或丢了新清单 / 扩展。
+                let exts = selected_ext_names(self.panel());
+                self.user_commands = self.app().user_commands(&exts);
+                self.workflows = self.app().workflows();
+                self.modal = Modal::CommandPalette;
+                self.cmd_query.clear();
+                self.palette_index = 0;
+                cx.notify();
+            }
+            "search.global" => {
+                self.modal = Modal::GlobalSearch;
+                self.search_query.clear();
+                self.search_results.clear();
+                self.palette_index = 0;
+                cx.notify();
+            }
+            "select.all" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, cx| {
+                    app.select_all_visible().await;
+                    // app 侧选择是唯一事实来源：全选后回灌 UI 高亮。
+                    pull_selection(&app, &entity, cx).await;
+                })
+                .detach();
+            }
+            "edit.undo" => self.app().undo(),
+            "edit.redo" => self.app().redo(),
+            "tab.new" => {
+                let pane = self.active_pane;
+                self.new_tab(cx, pane);
+                cx.notify();
+            }
+            "tab.close" => {
+                let pane = self.active_pane;
+                let tab = self.pane().active;
+                if !self.close_tab(pane, tab, cx) {
+                    cx.notify();
+                }
+            }
+            "tab.prev" => {
+                self.cycle_tab(-1);
+                cx.notify();
+            }
+            "tab.next" => {
+                self.cycle_tab(1);
+                cx.notify();
+            }
+            "pane.split" => {
+                self.toggle_split(Some(cx), None);
+                cx.notify();
+            }
+            "pane.prev" => {
+                self.switch_pane(-1);
+                cx.notify();
+            }
+            "pane.next" => {
+                self.switch_pane(1);
+                cx.notify();
+            }
+            key @ ("view.list" | "view.grid" | "view.gallery" | "view.columns") => {
+                let mode = match key {
+                    "view.grid" => ViewMode::Grid,
+                    "view.gallery" => ViewMode::Gallery,
+                    "view.columns" => ViewMode::Columns,
+                    _ => ViewMode::List,
+                };
+                self.panel_mut().view_mode = mode;
+                cx.notify();
+            }
+            "file.properties" => {
+                self.open_properties(cx, None);
+                cx.notify();
+            }
+            "file.duplicate" => {
+                let app = self.app();
+                // 与右键菜单同语义：只复制当前选中的那些（按可见顺序）。
+                let paths = {
+                    let panel = self.panel();
+                    panel
+                        .window
+                        .iter()
+                        .filter(|e| panel.selection.is_selected(&e.id))
+                        .map(|e| e.path.clone())
+                        .collect::<Vec<_>>()
+                };
+                if paths.is_empty() {
+                    return;
+                }
+                cx.spawn(async move |_weak, _cx| {
+                    app.duplicate_paths(paths).await;
+                })
+                .detach();
+            }
+            "clipboard.copy" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.copy_selection_to_clipboard().await;
+                })
+                .detach();
+            }
+            "clipboard.cut" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.cut_selection_to_clipboard().await;
+                })
+                .detach();
+            }
+            "clipboard.paste" => {
+                let app = self.app();
+                let dest = self.panel().path.clone();
+                cx.spawn(async move |_weak, _cx| {
+                    let _ = app.paste_clipboard(dest).await;
+                })
+                .detach();
+            }
+            "clipboard.copy_path" => {
+                // 路径是普通文本，直接进系统剪贴板（不经过内部文件剪贴板）。
+                let text = {
+                    let panel = self.panel();
+                    panel
+                        .window
+                        .iter()
+                        .filter(|e| panel.selection.is_selected(&e.id))
+                        .map(|e| e.path.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            "nav.parent" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    let _ = app.open_parent().await;
+                })
+                .detach();
+            }
+            "file.trash" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, _cx| {
+                    app.delete_selection().await;
+                })
+                .detach();
+            }
+            "list.rename" => {
+                self.open_batch_rename(cx, None);
+                cx.notify();
+            }
+            "list.open" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, cx| {
+                    open_focused(&app, &entity, cx).await;
+                })
+                .detach();
+            }
+            "list.preview" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, cx| {
+                    open_quick_look(&app, &entity, cx).await;
+                })
+                .detach();
+            }
+            "keys.open" => self.open_keys_picker(cx),
+            other => tracing::debug!("未绑定的动作 id：{other}"),
+        }
+    }
+
+    /// 打开快捷键设置器。
+    pub(crate) fn open_keys_picker(&mut self, cx: &mut Context<Self>) {
+        self.keys_index = 0;
+        self.keys_capturing = None;
+        self.modal = Modal::Keys;
+        cx.notify();
+    }
+
+    /// 设置器里当前聚焦的动作 id。
+    fn keys_focused(&self) -> Option<&'static str> {
+        crate::keys::BINDINGS.get(self.keys_index).map(|b| b.id)
+    }
+
+    /// 把一次按键捕获为当前动作的新键位。
+    fn keys_capture(&mut self, combo: &crate::keys::KeyCombo, cx: &mut Context<Self>) {
+        let Some(id) = self.keys_capturing else {
+            return;
+        };
+        self.keys_capturing = None;
+        if combo.is_modified() {
+            // 冲突检查：同一键位不能挂两个动作，否则永远只有先注册的那个响应。
+            if let Some(other) = self.keymap.conflict(id, combo) {
+                self.modal = Modal::Info(format!(
+                    "{other} 已经占用了 {}。\n\n请先改掉那一个，或换个组合键。",
+                    combo.format()
+                ));
+                cx.notify();
+                return;
+            }
+        }
+        self.keymap.rebind(id, combo.clone());
+        self.app().set_keybinding(id, &combo.spec());
+        cx.notify();
+    }
+
+    /// 解绑当前动作（键位置空，命中时吞键）。
+    fn keys_unbind(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.keys_focused() else {
+            return;
+        };
+        if let Some(combo) = self.keymap.combo_of(id).cloned() {
+            self.keymap.unbind(id, combo);
+        }
+        self.app().set_keybinding(id, "");
+        self.keys_capturing = None;
+        cx.notify();
+    }
+
+    /// 恢复当前动作的默认键位。
+    fn keys_reset_one(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.keys_focused() else {
+            return;
+        };
+        self.keymap.reset(id);
+        self.app().clear_keybinding(id);
+        self.keys_capturing = None;
+        cx.notify();
+    }
+
+    /// 全部动作回到默认键位。
+    fn keys_reset_all(&mut self, cx: &mut Context<Self>) {
+        self.keymap.reset_all();
+        self.app().reset_keybindings();
+        self.keys_capturing = None;
+        cx.notify();
+    }
+
+    fn render_keys(&self, entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(1.0)).p(px(6.0));
+        body = body.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .px(px(4.0))
+                .pb(px(4.0))
+                .child(text!(match self.keys_capturing {
+                    Some(id) => format!(
+                        "请按下要绑给「{}」的组合键（Esc 取消，Delete 解绑）",
+                        crate::keys::Keymap::label(id)
+                    ),
+                    None => "↑↓ 选择 · Enter 捕获新键位 · Delete 解绑 · R 恢复该项默认 · Esc 关闭"
+                        .to_string(),
+                })),
+        );
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
+        for (i, b) in crate::keys::BINDINGS.iter().enumerate() {
+            let selected = i == self.keys_index;
+            let capturing = self.keys_capturing == Some(b.id);
+            let combo = self
+                .keymap
+                .combo_of(b.id)
+                .map(|c| c.format())
+                .unwrap_or_else(|| "（未绑定）".to_string());
+            let row = div()
+                .id(format!("keys-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .px(px(6.0))
+                .h(px(22.0))
+                .rounded(px(3.0))
+                .bg(if capturing {
+                    theme::selected_bg()
+                } else if selected {
+                    theme::hover_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_color(if capturing {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                })
+                .child(text!(b.label.to_string()))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(if capturing {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(if capturing {
+                            "按下新键位…"
+                        } else {
+                            &combo
+                        })),
+                );
+            list = list.child(row);
+        }
+        let mut reset_row = div()
+            .id("keys-reset-all")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .p(px(6.0))
+            .rounded(px(4.0))
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::hover_bg()))
+            .child(text!("恢复全部默认键位".to_string()));
+        let reset_ent = entity.clone();
+        reset_row.interactivity().on_click(move |_ev, _window, cx| {
+            reset_ent.update(cx, |v, cx| v.keys_reset_all(cx));
+        });
+        body = body.child(list).child(reset_row);
+        modal_card(
+            "快捷键",
+            "",
+            body,
+            "↑↓ 选择 · Enter 捕获 · Delete 解绑 · R 复位 · Esc 关闭",
+        )
+    }
+
+    // ------------------------------------------------------------ 布局
+
+    /// 布局设置器的行：`(标题, 当前值)`。最后一行是动作（恢复默认）。
+    fn layout_rows(&self) -> Vec<(String, String)> {
+        let on = |b: bool| if b { "开" } else { "关" };
+        let mode = ViewMode::from_key(&self.ui.view_mode)
+            .unwrap_or_default()
+            .label();
+        vec![
+            ("显示侧边栏".to_string(), on(self.ui.sidebar).to_string()),
+            ("显示状态栏".to_string(), on(self.ui.status_bar).to_string()),
+            ("列表斑马纹".to_string(), on(self.ui.zebra).to_string()),
+            (
+                "新标签页默认视图".to_string(),
+                format!("{mode}（Enter 切换）"),
+            ),
+            ("恢复默认布局".to_string(), String::new()),
+        ]
+    }
+
+    /// 执行一条用户自定义命令，输出用信息卡片回显（第四阶段·自定义命令）。
+    pub(crate) fn run_user_command_at(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(cmd) = self.user_commands.get(i).cloned() else {
+            return;
+        };
+        // 占位符上下文：当前目录 + 按可见顺序的选中项。
+        let ctx = {
+            let panel = self.panel();
+            let selected = panel
+                .window
+                .iter()
+                .filter(|e| panel.selection.is_selected(&e.id))
+                .map(|e| e.path.clone())
+                .collect();
+            mo_app::usercmds::CommandContext {
+                dir: panel.path.clone(),
+                selected,
+            }
+        };
+        self.modal = Modal::None;
+        let app = self.app();
+        let name = cmd.name.clone();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let res = app.run_user_command(cmd, ctx).await;
+            this.update(cx, |v, cx| {
+                v.modal = Modal::Info(match res {
+                    Err(e) => format!("「{name}」未执行：{e}"),
+                    Ok((line, out)) => {
+                        let code = out
+                            .code
+                            .map_or_else(|| "无法启动".to_string(), |c| c.to_string());
+                        let body = if out.text.trim().is_empty() {
+                            "（无输出）".to_string()
+                        } else {
+                            out.text
+                        };
+                        format!("「{name}」\n$ {line}\n退出码 {code}\n\n{body}")
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开布局设置器。
+    pub(crate) fn open_layout_picker(&mut self, cx: &mut Context<Self>) {
+        self.layout_index = 0;
+        self.modal = Modal::Layout;
+        cx.notify();
+    }
+
+    /// 立刻把当前 `ui` 写回配置。
+    fn persist_ui(&self) {
+        let ui = self.ui.clone();
+        self.app().set_ui_prefs(ui);
+    }
+
+    /// 触发布局设置器里的一行（开关取反 / 视图循环 / 恢复默认）。
+    pub(crate) fn layout_activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        match index {
+            0 => self.ui.sidebar = !self.ui.sidebar,
+            1 => self.ui.status_bar = !self.ui.status_bar,
+            2 => self.ui.zebra = !self.ui.zebra,
+            3 => {
+                // 按当前值循环到下一档视图。
+                let next = ViewMode::from_key(&self.ui.view_mode)
+                    .unwrap_or_default()
+                    .next();
+                self.ui.view_mode = next.key().to_string();
+            }
+            4 => {
+                // 恢复默认：配置落盘 + 内存里的列布局也一起复位。
+                self.app().reset_layout();
+                self.ui = mo_app::UiPrefs::default();
+                self.cols = crate::list_columns::ColumnLayout::new();
+                self.persist_ui();
+                self.modal = Modal::None;
+                cx.notify();
+                return;
+            }
+            _ => return,
+        }
+        self.persist_ui();
+        cx.notify();
+    }
+
+    /// 直接改单个界面开关（命令面板的三条直达命令用）。
+    pub(crate) fn toggle_ui_flag(&mut self, which: u8, cx: &mut Context<Self>) {
+        match which {
+            0 => self.ui.sidebar = !self.ui.sidebar,
+            1 => self.ui.status_bar = !self.ui.status_bar,
+            2 => self.ui.zebra = !self.ui.zebra,
+            _ => return,
+        }
+        self.persist_ui();
+        cx.notify();
+    }
+
+    fn render_layout(&self, entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        for (i, (label, value)) in self.layout_rows().into_iter().enumerate() {
+            let selected = i == self.layout_index;
+            let mut row = div()
+                .id(format!("layout-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .rounded(px(4.0))
+                .bg(if selected {
+                    theme::selected_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_color(if selected {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                })
+                .child(text!(label))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(value)),
+                );
+            let ent = entity.clone();
+            row.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| v.layout_activate(i, cx));
+            });
+            body = body.child(row);
+        }
+        modal_card(
+            "布局",
+            "",
+            body,
+            "↑↓ 选择 · Enter 切换 · 改动即时生效并写入 config.json · Esc 关闭",
+        )
     }
 
     // ------------------------------------------------------------ 列视图
@@ -1162,8 +2920,9 @@ impl RootView {
             ..
         } = drag
         else {
-            // 调列宽在移动过程中已即时生效；这里只需重绘一次，
-            // 让分隔线从「拖动中」的加粗态回到常态。
+            // 调列宽在移动过程中已即时生效；这里收尾时把宽度写回配置，
+            // 并重绘一次让分隔线从「拖动中」的加粗态回到常态。
+            self.app().save_column_prefs(self.cols.to_prefs());
             cx.notify();
             return;
         };
@@ -1176,6 +2935,8 @@ impl RootView {
         };
         if let Some(from) = self.cols.index_of(col) {
             if self.cols.move_col(from, to) {
+                // 列序是布局偏好的一部分：拖完就落盘，重启后保持。
+                self.app().save_column_prefs(self.cols.to_prefs());
                 cx.notify();
             }
         }
@@ -1828,6 +3589,15 @@ async fn sync_panel(
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 跟随系统：外观翻转时重解析调色板。只在真的变了时才做，避免每帧读配置。
+        let dark = Self::system_dark(window);
+        if dark != self.appearance_dark {
+            self.appearance_dark = dark;
+            if self.theme_name == "system" {
+                self.repaint_theme(cx);
+            }
+        }
+
         let entity = cx.entity().clone();
         let entity_key = entity.clone();
 
@@ -1838,21 +3608,21 @@ impl Render for RootView {
         };
         // 每个窗格可用的横向宽度：网格 / 画廊按它算列数（uniform_list 必须先知道行数）。
         let viewport_w = window.viewport_size().width.to_f64() as f32;
-        let per_pane_w = ((viewport_w - SIDEBAR_WIDTH) / visible_panes as f32 - 24.0).max(160.0);
+        let sidebar_w = if self.ui.sidebar { SIDEBAR_WIDTH } else { 0.0 };
+        let per_pane_w = ((viewport_w - sidebar_w) / visible_panes as f32 - 24.0).max(160.0);
 
         // 模态打开时，工具栏 / 状态栏保留，中央区换成模态卡片。
         let body: Div = match &self.modal {
             Modal::None => {
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_w_0()
-                    .child(sidebar::render(
+                let mut row = div().flex().flex_row().flex_1().min_w_0();
+                // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
+                if self.ui.sidebar {
+                    row = row.child(sidebar::render(
                         &self.panel().app,
                         &self.panel().path,
                         &entity,
                     ));
+                }
                 self.ensure_columns(cx);
                 for i in 0..visible_panes {
                     row = row.child(render_pane(self, i, &entity, per_pane_w));
@@ -1861,7 +3631,6 @@ impl Render for RootView {
             }
             Modal::CommandPalette => self.render_command_palette(&entity),
             Modal::GlobalSearch => self.render_global_search(&entity),
-            Modal::QuickLook => self.render_quick_look(),
             Modal::Trash => self.render_trash(),
             Modal::Diff => self.render_diff(),
             Modal::Properties => dialogs::properties(self, &entity),
@@ -1869,6 +3638,13 @@ impl Render for RootView {
             Modal::Archive => dialogs::archive(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
             Modal::Tags => dialogs::tags(&entity, self),
+            Modal::Theme => self.render_theme(&entity),
+            Modal::Layout => self.render_layout(&entity),
+            Modal::Keys => self.render_keys(&entity),
+            Modal::Extensions => self.render_extensions(&entity),
+            Modal::Duplicates => self.render_dedup(&entity),
+            Modal::Workflow => self.render_workflow(),
+            Modal::Sync => self.render_sync(&entity),
             Modal::Info(text) => render_info(text),
         };
 
@@ -1901,8 +3677,11 @@ impl Render for RootView {
                 panel.view_mode,
             ))
             .child(body)
-            .child(progress_panel::render(&ops, &app))
-            .child(status_bar::render(
+            .child(progress_panel::render(&ops, &app));
+
+        // 状态栏可关（配置 `ui.status_bar`）。
+        if self.ui.status_bar {
+            root = root.child(status_bar::render(
                 panel.visible_count,
                 &panel.path,
                 &panel.query,
@@ -1911,12 +3690,12 @@ impl Render for RootView {
                 can_undo,
                 can_redo,
             ));
+        }
 
         // 键盘路由：全局快捷键 + 模态内导航 + 输入即过滤。
         root.interactivity().on_key_down(move |ev, _window, cx| {
             let key = ev.keystroke.key.as_str();
             let m = &ev.keystroke.modifiers;
-            let platform = m.platform;
             let shift = m.shift;
             let plain = !m.control && !m.alt && !m.platform;
 
@@ -1935,141 +3714,22 @@ impl Render for RootView {
                 }
             }
 
-            // 全局快捷键（任何状态下都可触发）。
-            // ⌘Q：裸二进制没有菜单栏，macOS 收不到系统 terminate，
-            // 自己接住退出键（cx.quit 走 gpui 的正常退出流程）。
-            if platform && key.eq_ignore_ascii_case("q") {
-                cx.quit();
-                return;
-            }
-            if platform && shift && key.eq_ignore_ascii_case("p") {
-                entity_key.update(cx, |v, cx| {
-                    v.modal = Modal::CommandPalette;
-                    v.cmd_query.clear();
-                    v.palette_index = 0;
-                    cx.notify();
-                });
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("f") {
-                entity_key.update(cx, |v, cx| {
-                    v.modal = Modal::GlobalSearch;
-                    v.search_query.clear();
-                    v.search_results.clear();
-                    v.palette_index = 0;
-                    cx.notify();
-                });
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("a") {
-                let app = entity_key.update(cx, |v, _cx| v.app());
-                let this = entity_key.clone();
-                cx.spawn(async move |cx| {
-                    app.select_all_visible().await;
-                    // app 侧选择是唯一事实来源：全选后回灌 UI 高亮。
-                    pull_selection(&app, &this, cx).await;
-                })
-                .detach();
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("z") {
-                let app = entity_key.update(cx, |v, _cx| v.app());
-                if shift {
-                    app.redo();
-                } else {
-                    app.undo();
+            // 全局快捷键：一律查键表（用户可重映射 / 解绑，见 `keys` 模块）。
+            //
+            // ⚠️ 这里必须是唯一入口：原先每个快捷键一个
+            // `if platform && key.eq_ignore_ascii_case("t")` 的硬编码分支，
+            // 用户改了键、旧键位照样生效，等于改不动。硬编码已全部删除。
+            let combo = crate::keys::KeyCombo::from_keystroke(&ev.keystroke);
+            if combo.is_modified() {
+                let hit = entity_key.read(cx).keymap.lookup(&combo);
+                if let Some(action) = hit {
+                    entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
+                    return;
                 }
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("t") {
-                entity_key.update(cx, |v, cx| {
-                    v.new_tab(cx, v.active_pane);
-                    cx.notify();
-                });
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("w") {
-                entity_key.update(cx, |v, cx| {
-                    let pane = v.active_pane;
-                    let tab = v.pane().active;
-                    if !v.close_tab(pane, tab, cx) {
-                        cx.notify();
-                    }
-                });
-                return;
-            }
-            // ⌘⇧[ / ⌘⇧]：同一窗格内切换标签页（Finder 风格）。
-            if platform && shift && (key == "[" || key == "]") {
-                let step = if key == "[" { -1 } else { 1 };
-                entity_key.update(cx, |v, cx| {
-                    v.cycle_tab(step);
-                    cx.notify();
-                });
-                return;
-            }
-            // ⌘⇧D：双栏分栏开关（第二窗格按需创建）。
-            if platform && shift && key.eq_ignore_ascii_case("d") {
-                entity_key.update(cx, |v, cx| {
-                    v.toggle_split(Some(cx), None);
-                    cx.notify();
-                });
-                return;
-            }
-            // ⌘1..4：切换视图模式（列表 / 网格 / 画廊 / 列视图）。
-            if platform && matches!(key, "1" | "2" | "3" | "4") {
-                let mode = match key {
-                    "1" => ViewMode::List,
-                    "2" => ViewMode::Grid,
-                    "3" => ViewMode::Gallery,
-                    _ => ViewMode::Columns,
-                };
-                entity_key.update(cx, |v, cx| {
-                    v.panel_mut().view_mode = mode;
-                    cx.notify();
-                });
-                return;
-            }
-            // ⌘I：属性与权限面板（对着选中项，没有选中则当前目录）。
-            if platform && key.eq_ignore_ascii_case("i") {
-                entity_key.update(cx, |v, cx| {
-                    v.open_properties(cx, None);
-                    cx.notify();
-                });
-                return;
-            }
-            // ⌘C / ⌘X / ⌘V：应用内剪贴板的复制 / 剪切 / 粘贴。
-            if platform && key.eq_ignore_ascii_case("c") {
-                let app = entity_key.update(cx, |v, _cx| v.app());
-                cx.spawn(async move |_cx| {
-                    app.copy_selection_to_clipboard().await;
-                })
-                .detach();
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("x") {
-                let app = entity_key.update(cx, |v, _cx| v.app());
-                cx.spawn(async move |_cx| {
-                    app.cut_selection_to_clipboard().await;
-                })
-                .detach();
-                return;
-            }
-            if platform && key.eq_ignore_ascii_case("v") {
-                let app = entity_key.update(cx, |v, _cx| v.app());
-                let dest = entity_key.update(cx, |v, _cx| v.panel().path.clone());
-                cx.spawn(async move |_cx| {
-                    let _ = app.paste_clipboard(dest).await;
-                })
-                .detach();
-                return;
-            }
-            // ⌘⇧← / ⌘⇧→：在窗格之间移动焦点。
-            if platform && shift && (key == "left" || key == "right") {
-                entity_key.update(cx, |v, cx| {
-                    v.switch_pane(if key == "left" { -1 } else { 1 });
-                    cx.notify();
-                });
-                return;
+                // 显式解绑的键位要吞掉这次按键：漏下去会触发系统 / 输入组件的默认行为。
+                if entity_key.read(cx).keymap.is_unbound(&combo) {
+                    return;
+                }
             }
 
             // 地址栏编辑态：按键基本都归地址栏的真实输入组件——它把退格 / 方向键 /
@@ -2086,8 +3746,20 @@ impl Render for RootView {
 
             // 模态内按键。
             if entity_key.update(cx, |v, _cx| v.modal != Modal::None) {
-                handle_modal_key(key, plain, &entity_key, cx);
+                handle_modal_key(key, plain, &combo, &entity_key, cx);
                 return;
+            }
+
+            // 裸键（回车 / 空格 / Delete / F2）同样走键表，用户可改。
+            // 没命中才继续往下走结构性按键：退格删过滤词、Esc 清过滤、
+            // 方向键移动焦点、单字符输入即过滤——这些不是「动作」，
+            // 让它们也进键表反而会把「按退格删一个过滤字符」这种手感弄没。
+            if !combo.is_modified() {
+                let hit = entity_key.read(cx).keymap.lookup(&combo);
+                if let Some(action) = hit {
+                    entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
+                    return;
+                }
             }
 
             // 非模态：键盘导航 + 输入即过滤 + 快速预览 + 删除选中。
@@ -2101,30 +3773,6 @@ impl Render for RootView {
                         app.move_cursor(step, extend).await;
                         // app 侧选择是唯一事实来源：移动后回灌 UI 高亮。
                         pull_selection(&app, &this, cx).await;
-                    })
-                    .detach();
-                }
-                "enter" if plain => {
-                    let app = entity_key.update(cx, |v, _cx| v.app());
-                    let this = entity_key.clone();
-                    cx.spawn(async move |cx| {
-                        open_focused(&app, &this, cx).await;
-                    })
-                    .detach();
-                }
-                "space" if plain => {
-                    tracing::info!("[kbd] 命中空格分支 → open_quick_look");
-                    let app = entity_key.update(cx, |v, _cx| v.app());
-                    let this = entity_key.clone();
-                    cx.spawn(async move |cx| {
-                        open_quick_look(&app, &this, cx).await;
-                    })
-                    .detach();
-                }
-                "delete" if plain => {
-                    let app = entity_key.update(cx, |v, _cx| v.app());
-                    cx.spawn(async move |_cx| {
-                        app.delete_selection().await;
                     })
                     .detach();
                 }
@@ -2268,6 +3916,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         sort: panel.sort,
                         dragging: view.dragging_column(),
                         resizing: view.resizing_divider(),
+                        zebra: view.ui.zebra,
                     },
                 )
                 .into_any_element(),
@@ -2416,8 +4065,40 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
     bar.child(new_btn.child(text!("＋".to_string())))
 }
 
+/// 当前选中项的扩展名集合（小写、含点），供扩展的 `when_ext` 条件判断。
+fn selected_ext_names(panel: &crate::panel::Panel) -> Vec<String> {
+    let mut out: Vec<String> = panel
+        .window
+        .iter()
+        .filter(|e| panel.selection.is_selected(&e.id))
+        .filter_map(|e| {
+            e.path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| format!(".{}", x.to_ascii_lowercase()))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 新建面板：套用配置里的默认视图模式（第四阶段·自定义布局）。
+///
+/// 认不出的 `ui.view_mode` 回落 `List`——用户手改配置写错字符串不该让新标签页崩掉。
+fn panel_with_prefs(app: AppState, ui: &mo_app::UiPrefs) -> Panel {
+    let mode = ViewMode::from_key(&ui.view_mode).unwrap_or_default();
+    Panel::new(app).with_view_mode(mode)
+}
+
 /// 模态内按键处理（返回是否已被处理）。
-fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut App) {
+fn handle_modal_key(
+    key: &str,
+    plain: bool,
+    combo: &crate::keys::KeyCombo,
+    entity: &Entity<RootView>,
+    cx: &mut App,
+) {
     let modal = entity.update(cx, |v, _cx| v.modal.clone());
     match modal {
         Modal::CommandPalette => match key {
@@ -2429,7 +4110,7 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
                 cx.notify();
             }),
             "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = filtered_commands(&v.cmd_query).len();
+                let n = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows).len();
                 if n > 0 {
                     v.palette_index = (v.palette_index + 1).min(n - 1);
                 }
@@ -2669,7 +4350,114 @@ fn handle_modal_key(key: &str, plain: bool, entity: &Entity<RootView>, cx: &mut 
             }
             _ => {}
         },
-        Modal::QuickLook | Modal::Diff | Modal::Info(_) => match key {
+        Modal::Extensions => match key {
+            "escape" => close_modal(entity, cx),
+            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                v.ext_index = v.ext_index.saturating_sub(1);
+                cx.notify();
+            }),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                let n = v.extensions.len();
+                if n > 0 {
+                    v.ext_index = (v.ext_index + 1).min(n - 1);
+                }
+                cx.notify();
+            }),
+            "enter" => entity.update(cx, |v, cx| {
+                let i = v.ext_index;
+                v.toggle_extension(i, cx);
+            }),
+            _ => {}
+        },
+        Modal::Keys => {
+            // 捕获态：下一次按键就是新键位（Esc 取消，不绑）。
+            let capturing = entity.update(cx, |v, _cx| v.keys_capturing.is_some());
+            if capturing {
+                if key == "escape" {
+                    entity.update(cx, |v, cx| {
+                        v.keys_capturing = None;
+                        cx.notify();
+                    });
+                    return;
+                }
+                let combo = combo.clone();
+                entity.update(cx, |v, cx| v.keys_capture(&combo, cx));
+                return;
+            }
+            match key {
+                "escape" => close_modal(entity, cx),
+                "up" | "arrowup" => entity.update(cx, |v, cx| {
+                    v.keys_index = v.keys_index.saturating_sub(1);
+                    cx.notify();
+                }),
+                "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                    let n = crate::keys::BINDINGS.len();
+                    v.keys_index = (v.keys_index + 1).min(n - 1);
+                    cx.notify();
+                }),
+                "enter" => entity.update(cx, |v, cx| {
+                    v.keys_capturing = v.keys_focused();
+                    cx.notify();
+                }),
+                "delete" | "backspace" => entity.update(cx, |v, cx| v.keys_unbind(cx)),
+                "r" => entity.update(cx, |v, cx| v.keys_reset_one(cx)),
+                _ => {}
+            }
+        }
+        Modal::Layout => match key {
+            "escape" => close_modal(entity, cx),
+            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                let n = v.layout_rows().len();
+                if n > 0 {
+                    v.layout_index = (v.layout_index + n - 1) % n;
+                }
+                cx.notify();
+            }),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                let n = v.layout_rows().len();
+                if n > 0 {
+                    v.layout_index = (v.layout_index + 1) % n;
+                }
+                cx.notify();
+            }),
+            "enter" => entity.update(cx, |v, cx| {
+                let i = v.layout_index;
+                v.layout_activate(i, cx);
+            }),
+            _ => {}
+        },
+        Modal::Theme => match key {
+            "escape" => entity.update(cx, |v, cx| v.theme_cancel(cx)),
+            "up" | "arrowup" => entity.update(cx, |v, cx| v.theme_move(-1, cx)),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| v.theme_move(1, cx)),
+            "enter" => entity.update(cx, |v, cx| v.theme_commit(cx)),
+            _ => {}
+        },
+        Modal::Workflow => {
+            if key == "escape" {
+                entity.update(cx, |v, cx| v.workflow_dismiss(cx));
+            }
+        }
+        Modal::Sync => {
+            if key == "escape" {
+                close_modal(entity, cx);
+            }
+        }
+        Modal::Duplicates => {
+            // 正在扫描时 Esc 是「取消扫描」，有结果时 Esc 才是「关掉模态」。
+            if key == "escape" {
+                entity.update(cx, |v, cx| {
+                    if v.dedup_running {
+                        v.cancel_dedup(cx);
+                    } else {
+                        v.modal = Modal::None;
+                        v.dedup = None;
+                        cx.notify();
+                    }
+                });
+            }
+        }
+        Modal::Diff | Modal::Info(_) => match key {
             "escape" | "space" => close_modal(entity, cx),
             _ => {}
         },
@@ -2722,7 +4510,6 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
         v.cmd_query.clear();
         v.search_query.clear();
         v.search_results.clear();
-        v.preview_cache = None;
         v.diff_cache = None;
         v.palette_index = 0;
         cx.notify();
@@ -2732,12 +4519,18 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
 /// 命令面板回车：执行选中的命令。
 fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
     let (id, app) = entity.update(cx, |v, _cx| {
-        let id = filtered_commands(&v.cmd_query)
+        let id = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows)
             .get(v.palette_index)
             .copied();
         (id, v.app())
     });
     match id {
+        Some(CommandId::User(i)) => {
+            entity.update(cx, |v, cx| v.run_user_command_at(i, cx));
+        }
+        Some(CommandId::Workflow(i)) => {
+            entity.update(cx, |v, cx| v.run_workflow_at(i, cx));
+        }
         Some(CommandId::OpenGlobalSearch) => {
             entity.update(cx, |v, cx| {
                 v.modal = Modal::GlobalSearch;
@@ -2890,6 +4683,77 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 v.palette_index = 0;
             });
         }
+        Some(CommandId::ThemePicker) => {
+            entity.update(cx, |v, cx| {
+                // open_theme_picker 自己会把 modal 换成主题选择器。
+                v.open_theme_picker(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::FolderSync) => {
+            entity.update(cx, |v, cx| {
+                v.open_sync_picker(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::FindDuplicates) => {
+            entity.update(cx, |v, cx| {
+                v.start_dedup(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::ExtensionsPicker) => {
+            entity.update(cx, |v, cx| {
+                v.open_extensions_picker(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::KeysPicker) => {
+            entity.update(cx, |v, cx| {
+                v.open_keys_picker(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::LayoutPicker) => {
+            entity.update(cx, |v, cx| {
+                v.open_layout_picker(cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(
+            id @ (CommandId::ToggleSidebar | CommandId::ToggleStatusBar | CommandId::ToggleZebra),
+        ) => {
+            let which = match id {
+                CommandId::ToggleStatusBar => 1,
+                CommandId::ToggleZebra => 2,
+                _ => 0,
+            };
+            entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.toggle_ui_flag(which, cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(id @ (CommandId::ThemeLight | CommandId::ThemeDark | CommandId::ThemeSystem)) => {
+            let name = match id {
+                CommandId::ThemeDark => "dark",
+                CommandId::ThemeSystem => "system",
+                _ => "light",
+            };
+            entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.apply_theme(name, true, cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
         Some(CommandId::CreateSymlink) | Some(CommandId::CreateHardlink) => {
             let hard = matches!(id, Some(CommandId::CreateHardlink));
             let this = entity.clone();
@@ -2979,9 +4843,11 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
                 match app.preview(&h.path) {
                     Ok(pv) => {
                         this.update(cx, |v, cx| {
-                            v.preview_cache = Some(pv);
-                            v.modal = Modal::QuickLook;
-                            cx.notify();
+                            // 预览是独立窗口：搜索模态照常关掉。
+                            v.modal = Modal::None;
+                            v.search_query.clear();
+                            v.search_results.clear();
+                            v.show_preview(pv, cx);
                         });
                     }
                     Err(e) => {
@@ -3062,7 +4928,22 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::CloseTab
         | CommandId::ToggleSplit
         | CommandId::CreateSymlink
-        | CommandId::CreateHardlink => {}
+        | CommandId::CreateHardlink
+        // 主题四则走 UI 层（on_palette_enter），这里只占位保持穷尽。
+        | CommandId::ThemePicker
+        | CommandId::ThemeLight
+        | CommandId::ThemeDark
+        | CommandId::ThemeSystem
+        | CommandId::LayoutPicker
+        | CommandId::KeysPicker
+        | CommandId::ExtensionsPicker
+        | CommandId::FindDuplicates
+        | CommandId::FolderSync
+        | CommandId::Workflow(_)
+        | CommandId::ToggleSidebar
+        | CommandId::ToggleStatusBar
+        | CommandId::ToggleZebra
+        | CommandId::User(_) => {}
     }
 }
 
@@ -3079,9 +4960,7 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
     match app.preview(&p) {
         Ok(pv) => {
             this.update(cx, |v, cx| {
-                v.preview_cache = Some(pv);
-                v.modal = Modal::QuickLook;
-                cx.notify();
+                v.show_preview(pv, cx);
             });
         }
         Err(e) => {
@@ -3164,7 +5043,11 @@ async fn pull_selection(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncA
     });
 }
 
-/// Enter：打开聚焦 / 选中项——目录进入，文件快速预览。
+/// 打开聚焦 / 选中项：目录进入，文件用**系统默认应用**打开。
+///
+/// ⚠️ 这里绝不能退回「文件走预览」：预览是空格（`list.preview`）的专属语义，
+/// 打开键一旦去预览，Windows 上 Enter 和空格就变成同一件事了。macOS 上
+/// Enter 更是重命名、⌘↓ 才是打开（见 `keys::default_spec`）。
 async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     // `selection_paths` 无选中时回退聚焦项，正好是键盘光标语义。
     let Some(p) = app.selection_paths().await.into_iter().next() else {
@@ -3172,10 +5055,11 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
     };
     if p.is_dir() {
         let _ = app.open_directory(&p).await;
-    } else if let Ok(pv) = app.preview(&p) {
+        return;
+    }
+    if let Err(e) = app.open_with_system(&p).await {
         this.update(cx, |v, cx| {
-            v.preview_cache = Some(pv);
-            v.modal = Modal::QuickLook;
+            v.modal = Modal::Info(format!("无法打开 {p:?}：{e}"));
             cx.notify();
         });
     }
@@ -3214,7 +5098,7 @@ fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
 
 impl RootView {
     fn render_command_palette(&self, _entity: &Entity<RootView>) -> Div {
-        let list = filtered_commands(&self.cmd_query);
+        let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
         let idx = self.palette_index;
         let mut body = div()
             .flex()
@@ -3223,7 +5107,10 @@ impl RootView {
             .overflow_y_scrollbar()
             .h(px(360.0));
         for (i, id) in list.iter().enumerate() {
-            let def = commands().into_iter().find(|c| c.id == *id).unwrap();
+            let def = commands_in(&self.user_commands, &self.workflows)
+                .into_iter()
+                .find(|c| c.id == *id)
+                .unwrap();
             let selected = i == idx;
             let row = div()
                 .id(format!("cmd-row-{i}"))
@@ -3297,38 +5184,6 @@ impl RootView {
             body,
             "↑↓ 选择 · Enter 打开 · Esc 关闭",
         )
-    }
-
-    fn render_quick_look(&self) -> Div {
-        let pv = self.preview_cache.clone();
-        let body: Div = match pv {
-            Some(p) => {
-                let text = p.text.clone().unwrap_or_default();
-                match p.kind {
-                    mo_preview::PreviewKind::Image => {
-                        // 图片：直接加载原图路径。
-                        if let Some(path) = &p.image {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.0))
-                                .child(text!(format!("🖼 {}（{} 字节）", p.title, p.size)))
-                                .child(img(path.clone()))
-                        } else {
-                            div().child(text!(text))
-                        }
-                    }
-                    _ => div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(text!(format!("{} · {} 字节", p.title, p.size)))
-                        .child(div().overflow_y_scrollbar().h(px(320.0)).child(text!(text))),
-                }
-            }
-            None => div().child(text!("（无预览）".to_string())),
-        };
-        modal_card("快速预览", "", body, "Space / Esc 关闭")
     }
 
     fn render_trash(&self) -> Div {
@@ -3664,29 +5519,45 @@ fn diff_row(
         )
 }
 
-/// 相同行底色（白）。
+/// 相同行底色：跟随内容区底色——深色主题下写死白会把整屏 diff 打回浅色。
 fn diff_eq_bg() -> gpui_kit::Rgba {
-    gpui_kit::rgb(0xffffff)
+    crate::theme::surface()
 }
 
-/// 删除行底色（浅红）。
+/// 删除行底色（浅色档浅红 / 深色档暗红）。
 fn diff_del_bg() -> gpui_kit::Rgba {
-    gpui_kit::rgb(0xfdecec)
+    if crate::theme::is_dark() {
+        gpui_kit::rgb(0x3a2226)
+    } else {
+        gpui_kit::rgb(0xfdecec)
+    }
 }
 
-/// 删除行前景（深红）。
+/// 删除行前景（浅色档深红 / 深色档提亮，保证在暗底上读得清）。
 fn diff_del_fg() -> gpui_kit::Rgba {
-    gpui_kit::rgb(0x8f1f1f)
+    if crate::theme::is_dark() {
+        gpui_kit::rgb(0xff9f9a)
+    } else {
+        gpui_kit::rgb(0x8f1f1f)
+    }
 }
 
-/// 新增行底色（浅绿）。
+/// 新增行底色（浅色档浅绿 / 深色档暗绿）。
 fn diff_add_bg() -> gpui_kit::Rgba {
-    gpui_kit::rgb(0xe9f6e9)
+    if crate::theme::is_dark() {
+        gpui_kit::rgb(0x1f3325)
+    } else {
+        gpui_kit::rgb(0xe9f6e9)
+    }
 }
 
-/// 新增行前景（深绿）。
+/// 新增行前景（浅色档深绿 / 深色档提亮）。
 fn diff_add_fg() -> gpui_kit::Rgba {
-    gpui_kit::rgb(0x1f6b2a)
+    if crate::theme::is_dark() {
+        gpui_kit::rgb(0x8fe0a0)
+    } else {
+        gpui_kit::rgb(0x1f6b2a)
+    }
 }
 
 /// 一致提示的前景色（绿）。
@@ -3818,13 +5689,14 @@ mod tests {
     // ⚠️ 这里**不能** `use super::*`：app.rs 顶层有 `use gpui_kit::*`，
     // 会把 gpui 的 `test` 属性宏一起引进来，把内置的 `#[test]` 顶掉，
     // 展开时直接撞递归上限（`recursion limit reached while expanding #[test]`）。
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{px, TestAppContext};
     use mo_app::AppState;
 
-    use super::RootView;
+    use super::{Modal, RootView};
 
     /// 进入地址栏编辑态：路径要**预填**，且内容要**整条被选中**。
     ///
@@ -3839,6 +5711,7 @@ mod tests {
     /// （集成测试不受影响，见 `file_item.rs` 的同类注释）。
     #[test]
     fn address_edit_prefills_and_selects_the_whole_path() {
+        crate::isolate_config_for_tests();
         let mut cx = TestAppContext::single();
         // 框架的 `InputState` 依赖 gpui-component 的 Theme 全局
         // （生产环境由 `run()` 里的 `gpui_kit::init` 注册），测试里补上。
@@ -3877,6 +5750,7 @@ mod tests {
     /// Esc 与失焦都要退出编辑态（面包屑才回得来）。
     #[test]
     fn address_edit_ends_on_escape_and_blur() {
+        crate::isolate_config_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -3914,6 +5788,7 @@ mod tests {
     /// 布局把文件列表压小——这条测试同时守住这两点。
     #[test]
     fn context_menu_renders_at_the_pointer_without_disturbing_layout() {
+        crate::isolate_config_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -3964,6 +5839,7 @@ mod tests {
     /// 贴着右下角打开时，菜单必须被钳回视口内（否则会被窗口边缘切掉）。
     #[test]
     fn context_menu_is_clamped_inside_the_viewport() {
+        crate::isolate_config_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -3999,6 +5875,7 @@ mod tests {
     /// 条目菜单比空白菜单长（多了打开 / 重命名 / 废纸篓…），且 Esc 能关掉。
     #[test]
     fn entry_menu_has_more_items_and_escape_closes_it() {
+        crate::isolate_config_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -4041,5 +5918,166 @@ mod tests {
             })
         });
         assert!(closed, "close_context_menu 没有清掉菜单");
+    }
+
+    /// 主题选择器：打开时光标停在当前主题；↑↓ 换预览项并真的改到全局调色板；
+    /// Esc 还原（不写配置——配置是用户文件，测试绝不落盘）。
+    #[test]
+    fn theme_picker_previews_and_restores() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let (names, start_index, start_theme) = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_theme_picker(cx);
+                (
+                    crate::theme::choices(&v.app().custom_themes()),
+                    v.theme_index,
+                    v.theme_name.clone(),
+                )
+            })
+        });
+        assert_eq!(
+            &names[..3],
+            ["light", "dark", "system"],
+            "内置三档主题必须都在候选里"
+        );
+        assert_eq!(
+            start_theme, names[start_index],
+            "光标应停在当前主题上（start={start_index} names={names:?}）"
+        );
+
+        // ↓ 预览下一档：调色板真的换了，且没有落盘（theme_name 变了但配置没动）。
+        let after_down = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.theme_move(1, cx);
+                v.theme_name.clone()
+            })
+        });
+        assert_ne!(after_down, start_theme, "↓ 之后预览项应当变化");
+        let want = crate::theme::resolve(&after_down, &HashMap::new(), false);
+        assert_eq!(crate::theme::current(), want, "全局调色板应跟随预览项");
+
+        // Esc 还原到配置里的主题。
+        let restored = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.theme_cancel(cx);
+                (v.theme_name.clone(), v.modal.clone())
+            })
+        });
+        assert_eq!(restored.0, start_theme, "Esc 应当还原预览");
+        assert_eq!(restored.1, Modal::None, "Esc 之后选择器应当关掉");
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    /// 组合键要真的经过键表 → 派发这条链路（headless 派发按键，不靠模拟输入）。
+    ///
+    /// 守的是这次改造的核心风险：键表接上了但按键路由没走它（表现是「改了键
+    /// 没反应」）。顺带守住 Windows 的修饰键映射——gpui 在 Windows 上把
+    /// `platform` 给的是 Win 键，Ctrl 在 `control` 里。
+    #[test]
+    fn global_chords_route_through_keymap() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        // `add_window_view` 直接给回 VisualTestContext，按键派发用它。
+        let (root, mut cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        // 平台主修饰键的写法：macOS 是 cmd，其它平台是 ctrl。
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let tabs = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.pane().tabs.len()))
+        };
+
+        // Ctrl/Cmd+T → tab.new
+        let before = tabs(&mut cx);
+        cx.simulate_keystrokes(&format!("{main}-t"));
+        assert_eq!(tabs(&mut cx), before + 1, "{main}-t 应当新建标签页");
+
+        // Ctrl/Cmd+Shift+P → 命令面板
+        cx.simulate_keystrokes(&format!("{main}-shift-p"));
+        let modal = cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()));
+        assert_eq!(modal, Modal::CommandPalette, "命令面板快捷键应当生效");
+
+        // 改绑之后旧键位必须失效：这是「自定义快捷键」的最低要求。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                let mut overrides = HashMap::new();
+                overrides.insert("tab.new".to_string(), format!("{main}+alt+t"));
+                v.keymap = crate::keys::Keymap::build(&overrides);
+            })
+        });
+        let before = tabs(&mut cx);
+        cx.simulate_keystrokes(&format!("{main}-t"));
+        assert_eq!(tabs(&mut cx), before, "改绑后旧键位不该还有反应");
+        cx.simulate_keystrokes(&format!("{main}-alt-t"));
+        assert_eq!(tabs(&mut cx), before + 1, "新键位应当生效");
+    }
+
+    /// 键表要真的驱动按键语义：改绑后旧键位失效、解绑吞键，派发动作可用。
+    ///
+    /// ⚠️ 这里刻意**不写配置文件**：配置目录是整个测试进程共享的一份，
+    /// 并发跑的测试会互相读到对方写的配置（表现为随机失败）。
+    /// 「配置 → 键表」这一环由 `keys.rs` 的单测覆盖，这里只测「键表 → 行为」。
+    #[test]
+    fn keymap_drives_lookup_and_dispatch() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let overrides: HashMap<String, String> = [
+            ("tab.new".to_string(), "cmd+alt+n".to_string()),
+            ("tab.close".to_string(), String::new()),
+        ]
+        .into_iter()
+        .collect();
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                v.keymap = crate::keys::Keymap::build(&overrides)
+            });
+        });
+
+        let probe = |v: &RootView, spec: &str| {
+            v.keymap
+                .lookup(&crate::keys::KeyCombo::parse(spec).unwrap())
+                .map(|s| s.to_string())
+        };
+        let hits = cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                (
+                    probe(v, "cmd+alt+n"),
+                    probe(v, "cmd+t"),
+                    probe(v, "cmd+w"),
+                    v.keymap
+                        .is_unbound(&crate::keys::KeyCombo::parse("cmd+w").unwrap()),
+                )
+            })
+        });
+        assert_eq!(hits.0.as_deref(), Some("tab.new"), "改绑的键位应当命中");
+        assert_eq!(hits.1, None, "旧键位应当失效");
+        assert_eq!(hits.2, None, "解绑后不该有动作");
+        assert!(hits.3, "解绑的键位应当被吞掉，而不是漏给系统");
+
+        // 派发动作仍然可用：tab.new 真的多出一个标签页。
+        let before = cx.update(|_w, cx| root.update(cx, |v, _cx| v.pane().tabs.len()));
+        cx.update(|_w, cx| {
+            root.update(cx, |v, cx| v.dispatch_action("tab.new", cx));
+        });
+        let after = cx.update(|_w, cx| root.update(cx, |v, _cx| v.pane().tabs.len()));
+        assert_eq!(after, before + 1, "tab.new 应当新建标签页");
     }
 }

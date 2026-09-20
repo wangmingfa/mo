@@ -51,6 +51,27 @@ impl ViewMode {
             ViewMode::Columns => ViewMode::List,
         }
     }
+
+    /// 配置文件里用的稳定键名（不要用中文标签，改文案会让用户配置失效）。
+    pub fn key(&self) -> &'static str {
+        match self {
+            ViewMode::List => "list",
+            ViewMode::Grid => "grid",
+            ViewMode::Gallery => "gallery",
+            ViewMode::Columns => "columns",
+        }
+    }
+
+    /// 键名 → 视图模式；不认识返回 `None`（调用方回落默认，不让布局崩掉）。
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "list" => Some(ViewMode::List),
+            "grid" => Some(ViewMode::Grid),
+            "gallery" => Some(ViewMode::Gallery),
+            "columns" => Some(ViewMode::Columns),
+            _ => None,
+        }
+    }
 }
 
 /// 一个窗格：竖栏，内含若干标签页。
@@ -158,6 +179,12 @@ impl Panel {
             column_busy: false,
             sort: (SortKey::Name, SortDir::Asc),
         }
+    }
+
+    /// 套上默认视图模式（配置里的 `ui.view_mode`）。
+    pub fn with_view_mode(mut self, mode: ViewMode) -> Self {
+        self.view_mode = mode;
+        self
     }
 
     /// 标签页标题：当前目录名；「此电脑」虚拟根显示固定名；尚未加载时为「新标签页」。

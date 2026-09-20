@@ -72,6 +72,21 @@ impl ColId {
             ColId::Kind => 3,
         }
     }
+
+    /// 配置文件里用的稳定键名（不要用中文标题：改文案就会让用户配置失效）。
+    pub fn key(self) -> &'static str {
+        match self {
+            ColId::Name => "name",
+            ColId::Date => "date",
+            ColId::Size => "size",
+            ColId::Kind => "kind",
+        }
+    }
+
+    /// 键名 → 列；不认识返回 `None`（配置里的未知列直接忽略，不能让布局崩掉）。
+    pub fn from_key(key: &str) -> Option<Self> {
+        ColId::ALL.into_iter().find(|c| c.key() == key)
+    }
 }
 
 /// 列宽下限 / 上限：太窄表头文字会被压没，太宽会把其它列挤出行外。
@@ -139,6 +154,52 @@ impl ColumnLayout {
     pub fn set_widths(&mut self, widths: &[(ColId, f32)]) {
         for (col, w) in widths {
             self.set_width(*col, *w);
+        }
+    }
+
+    /// 从配置偏好还原布局。
+    ///
+    /// 规则：先按默认布局起底，再套用配置——
+    /// * `order` 里认识的键按给出顺序排前面，没提到的列按默认顺序补在后面
+    ///   （这样手改配置漏掉一列也不会让列凭空消失）；
+    /// * `widths` 逐列覆盖，越界的宽度由 [`set_width`] 钳住。
+    pub fn from_prefs(prefs: &mo_app::ColumnPrefs) -> Self {
+        let mut out = Self::new();
+        if !prefs.order.is_empty() {
+            let mut order: Vec<ColId> = prefs
+                .order
+                .iter()
+                .filter_map(|k| ColId::from_key(k))
+                .collect();
+            // 去重，避免配置里写了两遍同一列把列复制出来。
+            order.dedup();
+            for col in ColId::ALL {
+                if !order.contains(&col) {
+                    order.push(col);
+                }
+            }
+            out.order = order;
+        }
+        for col in ColId::ALL {
+            if let Some(w) = prefs.widths.get(col.key()) {
+                out.set_width(col, *w);
+            }
+        }
+        out
+    }
+
+    /// 导出为配置偏好（拖完列 / 改完宽度后持久化用）。
+    pub fn to_prefs(&self) -> mo_app::ColumnPrefs {
+        let mut widths = std::collections::HashMap::new();
+        for col in ColId::ALL {
+            if col.is_flex() {
+                continue;
+            }
+            widths.insert(col.key().to_string(), self.width(col));
+        }
+        mo_app::ColumnPrefs {
+            order: self.order.iter().map(|c| c.key().to_string()).collect(),
+            widths,
         }
     }
 
@@ -360,6 +421,57 @@ mod tests {
             vec![(ColId::Kind, 130.0)],
             "右侧是弹性列：右拖由左列独自变宽"
         );
+    }
+
+    /// 配置偏好往返：导出再还原应当一模一样。
+    #[test]
+    fn prefs_round_trip() {
+        let mut l = ColumnLayout::new();
+        assert!(l.move_col(3, 0));
+        l.set_width(ColId::Date, 200.0);
+        let prefs = l.to_prefs();
+        let back = ColumnLayout::from_prefs(&prefs);
+        assert_eq!(back.order, l.order);
+        for col in ColId::ALL {
+            assert_eq!(back.width(col), l.width(col), "{col:?} 宽度不匹配");
+        }
+    }
+
+    /// 手改配置的容错：未知列键忽略、漏掉的列补回、越界宽度钳住。
+    #[test]
+    fn prefs_are_forgiving() {
+        let mut widths = std::collections::HashMap::new();
+        widths.insert("size".to_string(), 9999.0); // 超上限
+        widths.insert("nonsense".to_string(), 50.0); // 未知列
+        let prefs = mo_app::ColumnPrefs {
+            order: vec!["kind".to_string(), "nope".to_string(), "kind".to_string()],
+            widths,
+        };
+        let l = ColumnLayout::from_prefs(&prefs);
+        assert_eq!(
+            l.order,
+            vec![ColId::Kind, ColId::Name, ColId::Date, ColId::Size],
+            "未知 / 重复键忽略，漏掉的列按默认顺序补回"
+        );
+        assert_eq!(l.width(ColId::Size), MAX_COL_W, "越界宽度应被钳住");
+        assert_eq!(l.width(ColId::Date), 150.0, "没覆盖的列保持默认");
+
+        // 空偏好 = 默认布局。
+        let d = ColumnLayout::from_prefs(&mo_app::ColumnPrefs::default());
+        assert_eq!(d.order, ColId::ALL.to_vec());
+    }
+
+    /// 列键名稳定：改名会让用户配置失效，所以只允许这 4 个值。
+    #[test]
+    fn column_keys_are_stable() {
+        assert_eq!(
+            ColId::ALL.map(|c| c.key()),
+            ["name", "date", "size", "kind"]
+        );
+        for col in ColId::ALL {
+            assert_eq!(ColId::from_key(col.key()), Some(col));
+        }
+        assert_eq!(ColId::from_key("名称"), None);
     }
 
     /// 两侧共用同一个钳制后的位移：一侧触限时另一侧同步停住，线不会偏。

@@ -12,9 +12,11 @@ mod file_list;
 mod grid;
 mod icon;
 mod icons;
+mod keys;
 mod list_columns;
 mod listing;
 mod panel;
+mod preview;
 mod progress_panel;
 mod sidebar;
 mod status_bar;
@@ -39,25 +41,23 @@ fn init_tracing() {
         .init();
 }
 
-/// 让 gpui-component 的 `Theme` 跟随本项目的调色板。
+/// 测试专用：把配置目录钉到进程唯一的临时目录。
 ///
-/// 地址栏用的是框架的 `Input`（见 `toolbar::address_bar`），它的**选区底色、
-/// 光标色、前景色**全部取自 `Theme` 这个全局——不覆盖的话，那块会在
-/// 我们自绘的极简配色里突然冒出一套 shadcn 默认色。
-///
-/// 只覆盖与文本输入有关、且肉眼可见的几项：选区（用文件列表那抹蓝，压到
-/// 30% 透明以免盖住字形）、光标（同蓝）、前景 / 次要前景 / 边框。
-fn sync_component_theme(cx: &mut App) {
-    let t = component::Theme::global_mut(cx);
-    t.selection = {
-        let mut c = Hsla::from(theme::selected_bg());
-        c.a = 0.3;
-        c
-    };
-    t.caret = Hsla::from(theme::selected_bg());
-    t.foreground = Hsla::from(theme::text());
-    t.muted_foreground = Hsla::from(theme::muted());
-    t.border = Hsla::from(theme::divider());
+/// ⚠️ 凡是会建 `AppState` / `RootView` 的测试都要在开头调一次：视图模式、
+/// 侧边栏开关这些布局偏好会改变渲染结构，不隔离就会读到**开发者机器上的真实
+/// 配置**，于是同一份代码在别人机器上跑测试结论不同（表现是断言莫名失败）。
+#[doc(hidden)]
+pub fn isolate_config_for_tests() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("mo-test-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    });
+    std::env::set_var("MO_CONFIG_DIR", dir);
+    dir.clone()
 }
 
 /// 启动 Mo 图形界面。
@@ -70,8 +70,9 @@ pub fn run() {
     app.spawn_refresh_pump();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // 框架组件（地址栏的 Input）的配色对齐到我们自己的调色板。
-        sync_component_theme(cx);
+        // 框架组件（地址栏的 Input）的配色对齐到当前主题（`RootView::new` 里
+        // 先按配置套用主题，这里再同步一次给全局 Theme）。
+        theme::apply_component(cx);
         // NSApplication 此时已创建：把嵌入的 PNG 设为 Dock / ⌘Tab 图标。
         icon::set_dock_icon();
         let app = app.clone();

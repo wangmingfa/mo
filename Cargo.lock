@@ -4229,6 +4229,8 @@ dependencies = [
  "mo-search",
  "mo-thumbnails",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "windows-sys 0.52.0",

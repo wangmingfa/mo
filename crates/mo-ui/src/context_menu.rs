@@ -96,8 +96,8 @@ pub(crate) enum MenuAction {
 pub(crate) struct MenuItem {
     pub action: MenuAction,
     pub label: String,
-    /// 右侧快捷键提示（纯展示，不参与命中；这些键本来就由全局快捷键接管）。
-    pub hint: &'static str,
+    /// 右侧快捷键提示（纯展示，不参与命中；由键表推导，见 [`crate::keys::hint`]）。
+    pub hint: String,
     pub enabled: bool,
     pub separator_before: bool,
     /// 二级菜单（「打开方式」的应用列表）。非空时本行 hover 展开，点击动作由
@@ -109,13 +109,13 @@ impl MenuItem {
     fn new(
         action: MenuAction,
         label: impl Into<String>,
-        hint: &'static str,
+        hint: impl Into<String>,
         enabled: bool,
     ) -> Self {
         Self {
             action,
             label: label.into(),
-            hint,
+            hint: hint.into(),
             enabled,
             separator_before: false,
             submenu: Vec::new(),
@@ -157,8 +157,20 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         return vec![
             MenuItem::new(MenuAction::NewFolder, "新建文件夹", "", true),
             MenuItem::new(MenuAction::NewFile, "新建文本文件", "", true),
-            MenuItem::new(MenuAction::Paste, "粘贴", "⌘V", true).separated(),
-            MenuItem::new(MenuAction::SelectAll, "全选", "⌘A", true).separated(),
+            MenuItem::new(
+                MenuAction::Paste,
+                "粘贴",
+                crate::keys::hint("clipboard.paste"),
+                true,
+            )
+            .separated(),
+            MenuItem::new(
+                MenuAction::SelectAll,
+                "全选",
+                crate::keys::hint("select.all"),
+                true,
+            )
+            .separated(),
             MenuItem::new(MenuAction::Refresh, "刷新", "", true),
             MenuItem::new(MenuAction::OpenTerminal, "在终端中打开", "", true).separated(),
             MenuItem::new(MenuAction::Properties, "显示简介", "", true),
@@ -170,10 +182,11 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
     let mut out = Vec::new();
 
     // 打开（目录进入；文件用系统默认应用，与双击一致）
+    // 提示由键表推导：macOS 是 ⌘↓，Windows / Linux 是 Enter。
     out.push(MenuItem::new(
         MenuAction::Open,
         "打开",
-        if is_dir { "↩" } else { "" },
+        crate::keys::hint("list.open"),
         true,
     ));
     // 打开方式：仅文件；hover 展开二级菜单（应用列表 + 系统选择对话框）。
@@ -188,7 +201,12 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         out.push(
             MenuItem::new(MenuAction::OpenWithOther, "打开方式", "▸", true).with_submenu(submenu),
         );
-        out.push(MenuItem::new(MenuAction::QuickLook, "快速查看", "␣", true));
+        out.push(MenuItem::new(
+            MenuAction::QuickLook,
+            "快速查看",
+            crate::keys::hint("list.preview"),
+            true,
+        ));
     }
     if is_dir {
         out.push(MenuItem::new(
@@ -214,7 +232,7 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
             } else {
                 "重命名…"
             },
-            "F2",
+            crate::keys::hint("list.rename"),
             true,
         )
         .separated(),
@@ -226,12 +244,27 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         } else {
             "创建副本"
         },
-        "⌘D",
+        crate::keys::hint("file.duplicate"),
         true,
     ));
-    out.push(MenuItem::new(MenuAction::Copy, "复制", "⌘C", true));
-    out.push(MenuItem::new(MenuAction::Cut, "剪切", "⌘X", true));
-    out.push(MenuItem::new(MenuAction::CopyPath, "拷贝路径", "⌥⌘C", true));
+    out.push(MenuItem::new(
+        MenuAction::Copy,
+        "复制",
+        crate::keys::hint("clipboard.copy"),
+        true,
+    ));
+    out.push(MenuItem::new(
+        MenuAction::Cut,
+        "剪切",
+        crate::keys::hint("clipboard.cut"),
+        true,
+    ));
+    out.push(MenuItem::new(
+        MenuAction::CopyPath,
+        "拷贝路径",
+        crate::keys::hint("clipboard.copy_path"),
+        true,
+    ));
 
     // 删除
     out.push(
@@ -242,7 +275,7 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
             } else {
                 "移到废纸篓".to_string()
             },
-            "⌘⌫",
+            crate::keys::hint("file.trash"),
             true,
         )
         .separated(),
@@ -285,7 +318,7 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
     out.push(MenuItem::new(
         MenuAction::Properties,
         "显示简介",
-        "⌘I",
+        crate::keys::hint("file.properties"),
         true,
     ));
     if is_dir {

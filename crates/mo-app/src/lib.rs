@@ -14,14 +14,23 @@
 //! 关键原则：**mo-core 不依赖 GPUI**，核心文件系统逻辑可单独测试。
 
 mod controller;
+/// 扩展系统：声明式清单 + 外部程序。
+pub mod extensions;
 mod metadata;
 /// 系统 shell 集成（默认打开 / 打开方式）。
 pub mod shell;
 mod thumbnail;
+/// 用户自定义命令（占位符 / 清单 / 执行）。
+pub mod usercmds;
+/// 自动化工作流：多步命令顺序执行。
+pub mod workflows;
 
 pub use controller::DirectoryController;
 pub use metadata::MetadataScheduler;
+// 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
+pub use mo_config::{ColumnPrefs, Config, ThemeColors, UiPrefs, UserCommand, Workflow};
 pub use thumbnail::ThumbnailScheduler;
+pub use workflows::{run_workflow, StepResult, WorkflowReport};
 
 use std::future::Future;
 use std::ops::Range;
@@ -864,6 +873,119 @@ impl AppState {
         mo_preview::preview_path(path)
     }
 
+    /// 全部工作流：配置里写的 + 扩展清单带的（`workflows` 字段），坏定义丢弃。
+    pub fn workflows(&self) -> Vec<Workflow> {
+        let mut out = workflows::sanitize(self.config().workflows);
+        for e in self.extensions() {
+            for w in e.manifest.workflows.clone() {
+                let mut w = w;
+                if w.source.is_none() {
+                    w.source = Some(e.path.display().to_string());
+                }
+                if out.iter().any(|x| x.name == w.name) {
+                    tracing::warn!("工作流「{}」重名，忽略扩展里的那份", w.name);
+                    continue;
+                }
+                out.push(w);
+            }
+        }
+        workflows::sanitize(out)
+    }
+
+    /// 顺序执行一个工作流（在 blocking 池跑，UI 期间可继续操作）。
+    pub async fn run_workflow(
+        &self,
+        wf: Workflow,
+        ctx: usercmds::CommandContext,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> workflows::WorkflowReport {
+        self.spawn_blocking(move || workflows::run_workflow(&wf, &ctx, &cancel, |_| {}))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 某个目录的同步配对目标（未配对则 `None`）。
+    pub fn sync_target(&self, src: &Path) -> Option<PathBuf> {
+        self.config()
+            .sync_pairs
+            .get(&src.to_string_lossy().to_string())
+            .map(PathBuf::from)
+    }
+
+    /// 记下 / 更新一个目录的同步配对目标；传 `None` 表示解除配对。
+    pub fn set_sync_target(&self, src: &Path, dst: Option<&Path>) {
+        let mut cfg = self.config();
+        let key = src.to_string_lossy().to_string();
+        match dst {
+            Some(d) => {
+                cfg.sync_pairs.insert(key, d.to_string_lossy().to_string());
+            }
+            None => {
+                cfg.sync_pairs.remove(&key);
+            }
+        }
+        self.save_config(&cfg);
+    }
+
+    /// 生成同步计划（**只读**，不改动任何文件）。
+    ///
+    /// 扫描整棵树可能耗时，所以放 blocking 池；UI 必须先拿到计划给用户过目，
+    /// 点了执行才 apply。
+    pub async fn sync_plan(
+        &self,
+        src: PathBuf,
+        dst: PathBuf,
+        opts: mo_operations::SyncOptions,
+    ) -> Result<mo_operations::SyncPlan, String> {
+        self.spawn_blocking(move || mo_operations::plan_sync(&src, &dst, opts))
+            .await
+            .map_err(|e| format!("生成计划的任务失败：{e}"))
+    }
+
+    /// 按计划执行同步，返回（执行报告，待清理的多余文件）。
+    ///
+    /// ⚠️ 删除**不在这里做**：blocking 线程里拿不到异步操作队列（也不该
+    /// `block_on` 一个 tokio 锁），所以引擎只把「要清理哪些」交回来，由调用方
+    /// 走 [`AppState::trash_paths`] 送回收站——既复用了撤销记录，也让删除
+    /// 始终经过操作队列（有进度、可取消、可撤销）。
+    pub async fn sync_apply(
+        &self,
+        src: PathBuf,
+        dst: PathBuf,
+        plan: mo_operations::SyncPlan,
+    ) -> (mo_operations::SyncReport, Vec<PathBuf>) {
+        let mut victims: Vec<PathBuf> = Vec::new();
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let collect = sink.clone();
+        let report = self
+            .spawn_blocking(move || {
+                mo_operations::apply_sync_plan(&src, &dst, &plan, |victim| {
+                    // 引擎承诺不做永久删除：这里只登记，不动文件。
+                    collect.lock().unwrap().push(victim.to_path_buf());
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap_or_default();
+        if let Ok(got) = Arc::try_unwrap(sink) {
+            victims = got.into_inner().unwrap_or_default();
+        }
+        (report, victims)
+    }
+
+    /// 在 `root` 下查找重复文件（阻塞 IO 放 blocking 池，UI 期间可继续操作）。
+    ///
+    /// `cancel` 由调用方持有：整盘扫描可能跑几分钟，必须能中途停下。
+    pub async fn find_duplicates(
+        &self,
+        root: PathBuf,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> mo_operations::DedupReport {
+        self.spawn_blocking(move || mo_operations::find_duplicates(&[root], &cancel))
+            .await
+            .unwrap_or_default()
+    }
+
     // ---- 文件 / 文件夹比较 ----
 
     /// 比较两个条目（自动选择文件比较或树比较）。
@@ -1032,6 +1154,14 @@ impl AppState {
     /// 因为走回收站，删除天然可撤销——后续 `undo()` 会按原路径从回收站还原。
     pub async fn delete_selection(&self) -> Vec<u64> {
         let paths = self.selection_paths().await;
+        self.trash_paths(paths).await
+    }
+
+    /// 把**指定**路径逐个移入回收站（可撤销）。
+    ///
+    /// 与 `delete_selection` 同一条流水线，只是不走选择模型——重复文件清理
+    /// 要删的是「某个组里的其余副本」，跟当前选中项无关。
+    pub async fn trash_paths(&self, paths: Vec<PathBuf>) -> Vec<u64> {
         let mut ids = Vec::new();
         for p in paths {
             let id = self.ops.lock().await.next_id();
@@ -1393,7 +1523,14 @@ pub struct DirUsage {
 
 impl AppState {
     /// 配置文件路径（`~/Library/Application Support/mo/config.json` 等）。
+    ///
+    /// 设了 `MO_CONFIG_DIR` 环境变量时用该目录——测试靠它把配置钉到临时路径，
+    /// 否则测试会读到开发者机器上的真实配置（视图模式、侧边栏开关都会改变
+    /// 渲染结构，导致断言在别人机器上莫名失败）。便携部署也认这个变量。
     fn config_path() -> PathBuf {
+        if let Ok(dir) = std::env::var("MO_CONFIG_DIR") {
+            return PathBuf::from(dir).join("config.json");
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("mo")
@@ -1409,6 +1546,201 @@ impl AppState {
         if let Err(e) = cfg.save(&Self::config_path()) {
             tracing::warn!("配置保存失败：{e}");
         }
+    }
+
+    /// 当前主题名：`light` / `dark` / `system`（跟随系统）/ 自定义主题 key。
+    /// 配置里留空时按浅色处理。
+    pub fn theme_setting(&self) -> String {
+        let t = self.config().theme;
+        if t.is_empty() {
+            "light".to_string()
+        } else {
+            t
+        }
+    }
+
+    /// 切换主题并持久化。
+    pub fn set_theme(&self, name: &str) {
+        let mut cfg = self.config();
+        cfg.theme = name.to_string();
+        self.save_config(&cfg);
+    }
+
+    /// 自定义主题表（配置文件的 `custom_themes`）。
+    pub fn custom_themes(&self) -> std::collections::HashMap<String, ThemeColors> {
+        self.config().custom_themes
+    }
+
+    /// 新增 / 覆盖一个自定义主题（供「另存为自定义主题」与配置写回使用）。
+    pub fn set_custom_theme(&self, name: &str, colors: ThemeColors) {
+        let mut cfg = self.config();
+        cfg.custom_themes.insert(name.to_string(), colors);
+        self.save_config(&cfg);
+    }
+
+    /// 删除自定义主题；若它正是当前主题则退回浅色。
+    pub fn remove_custom_theme(&self, name: &str) {
+        let mut cfg = self.config();
+        cfg.custom_themes.remove(name);
+        if cfg.theme == name {
+            cfg.theme = "light".to_string();
+        }
+        self.save_config(&cfg);
+    }
+
+    /// 列布局偏好（顺序 + 宽度）。
+    pub fn column_prefs(&self) -> ColumnPrefs {
+        self.config().columns
+    }
+
+    /// 保存列布局（拖动列序 / 调整列宽后调用）。
+    pub fn save_column_prefs(&self, prefs: ColumnPrefs) {
+        let mut cfg = self.config();
+        cfg.columns = prefs;
+        self.save_config(&cfg);
+    }
+
+    /// 界面布局偏好（侧边栏 / 状态栏 / 斑马纹 / 默认视图）。
+    pub fn ui_prefs(&self) -> UiPrefs {
+        self.config().ui
+    }
+
+    /// 逐项改界面偏好并持久化（第四阶段·自定义布局）。
+    pub fn set_ui_prefs(&self, prefs: UiPrefs) {
+        let mut cfg = self.config();
+        cfg.ui = prefs;
+        self.save_config(&cfg);
+    }
+
+    /// 快捷键覆盖表：动作 id → 键串（空串 = 解绑）。
+    pub fn keybindings(&self) -> std::collections::HashMap<String, String> {
+        self.config().keybindings
+    }
+
+    /// 改一个动作的键位并持久化（`spec` 为空串表示解绑）。
+    pub fn set_keybinding(&self, id: &str, spec: &str) {
+        let mut cfg = self.config();
+        cfg.keybindings.insert(id.to_string(), spec.to_string());
+        self.save_config(&cfg);
+    }
+
+    /// 恢复某个动作的默认键位（删掉覆盖项）。
+    pub fn clear_keybinding(&self, id: &str) {
+        let mut cfg = self.config();
+        cfg.keybindings.remove(id);
+        self.save_config(&cfg);
+    }
+
+    /// 全部快捷键回到默认。
+    pub fn reset_keybindings(&self) {
+        let mut cfg = self.config();
+        cfg.keybindings.clear();
+        self.save_config(&cfg);
+    }
+
+    /// 恢复默认布局：清掉列偏好 + 界面开关回到全开、默认列表视图。
+    pub fn reset_layout(&self) {
+        let mut cfg = self.config();
+        cfg.columns = ColumnPrefs::default();
+        cfg.ui = UiPrefs::default();
+        self.save_config(&cfg);
+    }
+
+    /// 用户自定义命令：配置里写的 + `commands/*.json` 清单 + 启用的扩展。
+    ///
+    /// 清单与扩展目录都只认**自己的配置目录**，绝不扫描正在浏览的目录——否则
+    /// 打开别人给的文件夹就等于跑了它带的脚本。同名命令保留先加载的那条并告警。
+    /// `selected_exts` 是选中项的扩展名（小写含点），供扩展的 `when_ext` 条件用。
+    pub fn user_commands(&self, selected_exts: &[String]) -> Vec<UserCommand> {
+        let cfg = self.config();
+        let mut out: Vec<UserCommand> = cfg
+            .commands
+            .iter()
+            .filter(|c| {
+                let bad = usercmds::validate(c).is_some();
+                if bad {
+                    tracing::warn!("配置里有一条自定义命令不合法，已忽略");
+                }
+                !bad
+            })
+            .cloned()
+            .collect();
+        for c in usercmds::load_manifests(&Self::commands_dir()) {
+            if out.iter().any(|e| e.name == c.name) {
+                tracing::warn!(
+                    "命令「{}」重名，忽略 {}",
+                    c.name,
+                    c.source.unwrap_or_default()
+                );
+                continue;
+            }
+            out.push(c);
+        }
+        for c in extensions::flatten(&self.extensions(), selected_exts) {
+            if out.iter().any(|e| e.name == c.name) {
+                tracing::warn!(
+                    "命令「{}」重名，忽略 {}",
+                    c.name,
+                    c.source.clone().unwrap_or_default()
+                );
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// 已加载的扩展（`<配置目录>/mo/extensions/<id>/manifest.json`）。
+    pub fn extensions(&self) -> Vec<extensions::Extension> {
+        extensions::load(&extensions::extensions_root(&Self::config_path()))
+    }
+
+    /// 启用 / 停用某个扩展：改写它自己清单里的 `enabled`。
+    pub fn set_extension_enabled(&self, id: &str, on: bool) -> Result<(), String> {
+        let ext = self
+            .extensions()
+            .into_iter()
+            .find(|e| e.manifest.id == id)
+            .ok_or_else(|| format!("找不到扩展「{id}」"))?;
+        let text = std::fs::read_to_string(&ext.path).map_err(|e| e.to_string())?;
+        let mut m: extensions::Manifest = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        m.enabled = on;
+        std::fs::write(
+            &ext.path,
+            serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// 命令清单目录（`<配置目录>/mo/commands`，受 `MO_CONFIG_DIR` 影响）。
+    pub fn commands_dir() -> PathBuf {
+        Self::config_path()
+            .parent()
+            .map(|p| p.join("commands"))
+            .unwrap_or_else(|| PathBuf::from("commands"))
+    }
+
+    /// 执行一条用户自定义命令（占位符展开 + 平台 shell + 输出捕获）。
+    ///
+    /// 返回 `(是否可执行, 结果)`：占位符缺上下文时不执行，避免把
+    /// `rm {file}` 跑成 `rm`（少了参数就等于对空目标动手）。
+    pub async fn run_user_command(
+        &self,
+        cmd: UserCommand,
+        ctx: usercmds::CommandContext,
+    ) -> Result<(String, usercmds::CommandOutput), String> {
+        let (line, ok) = usercmds::expand(&cmd.shell, &ctx);
+        if !ok {
+            return Err("这条命令需要先在右侧列表里选中条目（用到 {file} / {files}）".to_string());
+        }
+        let cwd = ctx.dir.clone();
+        let shown = line.clone();
+        // ⚠️ 必须走 `spawn_blocking`（进程级 runtime）：这里的 `await` 跑在
+        // GPUI 执行器上，直接 `tokio::spawn` 会 panic「no reactor running」。
+        self.spawn_blocking(move || usercmds::run(&line, cwd.as_deref()))
+            .await
+            .map_err(|e| format!("命令任务失败：{e}"))
+            .and_then(|r| r.map(|out| (shown, out)))
     }
 
     /// 侧边栏书签（含用户自己加的，去重且只保留仍在的目录）。

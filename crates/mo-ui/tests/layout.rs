@@ -23,6 +23,9 @@ fn open_app(
     window_size: Size<Pixels>,
     cx: &mut TestAppContext,
 ) -> (VisualTestContext, WindowHandle<RootView>) {
+    // 钉住配置目录到临时路径：否则视图模式 / 侧边栏开关这些布局偏好会读到人家的
+    // 真实 config.json，同一份代码在不同机器上渲染结构不同。
+    mo_ui::isolate_config_for_tests();
     let app = AppState::new();
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);

@@ -9,6 +9,7 @@
 
 mod archive;
 mod copy;
+mod dedup;
 mod delete;
 mod fs_util;
 mod hash;
@@ -18,11 +19,13 @@ mod move_op;
 mod perms;
 mod rename;
 mod restore_op;
+mod sync;
 mod trash;
 mod trash_op;
 
 pub use archive::{create_archive, extract_archive, ArchiveFormat};
 pub use copy::CopyOperation;
+pub use dedup::{find_duplicates, DedupReport, DupGroup};
 pub use delete::DeleteOperation;
 pub use fs_util::{resolve_target, unique_path, ConflictPolicy, Target};
 pub use hash::{compute_hashes, HashAlgo};
@@ -32,6 +35,10 @@ pub use move_op::MoveOperation;
 pub use perms::{mode_string, set_permissions};
 pub use rename::RenameOperation;
 pub use restore_op::RestoreOperation;
+pub use sync::{
+    apply as apply_sync_plan, plan as plan_sync, Action as SyncAction,
+    ConflictPolicy as SyncConflictPolicy, Plan as SyncPlan, SyncMode, SyncOptions, SyncReport,
+};
 pub use trash::{Trash, TrashEntry, TrashError};
 pub use trash_op::TrashOperation;
 

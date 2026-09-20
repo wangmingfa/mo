@@ -13,6 +13,7 @@
 | [build-and-lints.md](build-and-lints.md) | 构建与依赖：future-incompat 补丁、workspace lints、cfg 检查 |
 | [engine-testing.md](engine-testing.md) | 引擎逻辑与测试方法：headless 布局测试、通用算法陷阱 |
 | [async-runtime.md](async-runtime.md) | 异步 runtime：后台任务洪泛饿死 UI、刷新竞态、跨目录快照覆盖 |
+| [customization.md](customization.md) | 自定义系统：配置文件 BOM、主题取色的全局槽位、深色档语义色 |
 
 ## 约定
 
