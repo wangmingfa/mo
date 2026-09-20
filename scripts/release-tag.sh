@@ -12,7 +12,11 @@
 #   ./scripts/release-tag.sh major         # 0.1.0 → 1.0.0
 #   ./scripts/release-tag.sh 1.2.3         # 显式指定
 #   ./scripts/release-tag.sh patch --no-push   # 只本地打 tag，稍后自己推
-#   ./scripts/release-tag.sh patch --skip-checks  # 跳过 fmt/clippy/test
+#   ./scripts/release-tag.sh patch --skip-checks  # 跳过 fmt/clippy/test，快速发布
+#
+# 质量门禁与最终确认都是方向键菜单（↑/↓ 移动光标，回车确认，默认选中
+# 第一项）；选「跳过」直接发布，push 后 CI 仍会兜底跑一遍。--skip-checks
+# 免交互直接跳过门禁，适合赶时间的快速发布。
 #
 # 唯一 versions 真源：[workspace.package].version（各 crate 都是
 # version.workspace = true），所以只改这一处。
@@ -28,7 +32,7 @@ NO_PUSH=0
 SKIP_CHECKS=0
 
 usage() {
-  sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -45,6 +49,59 @@ done
 # ---------------------------------------------------------------- 前置检查
 die() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
 step() { printf '\033[36m→ %s\033[0m\n' "$1"; }
+
+# 方向键菜单：↑/↓ 移动光标，回车确认，Ctrl+C 退出；结果存入全局
+# MENU_INDEX（0 起，默认选中第一项）。用法：
+#   menu "提示文字" "选项一" "选项二"
+#   if [ "$MENU_INDEX" -eq 1 ]; then ...; fi
+menu() {
+  local prompt="$1"
+  shift
+  local -a options=("$@")
+  local count=$# sel=0 i key rest
+
+  printf '%s\n' "$prompt"
+  for i in "${!options[@]}"; do
+    if [ "$i" -eq "$sel" ]; then
+      printf '\033[36m❯ %s\033[0m\n' "${options[$i]}"
+    else
+      printf '  %s\n' "${options[$i]}"
+    fi
+  done
+
+  while :; do
+    IFS= read -rsn1 key
+    case "$key" in
+      $'\033')
+        read -rsn2 rest
+        case "$rest" in
+          '[A' | 'OA')
+            if [ "$sel" -gt 0 ]; then
+              sel=$((sel - 1))
+            fi
+            ;;
+          '[B' | 'OB')
+            if [ "$sel" -lt $((count - 1)) ]; then
+              sel=$((sel + 1))
+            fi
+            ;;
+          *) continue 2 ;;
+        esac
+        printf '\033[%dA' "$count"
+        for i in "${!options[@]}"; do
+          if [ "$i" -eq "$sel" ]; then
+            printf '\033[K\033[36m❯ %s\033[0m\n' "${options[$i]}"
+          else
+            printf '\033[K  %s\n' "${options[$i]}"
+          fi
+        done
+        ;;
+      '' | $'\r') break ;;
+      *) ;;
+    esac
+  done
+  MENU_INDEX=$sel
+}
 
 command -v git >/dev/null || die "需要 git"
 command -v cargo >/dev/null || die "需要 cargo"
@@ -100,6 +157,16 @@ git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG 已存在
 # ---------------------------------------------------------------- 版本写入
 # 先在**改文件之前**跑门禁：不合格时工作区仍是干净的，不必手动回滚。
 if [ "$SKIP_CHECKS" -eq 0 ]; then
+  menu "质量门禁 fmt / clippy / test 可能需要几分钟" \
+    "运行质量门禁（推荐）" \
+    "跳过，快速发布（push 后 CI 兜底）"
+  if [ "$MENU_INDEX" -eq 1 ]; then
+    SKIP_CHECKS=1
+    printf '\033[33m! 已跳过质量门禁；push 后 CI 仍会跑一遍，留意 Actions 结果\033[0m\n'
+  fi
+fi
+
+if [ "$SKIP_CHECKS" -eq 0 ]; then
   step "质量门禁：fmt / clippy / test"
   cargo fmt --all -- --check
   cargo clippy --all-targets --all-features -- -D warnings
@@ -138,6 +205,11 @@ fi
 # ---------------------------------------------------------------- 确认并推送
 printf '\n\033[1m即将发布\033[0m\n'
 printf '  版本：%s（当前 branch %s）\n' "$TAG" "$BRANCH"
+if [ "$SKIP_CHECKS" -eq 1 ]; then
+  printf '  门禁：\033[33m已跳过\033[0m\n'
+else
+  printf '  门禁：fmt / clippy / test 已通过\n'
+fi
 printf '  remote：%s  →  %s\n' "$REMOTE" "$(git remote get-url "$REMOTE")"
 if [ "$VERSION_COMMIT" -eq 1 ]; then
   printf '  提交：chore(release): bump version to %s\n' "$VERSION"
@@ -147,11 +219,8 @@ if [ "$NO_PUSH" -eq 1 ]; then
   printf '  \033[33m--no-push：只本地打 tag，不推送\033[0m\n'
 fi
 printf '\n'
-read -r -p "确认继续？[y/N] " ANSWER
-case "$ANSWER" in
-  y | Y | yes) ;;
-  *) die "已取消" ;;
-esac
+menu "确认发布 $TAG？（推送后自动触发 GitHub Release 流水线）" "确认发布" "取消"
+[ "$MENU_INDEX" -eq 0 ] || die "已取消"
 
 if [ "$VERSION_COMMIT" -eq 1 ]; then
   step "提交版本改动"
