@@ -64,12 +64,32 @@ pub enum RemoteError {
         /// 底层错误文本。
         detail: String,
     },
+    /// 服务器拒绝这组凭据：匿名登录不被接受，或用户名 / 密码不对。
+    ///
+    /// 与 [`RemoteError::Transport`] 分开是有意的——UI 拿到它要弹「输入账号密码」
+    /// 的框，而「连不上 / 超时 / DNS 失败」要显示成地址错误。混成一句字符串就
+    /// 没法分流了（这正是改造前的问题：一切都压成 `Transport`）。
+    #[error("{kind}被服务器拒绝：{detail}")]
+    AuthRequired {
+        /// 失败发生在哪一步（登录 / 认证）。
+        kind: &'static str,
+        /// 底层错误文本。
+        detail: String,
+    },
 }
 
 impl RemoteError {
     /// 统一的「这一步失败了」构造器：底层错误文本进 `detail`。
     pub fn transport(kind: &'static str, e: impl std::fmt::Display) -> Self {
         RemoteError::Transport {
+            kind,
+            detail: e.to_string(),
+        }
+    }
+
+    /// 「服务器不接受这组凭据」——UI 据此弹认证框。
+    pub fn auth(kind: &'static str, e: impl std::fmt::Display) -> Self {
+        RemoteError::AuthRequired {
             kind,
             detail: e.to_string(),
         }

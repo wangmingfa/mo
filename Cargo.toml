@@ -69,6 +69,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 用户目录（缓存 / 配置存放位置），跨平台
 dirs = "5"
 
+# 系统钥匙串（macOS Keychain / Windows 凭据管理器 / Linux Secret Service）：
+# 「连接到服务器」勾了「记住密码」时，密码的落点。**不要**把密码写进
+# config.json —— 那是明文。默认 feature `v1` 已含三平台后端。
+keyring = "4"
+
 # 归档（压缩 / 解压）
 zip = "0.6"
 tar = "0.4"

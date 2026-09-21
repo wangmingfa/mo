@@ -61,10 +61,7 @@ impl FtpFileSystem {
             let mut stream = AsyncFtpStream::connect(&addr)
                 .await
                 .map_err(|e| RemoteError::transport("连接", e))?;
-            stream
-                .login(&user, &password)
-                .await
-                .map_err(|e| RemoteError::transport("登录", e))?;
+            stream.login(&user, &password).await.map_err(login_error)?;
             Ok::<_, RemoteError>(stream)
         })?;
 
@@ -147,6 +144,21 @@ fn parse_list(line: &str) -> Option<File> {
     ListParser::parse_posix(l)
         .or_else(|_| ListParser::parse_dos(l))
         .ok()
+}
+
+/// 把 FTP 登录失败分成「凭据被拒」与「别的毛病」两类。
+///
+/// `530 Not logged in`（RFC 959）是登录失败的规范应答：用户名 / 密码不对，或
+/// 服务器不接受匿名。**只有它能触发「请输入账号密码」的弹窗**；其余（421 服务
+/// 不可用、连接被中断…）照旧走 `Transport`——否则一句「密码不对」会把真正的
+/// 故障盖住，用户会在正确的密码上反复试。
+fn login_error(e: suppaftp::FtpError) -> RemoteError {
+    match &e {
+        suppaftp::FtpError::UnexpectedResponse(resp) if resp.status.code() == 530 => {
+            RemoteError::auth("登录", &e)
+        }
+        _ => RemoteError::transport("登录", e),
+    }
 }
 
 #[async_trait]
@@ -242,6 +254,36 @@ fn system_time_from_naive(t: chrono::NaiveDateTime) -> std::time::SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 530 `Not logged in` 是「服务器要账号密码」的唯一信号。
+    ///
+    /// UI 靠这个分类决定弹不弹认证框：判成 `Transport` 只会干显示一句错误
+    /// （改造前的行为），判成 `AuthRequired` 才会问用户名密码。
+    #[test]
+    fn login_530_asks_for_credentials() {
+        let err = suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response {
+            status: suppaftp::Status::from(530u32),
+            body: b"530 Login incorrect.".to_vec(),
+        });
+        assert!(
+            matches!(login_error(err), RemoteError::AuthRequired { .. }),
+            "530 应当被判为「需要凭据」"
+        );
+    }
+
+    /// 其余登录失败仍是普通传输错误——别让「服务不可用」冒充「密码不对」，
+    /// 那会让用户在一个正确的密码上反复试。
+    #[test]
+    fn login_other_failures_stay_transport() {
+        let err = suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response {
+            status: suppaftp::Status::from(421u32),
+            body: b"421 Service not available.".to_vec(),
+        });
+        assert!(
+            matches!(login_error(err), RemoteError::Transport { .. }),
+            "421 不该被当成「需要凭据」"
+        );
+    }
 
     #[test]
     fn paths_are_normalized_to_remote_absolute() {

@@ -67,6 +67,62 @@ pub(crate) enum Modal {
     Extensions,
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
     ConnectServer,
+    /// 「服务器要求登录」——用户名 + 密码（星号）+ 记住密码。
+    ///
+    /// 只在服务器**真的拒绝**了匿名登录时出现（`ConnectFailure::NeedsCredentials`），
+    /// 所以地址里没写凭据不等于会弹它：匿名能进就直接进了。
+    ConnectAuth,
+}
+
+/// 认证弹窗的状态。
+///
+/// 与 [`Modal::ConnectAuth`] 一起用：`modal` 决定「在不在这个界面」，
+/// 这里存界面上的东西。字段合成一个 `Option` 而不是散在 `RootView` 上，
+/// 是因为它们必须同生同灭——取消一次漏清一个，下次打开就会带着上次的
+/// 用户名 / 错误信息。
+pub(crate) struct ConnectAuthState {
+    /// 要连的服务器（`scheme://host:port`），提交时原样回传。
+    pub endpoint: String,
+    /// 上次尝试的失败原因，作为弹窗里的说明文字。
+    pub hint: Option<String>,
+    /// 用户名 / 密码不对时的错误。
+    pub error: Option<String>,
+    /// 用户名初值：地址里写了 `ftp://alice@host` 就带过来，别让用户再敲一遍。
+    pub user_seed: String,
+    /// 用户名输入框。
+    pub user: Option<Entity<InputState>>,
+    /// 密码输入框（`masked(true)`，绘制层显示成星号）。
+    pub pass: Option<Entity<InputState>>,
+    /// 两个输入框的事件订阅句柄。
+    ///
+    /// ⚠️ 必须持有：`Subscription` 一 drop 就退订，回车那一下（这个弹窗里
+    /// 最主要的一个键）就再也收不到了。
+    pub subs: Vec<Subscription>,
+    /// 「记住密码」是否勾上。默认勾上——用户填完凭据多半就是希望下次别再填。
+    pub remember: bool,
+    /// 是否已经做过**首次**聚焦。
+    ///
+    /// 之后不再抢焦点：用户名 / 密码之间要能 Tab 切换，点「记住密码」也会把
+    /// 焦点带走，每帧强拉回来就打断这些操作了。（地址框那边是另一个尺度——
+    /// 只有一个输入框，每帧确保聚焦反而更好用。）
+    pub focused: bool,
+}
+
+impl ConnectAuthState {
+    /// 新建：`detail` 是上次尝试的失败原因（首次进来时是 `None`）。
+    fn new(endpoint: String, detail: Option<String>, user_seed: &str) -> Self {
+        Self {
+            endpoint,
+            hint: detail,
+            error: None,
+            user_seed: user_seed.to_string(),
+            user: None,
+            pass: None,
+            subs: Vec::new(),
+            remember: true,
+            focused: false,
+        }
+    }
 }
 
 /// 命令面板中的可执行命令。
@@ -565,6 +621,13 @@ pub struct RootView {
     pub(crate) connect_sub: Option<Subscription>,
     /// 连接失败时的错误提示（保留对话框展示）。
     pub(crate) connect_error: Option<String>,
+    /// 「连接到服务器」对话框里列出的**已记住的服务器**。
+    ///
+    /// 存快照而不是每帧重读：`saved_servers()` 每次都要读一遍配置文件，而这份
+    /// 列表在对话框开着期间不会变（重新打开时再读一次）。
+    pub(crate) connect_servers: Vec<mo_app::SavedServer>,
+    /// 认证弹窗（用户名 / 密码 / 记住密码）的状态；`None` = 不在认证态。
+    pub(crate) connect_auth: Option<ConnectAuthState>,
     /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
     /// 通过 [`RootView::notice`] 的 `ok` 参数设置，关闭提示时清回 `None`。
     pub(crate) notice_ok: Option<String>,
@@ -677,6 +740,8 @@ impl RootView {
             connect_input: None,
             connect_sub: None,
             connect_error: None,
+            connect_servers: Vec::new(),
+            connect_auth: None,
             notice_ok: None,
         };
 
@@ -969,31 +1034,41 @@ impl RootView {
 
     // ------------------------------------------------------------ 连接到服务器
 
-    /// 打开「连接到服务器」对话框：清空上次的错误，准备接收地址。
+    /// 打开「连接到服务器」对话框：清空上次的错误与认证态，准备接收地址。
     ///
     /// 地址输入框不在这里建——建 `InputState` / 聚焦都要 `Window`，而这个方法的
-    /// 调用点未必有（命令面板那条路就没有）。交给 [`RootView::sync_connect_input`]，
+    /// 调用点未必有（命令面板那条路就没有）。交给 [`RootView::sync_connect_inputs`]，
     /// 由 `render` 每帧收口。
     pub(crate) fn open_connect_dialog(&mut self, cx: &mut Context<Self>) {
         self.connect_error = None;
+        self.connect_auth = None;
+        // 「记住的服务器」在打开这一刻取一次快照：列在下面的那几行要能点，
+        // 而每帧重读一遍配置文件没必要（列表在对话框开着期间不会变）。
+        self.connect_servers = self.app().saved_servers();
         self.modal = Modal::ConnectServer;
         cx.notify();
     }
 
-    /// 连接对话框的地址输入框：开着就确保它存在、且握着键盘焦点；关了就丢掉。
+    /// 连接相关的输入框：开着就确保存在、握着焦点；关了就丢掉。
     ///
     /// 放在 `render` 里而不是「打开 / 关闭」两处：
     /// * 入口未必有 `Window`（同上），而建输入框 / 聚焦都离不开它；
-    /// * 关闭有四条路（Esc / 取消 / 点遮罩 / 连接成功），在这里统一收口，
-    ///   不会漏掉哪条。
+    /// * 关闭有多条路（Esc / 取消 / 点遮罩 / 连接成功），在这里统一收口不会漏。
+    fn sync_connect_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_connect_address(window, cx);
+        self.sync_connect_auth(window, cx);
+    }
+
+    /// 地址对话框的输入框。
     ///
     /// **每帧都确保聚焦**而不是只在建的时候聚焦一次：对话框里点一下空白或按钮
-    /// 会把焦点带走，那之后打字就没反应了。
+    /// 会把焦点带走，那之后打字就没反应了。（认证弹窗有多个控件，尺度不同，
+    /// 见 `ConnectAuthState::focused` 的说明。）
     ///
-    /// 焦点必须在输入框上，这个 bug 才算真的修好：⌘A / ⌘C / ⌘V / ⌘Z 由输入组件在
-    /// **绑定阶段**消费掉（早于本视图的 `on_key_down`），落到浏览区那边就成了
-    /// 「全选后面的文件」。
-    fn sync_connect_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 焦点必须在输入框上，键盘穿透那个 bug 才算真的修好：⌘A / ⌘C / ⌘V / ⌘Z 由
+    /// 输入组件在**绑定阶段**消费掉（早于本视图的 `on_key_down`），落到浏览区
+    /// 那边就成了「全选后面的文件」。
+    fn sync_connect_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal != Modal::ConnectServer {
             // 关掉了：实体与订阅一起丢（下次打开重建，上一轮的地址、选区、
             // 撤销历史都不跟过来）。
@@ -1025,8 +1100,68 @@ impl RootView {
         }
     }
 
-    /// 用对话框里输入的地址发起连接。失败则保留对话框并把错误显示出来，
-    /// 让用户改地址重试；成功才关掉对话框（导航由 `connect_remote` 完成）。
+    /// 认证弹窗的用户名 / 密码输入框。
+    ///
+    /// 密码框靠 `InputState::masked(true)`——**「密码显示成星号」就是它**：掩码
+    /// 发生在绘制层，`value()` 取到的仍是明文，提交时直接拿去登录。
+    fn sync_connect_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 不在认证态：状态一起丢掉，免得下次进来带着上次的用户名 / 错误。
+        if self.modal != Modal::ConnectAuth {
+            self.connect_auth = None;
+            return;
+        }
+        let Some(auth) = self.connect_auth.as_mut() else {
+            return;
+        };
+        if auth.user.is_none() {
+            let user = cx.new(|cx| InputState::new(window, cx));
+            let pass = cx.new(|cx| InputState::new(window, cx).masked(true));
+            if !auth.user_seed.is_empty() {
+                let seed = auth.user_seed.clone();
+                user.update(cx, |s, cx| s.set_value(seed, window, cx));
+            }
+            // 两个框都接回车——用户在哪个框上按都该发起连接。
+            let sub_user = cx.subscribe_in(
+                &user,
+                window,
+                |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.connect_auth_submit(cx);
+                    }
+                },
+            );
+            let sub_pass = cx.subscribe_in(
+                &pass,
+                window,
+                |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.connect_auth_submit(cx);
+                    }
+                },
+            );
+            auth.subs = vec![sub_user, sub_pass];
+            auth.user = Some(user);
+            auth.pass = Some(pass);
+        }
+
+        // 只在刚打开时聚焦一次：用户名空就停在用户名上；已经有用户名（地址里
+        // 带过来的，或上次试过）就直接跳到密码——「密码敲错了再试一次」是这个
+        // 弹窗的主路径，让用户少按一次 Tab。
+        if !auth.focused {
+            auth.focused = true;
+            let (user, pass) = (auth.user.clone(), auth.pass.clone());
+            let user_empty = user
+                .as_ref()
+                .is_some_and(|s| s.read(cx).value().trim().is_empty());
+            match (user_empty, user, pass) {
+                (true, Some(u), _) => u.update(cx, |s, cx| s.focus(window, cx)),
+                (false, _, Some(p)) => p.update(cx, |s, cx| s.focus(window, cx)),
+                _ => {}
+            }
+        }
+    }
+
+    /// 用对话框里输入的地址发起连接。
     pub(crate) fn connect_submit(&mut self, cx: &mut Context<Self>) {
         let text = self
             .connect_input
@@ -1036,25 +1171,200 @@ impl RootView {
         if text.is_empty() {
             return;
         }
+        self.start_connect(text, cx);
+    }
+
+    /// 点「已记住的服务器」里的一行：直接用存下的凭据连这台。
+    pub(crate) fn connect_to(&mut self, endpoint: String, cx: &mut Context<Self>) {
+        self.start_connect(endpoint, cx);
+    }
+
+    /// 发起一次连接，把结果落到 UI 状态上。
+    ///
+    /// 地址框回车与点服务器列表共用这条路（真正的建 socket 在 `connect_remote`
+    /// 内部的 blocking 池里，这里只管等）。
+    fn start_connect(&mut self, address: String, cx: &mut Context<Self>) {
         let app = self.app();
         self.connect_error = None;
+        if let Some(auth) = self.connect_auth.as_mut() {
+            auth.error = None;
+        }
         cx.notify();
         let this = cx.entity().clone();
         cx.spawn(async move |_weak, cx| {
-            match app.connect_remote(&text).await {
-                Ok(()) => {
-                    this.update(cx, |v, cx| {
-                        v.modal = Modal::None;
-                        v.connect_error = None;
-                        cx.notify();
-                    });
+            let outcome = app.connect_remote(&address).await;
+            let connected = outcome.is_ok();
+            this.update(cx, |v, cx| {
+                v.on_connect_result(outcome, cx);
+                if connected {
+                    // 连上了就把这台记进列表（**不写密码**——密码要不要记住由
+                    // 认证弹窗里那个勾决定，这里不替用户做主）。
+                    v.remember_active_server(cx);
                 }
-                Err(e) => {
-                    this.update(cx, |v, cx| {
-                        v.connect_error = Some(e);
-                        // 保持对话框打开，避免把错误信息一闪而过。
-                        cx.notify();
-                    });
+            });
+        })
+        .detach();
+    }
+
+    /// 认证弹窗的「连接 / 回车」：带上刚填的凭据再连一次。
+    pub(crate) fn connect_auth_submit(&mut self, cx: &mut Context<Self>) {
+        let Some(auth) = self.connect_auth.as_ref() else {
+            return;
+        };
+        let endpoint = auth.endpoint.clone();
+        let remember = auth.remember;
+        let user = auth
+            .user
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let password = auth
+            .pass
+            .as_ref()
+            .map(|s| s.read(cx).value().to_string())
+            .unwrap_or_default();
+
+        if user.is_empty() {
+            if let Some(auth) = self.connect_auth.as_mut() {
+                auth.error = Some("用户名不能为空".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(auth) = self.connect_auth.as_mut() {
+            auth.error = None;
+        }
+        cx.notify();
+
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let outcome = app
+                .connect_remote_with_credentials(&endpoint, &user, &password)
+                .await;
+            this.update(cx, |v, cx| {
+                let connected = outcome.is_ok();
+                v.on_connect_result(outcome, cx);
+                if connected {
+                    // 勾了「记住密码」才把密码交给钥匙串；没勾也照样把这台记进
+                    // 列表——下次打开对话框只需补个密码。
+                    v.remember_server_async(
+                        endpoint.clone(),
+                        user.clone(),
+                        remember.then(|| password.clone()),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 认证弹窗的「取消 / Esc」：退回地址对话框，而不是整个关掉。
+    ///
+    /// 用户按 Esc 多半是想改地址（端口敲错、主机名打错），把刚敲的地址一起
+    /// 丢掉太粗暴。
+    pub(crate) fn connect_auth_cancel(&mut self, cx: &mut Context<Self>) {
+        self.connect_auth = None;
+        self.connect_error = None;
+        self.modal = Modal::ConnectServer;
+        cx.notify();
+    }
+
+    /// 忘掉一台服务器：从列表里删掉，并清掉钥匙串里存下的密码。
+    pub(crate) fn connect_forget_server(&mut self, endpoint: String, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let app2 = app.clone();
+            let result = app
+                .spawn_blocking(move || app2.forget_server(&endpoint))
+                .await;
+            this.update(cx, |v, cx| {
+                // 列表变了，重新取一份快照给下一帧渲染。
+                v.connect_servers = v.app().saved_servers();
+                if let Ok(Err(e)) = result {
+                    v.connect_error = Some(e);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 连接结果的统一落点（地址回车 / 点列表 / 认证提交都会走到）。
+    ///
+    /// * `Ok` —— 关掉对话框（记住服务器由调用方另行处理）；
+    /// * `NeedsCredentials` —— 换到认证弹窗，并带上这次用的用户名；
+    /// * `Message` —— 就地显示错误，对话框留着让用户改地址重试。
+    fn on_connect_result(
+        &mut self,
+        outcome: Result<(), mo_app::ConnectFailure>,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(()) => {
+                self.modal = Modal::None;
+                self.connect_error = None;
+                self.connect_auth = None;
+            }
+            Err(mo_app::ConnectFailure::NeedsCredentials {
+                endpoint,
+                user,
+                detail,
+            }) => {
+                self.connect_auth = Some(ConnectAuthState::new(
+                    endpoint,
+                    (!detail.is_empty()).then_some(detail),
+                    &user,
+                ));
+                self.modal = Modal::ConnectAuth;
+            }
+            Err(mo_app::ConnectFailure::Message(msg)) => match self.connect_auth.as_mut() {
+                // 认证弹窗里失败：错误留在弹窗内（用户正在改的那几个框旁边）。
+                Some(auth) => auth.error = Some(msg),
+                None => self.connect_error = Some(msg),
+            },
+        }
+        cx.notify();
+    }
+
+    /// 连接成功后把这台服务器记进「记住的服务器」（不含密码）。
+    fn remember_active_server(&self, cx: &mut Context<Self>) {
+        let Some(url) = self.app().active_connection() else {
+            return;
+        };
+        let endpoint = url.endpoint();
+        let user = url.user.clone().unwrap_or_default();
+        self.remember_server_async(endpoint, user, None, cx);
+    }
+
+    /// 记下一台服务器（可选地把密码写进钥匙串），放在 blocking 池里做。
+    ///
+    /// 不能留在 UI 线程上的两个理由：macOS 写钥匙串可能弹系统授权框；Linux 上
+    /// 没有 Secret Service 时这一步会走完整条失败路径。
+    ///
+    /// 失败只在**用户勾了记住密码**时才打扰他——顺手记进列表那一步失败了
+    /// 就静默算了（浏览本身没受影响）；但用户主动勾的「记住密码」没记住，
+    /// 必须给个说法。
+    fn remember_server_async(
+        &self,
+        endpoint: String,
+        user: String,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let wanted = password.is_some();
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let app2 = app.clone();
+            let result = app
+                .spawn_blocking(move || app2.remember_server(&endpoint, &user, password.as_deref()))
+                .await;
+            if wanted {
+                if let Ok(Err(e)) = result {
+                    this.update(cx, |v, cx| v.notice(e, None, cx));
                 }
             }
         })
@@ -1064,7 +1374,11 @@ impl RootView {
     /// 「连接到服务器」对话框：走 [`dialog_overlay`]（带遮罩的浮层，非替换中央区）。
     ///
     /// 它是个小对话框，不该把整个浏览区顶掉。地址框是框架的**真实输入框**
-    /// （见 [`RootView::sync_connect_input`]）；回车连接、Esc 取消见 `handle_modal_key`。
+    /// （见 [`RootView::sync_connect_address`]）；回车连接、Esc 取消见 `handle_modal_key`。
+    ///
+    /// 记住过的服务器会列在地址框下面——点一行直接用存下的凭据连，不用再敲地址。
+    /// 地址里**不需要也不建议**写用户名密码：服务器要凭据时会自己弹认证框
+    /// （见 [`RootView::render_connect_auth`]）。
     fn render_connect(&self, entity: &Entity<RootView>) -> impl IntoElement {
         let mut body = div().flex().flex_col().gap(px(10.0));
         body = body.child(
@@ -1107,6 +1421,29 @@ impl RootView {
             );
         }
         body = body.child(field);
+
+        // 记住过的服务器：点一行直接用存下的凭据连。
+        if !self.connect_servers.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme::muted())
+                    .child(text!("已记住的服务器（点击直接连接）：".to_string())),
+            );
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(120.0))
+                .overflow_y_scrollbar()
+                // 测试用（release no-op）：断言列表确实渲染出来了。
+                .debug_selector(|| "mo-connect-servers".to_string());
+            for (i, server) in self.connect_servers.iter().enumerate() {
+                list = list.child(self.saved_server_row(i, server, entity));
+            }
+            body = body.child(list);
+        }
+
         if let Some(err) = &self.connect_error {
             body = body.child(
                 div()
@@ -1133,6 +1470,7 @@ impl RootView {
             ent_cancel.update(cx, |v, cx| {
                 v.modal = Modal::None;
                 v.connect_error = None;
+                v.connect_auth = None;
                 cx.notify();
             });
         });
@@ -1144,8 +1482,255 @@ impl RootView {
             "连接到服务器",
             "",
             body,
-            "格式 ftp://用户:密码@主机:端口/路径 或 sftp://… · 回车连接 · Esc 取消",
+            "只输 ftp://主机:端口 即可，需要账号密码时会提示 · 回车连接 · Esc 取消",
         )
+    }
+
+    /// 「已记住的服务器」里的一行：点整行直连，右侧 ✕ 忘掉它（含钥匙串里的密码）。
+    fn saved_server_row(
+        &self,
+        index: usize,
+        server: &mo_app::SavedServer,
+        entity: &Entity<RootView>,
+    ) -> impl IntoElement {
+        let mut row = div()
+            .id(("mo-connect-server", index))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(26.0))
+            .px(px(8.0))
+            .rounded(px(4.0))
+            .hover(|s| s.bg(theme::hover_bg()))
+            // 测试用（release no-op）：按序号定位某一行。
+            .debug_selector(move || format!("mo-connect-server-{index}"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(12.0))
+                    .child(text!(server.endpoint.clone())),
+            );
+        if !server.user.is_empty() {
+            row = row.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .child(text!(server.user.clone())),
+            );
+        }
+
+        // ✕：忘掉这台——列表与钥匙串里的密码一起清掉。
+        let ent_forget = entity.clone();
+        let endpoint = server.endpoint.clone();
+        let mut forget = div()
+            .id(("mo-connect-forget", index))
+            .px(px(6.0))
+            .rounded(px(3.0))
+            .text_size(px(11.0))
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::hover_bg()))
+            .child(text!("✕".to_string()));
+        forget.interactivity().on_click(move |_, _window, cx| {
+            // 别让「忘掉」顺带触发整行的「连接」。
+            cx.stop_propagation();
+            let endpoint = endpoint.clone();
+            ent_forget.update(cx, |v, cx| v.connect_forget_server(endpoint, cx));
+        });
+        row = row.child(forget);
+
+        let ent_go = entity.clone();
+        let endpoint = server.endpoint.clone();
+        row.interactivity().on_click(move |_, _window, cx| {
+            let endpoint = endpoint.clone();
+            ent_go.update(cx, |v, cx| v.connect_to(endpoint, cx));
+        });
+        row
+    }
+
+    /// 认证弹窗：服务器要求登录时出现（用户名 + 密码 + 记住密码）。
+    ///
+    /// 只在服务器**真的拒绝**了匿名登录后才出现——「地址里没写凭据」不等于会弹它。
+    /// 密码框是 `InputState::masked(true)`，**绘制层显示成星号**；勾了「记住密码」
+    /// 就把凭据交给系统钥匙串（`mo_app` 的 `credentials`），而不是写进明文配置。
+    fn render_connect_auth(&self, entity: &Entity<RootView>) -> AnyElement {
+        let Some(auth) = self.connect_auth.as_ref() else {
+            // 状态还没建（`sync_connect_auth` 在 render 之前就跑过了，正常到不了
+            // 这里）：给个空壳，别 panic。
+            return div().into_any_element();
+        };
+        let mut body = div().flex().flex_col().gap(px(10.0));
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::text())
+                .child(text!(format!("{} 需要登录：", auth.endpoint))),
+        );
+        if let Some(hint) = &auth.hint {
+            body = body.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme::muted())
+                    .child(text!(hint.clone())),
+            );
+        }
+
+        for (label, id, state) in [
+            ("用户名", "mo-connect-user", auth.user.as_ref()),
+            ("密码", "mo-connect-pass", auth.pass.as_ref()),
+        ] {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        // `text!` 没有定宽方法，要定宽就包一层。
+                        div()
+                            .w(px(48.0))
+                            .text_size(px(12.0))
+                            .text_color(theme::muted())
+                            .child(text!(label.to_string())),
+                    )
+                    .child(self.auth_field(id, state)),
+            );
+        }
+
+        body = body.child(self.remember_checkbox(auth.remember, entity));
+
+        if let Some(err) = &auth.error {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(diff_del_fg())
+                    .child(text!(err.clone())),
+            );
+        }
+
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap(px(8.0))
+            .pt(px(4.0));
+        let ent_go = entity.clone();
+        let mut go = Self::sync_button("connect-auth-go", "连接", true);
+        go.interactivity().on_click(move |_, _window, cx| {
+            ent_go.update(cx, |v, cx| v.connect_auth_submit(cx));
+        });
+        let ent_back = entity.clone();
+        let mut back = Self::sync_button("connect-auth-cancel", "返回", false);
+        back.interactivity().on_click(move |_, _window, cx| {
+            ent_back.update(cx, |v, cx| v.connect_auth_cancel(cx));
+        });
+        actions = actions.child(back).child(go);
+        body = body.child(actions);
+
+        dialog_overlay(
+            entity,
+            "需要登录",
+            "",
+            body,
+            "密码显示为星号 · 勾选「记住密码」则存入系统钥匙串 · 回车连接 · Esc 返回",
+        )
+        .into_any_element()
+    }
+
+    /// 认证弹窗里的一行输入框（与地址框同款外观，标识不同便于测试定位）。
+    fn auth_field(&self, id: &'static str, state: Option<&Entity<InputState>>) -> Div {
+        let mut field = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(28.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::separator())
+            // 测试用（release no-op）：定位用户名 / 密码框。
+            .debug_selector(move || id.to_string());
+        if let Some(state) = state {
+            field = field.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(
+                        Input::new(state)
+                            .appearance(false)
+                            .bordered(false)
+                            .small()
+                            .text_size(px(13.0))
+                            .p(px(0.0)),
+                    ),
+            );
+        }
+        field
+    }
+
+    /// 认证弹窗里的「记住密码」勾选框（自绘：点击切换 + ✓）。
+    ///
+    /// 没有现成的 checkbox 组件，而这里只需要一个布尔——画个方框加个对勾比引
+    /// 一整套控件轻。
+    fn remember_checkbox(&self, on: bool, entity: &Entity<RootView>) -> impl IntoElement {
+        let mark = if on { "✓" } else { "" }.to_string();
+        let mut row = div()
+            .id("mo-connect-remember")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .child(
+                div()
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(if on {
+                        theme::accent()
+                    } else {
+                        theme::separator()
+                    })
+                    .bg(if on {
+                        theme::selected_bg()
+                    } else {
+                        theme::surface()
+                    })
+                    .text_size(px(10.0))
+                    .text_color(theme::selected_text())
+                    .child(text!(mark)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme::text())
+                    .child(text!("记住密码（存入系统钥匙串）".to_string())),
+            )
+            // 测试用（release no-op）：断言勾选框在。
+            .debug_selector(|| "mo-connect-remember".to_string());
+        let ent = entity.clone();
+        row.interactivity().on_click(move |_, _window, cx| {
+            ent.update(cx, |v, cx| {
+                if let Some(auth) = v.connect_auth.as_mut() {
+                    auth.remember = !auth.remember;
+                }
+                cx.notify();
+            });
+        });
+        row
     }
 
     /// 地址栏回车：按输入的路径跳转，并把键盘焦点还给根视图。
@@ -1172,11 +1757,20 @@ impl RootView {
         if text.contains("://") {
             cx.notify();
             cx.spawn(async move |weak, cx| {
-                if let Err(e) = app.connect_remote(&text).await {
-                    let _ = weak.update(cx, |v, cx| {
-                        v.notice(format!("连接失败：{e}"), None, cx);
-                    });
-                }
+                let outcome = app.connect_remote(&text).await;
+                let _ = weak.update(cx, |v, cx| match outcome {
+                    Ok(()) => v.remember_active_server(cx),
+                    // 地址栏这条路没有对话框，但「需要登录」的处置一样——直接弹
+                    // 认证框（`on_connect_result` 负责把用户名带进去）。
+                    Err(failure @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
+                        v.on_connect_result(Err(failure), cx);
+                    }
+                    // 其余失败走信息提示：地址栏那边没有可以留在原地显示错误的
+                    // 对话框。
+                    Err(mo_app::ConnectFailure::Message(msg)) => {
+                        v.notice(format!("连接失败：{msg}"), None, cx);
+                    }
+                });
             })
             .detach();
             return;
@@ -3935,7 +4529,7 @@ impl Render for RootView {
 
         // 「连接到服务器」的地址输入框：开着就确保存在并握着焦点，关了就回收。
         // 放在这里（而不是打开 / 关闭两处）见 `sync_connect_input` 的说明。
-        self.sync_connect_input(window, cx);
+        self.sync_connect_inputs(window, cx);
 
         let visible_panes = if self.split && self.panes.len() > 1 {
             2
@@ -3957,6 +4551,7 @@ impl Render for RootView {
             Modal::None
             | Modal::Info(_)
             | Modal::ConnectServer
+            | Modal::ConnectAuth
             | Modal::Properties
             | Modal::Archive
             | Modal::Tags
@@ -4166,11 +4761,13 @@ impl Render for RootView {
         });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
-        // ⚠️ 两个例外——焦点属于真实输入组件时不能抢：
+        // ⚠️ 三个例外——焦点属于真实输入组件时不能抢：
         // * 地址栏编辑态：抢回来会立刻给输入框一个 Blur → 触发 end_address_edit，
         //   表现为「点编辑闪一下又退回显示态」；
-        // * 「连接到服务器」对话框：抢走刚给输入框的焦点，打字就没反应了。
-        let input_owns_focus = self.panel().address_editing || self.modal == Modal::ConnectServer;
+        // * 「连接到服务器」对话框：抢走刚给地址框的焦点，打字就没反应了；
+        // * 「需要登录（认证）」弹窗：同上，而且那里有两个框要 Tab 切换。
+        let input_owns_focus = self.panel().address_editing
+            || matches!(self.modal, Modal::ConnectServer | Modal::ConnectAuth);
         if !self.focus.is_focused(window) && !input_owns_focus {
             cx.focus_self(window);
         }
@@ -4189,6 +4786,7 @@ impl Render for RootView {
                 root = root.child(render_notice_overlay(msg, &label, &entity));
             }
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
+            Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
             Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
             Modal::Archive => root = root.child(dialogs::archive(self, &entity)),
             Modal::Tags => root = root.child(dialogs::tags(&entity, self)),
@@ -4843,13 +5441,23 @@ fn handle_modal_key(
             "escape" => entity.update(cx, |v, cx| {
                 v.modal = Modal::None;
                 v.connect_error = None;
-                // 输入框在下一帧渲染时回收（见 `sync_connect_input`）。
+                // 认证弹窗状态一并清掉（地址→认证中间态被 Esc 打断的情况）。
+                v.connect_auth = None;
+                // 输入框在下一帧渲染时回收（见 `sync_connect_inputs`）。
                 cx.notify();
             }),
             // 回车正常由输入框消化（`InputEvent::PressEnter` → `connect_submit`）；
             // 这一条只在焦点不在输入框上时兜底。
             "enter" => entity.update(cx, |v, cx| v.connect_submit(cx)),
             // 字符 / 退格 / ⌘A / 剪贴板全归输入框，这里不再手搓字符串。
+            _ => {}
+        },
+        Modal::ConnectAuth => match key {
+            // Esc 退回地址对话框，而不是整个关掉：用户多半是想改地址
+            // （端口敲错、主机名打错），把刚敲的地址一起丢掉太粗暴。
+            "escape" => entity.update(cx, |v, cx| v.connect_auth_cancel(cx)),
+            // 同上，回车正常由两个输入框的 `PressEnter` 订阅消化。
+            "enter" => entity.update(cx, |v, cx| v.connect_auth_submit(cx)),
             _ => {}
         },
         Modal::Duplicates => {
@@ -6329,7 +6937,7 @@ mod tests {
     use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
-    use super::{Modal, RootView};
+    use super::{ConnectAuthState, Modal, RootView};
 
     /// 进入地址栏编辑态：路径要**预填**，且内容要**整条被选中**。
     ///
@@ -6756,6 +7364,151 @@ mod tests {
         // 同一条按键的另一半：后面的文件列表不能被动过。
         let files_selected = cx.update(|_window, cx| root.read(cx).panel().selection.count());
         assert_eq!(files_selected, 0, "⌘A 不该选到后面的文件列表");
+    }
+
+    /// 认证弹窗的密码框是**掩码**的——「密码全部显示为星号」就落在这里。
+    ///
+    /// 掩码由输入组件的绘制层实现（每个字符画成圆点），`is_masked()` 正是那个
+    /// 绘制分支的开关；同时断言 `value()` 仍是明文，否则拿去登录必然失败。
+    #[test]
+    fn connect_auth_masks_the_password() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 真去连一台「会拒绝匿名登录」的服务器不是单测能做的事，所以直接摆好
+        // 「服务器要凭据」那一刻的状态（生产路径见 `on_connect_result`）。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.connect_auth = Some(ConnectAuthState::new(
+                    "ftp://example.com:2121".to_string(),
+                    Some("530 Login incorrect.".to_string()),
+                    "alice",
+                ));
+                v.modal = Modal::ConnectAuth;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        for selector in ["mo-connect-user", "mo-connect-pass", "mo-connect-remember"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "认证弹窗没有渲染出 {selector}"
+            );
+        }
+
+        // `focus_handle` 是 `Focusable` 的方法：本模块刻意不用 glob，单独引入。
+        use gpui_kit::Focusable as _;
+        let (user_value, masked, focus_on_pass) = cx.update(|window, cx| {
+            let v = root.read(cx);
+            let auth = v.connect_auth.as_ref().expect("认证态应当还在");
+            let user = auth.user.clone().expect("用户名框应当已建好");
+            let pass = auth.pass.clone().expect("密码框应当已建好");
+            (
+                user.read(cx).value().to_string(),
+                // 掩码状态要经 `presentation()` 读——它是绘制层拿到的只读视图，
+                // 也正是「画不画圆点」那个分支看得见的东西。
+                pass.read(cx).presentation().is_masked(),
+                pass.read(cx).focus_handle(cx).is_focused(window),
+            )
+        });
+        assert_eq!(user_value, "alice", "用户名没有从地址里带进认证弹窗");
+        assert!(masked, "密码框没开掩码——密码会明文显示出来");
+        // 用户名已经有了 → 焦点直接落在密码上（改密码重试是这个弹窗的主路径）。
+        assert!(focus_on_pass, "用户名非空时焦点应当落在密码框上");
+
+        // 掩码只影响**显示**：值还是明文，`connect_auth_submit` 直接拿它去登录。
+        cx.simulate_input("s3cr3t");
+        let typed = cx.update(|_window, cx| {
+            let v = root.read(cx);
+            let pass = v
+                .connect_auth
+                .as_ref()
+                .and_then(|a| a.pass.clone())
+                .expect("密码框应当还在");
+            pass.read(cx).value().to_string()
+        });
+        assert_eq!(typed, "s3cr3t", "掩码不该改变实际取值");
+    }
+
+    /// 「连接到服务器」对话框会列出记住过的服务器，每行可点（一键重连）。
+    #[test]
+    fn connect_dialog_lists_remembered_servers() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.connect_servers = vec![mo_app::SavedServer {
+                    endpoint: "ftp://example.com:2121".to_string(),
+                    user: "alice".to_string(),
+                    last_used: 1,
+                }];
+                v.modal = Modal::ConnectServer;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-connect-servers").is_some(),
+            "记住的服务器列表没有渲染出来"
+        );
+        assert!(
+            cx.debug_bounds("mo-connect-server-0").is_some(),
+            "列表里没有第一行——点不了一键重连"
+        );
+    }
+
+    /// 认证弹窗按 Esc 退回地址对话框，而不是整个关掉。
+    ///
+    /// 用户按 Esc 多半是想改地址（端口敲错、主机名打错），把刚敲的地址一起丢掉
+    /// 太粗暴。
+    #[test]
+    fn connect_auth_escape_returns_to_the_address_dialog() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.connect_auth = Some(ConnectAuthState::new(
+                    "ftp://example.com:2121".to_string(),
+                    None,
+                    "alice",
+                ));
+                v.modal = Modal::ConnectAuth;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        cx.simulate_keystrokes("escape");
+
+        let (on_address_dialog, has_auth) = cx.update(|_window, cx| {
+            let v = root.read(cx);
+            // `Modal` 里有 `String`（`Info`），不是 `Copy`，所以用 `matches!` 判。
+            (
+                matches!(v.modal, Modal::ConnectServer),
+                v.connect_auth.is_some(),
+            )
+        });
+        assert!(
+            on_address_dialog,
+            "Esc 应当退回地址对话框（而不是整个关掉）"
+        );
+        assert!(!has_auth, "退回时认证态应当一并清掉");
     }
 
     /// 模态 / 对话框打开时，作用于下层文件列表的动作**不派发**。

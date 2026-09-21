@@ -27,6 +27,25 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// 一台记住的远程服务器。
+///
+/// **只存地址与用户名，密码不在这里**——config.json 是明文，密码写进去等于换个
+/// 地方泄露。密码存在系统钥匙串里，见 `mo_app::credentials`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedServer {
+    /// 连接标识 `scheme://host[:port]`（不含用户名 / 密码 / 路径）。
+    ///
+    /// 规格见 `mo_remote::RemoteUrl::endpoint`：同一台机器换个用户登录、
+    /// 或浏览到别的目录，都该落在同一条记录上。
+    pub endpoint: String,
+    /// 上次登录用的用户名（用来把「有用户名但没存密码」和「纯匿名」区分开）。
+    #[serde(default)]
+    pub user: String,
+    /// 上次使用的 unix 时间戳（秒）。列表按它倒序，越近用的越靠前。
+    #[serde(default)]
+    pub last_used: i64,
+}
+
 /// 应用配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -65,6 +84,9 @@ pub struct Config {
     /// 文件夹同步配对：源目录 → 目标目录。
     #[serde(default)]
     pub sync_pairs: HashMap<String, String>,
+    /// 记住的远程服务器（最近使用的在前）。**不含密码**——密码在系统钥匙串。
+    #[serde(default)]
+    pub remote_servers: Vec<SavedServer>,
 }
 
 /// 用户自定义命令（第四阶段·自定义命令，也是插件系统的命令面）。
@@ -166,6 +188,7 @@ impl Default for Config {
             commands: Vec::new(),
             workflows: Vec::new(),
             sync_pairs: HashMap::new(),
+            remote_servers: Vec::new(),
         }
     }
 }

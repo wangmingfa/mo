@@ -93,8 +93,11 @@ impl SftpFileSystem {
                 .authenticate_password(&user, &password)
                 .await
                 .map_err(|e| RemoteError::transport("认证", e))?;
+            // `AuthResult::Failure` 就是「凭据不对」——报成 `AuthRequired` 而不是
+            // `Transport`，UI 才会弹「输入账号密码」的框而不是干显示一句错误。
+            // （`Err(..)` 那条是传输层故障，仍走 `transport`。）
             if !matches!(auth, AuthResult::Success) {
-                return Err(RemoteError::transport("认证", "服务器拒绝提供的凭据"));
+                return Err(RemoteError::auth("认证", "服务器拒绝提供的凭据"));
             }
             let channel = client
                 .channel_open_session()

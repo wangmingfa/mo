@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 dirs.workspace = true
+keyring.workspace = true
 
 # Windows shell 集成（默认打开 / 打开方式）：ShellExecute 系列 FFI + 注册表枚举。
 [target.'cfg(windows)'.dependencies]

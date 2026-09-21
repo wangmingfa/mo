@@ -14,6 +14,8 @@
 //! 关键原则：**mo-core 不依赖 GPUI**，核心文件系统逻辑可单独测试。
 
 mod controller;
+/// 远程服务器的凭据存取（系统钥匙串）。
+mod credentials;
 /// 扩展系统：声明式清单 + 外部程序。
 pub mod extensions;
 mod metadata;
@@ -28,7 +30,9 @@ pub mod workflows;
 pub use controller::DirectoryController;
 pub use metadata::MetadataScheduler;
 // 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
-pub use mo_config::{ColumnPrefs, Config, ThemeColors, UiPrefs, UserCommand, Workflow};
+pub use mo_config::{
+    ColumnPrefs, Config, SavedServer, ThemeColors, UiPrefs, UserCommand, Workflow,
+};
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};
 
@@ -121,6 +125,40 @@ fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("failed to build tokio runtime")
     })
+}
+
+/// 一台服务器最多记住多少条（更早的滚掉）。
+const SAVED_SERVERS_MAX: usize = 20;
+
+/// 当前 unix 时间戳（秒）。取不到（系统时钟早于 1970）就当 0。
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// 「连接到服务器」的失败结果。
+///
+/// 拆成两种而不是压成一句字符串，是因为 UI 的处置完全不同：要凭据就弹认证框，
+/// 其余直接在对话框里显示错误。改造前一切都被压成 `String`，「密码不对」和
+/// 「主机名打错」在 UI 上长得一模一样，没法分别处置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectFailure {
+    /// 直接显示给用户的错误（地址写错 / 协议不支持 / 连不上 / 超时…）。
+    Message(String),
+    /// 服务器要账号密码：匿名登录被拒，或上次给的凭据不对。
+    NeedsCredentials {
+        /// 要连的服务器（`scheme://host:port`），认证框用来显示与重连。
+        endpoint: String,
+        /// 这次尝试用的用户名（地址里写的，或钥匙串里存过的）。
+        ///
+        /// 带出来是为了让认证框**初值**就是它——用户多半只需要补 / 改密码。
+        user: String,
+        /// 上次尝试的失败原因，作为认证框的初始提示。
+        detail: String,
+    },
 }
 
 impl AppState {
@@ -400,24 +438,76 @@ impl AppState {
 
     /// 按地址连上远程服务器并进入其根目录。
     ///
-    /// 解析 `scheme://user:pass@host:port/path`，建好对应后端后**整体替换**底层
-    /// `fs`——之后所有目录读写都走远程后端，本地浏览态被清空避免历史混淆。
+    /// 解析 `scheme://[user[:password]@]host[:port]/path`，建好对应后端后**整体替换**
+    /// 底层 `fs`——之后所有目录读写都走远程后端，本地浏览态被清空避免历史混淆。
     /// 连接动作会真去建 socket + 登录，必须放在 blocking 池，绝不能占用
     /// UI / GPUI 执行器（见 `mo-remote` 的 runtime 约定）。
     ///
-    /// 返回 `Err` 时保持原浏览态不变（不切 fs、不导航），调用方据此弹错。
-    pub async fn connect_remote(&self, input: &str) -> Result<(), String> {
-        let url = RemoteUrl::parse(input).map_err(|e| e.to_string())?;
-        if !mo_remote::supports(&url.scheme) {
-            return Err(format!("暂不支持的协议：{}（目前仅支持 ftp）", url.scheme));
+    /// 地址里**没写用户名**时，先查钥匙串里有没有存过这台服务器的凭据（用户上次
+    /// 勾了「记住密码」）——存过就直接用，省掉再弹一次认证框。显式写了用户名就以
+    /// 用户写的为准。
+    ///
+    /// 失败时保持原浏览态不变（不切 fs、不导航），并把失败分成两类返回，见
+    /// [`ConnectFailure`]。
+    pub async fn connect_remote(&self, input: &str) -> Result<(), ConnectFailure> {
+        let mut url = Self::parse_remote(input)?;
+        if url.user.is_none() {
+            if let Some((user, password)) = credentials::load(&url.endpoint()) {
+                url.user = Some(user);
+                url.password = Some(password);
+            }
         }
-        // 建连接是阻塞 IO（带自有 runtime 的 block_on），放 blocking 池。
+        self.finish_connect(url).await
+    }
+
+    /// 带上刚在认证框里填的凭据再连一次。
+    ///
+    /// `input` 是认证框对应的地址（`scheme://host:port`）；用户名 / 密码覆盖掉
+    /// 地址里可能写着的旧值。
+    pub async fn connect_remote_with_credentials(
+        &self,
+        input: &str,
+        user: &str,
+        password: &str,
+    ) -> Result<(), ConnectFailure> {
+        let mut url = Self::parse_remote(input)?;
+        url.user = Some(user.to_string());
+        url.password = Some(password.to_string());
+        self.finish_connect(url).await
+    }
+
+    /// 解析地址 + 检查协议：两条连接入口共用的前置。
+    fn parse_remote(input: &str) -> Result<RemoteUrl, ConnectFailure> {
+        let url = RemoteUrl::parse(input).map_err(|e| ConnectFailure::Message(e.to_string()))?;
+        if !mo_remote::supports(&url.scheme) {
+            return Err(ConnectFailure::Message(format!(
+                "暂不支持的协议：{}（目前支持 ftp / sftp）",
+                url.scheme
+            )));
+        }
+        Ok(url)
+    }
+
+    /// 建连接 + 切换浏览态（首次连接与带凭据重试共用同一条路）。
+    async fn finish_connect(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
+        let endpoint = url.endpoint();
         // 先 clone 一份给闭包：下面还要把原 `url` 存进 `connection`。
         let url_for_connect = url.clone();
         let connected = self
-            .spawn_blocking(move || mo_remote::connect(&url_for_connect).map_err(|e| e.to_string()))
+            .spawn_blocking(move || mo_remote::connect(&url_for_connect))
             .await
-            .map_err(|e| format!("连接任务失败：{e}"))??;
+            .map_err(|e| ConnectFailure::Message(format!("连接任务失败：{e}")))?
+            .map_err(|e| match e {
+                // 「服务器要凭据」单独分流：UI 据此弹认证框，而不是干显示一句话。
+                mo_remote::RemoteError::AuthRequired { detail, .. } => {
+                    ConnectFailure::NeedsCredentials {
+                        endpoint,
+                        user: url.user.clone().unwrap_or_default(),
+                        detail,
+                    }
+                }
+                other => ConnectFailure::Message(other.to_string()),
+            })?;
 
         // 切换底层 fs + 记下连接标识；之后 read_dir / 列目录都走远程后端。
         *self.fs.write().unwrap() = connected;
@@ -426,8 +516,58 @@ impl AppState {
         self.inner.write().await.navigation = NavigationState::new();
         self.open_directory(Path::new("/"))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         Ok(())
+    }
+
+    /// 「记住的服务器」列表（最近使用的在前）。
+    pub fn saved_servers(&self) -> Vec<SavedServer> {
+        let mut list = self.config().remote_servers;
+        // 最近的在前（`Reverse` 是因为默认是升序）。
+        list.sort_by_key(|s| std::cmp::Reverse(s.last_used));
+        list
+    }
+
+    /// 记下这台服务器，并可选择把密码写进系统钥匙串。
+    ///
+    /// * 列表（`config.json`，**明文**）里只留地址 / 用户名 / 时间戳；
+    /// * `password` 为 `Some` 才写钥匙串——没勾「记住密码」时**不碰**已有条目
+    ///   （用户可能更早勾过一次），要删走 [`AppState::forget_server`]。
+    ///
+    /// 返回钥匙串写入的错误（如果有）：UI 据此提示「这次没记住密码」，但不该
+    /// 影响刚刚成功的连接。
+    pub fn remember_server(
+        &self,
+        endpoint: &str,
+        user: &str,
+        password: Option<&str>,
+    ) -> Result<(), String> {
+        let mut cfg = self.config();
+        cfg.remote_servers.retain(|s| s.endpoint != endpoint);
+        cfg.remote_servers.insert(
+            0,
+            SavedServer {
+                endpoint: endpoint.to_string(),
+                user: user.to_string(),
+                last_used: now_secs(),
+            },
+        );
+        // 只留最近的一批，免得配置文件被连过的临时地址撑爆。
+        cfg.remote_servers.truncate(SAVED_SERVERS_MAX);
+        self.save_config(&cfg);
+
+        match password {
+            Some(pw) => credentials::store(endpoint, user, pw),
+            None => Ok(()),
+        }
+    }
+
+    /// 忘掉一台服务器：从列表里删掉，并清掉钥匙串里存下的密码。
+    pub fn forget_server(&self, endpoint: &str) -> Result<(), String> {
+        let mut cfg = self.config();
+        cfg.remote_servers.retain(|s| s.endpoint != endpoint);
+        self.save_config(&cfg);
+        credentials::forget(endpoint)
     }
 
     /// 断开远程连接：切回本地 fs，跳回主目录，并清空导航历史。

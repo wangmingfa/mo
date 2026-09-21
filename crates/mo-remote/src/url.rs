@@ -105,10 +105,12 @@ impl RemoteUrl {
         self.port.or_else(|| default_port(&self.scheme))
     }
 
-    /// 回显成地址串：默认端口与密码都不会写回来。
+    /// `host[:port]` 的规范化写法：IPv6 加方括号，默认端口省略。
     ///
-    /// 密码不回显是有意的——这个串会进 UI（侧边栏 / 标题栏）与日志。
-    pub fn display(&self) -> String {
+    /// 抽出来是因为 [`RemoteUrl::display`] 与 [`RemoteUrl::endpoint`] 必须共用
+    /// 同一套写法——否则同一个连接会在「已连接的地址」和「记住的服务器」里
+    /// 长出两个样子，钥匙串条目也就跟着对不上了。
+    fn authority(&self) -> String {
         let host_part = match self.host.contains(':') && !self.host.starts_with('[') {
             true => format!("[{}]", self.host),
             false => self.host.clone(),
@@ -118,15 +120,34 @@ impl RemoteUrl {
             (Some(p), _) => format!(":{p}"),
             (None, _) => String::new(),
         };
+        format!("{host_part}{port_part}")
+    }
+
+    /// 回显成地址串：默认端口与密码都不会写回来。
+    ///
+    /// 密码不回显是有意的——这个串会进 UI（侧边栏 / 标题栏）与日志。
+    pub fn display(&self) -> String {
         let user_part = self
             .user
             .as_ref()
             .map(|u| format!("{u}@"))
             .unwrap_or_default();
         format!(
-            "{}://{}{}{}{}",
-            self.scheme, user_part, host_part, port_part, self.path
+            "{}://{}{}{}",
+            self.scheme,
+            user_part,
+            self.authority(),
+            self.path
         )
+    }
+
+    /// 连接标识：`scheme://host[:port]`，**不含用户名 / 密码 / 路径**。
+    ///
+    /// 钥匙串条目与「记住的服务器」都用它当 key：同一台机器换个用户登录、或
+    /// 浏览到别的目录，都该落在同一条记录上。也正因为不含用户名，用户只敲
+    /// `ftp://主机:端口` 时才能查到之前存下的凭据。
+    pub fn endpoint(&self) -> String {
+        format!("{}://{}", self.scheme, self.authority())
     }
 
     /// 去掉具体路径，只留「连到哪台机器的哪个位置」。用作连接标识。
@@ -213,6 +234,28 @@ mod tests {
         assert_eq!(u.path, "/", "没给路径时根是 `/` 而不是空串");
         assert_eq!(u.port, None);
         assert_eq!(u.port_or_default(), Some(21));
+    }
+
+    /// 连接标识只留 `scheme://host[:port]`。
+    ///
+    /// 钥匙串条目与「记住的服务器」都按它索引，所以用户名 / 密码 / 路径都不能
+    /// 进去——同一台机器换个用户登录、或浏览到别的目录，都得命中同一条记录。
+    #[test]
+    fn endpoint_keeps_only_scheme_host_and_port() {
+        let u = RemoteUrl::parse("ftp://alice:s3cr3t@example.com:2121/pub/incoming")
+            .expect("应解析成功");
+        assert_eq!(u.endpoint(), "ftp://example.com:2121");
+    }
+
+    /// 默认端口不写进标识：`ftp://host` 与 `ftp://host:21` 是同一台。
+    ///
+    /// 否则用户两种写法各存一份凭据，勾了「记住密码」也认不出来。
+    #[test]
+    fn endpoint_omits_the_default_port() {
+        let short = RemoteUrl::parse("ftp://host").expect("应解析成功");
+        let long = RemoteUrl::parse("ftp://host:21").expect("应解析成功");
+        assert_eq!(short.endpoint(), long.endpoint());
+        assert_eq!(short.endpoint(), "ftp://host");
     }
 
     #[test]
