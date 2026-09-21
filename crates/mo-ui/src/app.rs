@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::{MoError, RenameSpec, SortKey};
@@ -551,9 +552,17 @@ pub struct RootView {
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
     /// 「打开方式」二级菜单是否展开（hover 驱动）。
     pub(crate) ctx_submenu_open: bool,
-    /// 连接到服务器对话框里正在输入的地址（复用 Archive / 批量重命名那种
-    /// 纯字符串字段，按字符输入、退格删除，不依赖真实输入框组件）。
-    pub(crate) connect_url: String,
+    /// 「连接到服务器」对话框的地址输入框（对话框开着期间存在，见 `sync_connect_input`）。
+    ///
+    /// 与地址栏走同一条路——框架的真实 [`InputState`]，而不是自绘的「字符串 +
+    /// 假光标 `▏`」。自绘那版没有选区：⌘A / ⌘C / ⌘V 全都落空，按键穿透到本视图
+    /// 的键表，变成「全选文件列表」这类浏览区动作（用户报的就是这个）。
+    pub(crate) connect_input: Option<Entity<InputState>>,
+    /// `connect_input` 的事件订阅句柄。
+    ///
+    /// ⚠️ 必须持有：gpui 的 `Subscription` 一旦 drop 就退订，回车那一下（对话框里
+    /// 最主要的一个键）就再也收不到了。
+    pub(crate) connect_sub: Option<Subscription>,
     /// 连接失败时的错误提示（保留对话框展示）。
     pub(crate) connect_error: Option<String>,
     /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
@@ -665,7 +674,8 @@ impl RootView {
             context_menu: None,
             open_with_apps: Vec::new(),
             ctx_submenu_open: false,
-            connect_url: String::new(),
+            connect_input: None,
+            connect_sub: None,
             connect_error: None,
             notice_ok: None,
         };
@@ -959,18 +969,70 @@ impl RootView {
 
     // ------------------------------------------------------------ 连接到服务器
 
-    /// 打开「连接到服务器」对话框：清空上次输入与错误，准备接收地址字符。
+    /// 打开「连接到服务器」对话框：清空上次的错误，准备接收地址。
+    ///
+    /// 地址输入框不在这里建——建 `InputState` / 聚焦都要 `Window`，而这个方法的
+    /// 调用点未必有（命令面板那条路就没有）。交给 [`RootView::sync_connect_input`]，
+    /// 由 `render` 每帧收口。
     pub(crate) fn open_connect_dialog(&mut self, cx: &mut Context<Self>) {
-        self.connect_url.clear();
         self.connect_error = None;
         self.modal = Modal::ConnectServer;
         cx.notify();
     }
 
+    /// 连接对话框的地址输入框：开着就确保它存在、且握着键盘焦点；关了就丢掉。
+    ///
+    /// 放在 `render` 里而不是「打开 / 关闭」两处：
+    /// * 入口未必有 `Window`（同上），而建输入框 / 聚焦都离不开它；
+    /// * 关闭有四条路（Esc / 取消 / 点遮罩 / 连接成功），在这里统一收口，
+    ///   不会漏掉哪条。
+    ///
+    /// **每帧都确保聚焦**而不是只在建的时候聚焦一次：对话框里点一下空白或按钮
+    /// 会把焦点带走，那之后打字就没反应了。
+    ///
+    /// 焦点必须在输入框上，这个 bug 才算真的修好：⌘A / ⌘C / ⌘V / ⌘Z 由输入组件在
+    /// **绑定阶段**消费掉（早于本视图的 `on_key_down`），落到浏览区那边就成了
+    /// 「全选后面的文件」。
+    fn sync_connect_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal != Modal::ConnectServer {
+            // 关掉了：实体与订阅一起丢（下次打开重建，上一轮的地址、选区、
+            // 撤销历史都不跟过来）。
+            self.connect_input = None;
+            self.connect_sub = None;
+            return;
+        }
+        if self.connect_input.is_none() {
+            let state = cx.new(|cx| InputState::new(window, cx));
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |this: &mut Self, _state, ev: &InputEvent, _window, cx| {
+                    // 单行输入框把回车报成 `PressEnter`（它在绑定阶段就吃掉了
+                    // `enter`，根视图那边收不到），这里接住它去连接。
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.connect_submit(cx);
+                    }
+                },
+            );
+            self.connect_input = Some(state);
+            self.connect_sub = Some(sub);
+        }
+        let Some(state) = self.connect_input.clone() else {
+            return;
+        };
+        if !state.read(cx).focus_handle(cx).is_focused(window) {
+            state.update(cx, |s, cx| s.focus(window, cx));
+        }
+    }
+
     /// 用对话框里输入的地址发起连接。失败则保留对话框并把错误显示出来，
     /// 让用户改地址重试；成功才关掉对话框（导航由 `connect_remote` 完成）。
     pub(crate) fn connect_submit(&mut self, cx: &mut Context<Self>) {
-        let text = self.connect_url.trim().to_string();
+        let text = self
+            .connect_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
         if text.is_empty() {
             return;
         }
@@ -1001,8 +1063,8 @@ impl RootView {
 
     /// 「连接到服务器」对话框：走 [`dialog_overlay`]（带遮罩的浮层，非替换中央区）。
     ///
-    /// 它是个小对话框，不该把整个浏览区顶掉。地址是纯字符串字段——命令面板入口
-    /// 没有 `Window`，建不了真实 `InputState`；回车连接、Esc 取消见 `handle_modal_key`。
+    /// 它是个小对话框，不该把整个浏览区顶掉。地址框是框架的**真实输入框**
+    /// （见 [`RootView::sync_connect_input`]）；回车连接、Esc 取消见 `handle_modal_key`。
     fn render_connect(&self, entity: &Entity<RootView>) -> impl IntoElement {
         let mut body = div().flex().flex_col().gap(px(10.0));
         body = body.child(
@@ -1011,11 +1073,40 @@ impl RootView {
                 .text_color(theme::muted())
                 .child(text!("输入服务器地址，回车连接：".to_string())),
         );
-        body = body.child(dialogs::field_row(
-            &self.connect_url,
-            true,
-            "connect-url".to_string(),
-        ));
+        // 外框与底色仍由这一层画（与地址栏编辑态同款）：`appearance(false)` +
+        // `bordered(false)` 把框架自带的 shadcn 边框关掉，别叠一层进来。
+        let mut field = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(28.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::accent())
+            // 测试用（release no-op）：断言地址框确实渲染出来了。
+            .debug_selector(|| "mo-connect-field".to_string());
+        if let Some(state) = &self.connect_input {
+            field = field.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(
+                        Input::new(state)
+                            .appearance(false)
+                            .bordered(false)
+                            .small()
+                            .text_size(px(13.0))
+                            .p(px(0.0)),
+                    ),
+            );
+        }
+        body = body.child(field);
         if let Some(err) = &self.connect_error {
             body = body.child(
                 div()
@@ -3842,6 +3933,10 @@ impl Render for RootView {
         let entity = cx.entity().clone();
         let entity_key = entity.clone();
 
+        // 「连接到服务器」的地址输入框：开着就确保存在并握着焦点，关了就回收。
+        // 放在这里（而不是打开 / 关闭两处）见 `sync_connect_input` 的说明。
+        self.sync_connect_input(window, cx);
+
         let visible_panes = if self.split && self.panes.len() > 1 {
             2
         } else {
@@ -3971,6 +4066,17 @@ impl Render for RootView {
             if combo.is_modified() {
                 let hit = entity_key.read(cx).keymap.lookup(&combo);
                 if let Some(action) = hit {
+                    // 模态 / 对话框打开时，作用于下层文件列表的动作**吞掉**：
+                    // 那个列表在遮罩后面，选中项 / 剪贴板却在背后被改掉。最容易被
+                    // 撞见的是 ⌘A——在「连接到服务器」的输入框里按 ⌘A，选中的是后面
+                    // 的文件（用户报的就是这个）；⌘X / ⌘V / ⌘Z / Delete 更糟。
+                    // 只拦这一类：导航 / 标签页 / 视图 / 切换模态照旧（Finder 的
+                    // sheet 也是这个尺度），否则模态一开连 ⌘T 都没了。
+                    if entity_key.read(cx).modal != Modal::None
+                        && crate::keys::touches_the_browser(action)
+                    {
+                        return;
+                    }
                     entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
                     return;
                 }
@@ -4060,9 +4166,12 @@ impl Render for RootView {
         });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
-        // ⚠️ 地址栏编辑态例外：此刻焦点应归地址栏输入框。若在这里抢回来，输入框会
-        // 立刻收到 Blur → 触发 end_address_edit，表现为「点编辑闪一下又退回显示态」。
-        if !self.focus.is_focused(window) && !self.panel().address_editing {
+        // ⚠️ 两个例外——焦点属于真实输入组件时不能抢：
+        // * 地址栏编辑态：抢回来会立刻给输入框一个 Blur → 触发 end_address_edit，
+        //   表现为「点编辑闪一下又退回显示态」；
+        // * 「连接到服务器」对话框：抢走刚给输入框的焦点，打字就没反应了。
+        let input_owns_focus = self.panel().address_editing || self.modal == Modal::ConnectServer;
+        if !self.focus.is_focused(window) && !input_owns_focus {
             cx.focus_self(window);
         }
 
@@ -4734,20 +4843,13 @@ fn handle_modal_key(
             "escape" => entity.update(cx, |v, cx| {
                 v.modal = Modal::None;
                 v.connect_error = None;
+                // 输入框在下一帧渲染时回收（见 `sync_connect_input`）。
                 cx.notify();
             }),
+            // 回车正常由输入框消化（`InputEvent::PressEnter` → `connect_submit`）；
+            // 这一条只在焦点不在输入框上时兜底。
             "enter" => entity.update(cx, |v, cx| v.connect_submit(cx)),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    v.connect_url.push(ch);
-                    cx.notify();
-                });
-            }
-            "backspace" => entity.update(cx, |v, cx| {
-                v.connect_url.pop();
-                cx.notify();
-            }),
+            // 字符 / 退格 / ⌘A / 剪贴板全归输入框，这里不再手搓字符串。
             _ => {}
         },
         Modal::Duplicates => {
@@ -6596,6 +6698,119 @@ mod tests {
         }
     }
 
+    /// 「连接到服务器」的地址框是**真实输入框**：⌘A 选中框里的内容，不是后面的文件列表。
+    ///
+    /// 自绘的「字符串 + 假光标 `▏`」那版没有选区，⌘A 直接穿透到根视图的键表，
+    /// 变成 `select.all` → 全选文件列表（用户报的就是这个）。换成框架的真实
+    /// `InputState` 后，⌘A / ⌘C / ⌘V / ⌘Z / 光标全归输入组件，它在**绑定阶段**
+    /// 就把键吃掉了，根本到不了本视图的监听器。
+    #[test]
+    fn cmd_a_in_the_connect_dialog_selects_the_field_not_the_file_list() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_connect_dialog(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-connect-field").is_some(),
+            "连接对话框的地址框没有渲染出来"
+        );
+        let state = cx.update(|_window, cx| {
+            root.read(cx)
+                .connect_input
+                .clone()
+                .expect("打开对话框后应当已经建好真实输入框")
+        });
+
+        // 敲地址进去（字符归输入框——`handle_modal_key` 里那套手搓字符串已删掉）。
+        cx.simulate_input("sftp://example.com");
+        cx.simulate_keystrokes(&format!("{main}-a"));
+
+        // 读焦点的 `focus_handle` 是 `Focusable` 的方法：本模块刻意不用 glob
+        // （会与 `#[test]` 属性撞名，见模块头的说明），这里单独引入。
+        use gpui_kit::Focusable as _;
+        let (value, selected, focused) = cx.update(|window, cx| {
+            let s = state.read(cx);
+            (
+                s.value().to_string(),
+                s.selected_value().to_string(),
+                s.focus_handle(cx).is_focused(window),
+            )
+        });
+        assert!(focused, "地址框没有握着键盘焦点——按键会漏给后面的浏览区");
+        assert_eq!(value, "sftp://example.com", "地址框没有收到输入的字符");
+        assert_eq!(
+            selected, value,
+            "⌘A 应当选中地址框里的内容：value={value:?} selected={selected:?}"
+        );
+        // 同一条按键的另一半：后面的文件列表不能被动过。
+        let files_selected = cx.update(|_window, cx| root.read(cx).panel().selection.count());
+        assert_eq!(files_selected, 0, "⌘A 不该选到后面的文件列表");
+    }
+
+    /// 模态 / 对话框打开时，作用于下层文件列表的动作**不派发**。
+    ///
+    /// 见证点用 `file.properties`（⌘I）：它是浏览区动作，一按就会把当前模态换成
+    /// 属性对话框——模态还是原来那个，说明它被吞掉了。
+    ///
+    /// 不用 ⌘A 当见证：这里没有文件可选，「全选」是空转，测不出真假。
+    /// 反例也在同一条测试里：窗口级动作（⌘T）不该被一起吞掉——Finder 的 sheet
+    /// 也照样响应菜单快捷键，一刀切地吞会让模态一开连标签页都建不了。
+    #[test]
+    fn browser_shortcuts_are_swallowed_while_a_dialog_is_open() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+
+        // 命令面板：自绘输入行 → 焦点在根视图上，⌘I 会一路走到全局键表。
+        // `panel.path` 摆好，属性对话框才有得开（否则 `open_properties` 直接返回，
+        // 见证点就成了空转）。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.panel_mut().path = Some(PathBuf::from("/tmp/mo-modal-key-test"));
+                v.modal = Modal::CommandPalette;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        cx.simulate_keystrokes(&format!("{main}-i"));
+        let modal = cx.update(|_window, cx| root.read(cx).modal.clone());
+        assert_eq!(
+            modal,
+            Modal::CommandPalette,
+            "⌘I 把对话框顶掉了——模态打开时浏览区动作没被吞掉"
+        );
+
+        // 反例：窗口级动作照旧。
+        let before = cx.update(|_window, cx| root.read(cx).pane().tabs.len());
+        cx.simulate_keystrokes(&format!("{main}-t"));
+        let after = cx.update(|_window, cx| root.read(cx).pane().tabs.len());
+        assert_eq!(
+            after,
+            before + 1,
+            "模态打开时窗口级快捷键（⌘T）不该被一起吞掉"
+        );
+    }
+
     /// 贴着右下角打开时，菜单必须被钳回视口内（否则会被窗口边缘切掉）。
     #[test]
     fn context_menu_is_clamped_inside_the_viewport() {
@@ -6629,6 +6844,142 @@ mod tests {
         assert!(
             f32::from(menu.origin.y + menu.size.height) <= vh,
             "菜单底部被切出视口：menu={menu:?} viewport={vw}x{vh}"
+        );
+    }
+
+    /// 右键菜单的**首 / 末项 hover 底色必须跟着面板圆角**收一下。
+    ///
+    /// 面板是 `.rounded(PANEL_RADIUS)` + 上下内边距 `PAD`，而菜单项的 hover 底色是
+    /// `w_full()` 的**矩形**——上下的边一路顶到面板边缘，把面板上下那两个圆角切方。
+    /// gpui 不会把子元素裁进父级圆角（与 `dialog_header_carries_the_card_corner_radius`
+    /// 是同一个病），所以只能让 hover 样式自己收角：首项 `.rounded_t`、末项 `.rounded_b`、
+    /// 只有一项时四个角全收。它只在 hover 时才可见，肉眼很容易漏过去。
+    ///
+    /// 断言的是 `painted_quads()` 里的真实绘制输出（每个 quad 的 `corner_radii`），
+    /// 不需要栅格化；鼠标用 `simulate_mouse_move` 真的停到那一行上。
+    #[test]
+    fn context_menu_item_hover_follows_the_panel_corner() {
+        use crate::context_menu::{ITEM_H, ITEM_RADIUS, MENU_W, PAD, PANEL_RADIUS};
+
+        /// 窗口逻辑坐标下的一点，找出它底下那条菜单项 hover 底色 quad
+        /// （高 = 一项、宽 = 面板内容盒——只有 hover 中的那一行会画出这种 quad）。
+        fn pick_hover_quad(quads: &[gpui_kit::Quad], x: f32, y: f32, scale: f32) -> gpui_kit::Quad {
+            let (x, y) = (x * scale, y * scale);
+            quads
+                .iter()
+                .find(|q| {
+                    let (ox, oy) = (q.bounds.origin.x.as_f32(), q.bounds.origin.y.as_f32());
+                    let (w, h) = (q.bounds.size.width.as_f32(), q.bounds.size.height.as_f32());
+                    ox <= x
+                        && x <= ox + w
+                        && oy <= y
+                        && y <= oy + h
+                        && (h - ITEM_H * scale).abs() < 1.0
+                        && w > (MENU_W - 8.0) * scale
+                })
+                .copied()
+                .expect("鼠标底下没有菜单项 hover 底色的 quad（项没渲染？还是没 hover 上？）")
+        }
+
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 空白处菜单：首项「新建文件夹」、末项「显示简介」，全部可用（都有 hover）。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_context_menu(None, 120.0, 120.0, 0, 0, cx)
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let menu = cx
+            .debug_bounds("mo-context-menu")
+            .expect("右键菜单没有渲染");
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let (menu_x, menu_y) = (f32::from(menu.origin.x), f32::from(menu.origin.y));
+        let menu_w = f32::from(menu.size.width);
+        let menu_h = f32::from(menu.size.height);
+        // 项底色的左缘（面板内容盒内，避开左边框）。
+        let x = menu_x + 2.0;
+        let r = ITEM_RADIUS * scale;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+
+        // ---- 第一项：上面两角跟随面板圆角，下面两角是直角
+        let (fx, fy) = (x, menu_y + PAD + ITEM_H / 2.0);
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(gpui_kit::Point::new(px(fx), px(fy)), cx)
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let quads = cx.update(|window, _cx| window.painted_quads());
+
+        // 面板自己的圆角（同位置同尺寸、四角有半径的那张底色）。
+        let panel_r = quads
+            .iter()
+            .find(|q| {
+                near(q.bounds.origin.x.as_f32(), menu_x * scale)
+                    && near(q.bounds.origin.y.as_f32(), menu_y * scale)
+                    && near(q.bounds.size.width.as_f32(), menu_w * scale)
+                    && near(q.bounds.size.height.as_f32(), menu_h * scale)
+                    && q.corner_radii.top_left.as_f32() > 0.0
+            })
+            .map(|q| q.corner_radii.top_left.as_f32())
+            .expect("没找到面板那层圆角底色 quad");
+        assert!(
+            near(panel_r, PANEL_RADIUS * scale),
+            "面板圆角实测 {}pt，不是 {PANEL_RADIUS}pt",
+            panel_r / scale
+        );
+        // 项底色圆角必须比面板的小，否则它会溢出面板圆角——不是同心就穿帮。
+        assert!(
+            r < panel_r,
+            "项底色圆角 {ITEM_RADIUS}pt 不小于面板圆角 {}pt：会溢出面板的圆角",
+            panel_r / scale
+        );
+
+        let q = pick_hover_quad(&quads, fx, fy, scale);
+        assert!(
+            (q.corner_radii.top_left.as_f32() - r).abs() < 0.5
+                && (q.corner_radii.top_right.as_f32() - r).abs() < 0.5,
+            "第一项的 hover 底色没有跟随面板顶部圆角（期望 {r}）——它会把面板上面两个角\
+             切方：{:?}",
+            q.corner_radii
+        );
+        assert_eq!(
+            (
+                q.corner_radii.bottom_left.as_f32(),
+                q.corner_radii.bottom_right.as_f32()
+            ),
+            (0.0, 0.0),
+            "第一项下面接的不是面板边缘，不该有圆角"
+        );
+
+        // ---- 最后一项：反过来，下面两角跟随面板圆角
+        let (lx, ly) = (x, menu_y + menu_h - PAD - ITEM_H / 2.0);
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(gpui_kit::Point::new(px(lx), px(ly)), cx)
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let q = pick_hover_quad(&quads, lx, ly, scale);
+        assert!(
+            (q.corner_radii.bottom_left.as_f32() - r).abs() < 0.5
+                && (q.corner_radii.bottom_right.as_f32() - r).abs() < 0.5,
+            "末项的 hover 底色没有跟随面板底部圆角（期望 {r}）：{:?}",
+            q.corner_radii
+        );
+        assert_eq!(
+            (
+                q.corner_radii.top_left.as_f32(),
+                q.corner_radii.top_right.as_f32()
+            ),
+            (0.0, 0.0),
+            "末项上面接的不是面板边缘，不该有圆角"
         );
     }
 

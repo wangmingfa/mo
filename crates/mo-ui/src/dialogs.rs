@@ -416,6 +416,11 @@ pub fn tags(entity: &Entity<RootView>, view: &RootView) -> impl IntoElement {
 }
 
 /// 一个可编辑的输入行（带光标提示）。
+///
+/// ⚠️ 这是「字符串 + 假光标 `▏`」那套：没有选区，⌘A / ⌘C / ⌘V 全都落空，
+/// 按键会穿透到根视图的键表变成浏览区动作。键盘路由那头有兜底（模态打开时
+/// 作用于文件列表的动作一律吞掉，见 `keys::BROWSER_SCOPED`），但**新写的输入行
+/// 优先用真实 `InputState`**（地址栏 / 连接到服务器就是这么做的）。
 pub(crate) fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> {
     div()
         .id(id)

@@ -19,10 +19,20 @@ use crate::theme;
 pub(crate) const MENU_W: f32 = 232.0;
 
 /// 单个菜单项的高度。
-const ITEM_H: f32 = 26.0;
+pub(crate) const ITEM_H: f32 = 26.0;
 
 /// 菜单面板的上下内边距。
-const PAD: f32 = 4.0;
+pub(crate) const PAD: f32 = 4.0;
+
+/// 菜单面板的圆角半径。
+pub(crate) const PANEL_RADIUS: f32 = 8.0;
+
+/// 菜单项 hover 底色的圆角半径。
+///
+/// 面板只有上下内边距，所以首 / 末项的底色矩形会一路顶到面板边缘、压住面板圆角
+/// ——矩形的底色把圆角「切方」（gpui 不把子元素裁进父级圆角，与对话框标题栏
+/// 那处是同一类问题）。取「面板半径 − 上下内边距」＝与面板同心，正好嵌在圆角内侧。
+pub(crate) const ITEM_RADIUS: f32 = PANEL_RADIUS - PAD;
 
 /// 分隔线占用的高度（1px 线 + 上下各 3px 呼吸）。
 const SEP_H: f32 = 7.0;
@@ -425,7 +435,7 @@ pub(crate) fn render(
         .bg(theme::surface())
         .border_1()
         .border_color(theme::divider())
-        .rounded(px(8.0))
+        .rounded(px(PANEL_RADIUS))
         .shadow_lg()
         // 测试用（release no-op）：定位 / 钳制的断言都查这个选择器。
         .debug_selector(|| "mo-context-menu".to_string())
@@ -481,7 +491,11 @@ pub(crate) fn render(
             let action = it.action;
             let item_entity = entity.clone();
             let has_submenu = !it.submenu.is_empty();
-            row = row.hover(|s| s.bg(theme::hover_bg()));
+            // 只有贴住面板边缘的那一项（第一项 / 最后一项）需要跟随圆角。
+            // 第一项若有前导分隔线，则压在圆角上的其实是那条线，不是这一行。
+            let is_first = i == 0 && !it.separator_before;
+            let is_last = i + 1 == items.len();
+            row = row.hover(move |s| item_hover_bg(s, is_first, is_last));
             // 二级菜单交互（⚠️ 一行只能挂一次 on_hover，两种情况合并处理）：
             // hover 到带子菜单的行展开；hover 到其它行收起。离开主菜单
             // （鼠标进二级菜单）不收起——否则跨面板的间隙会把菜单闪掉；
@@ -525,7 +539,7 @@ pub(crate) fn render(
             .bg(theme::surface())
             .border_1()
             .border_color(theme::divider())
-            .rounded(px(8.0))
+            .rounded(px(PANEL_RADIUS))
             .shadow_lg()
             .occlude()
             .debug_selector(|| "mo-context-submenu".to_string())
@@ -533,6 +547,8 @@ pub(crate) fn render(
             .text_color(theme::text());
 
         for (j, (label, action)) in sub_items.iter().enumerate() {
+            let is_first = j == 0;
+            let is_last = j + 1 == sub_items.len();
             let mut item = div()
                 .id(("mo-ctx-subitem", j))
                 .flex()
@@ -541,7 +557,7 @@ pub(crate) fn render(
                 .h(px(ITEM_H))
                 .px(px(10.0))
                 .truncate()
-                .hover(|s| s.bg(theme::hover_bg()))
+                .hover(move |s| item_hover_bg(s, is_first, is_last))
                 .child(text!(label.clone()));
             let entity_click = entity.clone();
             let action = *action;
@@ -557,6 +573,21 @@ pub(crate) fn render(
     }
 
     wrapper
+}
+
+/// 菜单项 hover 时的底色。
+///
+/// 贴住面板上下边缘的那一项（第一项 / 最后一项）要顺着面板圆角收一下，否则
+/// 矩形底色会把圆角「切方」——见 `ITEM_RADIUS` 的说明。
+fn item_hover_bg(s: StyleRefinement, is_first: bool, is_last: bool) -> StyleRefinement {
+    let s = s.bg(theme::hover_bg());
+    match (is_first, is_last) {
+        // 只有一项的短菜单：上下都要收。
+        (true, true) => s.rounded(px(ITEM_RADIUS)),
+        (true, false) => s.rounded_t(px(ITEM_RADIUS)),
+        (false, true) => s.rounded_b(px(ITEM_RADIUS)),
+        (false, false) => s,
+    }
 }
 
 /// 第 `index` 个条目在面板内的纵向偏移（含上方分隔线），二级菜单定位用。

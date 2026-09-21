@@ -419,6 +419,39 @@ pub const BINDINGS: [Binding; 28] = [
     },
 ];
 
+/// 作用于**下层文件列表**的绑定 id：选中项、剪贴板、文件操作、对当前目录的读取。
+///
+/// 模态 / 对话框打开时这些动作不派发（判定见 [`touches_the_browser`]，用在
+/// `RootView` 的键盘路由里）：那个列表在遮罩后面，用户看不见它，选中项却会在
+/// 背后被改掉。
+///
+/// 最容易被撞见的一例是 ⌘A——在「连接到服务器」的输入框里按 ⌘A，选中的是后面的
+/// 文件；⌘X / ⌘V / ⌘Z / Delete 更糟，会真的动文件或剪贴板。反差在于导航 / 窗口 /
+/// 视图 / 切换模态这些**不碰选中项**的动作照旧放行（Finder 的 sheet 也是这样）。
+///
+/// ⚠️ 新增绑定若作用于浏览区，记得加进来——`browser_scoped_ids_all_exist` 守住
+/// 拼写（写错的 id 会静默失效，等于没拦）。
+pub const BROWSER_SCOPED: [&str; 13] = [
+    "select.all",
+    "edit.undo",
+    "edit.redo",
+    "file.properties",
+    "file.duplicate",
+    "clipboard.copy",
+    "clipboard.cut",
+    "clipboard.paste",
+    "clipboard.copy_path",
+    "file.trash",
+    "list.rename",
+    "list.open",
+    "list.preview",
+];
+
+/// 这个绑定 id 是否作用于下层文件列表（模态打开时应当被吞掉）。
+pub fn touches_the_browser(id: &str) -> bool {
+    BROWSER_SCOPED.contains(&id)
+}
+
 /// 某个动作在本平台的默认键串。
 ///
 /// ⚠️ macOS 与 Windows / Linux 的两个动作默认键位**故意不同**，这是平台惯例，
@@ -755,6 +788,22 @@ mod tests {
         );
         let rename_combo = map.combo_of("list.rename").unwrap().clone();
         assert!(!rename_combo.matches(&open_combo), "重命名与打开不该撞键");
+    }
+
+    /// `BROWSER_SCOPED` 里的 id 必须都是真的绑定——写错的 id 会静默失效，
+    /// 等于那一条没拦（模态打开时照样打到下层文件列表）。
+    #[test]
+    fn browser_scoped_ids_all_exist() {
+        for id in BROWSER_SCOPED {
+            assert!(
+                BINDINGS.iter().any(|b| b.id == id),
+                "BROWSER_SCOPED 里的 {id:?} 不是绑定 id（拼错了？）"
+            );
+            assert!(touches_the_browser(id), "{id:?} 应当被判为作用于浏览区");
+        }
+        // 反例：窗口级动作不该被拦，否则模态打开时连新建标签页都没了。
+        assert!(!touches_the_browser("tab.new"));
+        assert!(!touches_the_browser("palette.open"));
     }
 
     /// 菜单提示由键表推导（抄来的字面量会随重映射漂移）。
