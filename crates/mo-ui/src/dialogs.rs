@@ -350,8 +350,10 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
         let entity_click = entity.clone();
         let path = u.path.clone();
         row.interactivity().on_click(move |ev, _window, cx| {
+            // 磁盘分析列的是**本机**目录（`analyze_usage` 走 `std::fs`），所以这里是
+            // 本地判断；进了这个分支必然是目录，交给 `open_entry` 时就是 `true`。
             if ev.click_count() >= 2 && path.is_dir() {
-                entity_click.update(cx, |v, cx| v.open_entry(path.clone(), cx));
+                entity_click.update(cx, |v, cx| v.open_entry(path.clone(), true, cx));
             }
         });
         body = body.child(row);

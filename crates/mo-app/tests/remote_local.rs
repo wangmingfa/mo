@@ -13,17 +13,35 @@
 //!    服务器，只有退出应用才会断开」。所以连接活在进程级 `SessionRegistry` 里，
 //!    比 `AppState` 活得久；终点只有显式断开（`disconnect_connection`）与进程退出。
 //!
+//! 4. **闲置被服务器掐断的连接会自愈**。用户报的现象：连上 FTP、过一阵子切回去，
+//!    弹 `Broken pipe (os error 32)`，然后再也回不去。根因是「会话活着」与「连接
+//!    还能用」被当成了同一件事——FTP 服务器会把闲置的控制连接单方面关掉。现在读目录
+//!    之前先探活（`FileSystem::is_alive`），断了就用会话里记着的凭据**原地重连**。
+//! 5. **切换失败要整体回滚**。失败时若只翻了「看哪边」而目录没换成功，就会留下
+//!    「标签页徽标说 FTP、列表还是本地那份」的半切换态——侧边栏两边同时高亮
+//!    （用户报的「关闭弹窗后左侧选中了 2 个项目」）。
+//! 6. **同端点同用户名只占一行**。用户报的现象：闲置断线后从认证框重新填了密码，
+//!    侧边栏「远程」区长出了两行同一台服务器——旧那行已经死了，点它只会继续失败。
+//!    根因是复用判据带了密码，密码一变就被当成一条新连接。现在判据是「端点 +
+//!    用户名」，密码变了就在**原来那个编号**上把连接与凭据换掉。
+//! 7. **「是不是目录」只问列表模型**。远程条目的路径（`/1`）在本机不存在，
+//!    `Path::is_dir()` 会把远程目录判成文件，双击就被交给系统 `open`——日志里
+//!    `The file /1 does not exist.`，界面一动不动。判据取当前列表那一行的 `kind`。
+//!
 //! 为什么守卫落在 `mo-app` 而不是 UI 层：headless 的 GPUI 测试调度器会把「后台
 //! tokio 线程唤醒测试任务」判成不确定性直接 panic（点击回调最终 `await` 到
 //! `spawn_blocking`），UI 层写不出这条路径的自动化测试。见 `verify-gpui-layout-headless`。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use mo_app::{AppState, SessionRegistry};
+use mo_app::{AppState, ConnectFailure, SessionRegistry};
 use mo_core::{EntryKind, FileId, FileMetadata, MoError};
 use mo_fs::{FileSystem, ReadDirEntry};
+use mo_remote::RemoteUrl;
 
 /// 测试用的远程地址。
 ///
@@ -31,10 +49,47 @@ use mo_fs::{FileSystem, ReadDirEntry};
 /// 会立刻拒绝（而不是把测试卡在一条 SYN 上等超时），用例就会干脆地红掉。
 const TEST_URL: &str = "ftp://127.0.0.1:1";
 
+/// 假远程后端的健康状况。
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Health {
+    /// 连接好的。
+    #[default]
+    Ok,
+    /// 探活说「断了」——闲置被服务器掐掉的样子。
+    Dead,
+    /// 探活说「活着」，但一读目录就断——网络在两次操作之间抖掉的样子。
+    DiesWhileReading,
+}
+
+/// 用户报的那个错误的等价物：`mo_remote` 把「连接断了」标成这个标记（判据见
+/// `mo_remote::is_disconnected`），上层据此决定重连重试。
+fn disconnected_error() -> MoError {
+    mo_remote::RemoteError::disconnected("列目录", "Broken pipe (os error 32)").into()
+}
+
 /// 只认识 `/` 与 `/pub` 的假远程后端：其它路径一律「远端没有这样的目录」，
 /// 并记下被问过的路径——用来证明「切回来时读的是哪台机器的哪个目录」。
 struct FakeRemoteFs {
     asked: Arc<Mutex<Vec<PathBuf>>>,
+    /// 探活 / 读目录时的行为，见 [`Health`]。
+    health: Health,
+    /// 列目录里那一条文件的名字。重连返回的新后端会换个名字，好断言「后面那次读
+    /// 确实走了新连接」。
+    marker: String,
+    /// 额外多列一条**目录**（名字自定）。默认 `None`——只有「目录判据来自列表」
+    /// 那条守卫需要它：要一个「列表里说是目录、本机磁盘上却不存在」的条目。
+    extra_dir: Option<String>,
+}
+
+impl Default for FakeRemoteFs {
+    fn default() -> Self {
+        Self {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            health: Health::Ok,
+            marker: "remote.txt".to_string(),
+            extra_dir: None,
+        }
+    }
 }
 
 impl FakeRemoteFs {
@@ -49,16 +104,38 @@ impl FileSystem for FakeRemoteFs {
         self.read_dir_blocking(path)
     }
 
+    fn is_alive(&self) -> bool {
+        self.health != Health::Dead
+    }
+
     fn read_dir_blocking(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         self.asked.lock().unwrap().push(path.to_path_buf());
+        if self.health == Health::DiesWhileReading {
+            return Err(disconnected_error());
+        }
+        if self.health == Health::Dead {
+            // 探活已经说过「断了」：这时候绝不该再拿这条连接去读。谁读到这儿，
+            // 就说明「闲置先探活」这一步被绕过了。
+            panic!("连接已死，探活之后不该再拿它读目录");
+        }
         match path.to_str() {
-            Some("/") => Ok(Vec::new()),
-            Some("/pub") => Ok(vec![ReadDirEntry::new(
-                FileId::synthetic(Path::new("/pub/remote.txt")),
-                "remote.txt".to_string(),
-                EntryKind::File,
-                PathBuf::from("/pub/remote.txt"),
-            )]),
+            Some("/") | Some("/pub") => {
+                let mut entries = vec![ReadDirEntry::new(
+                    FileId::synthetic(Path::new(&self.marker)),
+                    self.marker.clone(),
+                    EntryKind::File,
+                    PathBuf::from(format!("/{}", self.marker)),
+                )];
+                if let Some(dir) = &self.extra_dir {
+                    entries.push(ReadDirEntry::new(
+                        FileId::synthetic(Path::new("/extra-dir")),
+                        dir.clone(),
+                        EntryKind::Directory,
+                        PathBuf::from(format!("/{dir}")),
+                    ));
+                }
+                Ok(entries)
+            }
             other => Err(MoError::Other(format!(
                 "远端没有这样的目录：{}",
                 other.unwrap_or_default()
@@ -115,6 +192,7 @@ fn connect_fake_at(app: &AppState, url: &str) -> (u64, Arc<Mutex<Vec<PathBuf>>>)
     app.install_backend_for_test(
         Arc::new(FakeRemoteFs {
             asked: asked.clone(),
+            ..Default::default()
         }),
         url,
     );
@@ -129,6 +207,48 @@ fn connect_fake_at(app: &AppState, url: &str) -> (u64, Arc<Mutex<Vec<PathBuf>>>)
 
 fn connect_fake(app: &AppState) -> Arc<Mutex<Vec<PathBuf>>> {
     connect_fake_at(app, TEST_URL).1
+}
+
+/// 登入一条「有毛病」的假连接（探活说断 / 一读就断），返回它的编号。
+fn connect_sick(app: &AppState, url: &str, health: Health) -> u64 {
+    app.install_backend_for_test(
+        Arc::new(FakeRemoteFs {
+            health,
+            ..Default::default()
+        }),
+        url,
+    );
+    app.live_connections()
+        .last()
+        .expect("应当刚登入一条连接")
+        .id
+}
+
+/// 「重连」用的建连接实现：记下被调用次数，每次返回一条**新的健康**连接。
+///
+/// 新连接列出来的文件名带 `fresh-<n>`，于是「后面那次读真的走了新连接」是可断言的
+/// ——只断言「重连被调用过」会漏掉「换了连接却还读旧的那份」。
+fn counting_connector() -> (Arc<AtomicUsize>, mo_app::Connector) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let connector = {
+        let calls = calls.clone();
+        Arc::new(move |_url: &RemoteUrl| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(FakeRemoteFs {
+                marker: format!("fresh-{n}.txt"),
+                ..Default::default()
+            }) as Arc<dyn FileSystem>)
+        })
+    };
+    (calls, connector)
+}
+
+/// 一个「重连也失败」的建连接实现。
+///
+/// 收的是「现造一个错误」而不是错误本身：`RemoteError` 不是 `Clone`（也没必要为了
+/// 测试去给它加一条派生）。
+fn failing_connector(make_error: fn() -> mo_remote::RemoteError) -> mo_app::Connector {
+    Arc::new(move |_url: &RemoteUrl| Err(make_error()))
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -351,5 +471,283 @@ fn disconnect_remote_drops_the_session() {
 
         assert!(app.live_connections().is_empty(), "断开后不该还有连接");
         assert!(!app.browsing_remote(), "断开后应当回到本地浏览");
+    });
+}
+
+/// 闲置被服务器掐断的连接，切回来时会**静默重连**——用户看不到 `Broken pipe`。
+///
+/// 这就是用户报的那条：连上 FTP → 切去本地干活 → 过一阵子切回来 → 弹报错。
+/// 服务器早把闲置的控制连接关了，而「会话活着」并不等于「连接还能用」。
+#[test]
+fn an_idle_connection_is_revived_before_it_is_used() {
+    let (calls, connector) = counting_connector();
+    let sessions = Arc::new(SessionRegistry::with_connector(connector));
+    let app = tab(&sessions);
+    let id = connect_sick(&app, TEST_URL, Health::Dead);
+    // 模拟「闲置了一阵子」。真实场景里这是几分钟，测试里把时刻直接往前拨。
+    sessions.age_for_test(id, Duration::from_secs(3600));
+
+    runtime().block_on(async {
+        app.open_connection(id)
+            .await
+            .expect("闲置被掐断的连接应当自动重连，而不是把 Broken pipe 弹给用户");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "应当恰好重连一次");
+        assert!(app.browsing_remote(), "重连后应当就在这条连接上");
+        assert_eq!(
+            app.live_connections().len(),
+            1,
+            "重连是**原地**替换连接对象，不该在侧边栏多留一行"
+        );
+        assert_eq!(
+            app.active_connection_id(),
+            Some(id),
+            "编号不变——侧边栏的高亮不该跳"
+        );
+        assert!(
+            app.current_entries()
+                .await
+                .iter()
+                .any(|e| e.name == "fresh-0.txt"),
+            "重连之后必须真的用**新**连接去读（换了连接还在读旧的那份等于没修）"
+        );
+    });
+}
+
+/// 探活说「活着」、一读就断（网络在两次操作之间抖掉）：重连后再读一次，
+/// 用户同样看不到报错。守卫 `load_path` 里那个「最多两轮」的循环。
+#[test]
+fn a_connection_that_dies_mid_read_is_retried_once() {
+    let (calls, connector) = counting_connector();
+    let sessions = Arc::new(SessionRegistry::with_connector(connector));
+    let app = tab(&sessions);
+    let id = connect_sick(&app, TEST_URL, Health::DiesWhileReading);
+
+    runtime().block_on(async {
+        app.open_connection(id)
+            .await
+            .expect("读的瞬间断线应当重连后重试一次");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "应当恰好重连一次");
+        assert!(
+            app.current_entries()
+                .await
+                .iter()
+                .any(|e| e.name == "fresh-0.txt"),
+            "重试必须走新连接"
+        );
+    });
+}
+
+/// 重连被服务器拒（比如闲置期间那边改了密码）：错误要能让 UI 弹认证框，
+/// 而不是干显示一句话。
+#[test]
+fn a_rejected_reconnect_asks_for_credentials() {
+    let sessions = Arc::new(SessionRegistry::with_connector(failing_connector(|| {
+        mo_remote::RemoteError::auth("登录", "530 Login incorrect.")
+    })));
+    let app = tab(&sessions);
+    let id = connect_sick(&app, TEST_URL, Health::Dead);
+    sessions.age_for_test(id, Duration::from_secs(3600));
+
+    runtime().block_on(async {
+        match app.open_connection(id).await {
+            Err(ConnectFailure::NeedsCredentials { endpoint, .. }) => {
+                assert_eq!(endpoint, TEST_URL)
+            }
+            other => panic!("应当报「需要凭据」（UI 据此弹认证框），实际：{other:?}"),
+        }
+    });
+}
+
+/// 切换失败要**整体回滚**，不能留下「标签页徽标说 FTP、列表还是本地那份」的半切换态。
+///
+/// 用户报的「关闭弹窗之后左侧选中了 2 个项目」：`on_remote` 已经翻了、目录却没换成，
+/// 于是侧边栏按「当前路径」高亮的那一项和按「当前连接」高亮的那一项同时亮着。
+#[test]
+fn a_failed_switch_rolls_the_browsing_state_back() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    connect_fake(&app);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/pub"))
+            .await
+            .expect("先待在远程 /pub");
+        let entries_before = app.current_entries().await.len();
+
+        // 切本地失败：本地根本没有这层目录。
+        let missing = std::env::temp_dir().join("mo-nonexistent-here/xyz");
+        app.open_local(&missing)
+            .await
+            .expect_err("不存在的本地路径应当失败");
+
+        assert!(
+            app.browsing_remote(),
+            "失败后应当还在原来那条连接上（否则徽标 / 地址栏 / 侧边栏高亮会互相矛盾）"
+        );
+        assert_eq!(
+            app.current_path().await.as_deref(),
+            Some(Path::new("/pub")),
+            "位置不该变"
+        );
+        assert_eq!(
+            app.current_entries().await.len(),
+            entries_before,
+            "列表还是原来那份"
+        );
+        assert_eq!(
+            app.remote_url().map(|u| u.endpoint()).as_deref(),
+            Some(TEST_URL),
+            "地址栏仍应显示这台服务器"
+        );
+    });
+}
+
+/// 同端点同用户名在侧边栏**只占一行**。
+///
+/// 用户报的「左侧选中了 2 个项目」里那条连接就是多出来的：重新走一遍连接（地址栏
+/// 再敲一次 / 认证框重填）不该在「远程」区长出第二行。
+#[test]
+fn the_same_account_never_takes_a_second_row() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (id, asked) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+
+    runtime().block_on(async {
+        app.connect_remote("ftp://alice@127.0.0.1:1")
+            .await
+            .expect("同端点同用户名应当就在原来那条上收场（真去连 127.0.0.1:1 会立刻被拒）");
+
+        let live = app.live_connections();
+        assert_eq!(live.len(), 1, "同端点同用户名只该有一行");
+        assert_eq!(live[0].id, id, "而且就是原来那个编号——侧边栏那一行不新增");
+        assert_eq!(app.active_connection_id(), Some(id));
+        assert!(
+            asked.lock().unwrap().iter().any(|p| p == Path::new("/")),
+            "复用应当真的用原来那条连接的后端去读"
+        );
+    });
+}
+
+/// 同一台服务器上换了密码（认证框重填一次）：新连接**接在原来那个编号上**。
+///
+/// 这条守卫的是用户报的那个「两行」：判据只要还带着密码，密码一变就会既留下旧
+/// 那条（已经死了的），又新建一条——点旧的那条继续失败，怎么点都回不去。
+#[test]
+fn a_new_password_reconnects_the_same_row() {
+    let (calls, connector) = counting_connector();
+    let sessions = Arc::new(SessionRegistry::with_connector(connector));
+    let app = tab(&sessions);
+    // 先用「旧密码那套」登入（假后端，避免真建 socket）。
+    let (id, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+
+    runtime().block_on(async {
+        app.connect_remote_with_credentials("ftp://127.0.0.1:1", "alice", "pw2")
+            .await
+            .expect("换了密码应当真连一次");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "换了凭据必须真连，不能拿旧连接凑合"
+        );
+        let live = app.live_connections();
+        assert_eq!(live.len(), 1, "同端点同用户名仍然只有一行");
+        assert_eq!(
+            live[0].id, id,
+            "编号不变——侧边栏那一行不新增、不闪、高亮不跳"
+        );
+        assert!(
+            app.current_entries()
+                .await
+                .iter()
+                .any(|e| e.name == "fresh-0.txt"),
+            "换完之后必须真的用新连接去读"
+        );
+
+        // 新凭据记进了会话：再连一次（地址里不带密码 = 走钥匙串 / 匿名那条）应当
+        // 直接复用，而不是又连一次、又添一行。
+        app.connect_remote("ftp://alice@127.0.0.1:1")
+            .await
+            .expect("应当复用刚换过凭据的那条会话");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "复用不该再连一次（凭据没记进会话的话这里会连第二次）"
+        );
+        assert_eq!(app.live_connections().len(), 1);
+    });
+}
+
+/// 不变式兜底：表里同 key（端点 + 用户名）已经有条目时，再登入一条也会把旧的
+/// 摘掉——这条走的是 `add` 本身（测试用的登入接口绕过 `find` 的复用短路）。
+#[test]
+fn installing_the_same_account_twice_keeps_one_row() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (second, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+
+    let live = app.live_connections();
+    assert_eq!(live.len(), 1, "同 key 的旧条目应当被摘掉，不留两行");
+    assert_eq!(live[0].id, second, "留下的应当是刚登入的那条");
+}
+
+/// 同端点但**账号不同**仍然是两行：一行一条连接，两个账号就是两条连接。
+#[test]
+fn a_second_account_on_the_same_host_keeps_its_own_row() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (alice, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (bob, _) = connect_fake_at(&app, "ftp://bob@127.0.0.1:1");
+
+    assert_ne!(alice, bob, "两个账号是两条连接，不该互相顶掉");
+    assert_eq!(
+        app.live_connections().len(),
+        2,
+        "同一台服务器的两个账号应当各占一行"
+    );
+}
+
+/// 「是不是目录」来自**列表模型**（`entry.kind`），而不是本机磁盘。
+///
+/// 用户报的「双击 FTP 里的目录没反应，日志里 `The file /1 does not exist.`」：
+/// 远程条目的路径（`/1`）在本机根本不存在，`Path::is_dir()` 把远程目录一律判成
+/// 文件，双击就把它交给系统 `open` 去开一个本地不存在的路径。这条守卫钉住判据的
+/// 出处：模型说目录就是目录——哪怕本机磁盘上根本没有这个路径。
+#[test]
+fn whether_an_entry_is_a_directory_comes_from_the_listing() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let dir_name = "远端目录";
+    app.install_backend_for_test(
+        Arc::new(FakeRemoteFs {
+            extra_dir: Some(dir_name.to_string()),
+            ..Default::default()
+        }),
+        TEST_URL,
+    );
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+
+        let remote_dir = PathBuf::from(format!("/{dir_name}"));
+        assert!(
+            !remote_dir.is_dir(),
+            "前提：这个远程目录在本机不存在——否则这条测试测不出两种判据的差别"
+        );
+        assert_eq!(
+            app.entry_is_dir(&remote_dir).await,
+            Some(true),
+            "列表里它是目录，entry_is_dir 就得说目录（旧的 Path::is_dir() 在这里给 false）"
+        );
+        assert_eq!(
+            app.entry_is_dir(Path::new("/remote.txt")).await,
+            Some(false),
+            "列表里是文件就得说文件"
+        );
+        assert_eq!(
+            app.entry_is_dir(Path::new("/不在列表里")).await,
+            None,
+            "不在当前列表里的路径返回 None，交给调用方兜底"
+        );
     });
 }

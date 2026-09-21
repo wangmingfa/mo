@@ -168,19 +168,21 @@ fn cell(
     // 窗格容器，把菜单换成「空白处」版本。
     let ctx_entity = entity.clone();
     let ctx_path = entry.path.clone();
-    let ctx_is_dir = matches!(entry.kind, mo_core::EntryKind::Directory);
+    // 目录判据来自列表模型（`entry.kind`）：远程条目在本地磁盘上不存在，
+    // `Path::is_dir()` 会把远程目录判成文件（见 `RootView::open_entry`）。
+    let is_dir = matches!(entry.kind, mo_core::EntryKind::Directory);
     c.interactivity()
         .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
             let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
             ctx_entity.update(cx, |v, cx| {
-                v.open_context_menu(Some((ctx_path.clone(), ctx_is_dir)), x, y, pane, tab, cx);
+                v.open_context_menu(Some((ctx_path.clone(), is_dir)), x, y, pane, tab, cx);
             });
             cx.stop_propagation();
         });
     let click_entity = entity.clone();
     c.interactivity().on_click(move |ev, _window, cx| {
         if ev.click_count() >= 2 {
-            click_entity.update(cx, |v, cx| v.open_entry(entry_path.clone(), cx));
+            click_entity.update(cx, |v, cx| v.open_entry(entry_path.clone(), is_dir, cx));
             return;
         }
         // 修饰键决定选择语义：无修饰 = 单选替换；cmd/ctrl = 切换多选；shift = 连选。

@@ -192,10 +192,20 @@ pub fn render(
             let app = app_back.clone();
             let entity = entity_back.clone();
             cx.spawn(async move |cx| {
-                if let Err(e) = app.open_connection(id).await {
-                    entity.update(cx, |v, cx| {
-                        v.notice(format!("切换远程连接失败：{e}"), None, cx);
-                    });
+                // `open_connection` 会先保活 / 重连（闲置被服务器掐掉的连接在这里
+                // 静默恢复），所以走不到 `Err` 就已经是「真的不行了」。
+                match app.open_connection(id).await {
+                    Ok(()) => {}
+                    // 服务器拒了凭据（比如闲置期间那边改了密码）：直接弹认证框，
+                    // 别让用户对着一句错误发呆。
+                    Err(f @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
+                        entity.update(cx, |v, cx| v.on_connect_result(Err(f), cx));
+                    }
+                    Err(e) => {
+                        entity.update(cx, |v, cx| {
+                            v.notice(format!("切换远程连接失败：{e}"), None, cx);
+                        });
+                    }
                 }
                 // 切过去之后标签页徽标 / 地址栏都变了，立刻重绘。
                 entity.update(cx, |_, cx| cx.notify());

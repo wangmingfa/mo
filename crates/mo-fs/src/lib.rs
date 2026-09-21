@@ -62,6 +62,18 @@ pub trait FileSystem: Send + Sync {
 
     /// 重命名 / 移动（同一文件系统下为原子操作）。
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError>;
+
+    /// 连接是否还活着（**只有远程后端会真的探测**，本地实现不碰网络）。
+    ///
+    /// 用途：远程会话闲置久了会被服务器单方面掐断（FTP 的 `idle_session_timeout`
+    /// 很常见），上层在「闲置一阵子之后再读目录」之前先用它确认连接还在，断了就
+    /// 重建——而不是把一句 `Broken pipe (os error 32)` 弹给用户看。
+    ///
+    /// ⚠️ 会做一次网络往返，必须在 **blocking 上下文**调用（与
+    /// [`FileSystem::read_dir_blocking`] 同一个约定）；默认实现直接 `true`。
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// 从 `std::io::Error` 推导目录错误类型。

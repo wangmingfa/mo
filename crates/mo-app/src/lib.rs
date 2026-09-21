@@ -168,6 +168,20 @@ pub enum ConnectFailure {
     },
 }
 
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectFailure::Message(msg) => write!(f, "{msg}"),
+            // 这条通常由 UI 单独处置（弹认证框），但日志与兜底提示也得能打印它。
+            ConnectFailure::NeedsCredentials {
+                endpoint, detail, ..
+            } => {
+                write!(f, "{endpoint} 需要账号密码：{detail}")
+            }
+        }
+    }
+}
+
 /// 一条活着的远程会话的编号。
 ///
 /// 会话活在 [`SessionRegistry`] 里，界面只拿这个编号指代「哪一条连接」：侧边栏按它
@@ -191,6 +205,12 @@ struct RemoteSession {
     /// 切回本地再切回来时回到这里，而不是每次都掉回根目录——「会话还活着」的
     /// 体感一半来自不重登，另一半来自位置还在。
     path: String,
+    /// 最近一次**确认这条连接还能用**的时刻（登入算一次，读目录成功 / 探活通过
+    /// 各刷新一次）。
+    ///
+    /// 用途：只有闲置超过 [`IDLE_PROBE`] 才在下次读目录前探活——探活是一次网络
+    /// 往返，连续浏览时不该每次进目录都白付。
+    last_used: std::time::Instant,
 }
 
 /// 活着的连接一览（侧边栏「远程」区按这个列表渲染）。
@@ -208,12 +228,34 @@ pub struct LiveConnection {
 /// 标签页各自持有一份 `AppState`——会话若挂在 `AppState` 上，就会被标签页一起带走。
 /// 所以连接上移到这里，`AppState` 只记「我看的是哪一条」。注册表是进程级的
 /// （[`session_registry`]），于是新开的标签页天然看得见已经连着的服务器。
-#[derive(Default)]
 pub struct SessionRegistry {
     sessions: std::sync::Mutex<Vec<RemoteSession>>,
     /// 编号分配器：从 1 起，**永不复用**——断开又新建时，界面手里那个旧编号
     /// 不会认到新连接上。
     next_id: AtomicU64,
+    /// 怎么建连接。默认 [`mo_remote::connect`]。
+    ///
+    /// 做成字段（而不是就地调 `mo_remote::connect`）是为了让「断了会重连」这件事
+    /// **可测**：测试没法真去连一台 FTP，但能验「重连被调用了，而且换了新连接」。
+    connector: Connector,
+}
+
+/// 建一条远程连接的方式（见 [`SessionRegistry::connector`]）。
+///
+/// 公开是因为它出现在 [`SessionRegistry::with_connector`] 的签名里，而该方法的
+/// 调用方（测试）在另一个 crate——拿不到类型名就只能把整个签名抄一遍。
+pub type Connector =
+    Arc<dyn Fn(&RemoteUrl) -> Result<Arc<dyn FileSystem>, mo_remote::RemoteError> + Send + Sync>;
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        let connector: Connector = Arc::new(|url: &RemoteUrl| mo_remote::connect(url));
+        Self {
+            sessions: std::sync::Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            connector,
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -221,32 +263,115 @@ impl SessionRegistry {
         Self::default()
     }
 
+    /// ⚠️ 仅供测试：换一个「建连接」的实现。
+    #[doc(hidden)]
+    pub fn with_connector(connector: Connector) -> Self {
+        Self {
+            connector,
+            ..Self::default()
+        }
+    }
+
+    fn connector(&self) -> Connector {
+        self.connector.clone()
+    }
+
+    /// 刷新「上次确认能用」的时刻（读目录成功 / 探活通过）。
+    fn touch(&self, id: SessionId) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.id == id)
+        {
+            s.last_used = std::time::Instant::now();
+        }
+    }
+
+    /// ⚠️ 仅供测试：把这条会话的「上次确认能用」往前拨，模拟「闲置了很久」。
+    ///
+    /// 生产代码里这个时刻只由真实使用推进（见 [`Self::touch`] / [`Self::set_fs`]）；
+    /// 测试没法为了「闲置超时」真等 30 秒。
+    #[doc(hidden)]
+    pub fn age_for_test(&self, id: SessionId, by: std::time::Duration) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.id == id)
+        {
+            s.last_used = s.last_used.checked_sub(by).unwrap_or(s.last_used);
+        }
+    }
+
+    /// 原地换掉这条会话的连接对象（重连用）：**编号不变**，所以侧边栏那一行不闪、
+    /// 高亮也不会跳。
+    fn set_fs(&self, id: SessionId, fs: Arc<dyn FileSystem>) {
+        self.mutate(id, |s| s.fs = fs);
+    }
+
+    /// 原地换掉连接对象**和**地址（用户在同一台服务器上换了密码时走这条）。
+    ///
+    /// 只更新 `url`、不新增会话：同端点同用户名还是那一行，只是往后「切回来 /
+    /// 再重连」用的是新凭据——否则下次闲置重连又会被那个旧密码顶回来。
+    fn set_url_and_fs(&self, id: SessionId, url: RemoteUrl, fs: Arc<dyn FileSystem>) {
+        self.mutate(id, |s| {
+            s.url = url;
+            s.fs = fs;
+        });
+    }
+
+    /// 改一条会话，并顺手刷新「上次确认能用」的时刻（刚换过连接，算刚确认）。
+    fn mutate(&self, id: SessionId, f: impl FnOnce(&mut RemoteSession)) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.id == id)
+        {
+            f(s);
+            s.last_used = std::time::Instant::now();
+        }
+    }
+
     /// 登入一条新会话，返回它的编号。
+    ///
+    /// 顺手摘掉同 key（端点 + 用户名）的旧条目，给「(端点, 用户名) 至多一条」这条
+    /// 不变式兜底：正常路径由 [`Self::find`] 先拦住（找得到就在原编号上收场，压根
+    /// 走不到这儿），这里再保一道——万一漏进来一条，侧边栏也不该多出一行。
     fn add(&self, url: RemoteUrl, fs: Arc<dyn FileSystem>) -> SessionId {
+        let endpoint = url.endpoint();
         let mut list = self.sessions.lock().unwrap();
+        list.retain(|s| s.url.endpoint() != endpoint || s.url.user != url.user);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         list.push(RemoteSession {
             id,
             url,
             fs,
             path: "/".to_string(),
+            last_used: std::time::Instant::now(),
         });
         id
     }
 
-    /// 能直接复用的活会话：端点、用户名都对得上，且没给一个**不同**的密码。
+    /// 已登入的**同一条**连接：端点 + 用户名都对得上就是它。
     ///
-    /// 地址里显式写了另一个密码，说明用户就是想换凭据重登，那就真连；不带密码
-    /// （走钥匙串或匿名）才对得上「就是它，接着用」。见 [`RemoteUrl::endpoint`]。
-    fn find(&self, url: &RemoteUrl) -> Option<SessionId> {
-        self.sessions.lock().unwrap().iter().find_map(|s| {
-            let same_user = s.url.endpoint() == url.endpoint() && s.url.user == url.user;
-            let same_password = match &url.password {
-                Some(pw) => s.url.password.as_ref() == Some(pw),
-                None => true,
-            };
-            (same_user && same_password).then_some(s.id)
-        })
+    /// 注册表的不变式是「(端点, 用户名) 至多一条」——侧边栏「远程」区一行就是一条
+    /// 连接，同一台服务器同一个账号连两次不该长出两行。所以这里**不看密码**：
+    /// 密码不同不是「另一条连接」，而是同一条要换凭据，
+    /// [`AppState::finish_connect`] 会在**原来那个编号**上把连接换掉。
+    ///
+    /// 见 [`RemoteUrl::endpoint`]：端点里不含用户名，所以要两个键分别比。
+    fn find(&self, url: &RemoteUrl) -> Option<RemoteSession> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.url.endpoint() == url.endpoint() && s.url.user == url.user)
+            .cloned()
     }
 
     /// 取一条会话的副本（`None` = 已经断开了）。
@@ -314,11 +439,17 @@ impl SessionRegistry {
     }
 }
 
+/// 会话闲置超过这个时长，下次读目录前才值得探活。
+///
+/// 探活是一次网络往返：连续浏览（每次进目录间隔几秒）不该白付这次往返，而
+/// 「闲置」正是服务器掐断连接的时机。判据是 [`RemoteSession::last_used`]。
+const IDLE_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 本进程的会话注册表。
 ///
 /// 与共享 tokio runtime 同理：会话的生命周期就是进程的生命周期——「只有退出应用才
 /// 断开」就是它。`AppState::new` / `with_trash` 默认取这一份，所以每个标签页看到的是
-/// 同一张表；测试要隔离就用 [`AppState::with_isolated_sessions`]。
+/// 同一张表；测试要隔离就用 [`AppState::with_sessions`]。
 pub fn session_registry() -> Arc<SessionRegistry> {
     static REG: std::sync::OnceLock<Arc<SessionRegistry>> = std::sync::OnceLock::new();
     REG.get_or_init(|| Arc::new(SessionRegistry::new())).clone()
@@ -327,7 +458,7 @@ pub fn session_registry() -> Arc<SessionRegistry> {
 /// 本标签页在看哪一边。
 ///
 /// 会话本身不在这里（见 [`SessionRegistry`]），这里只剩「看的是哪一条」。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Source {
     /// 本标签页看着的那条会话。
     ///
@@ -506,35 +637,69 @@ impl AppState {
     /// * 打开瞬间先用缓存把元数据填满（stale-while-revalidate），再后台逐条校验；
     /// * 后台校验按「首屏优先」排队，用户看到的行最先补全。
     async fn load_path(&self, path: &Path) -> Result<(), MoError> {
-        let fs = self.active_fs();
+        // 远程会话闲置久了会被服务器单方面掐断（FTP 的 `idle_session_timeout` 很常见），
+        // 这时直接读目录只会拿到一句 `Broken pipe (os error 32)`。所以先确认连接还在，
+        // 断了就用会话里记着的凭据原地重连（见 `revive_if_stale`）——这条路径是所有
+        // 读目录的必经之地（进目录 / 刷新 / 前进后退），自愈放在这里最省事。
+        let session = self.active_session();
+        if let Some(id) = session {
+            self.revive_if_stale(id)
+                .await
+                .map_err(|e| MoError::Other(e.to_string()))?;
+        }
+
+        let mut fs = self.active_fs();
         let p = path.to_path_buf();
         let cache = self.cache();
         let dir_id = FileId::synthetic(path);
 
         // 阻塞部分：读目录 + 缓存预填 + 排序，全部在 blocking 线程完成。
-        let (dir, for_verify) = self
-            .spawn_blocking(move || -> Result<(Directory, Vec<Entry>), MoError> {
-                let raw = fs.read_dir_blocking(&p)?;
-                let mut dir = Directory::new(dir_id, p);
-                dir.set_entries(
-                    raw.into_iter()
-                        .map(|r| Entry::new(r.id, r.name, r.kind, r.path))
-                        .collect(),
-                );
-                if let Some(c) = cache.as_ref() {
-                    let hits = MetadataScheduler::prime_from_cache(c, &mut dir.entries);
-                    if hits > 0 {
-                        tracing::debug!("元数据缓存命中 {hits}/{} 条", dir.entries.len());
+        //
+        // 这里是个「最多两轮」的循环：连接死在**读的那一瞬间**（探活时还活着）时
+        // 重连再读一次——网络抖一下不该变成用户脸上的一条报错。
+        let mut retried = false;
+        let (dir, for_verify) = loop {
+            let fs_task = fs.clone();
+            let p_task = p.clone();
+            let cache_task = cache.clone();
+            let outcome = self
+                .spawn_blocking(move || -> Result<(Directory, Vec<Entry>), MoError> {
+                    let raw = fs_task.read_dir_blocking(&p_task)?;
+                    let mut dir = Directory::new(dir_id, p_task);
+                    dir.set_entries(
+                        raw.into_iter()
+                            .map(|r| Entry::new(r.id, r.name, r.kind, r.path))
+                            .collect(),
+                    );
+                    if let Some(c) = cache_task.as_ref() {
+                        let hits = MetadataScheduler::prime_from_cache(c, &mut dir.entries);
+                        if hits > 0 {
+                            tracing::debug!("元数据缓存命中 {hits}/{} 条", dir.entries.len());
+                        }
                     }
+                    dir.loading = false;
+                    dir.rebuild_view();
+                    // 后台校验需要一份条目副本（在 blocking 线程里克隆，不占异步 worker）。
+                    let for_verify = dir.entries.clone();
+                    Ok((dir, for_verify))
+                })
+                .await
+                .map_err(|e| MoError::Other(format!("读取目录的任务失败：{e}")))?;
+            match outcome {
+                Ok(v) => break v,
+                Err(e) if !retried && session.is_some() && mo_remote::is_disconnected(&e) => {
+                    retried = true;
+                    let id = session.expect("上面判过 `is_some`");
+                    tracing::warn!("读目录时连接已断，重连后重试一次：{e}");
+                    self.reconnect(id)
+                        .await
+                        .map_err(|f| MoError::Other(f.to_string()))?;
+                    // 注册表里那条连接已经换成新的了，重新取一份。
+                    fs = self.active_fs();
                 }
-                dir.loading = false;
-                dir.rebuild_view();
-                // 后台校验需要一份条目副本（在 blocking 线程里克隆，不占异步 worker）。
-                let for_verify = dir.entries.clone();
-                Ok((dir, for_verify))
-            })
-            .await
-            .map_err(|e| MoError::Other(format!("读取目录的任务失败：{e}")))??;
+                Err(e) => return Err(e),
+            }
+        };
 
         let first_screen = dir.visible_count().min(200);
 
@@ -548,9 +713,13 @@ impl AppState {
 
         // 记下这条会话待过的地方：切回本地再回来时回到同一层（见 `use_session`）。
         // 只在真读成功之后记，路径打错不该覆盖上次的位置。
+        //
+        // 顺带刷新「这条连接还能用」的时刻：能走到这里说明刚才那次目录读取真的成功了，
+        // 下一次读之前就不必再探活（见 `revive_if_stale`）。
         if let Some(id) = self.active_session() {
             self.sessions
                 .set_path(id, path.to_string_lossy().to_string());
+            self.sessions.touch(id);
         }
 
         // 切换监听目标：新目录替换旧 watcher，旧 watcher 被 drop 即停止监听。
@@ -722,25 +891,67 @@ impl AppState {
     }
 
     /// 建连接 + 切换浏览态（首次连接与带凭据重试共用同一条路）。
+    ///
+    /// 同端点同用户名的会话已经在了，就**在它身上收场**，按密码分两种：
+    ///
+    /// * 密码没变（或地址里干脆没写密码，走钥匙串 / 匿名）——直接切过去，连 socket
+    ///   都不重建，这是「切回本地不断开连接」省下的另一半；
+    /// * 密码变了——真连一次，然后把那条会话的连接与凭据**原地**换掉。编号不变，
+    ///   所以侧边栏还是那一行，不会多出一条来。
     async fn finish_connect(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
-        let endpoint = url.endpoint();
-
-        // 已经有一条能直接复用的会话（同主机 + 同用户名 + 同密码）？别再登一次。
-        //
-        // 这是「切回本地不断开连接」省下的另一半：从本地切回远程时不只省掉登录，
-        // 连 socket 都不重建。用户名或密码变了说明用户想换凭据，那必须真连（走下面）。
-        if let Some(id) = self.sessions.find(&url) {
+        if let Some(existing) = self.sessions.find(&url) {
+            let id = existing.id;
             let path = url.path.clone();
+            if url.password.is_none() || url.password == existing.url.password {
+                return self
+                    .use_session(id, Some(&path))
+                    .await
+                    .map_err(|e| ConnectFailure::Message(e.to_string()));
+            }
+            // 换了凭据：这里以前是「再加一条新会话」，于是同一台服务器同一个账号会
+            // 留下两行——旧那行往往已经死了（服务器改了密码 / 闲置被掐断），点它又
+            // 是一次失败。一行一条连接才是侧边栏该有的样子。
+            let connected = self.connect_now(&url).await?;
+            self.sessions.set_url_and_fs(id, url, connected);
             return self
                 .use_session(id, Some(&path))
                 .await
                 .map_err(|e| ConnectFailure::Message(e.to_string()));
         }
 
-        // 先 clone 一份给闭包：下面还要把原 `url` 存进会话。
-        let url_for_connect = url.clone();
-        let connected = self
-            .spawn_blocking(move || mo_remote::connect(&url_for_connect))
+        let connected = self.connect_now(&url).await?;
+
+        // 登记成一条新会话，并切到这个标签页看它。
+        //
+        // 端点相同而**账号不同**的会话仍然并存（注册表允许同端点多个账号）：那种
+        // 情况上面的 `find` 匹配不上，确实该另登一条、另占一行。断开只走显式那条路。
+        let id = self.sessions.add(url, connected);
+        // 切过去并进入远程根目录。读失败会把浏览态整体回滚回原样（连接留着——它
+        // 其实是通的，用户可以点侧边栏那一行再试），免得留下「徽标说 FTP、列表是
+        // 本地那份」的半切换态。
+        self.switch_source(
+            Source {
+                active: Some(id),
+                on_remote: true,
+            },
+            Path::new("/"),
+        )
+        .await
+        .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 真去建一条连接（首次连接与「换了凭据原地重连」共用这一条路）。
+    ///
+    /// 走注册表里那个可注入的 [`Connector`]（生产环境就是 `mo_remote::connect`）：
+    /// 「换了凭据之后用的仍是**那一条**会话」这件事得能测——测试没法真连一台 FTP，
+    /// 但能让 connector 每次返回一个列着不同文件名的假连接（见 `remote_local` 用例）。
+    async fn connect_now(&self, url: &RemoteUrl) -> Result<Arc<dyn FileSystem>, ConnectFailure> {
+        let endpoint = url.endpoint();
+        let user = url.user.clone().unwrap_or_default();
+        let connect = self.sessions.connector();
+        let target = url.clone();
+        self.spawn_blocking(move || connect(&target))
             .await
             .map_err(|e| ConnectFailure::Message(format!("连接任务失败：{e}")))?
             .map_err(|e| match e {
@@ -748,29 +959,12 @@ impl AppState {
                 mo_remote::RemoteError::AuthRequired { detail, .. } => {
                     ConnectFailure::NeedsCredentials {
                         endpoint,
-                        user: url.user.clone().unwrap_or_default(),
+                        user,
                         detail,
                     }
                 }
                 other => ConnectFailure::Message(other.to_string()),
-            })?;
-
-        // 登记成一条新会话，并切到这个标签页看它。
-        //
-        // **不动已有的会话**：别的标签页可能正看着它们，即便是同一台机器，也可能是
-        // 另一个账号（注册表允许同端点多个账号并存）。断开只走显式那条路。
-        let id = self.sessions.add(url, connected);
-        {
-            let mut src = self.source.lock().unwrap();
-            src.active = Some(id);
-            src.on_remote = true;
-        }
-        // 进入远程根目录，并清空本地导航历史，避免回退混进本地路径。
-        self.inner.write().await.navigation = NavigationState::new();
-        self.open_directory(Path::new("/"))
-            .await
-            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        Ok(())
+            })
     }
 
     /// 「记住的服务器」列表（最近使用的在前）。
@@ -864,6 +1058,95 @@ impl AppState {
         }
     }
 
+    /// 确认这条会话的连接还能用：闲置够久就先探活，断了就**原地重连**。
+    ///
+    /// 用户报的场景：连上 FTP → 切去本地干活 → 过一阵子切回来。服务器早把闲置的
+    /// 控制连接掐了，于是「切回去」等于对一条死 socket 发命令，界面弹
+    /// `Broken pipe (os error 32)`。连接对象连同凭据都还在注册表里，重连不需要
+    /// 用户再做任何事。
+    ///
+    /// 返回 `Err` 说明这条连接当前不可用：凭据被拒（`NeedsCredentials`，UI 可以
+    /// 据此弹认证框）或别的失败。
+    async fn revive_if_stale(&self, id: SessionId) -> Result<(), ConnectFailure> {
+        let Some(session) = self.sessions.entry(id) else {
+            return Err(ConnectFailure::Message(
+                "这条远程连接已经断开了".to_string(),
+            ));
+        };
+        // 刚用过就不必探活：一次 NOOP / stat 也是一次网络往返。
+        if session.last_used.elapsed() < IDLE_PROBE {
+            return Ok(());
+        }
+        let fs = session.fs.clone();
+        let alive = self
+            .spawn_blocking(move || fs.is_alive())
+            .await
+            .unwrap_or(false);
+        if alive {
+            self.sessions.touch(id);
+            return Ok(());
+        }
+        self.reconnect(id).await
+    }
+
+    /// 重建这条会话的连接：**不看探活结果**（要么探活说断了，要么读目录已经失败）。
+    ///
+    /// 连接对象在注册表里**原地替换**，编号不变——侧边栏那一行不闪、高亮不跳。
+    async fn reconnect(&self, id: SessionId) -> Result<(), ConnectFailure> {
+        let Some(session) = self.sessions.entry(id) else {
+            return Err(ConnectFailure::Message(
+                "这条远程连接已经断开了".to_string(),
+            ));
+        };
+        let url = session.url.clone();
+        let endpoint = url.endpoint();
+        let user = url.user.clone().unwrap_or_default();
+        let connect = self.sessions.connector();
+        let connected = self
+            .spawn_blocking(move || connect(&url))
+            .await
+            .map_err(|e| ConnectFailure::Message(format!("重连任务失败：{e}")))?
+            .map_err(|e| match e {
+                // 服务器拒了凭据（比如闲置期间那边改了密码）：交给 UI 弹认证框。
+                mo_remote::RemoteError::AuthRequired { detail, .. } => {
+                    ConnectFailure::NeedsCredentials {
+                        endpoint,
+                        user,
+                        detail,
+                    }
+                }
+                other => ConnectFailure::Message(format!("重新连接失败：{other}")),
+            })?;
+        self.sessions.set_fs(id, connected);
+        Ok(())
+    }
+
+    /// 切来源的统一收尾：先记下原状态，切失败就**整体回滚**。
+    ///
+    /// 半切换态是最难查的一类 bug：`on_remote` 已经翻了、目录却没换成，于是标签页
+    /// 徽标与地址栏说自己在 FTP、列表还是本地那一份，侧边栏两边同时高亮（用户报的
+    /// 「关闭弹窗后左侧选中了 2 个项目」正是这个）。
+    ///
+    /// 回滚连导航栈一起还：`open_directory` 会把新路径压进历史，失败后留着它，
+    /// 「后退」就会拿远程路径去本地读。
+    async fn switch_source(&self, src: Source, target: &Path) -> Result<(), MoError> {
+        let prev_src = self.source.lock().unwrap().clone();
+        let prev_nav = self.inner.read().await.navigation.clone();
+        let changed = prev_src.on_remote != src.on_remote || prev_src.active != src.active;
+        *self.source.lock().unwrap() = src;
+        // 换来源 = 换了一套路径命名空间：导航栈必须重置，否则「后退」会拿远程路径
+        // 去本地读、或反过来。
+        if changed {
+            self.inner.write().await.navigation = NavigationState::new();
+        }
+        if let Err(e) = self.open_directory(target).await {
+            *self.source.lock().unwrap() = prev_src;
+            self.inner.write().await.navigation = prev_nav;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// 打开本地目录。
     ///
     /// 当前在看远程时**只把「看哪边」切回本地，连接留着**：切来源要重置导航栈
@@ -872,22 +1155,27 @@ impl AppState {
     ///
     /// 侧边栏快捷访问与地址栏的本地路径输入都走这里，保证「回到本地」显式且安全。
     pub async fn open_local(&self, path: &Path) -> Result<(), MoError> {
-        let switched = {
-            let mut src = self.source.lock().unwrap();
-            let was_remote = src.on_remote;
-            src.on_remote = false;
-            was_remote
+        let src = {
+            let cur = self.source.lock().unwrap();
+            Source {
+                on_remote: false,
+                ..cur.clone()
+            }
         };
-        if switched {
-            self.inner.write().await.navigation = NavigationState::new();
-        }
-        self.open_directory(path).await
+        self.switch_source(src, path).await
     }
 
-    /// 切到指定会话（侧边栏那条连接点一下走这里）：不重新登录、不重建 socket，
-    /// 只是把浏览态切过去，并回到它上次待过的目录。
-    pub async fn open_connection(&self, id: SessionId) -> Result<(), MoError> {
-        self.use_session(id, None).await
+    /// 切到指定会话（侧边栏那条连接点一下走这里）：把浏览态切过去，并回到它上次
+    /// 待过的目录。
+    ///
+    /// 连接断了（闲置被服务器掐掉）会**先原地重连**，用户什么也不用做；返回
+    /// [`ConnectFailure`] 是为了把「服务器拒绝这组凭据」单独带出来，让 UI 弹认证框
+    /// 而不是干显示一句话。
+    pub async fn open_connection(&self, id: SessionId) -> Result<(), ConnectFailure> {
+        self.revive_if_stale(id).await?;
+        self.use_session(id, None)
+            .await
+            .map_err(|e| ConnectFailure::Message(e.to_string()))
     }
 
     /// 切回本标签页刚才待过的那条会话（`Ok` 时当前就在远程了）。
@@ -923,15 +1211,14 @@ impl AppState {
             }
             None => remembered,
         };
-        {
-            let mut src = self.source.lock().unwrap();
-            src.active = Some(id);
-            src.on_remote = true;
-        }
-        // 换来源 = 换了一套路径命名空间：导航栈必须重置，否则「后退」会拿远程路径
-        // 去本地读、或反过来。
-        self.inner.write().await.navigation = NavigationState::new();
-        self.open_directory(Path::new(&target)).await
+        self.switch_source(
+            Source {
+                active: Some(id),
+                on_remote: true,
+            },
+            Path::new(&target),
+        )
+        .await
     }
 
     /// 活着的全部连接（侧边栏「远程」区按它渲染；任何标签页看到的都是同一张表）。
@@ -1111,6 +1398,28 @@ impl AppState {
             .as_ref()
             .map(|d| d.entries.clone())
             .unwrap_or_default()
+    }
+
+    /// 这个路径**是不是目录**——问列表模型（`EntryKind`），**不问本地磁盘**。
+    ///
+    /// 为什么不直接用 `Path::is_dir()`：那查的是**本机文件系统**，而远程条目的路径
+    /// （`/1`）在本机根本不存在，远程目录会被一律判成「文件」，双击 / 回车把它交给
+    /// 系统默认应用去打开——用户看到的就是日志里那几行
+    /// `The file /1 does not exist.`，界面一动不动。
+    ///
+    /// 判据取当前目录列表里那一行的 `kind`（零 IO）：列表画着文件夹图标、双击就该
+    /// 进去，两者必须同源。返回 `None` = 这个路径不在当前列表里（分栏中兄弟列的条目、
+    /// 磁盘分析 / 搜索结果、书签……），由调用方决定怎么兜底。
+    pub async fn entry_is_dir(&self, path: &Path) -> Option<bool> {
+        self.inner
+            .read()
+            .await
+            .directory
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.kind.is_dir())
     }
 
     /// 当前目录路径。

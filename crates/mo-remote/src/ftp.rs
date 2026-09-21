@@ -60,7 +60,7 @@ impl FtpFileSystem {
         let conn = rt.block_on(async {
             let mut stream = AsyncFtpStream::connect(&addr)
                 .await
-                .map_err(|e| RemoteError::transport("连接", e))?;
+                .map_err(|e| transport_error("连接", e))?;
             stream.login(&user, &password).await.map_err(login_error)?;
             Ok::<_, RemoteError>(stream)
         })?;
@@ -75,6 +75,24 @@ impl FtpFileSystem {
     /// 连接对应的地址（回显时不带密码）。
     pub fn url(&self) -> &RemoteUrl {
         &self.url
+    }
+
+    /// 探活：发一个 `NOOP` 看控制连接还在不在。
+    ///
+    /// `NOOP` 是 RFC 959 要求必须实现的、一次往返、不改任何状态——正好回答
+    /// 「闲置这一阵之后，这条控制连接还在吗」。**必须带超时**（见
+    /// [`crate::PROBE_TIMEOUT`]），超时按「断了」处理。
+    ///
+    /// 阻塞式：走本连接自有的 runtime，和其余动作同一个约定（见模块文档）。
+    pub fn is_alive(&self) -> bool {
+        self.rt.block_on(async {
+            let probe = tokio::time::timeout(crate::PROBE_TIMEOUT, async {
+                let mut conn = self.conn.lock().await;
+                conn.noop().await
+            })
+            .await;
+            matches!(probe, Ok(Ok(())))
+        })
     }
 
     /// 把 trait 里的路径统一成远程绝对路径字符串。
@@ -97,7 +115,7 @@ impl FtpFileSystem {
                 let lines = conn
                     .list(Some(dir))
                     .await
-                    .map_err(|e| MoError::from(RemoteError::transport("列目录", e)))?;
+                    .map_err(|e| MoError::from(transport_error("列目录", e)))?;
                 Ok(lines.iter().filter_map(|l| parse_list(l)).collect())
             }
         }
@@ -129,6 +147,29 @@ impl FtpFileSystem {
     }
 }
 
+/// 把底层错误分成「连接断了」与「这一步没做成」。
+///
+/// 优先用 `io::ErrorKind`：`suppaftp` 把网络错误包在
+/// `FtpError::ConnectionError(io::Error)` 里，能拿到真正的 kind；拿不到 kind 的
+/// 再用错误文本兜底（见 [`crate::text_looks_disconnected`]）。
+///
+/// 这个分类决定上层「重连重试」还是「报错给用户」——用户报的那个
+/// `Connection error: Broken pipe (os error 32)` 就是漏在了这里。
+fn transport_error(kind: &'static str, e: suppaftp::FtpError) -> RemoteError {
+    let text = e.to_string();
+    let disconnected = match &e {
+        suppaftp::FtpError::ConnectionError(io) => {
+            crate::io_kind_is_disconnect(io.kind()) || crate::text_looks_disconnected(&text)
+        }
+        _ => crate::text_looks_disconnected(&text),
+    };
+    if disconnected {
+        RemoteError::disconnected(kind, text)
+    } else {
+        RemoteError::transport(kind, text)
+    }
+}
+
 /// 有些服务器在 MLSD / LIST 里回的是完整路径，只留最后一段当名字。
 fn file_name_only(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
@@ -157,12 +198,16 @@ fn login_error(e: suppaftp::FtpError) -> RemoteError {
         suppaftp::FtpError::UnexpectedResponse(resp) if resp.status.code() == 530 => {
             RemoteError::auth("登录", &e)
         }
-        _ => RemoteError::transport("登录", e),
+        _ => transport_error("登录", e),
     }
 }
 
 #[async_trait]
 impl FileSystem for FtpFileSystem {
+    fn is_alive(&self) -> bool {
+        FtpFileSystem::is_alive(self)
+    }
+
     async fn read_dir(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         self.entries_in(&Self::remote(path)).await
     }
@@ -192,7 +237,7 @@ impl FileSystem for FtpFileSystem {
         let mut conn = self.conn.lock().await;
         conn.mkdir(&remote)
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("建目录", e)))
+            .map_err(|e| MoError::from(transport_error("建目录", e)))
     }
 
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
@@ -206,7 +251,7 @@ impl FileSystem for FtpFileSystem {
         let mut cursor = Cursor::new(contents.to_vec());
         conn.put_file(&remote, &mut cursor)
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("上传", e)))?;
+            .map_err(|e| MoError::from(transport_error("上传", e)))?;
         Ok(())
     }
 
@@ -215,7 +260,7 @@ impl FileSystem for FtpFileSystem {
         let mut conn = self.conn.lock().await;
         conn.rm(&remote)
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("删除文件", e)))
+            .map_err(|e| MoError::from(transport_error("删除文件", e)))
     }
 
     async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
@@ -223,14 +268,14 @@ impl FileSystem for FtpFileSystem {
         let mut conn = self.conn.lock().await;
         conn.rmdir(&remote)
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("删除目录", e)))
+            .map_err(|e| MoError::from(transport_error("删除目录", e)))
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
         let mut conn = self.conn.lock().await;
         conn.rename(&Self::remote(from), &Self::remote(to))
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("重命名", e)))
+            .map_err(|e| MoError::from(transport_error("重命名", e)))
     }
 }
 
@@ -283,6 +328,37 @@ mod tests {
             matches!(login_error(err), RemoteError::Transport { .. }),
             "421 不该被当成「需要凭据」"
         );
+    }
+
+    /// 连接被掐断（用户报的那个 `Broken pipe (os error 32)`）必须归到
+    /// `Disconnected`——上层据此重建连接重试，而不是把它当普通错误弹给用户。
+    #[test]
+    fn broken_pipe_is_classified_as_disconnected() {
+        let e = suppaftp::FtpError::ConnectionError(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Broken pipe",
+        ));
+        assert!(
+            matches!(
+                transport_error("列目录", e),
+                RemoteError::Disconnected { .. }
+            ),
+            "断掉的连接要能被认出来"
+        );
+    }
+
+    /// 别的失败照旧是普通传输错误：别把「550 目录不存在」当成断线去重连
+    /// （那会变成「每次进一个不存在的目录都重登一次」）。
+    #[test]
+    fn other_failures_stay_transport() {
+        let e = suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response {
+            status: suppaftp::Status::from(550u32),
+            body: b"550 Failed to change directory.".to_vec(),
+        });
+        assert!(matches!(
+            transport_error("列目录", e),
+            RemoteError::Transport { .. }
+        ));
     }
 
     #[test]

@@ -363,7 +363,9 @@ pub fn render(
             row.interactivity().on_click(move |ev, _window, cx| {
                 // 双击（click_count >= 2）：进入目录 / 预览文件，与 Enter 同语义。
                 if ev.click_count() >= 2 {
-                    entity_click.update(cx, |v, cx| v.open_entry(entry_path.clone(), cx));
+                    // `is_dir` 来自 `entry.kind`（列表模型），不是 `Path::is_dir()`
+                    // ——远程目录在本地磁盘上不存在，见 `RootView::open_entry`。
+                    entity_click.update(cx, |v, cx| v.open_entry(entry_path.clone(), is_dir, cx));
                     return;
                 }
                 // 修饰键决定选择语义（Finder / 资源管理器一致）：

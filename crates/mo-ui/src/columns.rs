@@ -130,7 +130,7 @@ fn column_box(
         line.interactivity().on_click(move |ev, _window, cx| {
             click_entity.update(cx, |v, cx| {
                 if ev.click_count() >= 2 {
-                    v.open_entry(entry_path.clone(), cx);
+                    v.open_entry(entry_path.clone(), is_dir, cx);
                     return;
                 }
                 v.set_column_cursor(pane, tab, index, i);

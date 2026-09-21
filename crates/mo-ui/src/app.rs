@@ -1306,7 +1306,7 @@ impl RootView {
     /// * `Ok` —— 关掉对话框（记住服务器由调用方另行处理）；
     /// * `NeedsCredentials` —— 换到认证弹窗，并带上这次用的用户名；
     /// * `Message` —— 就地显示错误，对话框留着让用户改地址重试。
-    fn on_connect_result(
+    pub(crate) fn on_connect_result(
         &mut self,
         outcome: Result<(), mo_app::ConnectFailure>,
         cx: &mut Context<Self>,
@@ -1829,9 +1829,16 @@ impl RootView {
         .detach();
     }
 
-    /// 打开一个条目（双击 / Enter 同语义）：目录进入，文件快速预览。
-    pub(crate) fn open_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if path.is_dir() {
+    /// 打开一个条目（双击 / 回车同语义）：目录进入，文件用系统默认应用打开。
+    ///
+    /// ⚠️ `is_dir` 必须由调用方从**列表模型**（`entry.kind`）传来，**不要**在这里查
+    /// `path.is_dir()`（也不要退回那个写法）：那是本机磁盘判断，远程条目的路径
+    /// （`/1`）在本机不存在，远程目录会被当成文件交给系统 `open`——日志里只有
+    /// `The file /1 does not exist.`，界面一动不动（用户报的 bug，双击和回车都中）。
+    /// 判据的守卫在 `mo-app`：`AppState::entry_is_dir` +
+    /// `crates/mo-app/tests/remote_local.rs::whether_an_entry_is_a_directory_comes_from_the_listing`。
+    pub(crate) fn open_entry(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        if is_dir {
             let app = self.app();
             cx.spawn(async move |_weak, _cx| {
                 let _ = app.open_directory(&path).await;
@@ -4183,7 +4190,8 @@ impl RootView {
         match action {
             A::Open => {
                 if let Some(p) = target {
-                    self.open_entry(p, cx);
+                    // `is_dir` 取自右键时那个条目在列表里的 `kind`（见 `open_entry`）。
+                    self.open_entry(p, is_dir, cx);
                 }
             }
             A::QuickLook => {
@@ -4572,11 +4580,14 @@ impl Render for RootView {
                 let mut row = div().flex().flex_row().flex_1().min_w_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
                 if self.ui.sidebar {
-                    row = row.child(sidebar::render(
-                        &self.panel().app,
-                        &self.panel().path,
-                        &entity,
-                    ));
+                    // 浏览远程时**不给「当前位置」**：远程绝对路径和本地路径在字符串上
+                    // 分不开（FTP 的 home 往往就是本机 home），拿去比对本地快捷访问，
+                    // 会让「图片」「文档」这些本地项跟着一起高亮——用户报的「关闭弹窗
+                    // 后左侧选中了 2 个项目」有一半来自这里。
+                    let current = (!self.panel().app.browsing_remote())
+                        .then(|| self.panel().path.clone())
+                        .flatten();
+                    row = row.child(sidebar::render(&self.panel().app, &current, &entity));
                 }
                 self.ensure_columns(cx);
                 for i in 0..visible_panes {
@@ -6142,7 +6153,10 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
     let Some(p) = app.selection_paths().await.into_iter().next() else {
         return; // 空目录：没有聚焦项，静默。
     };
-    if p.is_dir() {
+    // 目录判据问**列表模型**（`EntryKind`），不问本地磁盘：远程条目（`/1`）在本机
+    // 不存在，`Path::is_dir()` 会把远程目录判成文件、交给系统 `open`（用户报的
+    // `The file /1 does not exist.`）。列表里查不到（路径不在当前目录）才回落本机判断。
+    if app.entry_is_dir(&p).await.unwrap_or_else(|| p.is_dir()) {
         let _ = app.open_directory(&p).await;
         return;
     }

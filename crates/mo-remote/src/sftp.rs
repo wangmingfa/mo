@@ -71,7 +71,7 @@ impl SftpFileSystem {
                 .worker_threads(1)
                 .enable_all()
                 .build()
-                .map_err(|e| RemoteError::transport("创建 runtime", e))?,
+                .map_err(|e| transport_error("创建 runtime", e))?,
         );
 
         let port = url.port_or_default().unwrap_or(22);
@@ -88,11 +88,11 @@ impl SftpFileSystem {
             let config = Arc::new(Config::default());
             let mut client = connect(config, addr, ClientHandler)
                 .await
-                .map_err(|e| RemoteError::transport("连接", e))?;
+                .map_err(|e| transport_error("连接", e))?;
             let auth = client
                 .authenticate_password(&user, &password)
                 .await
-                .map_err(|e| RemoteError::transport("认证", e))?;
+                .map_err(|e| transport_error("认证", e))?;
             // `AuthResult::Failure` 就是「凭据不对」——报成 `AuthRequired` 而不是
             // `Transport`，UI 才会弹「输入账号密码」的框而不是干显示一句错误。
             // （`Err(..)` 那条是传输层故障，仍走 `transport`。）
@@ -102,15 +102,15 @@ impl SftpFileSystem {
             let channel = client
                 .channel_open_session()
                 .await
-                .map_err(|e| RemoteError::transport("打开通道", e))?;
+                .map_err(|e| transport_error("打开通道", e))?;
             channel
                 .request_subsystem(true, "sftp")
                 .await
-                .map_err(|e| RemoteError::transport("启动 sftp 子系统", e))?;
+                .map_err(|e| transport_error("启动 sftp 子系统", e))?;
             let stream = channel.into_stream();
             SftpSession::new(stream)
                 .await
-                .map_err(|e| RemoteError::transport("初始化 sftp", e))
+                .map_err(|e| transport_error("初始化 sftp", e))
         })?;
 
         Ok(Self {
@@ -123,6 +123,23 @@ impl SftpFileSystem {
     /// 连接对应的地址（回显时不带密码）。
     pub fn url(&self) -> &RemoteUrl {
         &self.url
+    }
+
+    /// 探活：`stat(".")` 一次往返。
+    ///
+    /// 选 `stat` 而不是别的：每个 SFTP 服务器都必须实现它、一次往返、不改任何
+    /// 状态。**带超时**（见 [`crate::PROBE_TIMEOUT`]）：SSH 通道已经死了但没有
+    /// FIN 时请求会一直等（`russh-sftp` 自己的每请求超时是 10 秒，比这里长），
+    /// 超时按「断了」处理，交给上层重建连接。
+    pub fn is_alive(&self) -> bool {
+        self.rt.block_on(async {
+            let probe = tokio::time::timeout(crate::PROBE_TIMEOUT, async {
+                let s = self.sftp.lock().await;
+                s.metadata(".".to_string()).await
+            })
+            .await;
+            matches!(probe, Ok(Ok(_)))
+        })
     }
 
     /// 把 trait 里的路径统一成远程绝对路径字符串。
@@ -146,6 +163,20 @@ impl SftpFileSystem {
     }
 }
 
+/// 把 SFTP 侧的错误分成「连接断了」与「这一步没做成」。
+///
+/// 只能按**文本**判：`russh_sftp::Error::IO(String)` 把底层错误拍成了字符串
+/// （那个枚举不带 `source`），`russh::Error` 虽然带 `io::Error` 但连接期 / 会话期
+/// 混在一起、类型也杂；统一走 [`crate::text_looks_disconnected`] 更省心，判据本身
+/// 在那边有单测钉着（含 `Error::Timeout` —— 闲置之后一次请求超时等价于断线）。
+fn transport_error(kind: &'static str, e: impl std::fmt::Display) -> RemoteError {
+    if crate::text_looks_disconnected(&e.to_string()) {
+        RemoteError::disconnected(kind, e)
+    } else {
+        RemoteError::transport(kind, e)
+    }
+}
+
 /// 把 `ReadDir` 的迭代结果映射成上层条目（已自动过滤 `.` / `..`）。
 fn collect_entries(rd: impl Iterator<Item = DirEntry>) -> Vec<ReadDirEntry> {
     rd.map(|de| {
@@ -163,6 +194,10 @@ fn collect_entries(rd: impl Iterator<Item = DirEntry>) -> Vec<ReadDirEntry> {
 
 #[async_trait]
 impl FileSystem for SftpFileSystem {
+    fn is_alive(&self) -> bool {
+        SftpFileSystem::is_alive(self)
+    }
+
     async fn read_dir(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         let remote = Self::remote(path);
         let sftp = self.sftp.clone();
@@ -172,7 +207,7 @@ impl FileSystem for SftpFileSystem {
                 sftp.read_dir(remote).await
             })
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("列目录", e)))?;
+            .map_err(|e| MoError::from(transport_error("列目录", e)))?;
         Ok(collect_entries(rd))
     }
 
@@ -185,7 +220,7 @@ impl FileSystem for SftpFileSystem {
                 let sftp = sftp.lock().await;
                 sftp.read_dir(remote).await
             })
-            .map_err(|e| MoError::from(RemoteError::transport("列目录", e)))?;
+            .map_err(|e| MoError::from(transport_error("列目录", e)))?;
         Ok(collect_entries(rd))
     }
 
@@ -198,7 +233,7 @@ impl FileSystem for SftpFileSystem {
                 s.metadata(remote).await
             })
             .await
-            .map_err(|e| MoError::from(RemoteError::transport("读取元数据", e)))?;
+            .map_err(|e| MoError::from(transport_error("读取元数据", e)))?;
         Ok(FileMetadata {
             size: meta.size.unwrap_or(0),
             modified: meta.mtime.map(system_time_from_unix),
@@ -215,7 +250,7 @@ impl FileSystem for SftpFileSystem {
             s.create_dir(remote).await
         })
         .await
-        .map_err(|e| MoError::from(RemoteError::transport("建目录", e)))
+        .map_err(|e| MoError::from(transport_error("建目录", e)))
     }
 
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
@@ -228,13 +263,13 @@ impl FileSystem for SftpFileSystem {
             // 这里先探一次存在性：存在就拒绝，绝不静默覆盖远端数据。
             if s.try_exists(remote.clone())
                 .await
-                .map_err(|e| MoError::from(RemoteError::transport("检查存在", e)))?
+                .map_err(|e| MoError::from(transport_error("检查存在", e)))?
             {
                 return Err(MoError::Other(format!("远端已存在 {remote}——拒绝覆盖")));
             }
             s.write(remote, &contents)
                 .await
-                .map_err(|e| MoError::from(RemoteError::transport("上传", e)))
+                .map_err(|e| MoError::from(transport_error("上传", e)))
         })
         .await
     }
@@ -247,7 +282,7 @@ impl FileSystem for SftpFileSystem {
             s.remove_file(remote).await
         })
         .await
-        .map_err(|e| MoError::from(RemoteError::transport("删除文件", e)))
+        .map_err(|e| MoError::from(transport_error("删除文件", e)))
     }
 
     async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
@@ -258,7 +293,7 @@ impl FileSystem for SftpFileSystem {
             s.remove_dir(remote).await
         })
         .await
-        .map_err(|e| MoError::from(RemoteError::transport("删除目录", e)))
+        .map_err(|e| MoError::from(transport_error("删除目录", e)))
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
@@ -270,7 +305,7 @@ impl FileSystem for SftpFileSystem {
             s.rename(from, to).await
         })
         .await
-        .map_err(|e| MoError::from(RemoteError::transport("重命名", e)))
+        .map_err(|e| MoError::from(transport_error("重命名", e)))
     }
 }
 
