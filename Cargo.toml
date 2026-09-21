@@ -115,6 +115,10 @@ suppaftp = { version = "12", default-features = false, features = ["tokio"] }
 # SFTP 后端：纯 Rust SSH 实现（默认 aws-lc-rs 加密后端，无本机 libssh2 / OpenSSL 依赖）。
 russh = { version = "0.63" }
 russh-sftp = { version = "3" }
+# WebDAV 后端：基于 reqwest 的异步 PROPFIND/PUT/MKCOL/DELETE/MOVE 客户端（纯 Rust）。
+reqwest_dav = { version = "0.3" }
+# PROPFIND 的 href 是百分号编码的路径，还原成真实文件名要用它（纯 Rust、无本机依赖）。
+percent-encoding = { version = "2" }
 
 [profile.release]
 opt-level = 3

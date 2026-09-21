@@ -93,6 +93,37 @@ pub const PLUS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 /// 「从列表里移除」，而这里真正的语义是「把这条连接关掉」。
 pub const POWER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>"##;
 
+// ---- 远程协议图标（与上面同源风格：24×24、描边 2、单色描边）----
+//
+// 一个协议一个形状，靠**结构**区分而不是颜色（列表里是单色的）。认不出的协议
+// 回落到 [`GLOBE`]，不留空白位。
+
+/// SMB / 网络共享：三台节点连成一张网（共享文件夹挂在网络上）。
+pub const SMB: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg>"##;
+
+/// FTP / SFTP：托盘上一上一下两支箭头——协议本体就是「双向搬运文件」。
+pub const FTP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 15v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3"/><path d="M9 3v9"/><polyline points="6 9 9 12 12 9"/><path d="M15 12V3"/><polyline points="12 6 15 3 18 6"/></svg>"##;
+
+/// WebDAV：一朵云（DAV over HTTP(S)，实际用的基本都是坚果云 / Nextcloud 这类网盘）。
+pub const WEBDAV: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>"##;
+
+/// 按远程地址挑协议图标（`endpoint` 形如 `scheme://host[:port]`）。
+///
+/// scheme 正常由 `RemoteUrl::parse` 归一成了小写，但配置是明文 JSON、可能被手改过，
+/// 这里再挡一手大小写；`://` 缺失或协议不认识时回落到 [`GLOBE`]，不画空位。
+pub fn protocol_icon(endpoint: &str) -> &'static [u8] {
+    let scheme = endpoint
+        .split_once("://")
+        .map_or("", |(s, _)| s)
+        .to_ascii_lowercase();
+    match scheme.as_str() {
+        "smb" | "cifs" | "samba" => SMB,
+        "ftp" | "ftps" | "sftp" | "ssh" => FTP,
+        "webdav" | "dav" | "davs" => WEBDAV,
+        _ => GLOBE,
+    }
+}
+
 pub const QA_DESKTOP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>"##;
 
 pub const QA_DOWNLOAD: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>"##;
@@ -171,5 +202,27 @@ pub fn quick_access_icon(label: &str) -> &'static [u8] {
         FILE_VIDEO
     } else {
         FOLDER
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 协议图标：一个协议一个形状，别名归到同一个，认不出的回落到地球。
+    #[test]
+    fn protocol_icon_maps_scheme_aliases_and_falls_back() {
+        assert_eq!(protocol_icon("smb://172.25.48.48"), SMB);
+        assert_eq!(protocol_icon("cifs://nas/share"), SMB);
+        assert_eq!(protocol_icon("ftp://example.com:2121"), FTP);
+        assert_eq!(protocol_icon("sftp://example.com"), FTP);
+        assert_eq!(protocol_icon("webdav://cloud.example.com"), WEBDAV);
+        assert_eq!(protocol_icon("dav://cloud.example.com"), WEBDAV);
+        assert_eq!(protocol_icon("davs://cloud.example.com"), WEBDAV);
+        // 配置是明文 JSON，可能被手改过：大小写与畸形地址都不该 panic，也不该空着。
+        assert_eq!(protocol_icon("SMB://x"), SMB);
+        assert_eq!(protocol_icon("nfs://x"), GLOBE);
+        assert_eq!(protocol_icon("没有协议前缀"), GLOBE);
+        assert_eq!(protocol_icon(""), GLOBE);
     }
 }

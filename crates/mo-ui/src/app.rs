@@ -24,6 +24,14 @@ const SIDEBAR_WIDTH: f32 = 188.0;
 /// 地址栏编辑态的占位文字（空输入时显示）。
 pub(crate) const ADDRESS_PLACEHOLDER: &str = "输入路径，回车跳转";
 
+/// 「连接到服务器」地址框的占位文字（空输入时显示）。
+///
+/// 回答两件事：现在支持哪些协议、长什么样。写全 scheme 名（含 `davs`）——
+/// 「webdav 该输哪个前缀」正是用户最容易卡住的点，详细写法看对话框里的
+/// 「使用说明」折叠区。
+pub(crate) const CONNECT_ADDRESS_PLACEHOLDER: &str =
+    "支持 ftp / sftp / webdav / davs，例：davs://主机/路径";
+
 /// 同步计划最多列出这么多项（再多也只报总数，避免一次画几千行）。
 const PLAN_LIMIT: usize = 400;
 
@@ -251,7 +259,7 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         },
         CmdDef {
             id: CommandId::ConnectServer,
-            title: "连接到服务器…（FTP / SFTP 等远程协议）".to_string(),
+            title: "连接到服务器…（FTP / SFTP / WebDAV 等远程协议）".to_string(),
             category: "导航".to_string(),
         },
         CmdDef {
@@ -628,6 +636,8 @@ pub struct RootView {
     pub(crate) connect_servers: Vec<mo_app::SavedServer>,
     /// 认证弹窗（用户名 / 密码 / 记住密码）的状态；`None` = 不在认证态。
     pub(crate) connect_auth: Option<ConnectAuthState>,
+    /// 「使用说明」折叠区是否展开（默认折叠，展开后列出各协议的地址写法）。
+    pub(crate) connect_help_open: bool,
     /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
     /// 通过 [`RootView::notice`] 的 `ok` 参数设置，关闭提示时清回 `None`。
     pub(crate) notice_ok: Option<String>,
@@ -742,6 +752,7 @@ impl RootView {
             connect_error: None,
             connect_servers: Vec::new(),
             connect_auth: None,
+            connect_help_open: false,
             notice_ok: None,
         };
 
@@ -1086,7 +1097,8 @@ impl RootView {
             return;
         }
         if self.connect_input.is_none() {
-            let state = cx.new(|cx| InputState::new(window, cx));
+            let state =
+                cx.new(|cx| InputState::new(window, cx).placeholder(CONNECT_ADDRESS_PLACEHOLDER));
             let sub = cx.subscribe_in(
                 &state,
                 window,
@@ -1433,6 +1445,94 @@ impl RootView {
         }
         body = body.child(field);
 
+        // 「使用说明」折叠区：默认收起，点一下展开各协议的地址写法。
+        // 放在地址框正下方——用户敲地址卡住时最需要它，但平时不该占对话框高度。
+        let ent_help = entity.clone();
+        let mut help_toggle = div()
+            .id("mo-connect-help-toggle")
+            .flex()
+            .items_center()
+            .h(px(22.0))
+            .px(px(6.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::hover_bg()))
+            // 测试用（release no-op）：定位这个折叠开关。
+            .debug_selector(|| "mo-connect-help-toggle".to_string())
+            .child(text!(if self.connect_help_open {
+                "使用说明 ▾".to_string()
+            } else {
+                "使用说明 ▸".to_string()
+            }));
+        help_toggle.interactivity().on_click(move |_, _window, cx| {
+            ent_help.update(cx, |v, cx| {
+                v.connect_help_open = !v.connect_help_open;
+                cx.notify();
+            });
+        });
+        body = body.child(help_toggle);
+
+        if self.connect_help_open {
+            // 每种已支持的协议一行：地址写法 + 说明。行各自带 .id()——同一 text!
+            // 站点在循环里渲染多次时，祖先 ID 链不同才不会撞 a11y 节点（debug 会崩）。
+            const LINES: [(&str, &str); 5] = [
+                (
+                    "ftp://主机[:端口]",
+                    "FTP，默认端口 21；匿名连接可不写用户名",
+                ),
+                ("sftp://主机[:端口]", "SFTP（SSH），默认端口 22"),
+                (
+                    "webdav://主机[:端口]",
+                    "WebDAV over HTTP，默认端口 80（dav:// 等价）",
+                ),
+                (
+                    "davs://主机[:端口]",
+                    "WebDAV over HTTPS，默认端口 443（坚果云 / Nextcloud 等）",
+                ),
+                (
+                    "通用：协议://用户名:密码@主机[:端口]/路径",
+                    "密码可不写，需要时会弹框询问；服务器子路径直接接在后面（如 /remote.php/dav）",
+                ),
+            ];
+            let mut panel = div()
+                .id("mo-connect-help-panel")
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(theme::container())
+                .border_1()
+                .border_color(theme::separator())
+                // 测试用（release no-op）：断言展开面板确实渲染出来了。
+                .debug_selector(|| "mo-connect-help-panel".to_string());
+            for (i, (usage, note)) in LINES.iter().enumerate() {
+                panel = panel.child(
+                    div()
+                        .id(("mo-connect-help-line", i))
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(11.0))
+                                .child(text!(usage.to_string())),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .text_size(px(11.0))
+                                .text_color(theme::muted())
+                                .child(text!(note.to_string())),
+                        ),
+                );
+            }
+            body = body.child(panel);
+        }
+
         // 记住过的服务器：点一行直接用存下的凭据连。
         if !self.connect_servers.is_empty() {
             body = body.child(
@@ -1441,17 +1541,32 @@ impl RootView {
                     .text_color(theme::muted())
                     .child(text!("已记住的服务器（点击直接连接）：".to_string())),
             );
-            let mut list = div()
+            // 列表外框 + 斑马纹：与文件列表同款（奇数行 `theme::zebra()`，偶数行
+            // `theme::surface()`），外面套一圈 `separator()` 描边把整块收进对话框里。
+            // 圆角靠首/末行自己 `rounded_t` / `rounded_b` 收——这个 fork 不把子元素
+            // 裁进父级圆角，行底色会把框的两个角切方（见 `dialog_header` 的说明）。
+            let count = self.connect_servers.len();
+            let list = div()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
-                .max_h(px(120.0))
-                .overflow_y_scrollbar()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme::separator())
+                .bg(theme::surface())
                 // 测试用（release no-op）：断言列表确实渲染出来了。
-                .debug_selector(|| "mo-connect-servers".to_string());
-            for (i, server) in self.connect_servers.iter().enumerate() {
-                list = list.child(self.saved_server_row(i, server, entity));
-            }
+                .debug_selector(|| "mo-connect-servers".to_string())
+                .child({
+                    let mut rows = div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_h(px(120.0))
+                        .overflow_y_scrollbar();
+                    for (i, server) in self.connect_servers.iter().enumerate() {
+                        rows = rows.child(self.saved_server_row(i, count, server, entity));
+                    }
+                    rows
+                });
             body = body.child(list);
         }
 
@@ -1493,14 +1608,21 @@ impl RootView {
             "连接到服务器",
             "",
             body,
-            "只输 ftp://主机:端口 即可，需要账号密码时会提示 · 回车连接 · Esc 取消",
+            // 底部提示已去：协议写法在 placeholder 与「使用说明」折叠区里都有。
+            "",
         )
     }
 
-    /// 「已记住的服务器」里的一行：点整行直连，右侧 ✕ 忘掉它（含钥匙串里的密码）。
+    /// 「已记住的服务器」里的一行：行首一枚协议图标，点整行直连，右侧 ✕ 忘掉它
+    /// （含钥匙串里的密码）。
+    ///
+    /// 行底色沿用文件列表的斑马纹（奇数行 [`theme::zebra`]）。整块列表外圈还有边框
+    /// 与圆角，而这个 fork 不会把子元素裁进父级圆角，所以贴边的首/末行要自己收上/下
+    /// 两个角，否则矩形底色会把框角切方（同 `context_menu::item_hover_bg`）。
     fn saved_server_row(
         &self,
         index: usize,
+        count: usize,
         server: &mo_app::SavedServer,
         entity: &Entity<RootView>,
     ) -> impl IntoElement {
@@ -1509,13 +1631,31 @@ impl RootView {
             .flex()
             .flex_row()
             .items_center()
+            .w_full()
             .gap(px(8.0))
             .h(px(26.0))
             .px(px(8.0))
-            .rounded(px(4.0))
+            .bg(if index % 2 == 1 {
+                theme::zebra()
+            } else {
+                theme::surface()
+            })
             .hover(|s| s.bg(theme::hover_bg()))
             // 测试用（release no-op）：按序号定位某一行。
             .debug_selector(move || format!("mo-connect-server-{index}"))
+            // 协议图标：一眼分清这行是共享文件夹、FTP 还是网盘。颜色必须显式给——
+            // gpui 的 svg 不继承父级文字色，不给就不画。
+            .child(
+                div()
+                    .flex_shrink_0()
+                    // 测试用（release no-op）：断言行首图标位渲染出来了。
+                    .debug_selector(move || format!("mo-connect-server-icon-{index}"))
+                    .child(crate::icons::icon(
+                        crate::icons::protocol_icon(&server.endpoint),
+                        14.0,
+                        theme::muted(),
+                    )),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1524,6 +1664,14 @@ impl RootView {
                     .text_size(px(12.0))
                     .child(text!(server.endpoint.clone())),
             );
+        // 框是 `rounded(6)` + 1px 描边，行收 5px 才贴得住内侧弧线。
+        let radius = px(5.0);
+        row = match (index == 0, index + 1 == count) {
+            (true, true) => row.rounded(radius),
+            (true, false) => row.rounded_t(radius),
+            (false, true) => row.rounded_b(radius),
+            (false, false) => row,
+        };
         if !server.user.is_empty() {
             row = row.child(
                 div()
@@ -7518,6 +7666,257 @@ mod tests {
             cx.debug_bounds("mo-connect-server-0").is_some(),
             "列表里没有第一行——点不了一键重连"
         );
+    }
+
+    /// 「已记住的服务器」列表的观感：外框一圈描边 + 圆角，行底色奇偶交替（斑马纹），
+    /// 行首一枚协议图标。
+    ///
+    /// 斑马纹沿用文件列表那组角色色（奇数行 `theme::zebra()`、偶数行 `theme::surface()`）。
+    /// 贴边的首 / 末行还得自己收上 / 下两个角——gpui 不把子元素裁进父级圆角，矩形行底色
+    /// 会把外框那两个角切方（同 `context_menu_item_hover_follows_the_panel_corner`）。
+    /// 断言的是 `painted_quads()` 的真实绘制输出。
+    ///
+    /// ⚠️ 只断言**相对**关系（相邻两行不同色、隔一行同色；描边 alpha > 0），不拿
+    /// `theme::zebra()` 这类绝对色值去比：调色板是进程级全局槽位，
+    /// `theme::tests::set_switches_active_palette` 与主题选择器用例会在并行跑时临时
+    /// 翻成深色，比色值就是随机闪断。
+    #[test]
+    fn remembered_servers_list_has_a_frame_and_zebra_rows() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.connect_servers = [
+                    ("smb://172.25.48.48", ""),
+                    ("ftp://example.com:2121", "alice"),
+                    ("davs://cloud.example.com", "bob"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (endpoint, user))| mo_app::SavedServer {
+                    endpoint: endpoint.to_string(),
+                    user: user.to_string(),
+                    last_used: i as i64,
+                })
+                .collect();
+                v.modal = Modal::ConnectServer;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // `debug_bounds` 是逻辑像素，`painted_quads` 是缩放后像素：先统一成后者。
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let mut rects = [(0.0_f32, 0.0, 0.0, 0.0); 4];
+        for (slot, &selector) in [
+            "mo-connect-servers",
+            "mo-connect-server-0",
+            "mo-connect-server-1",
+            "mo-connect-server-2",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} 没有渲染"));
+            rects[slot] = (
+                f32::from(b.origin.x) * scale,
+                f32::from(b.origin.y) * scale,
+                f32::from(b.size.width) * scale,
+                f32::from(b.size.height) * scale,
+            );
+        }
+        let frame_rect = rects[0];
+        let row_rects = [rects[1], rects[2], rects[3]];
+
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let same_rect = |q: &gpui_kit::Quad, r: (f32, f32, f32, f32)| {
+            let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+            near(q.bounds.origin.x.as_f32(), r.0)
+                && near(q.bounds.origin.y.as_f32(), r.1)
+                && near(q.bounds.size.width.as_f32(), r.2)
+                && near(q.bounds.size.height.as_f32(), r.3)
+        };
+        let quad_at = |r: (f32, f32, f32, f32), what: &str| -> gpui_kit::Quad {
+            *quads
+                .iter()
+                .find(|q| same_rect(q, r))
+                .unwrap_or_else(|| panic!("{what} 没有画出同位同尺寸的 quad"))
+        };
+
+        // ---- 外框：四角同半径的圆角底色 + 一圈描边。
+        // 描边不并进底色那张 quad——gpui 每条边单独画一张同尺寸的 quad，
+        // 只在 `border_widths` 对应那条边上带宽度，所以要另找。
+        let frame = quad_at(frame_rect, "服务器列表外框");
+        let radius = frame.corner_radii.top_left.as_f32();
+        assert!(
+            radius > 0.0
+                && frame.corner_radii.top_right.as_f32() == radius
+                && frame.corner_radii.bottom_left.as_f32() == radius
+                && frame.corner_radii.bottom_right.as_f32() == radius,
+            "服务器列表外框不是四角同半径的圆角框：{:?}",
+            frame.corner_radii
+        );
+        let edges: Vec<(f32, f32)> = quads
+            .iter()
+            .filter(|q| same_rect(q, frame_rect))
+            .map(|q| {
+                (
+                    q.border_widths.top.as_f32()
+                        + q.border_widths.right.as_f32()
+                        + q.border_widths.bottom.as_f32()
+                        + q.border_widths.left.as_f32(),
+                    q.border_color.a,
+                )
+            })
+            .filter(|(w, _)| *w > 0.0)
+            .collect();
+        assert!(
+            edges.len() >= 4,
+            "服务器列表外框的描边不全（四条边各一张 quad）：实测 {}/4 条，宽度={:?}",
+            edges.len(),
+            edges
+        );
+        assert!(
+            edges.iter().all(|(_, a)| *a > 0.0),
+            "外框描边是透明的（alpha=0 就看不见这圈框了）：{edges:?}"
+        );
+
+        // ---- 斑马纹：奇偶交替（色值取自 `theme::zebra()` / `theme::surface()`）。
+        let row_quads = [
+            quad_at(row_rects[0], "第 0 行"),
+            quad_at(row_rects[1], "第 1 行"),
+            quad_at(row_rects[2], "第 2 行"),
+        ];
+        assert_ne!(
+            row_quads[0].background, row_quads[1].background,
+            "相邻两行同色——斑马纹没生效"
+        );
+        assert_eq!(
+            row_quads[0].background, row_quads[2].background,
+            "第 0 行与第 2 行不同色——交替规律断了（奇偶反了或多算了一行？）"
+        );
+
+        // ---- 贴框角的行自己收角：首行收上面两个、末行收下面两个、中间行全直角。
+        // 收的半径不大于外框即可（外框还含 1px 描边，行半径本就该小一圈）。
+        let corners = |q: &gpui_kit::Quad| {
+            (
+                q.corner_radii.top_left.as_f32(),
+                q.corner_radii.top_right.as_f32(),
+                q.corner_radii.bottom_left.as_f32(),
+                q.corner_radii.bottom_right.as_f32(),
+            )
+        };
+        let first = corners(&row_quads[0]);
+        assert!(
+            first.0 > 0.0 && first.0 == first.1 && first.0 <= radius,
+            "首行底色没跟随外框顶部圆角（外框半径 {radius}）：会把框上面两个角切方\
+             —— {first:?}"
+        );
+        assert_eq!(
+            (first.2, first.3),
+            (0.0, 0.0),
+            "首行下面还有行接着，不该有圆角"
+        );
+        assert_eq!(
+            corners(&row_quads[1]),
+            (0.0, 0.0, 0.0, 0.0),
+            "中间行贴不到框角，四角都该是直角"
+        );
+        let last = corners(&row_quads[2]);
+        assert!(
+            last.2 > 0.0 && last.2 == last.3 && last.2 <= radius,
+            "末行底色没跟随外框底部圆角（外框半径 {radius}）：会把框下面两个角切方\
+             —— {last:?}"
+        );
+        assert_eq!(
+            (last.0, last.1),
+            (0.0, 0.0),
+            "末行上面还有行接着，不该有圆角"
+        );
+
+        // ---- 行首的协议图标：每行一枚，落在地址文字之前。
+        // 哪个协议配哪个形状由 `icons::protocol_icon_maps_scheme_aliases_and_falls_back`
+        // 钉住，这里只守「图标位真的排出来了、没把行挤变形」。
+        for (i, selector) in [
+            "mo-connect-server-icon-0",
+            "mo-connect-server-icon-1",
+            "mo-connect-server-icon-2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("第 {i} 行行首没有协议图标"));
+            let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+            assert!(
+                (w - 14.0).abs() < 1.0 && (h - 14.0).abs() < 1.0,
+                "第 {i} 行的协议图标不是 14×14：{w}×{h}"
+            );
+            let (row_x, row_w) = (row_rects[i].0, row_rects[i].2);
+            let x = f32::from(b.origin.x) * scale;
+            assert!(
+                x > row_x && x < row_x + row_w / 2.0,
+                "第 {i} 行的协议图标不在行的左半（行左缘 {row_x}，图标左缘 {x}）：\
+                 排到地址后面了？"
+            );
+        }
+    }
+
+    /// 「使用说明」默认折叠，点一下展开各协议写法（再点一下收起）。
+    #[test]
+    fn connect_help_starts_collapsed_and_toggles() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_connect_dialog(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-connect-help-toggle").is_some(),
+            "「使用说明」开关没有渲染出来"
+        );
+        assert!(
+            cx.debug_bounds("mo-connect-help-panel").is_none(),
+            "使用说明默认应当折叠，不该占对话框高度"
+        );
+
+        // 点开关展开：面板出现、状态翻转。
+        let toggle = cx
+            .debug_bounds("mo-connect-help-toggle")
+            .expect("开关应当有几何信息才点得到");
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        cx.update(|window, cx| window.render_frame(cx));
+        let (panel_visible, expanded) = (
+            cx.debug_bounds("mo-connect-help-panel").is_some(),
+            cx.update(|_window, cx| root.read(cx).connect_help_open),
+        );
+        assert!(panel_visible, "点开「使用说明」后面板没有渲染出来");
+        assert!(expanded, "点击后 connect_help_open 应当为 true");
+
+        // 再点一下收起：面板消失。
+        let toggle = cx
+            .debug_bounds("mo-connect-help-toggle")
+            .expect("展开后开关仍应在");
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        cx.update(|window, cx| window.render_frame(cx));
+        let (panel_visible, expanded) = (
+            cx.debug_bounds("mo-connect-help-panel").is_some(),
+            cx.update(|_window, cx| root.read(cx).connect_help_open),
+        );
+        assert!(!panel_visible, "再次点击后面板应当收起");
+        assert!(!expanded, "再次点击后 connect_help_open 应当为 false");
     }
 
     /// 认证弹窗按 Esc 退回地址对话框，而不是整个关掉。

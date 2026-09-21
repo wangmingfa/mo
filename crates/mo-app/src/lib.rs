@@ -883,7 +883,7 @@ impl AppState {
         let url = RemoteUrl::parse(input).map_err(|e| ConnectFailure::Message(e.to_string()))?;
         if !mo_remote::supports(&url.scheme) {
             return Err(ConnectFailure::Message(format!(
-                "暂不支持的协议：{}（目前支持 ftp / sftp）",
+                "暂不支持的协议：{}（目前支持 ftp / sftp / webdav / davs）",
                 url.scheme
             )));
         }

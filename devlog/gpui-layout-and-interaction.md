@@ -332,3 +332,33 @@
   * `mo-app/tests/productivity.rs` 新增 `create_file_is_empty_and_never_overwrites`——
     新文件为空、重名序号插在**扩展名之前**（`新建文本 2.txt`）、已有文件内容原封不动、
     空白名字回落到默认名、以及「名字不冲突时不平白加序号」。
+
+## 24. 「已记住的服务器」列表补外框、斑马纹与协议图标
+
+* **需求**：连接对话框里记住的服务器列表按截图改样式——加一圈边框，行底色交替
+  （斑马纹沿用文件列表那组色值：奇数行 `theme::zebra()`、偶数行 `theme::surface()`），
+  行首再按协议放一枚图标。
+* **框角会被行底色切方**：gpui 不把子元素裁进父级圆角（同 §22 与
+  `dialog_header_carries_the_card_corner_radius`），所以贴边的首 / 末行得自己收角：
+  `context_menu::item_hover_bg` 那套 `rounded_t` / `rounded_b` 照搬过来，行半径 5pt
+  比外框 6pt 小一圈（外框还含 1px 描边），同心才不穿帮。中间行四角全直角。
+* ⚠️ **`painted_quads()` 里描边不并进底色那张 quad**：一个 `border_1()` 的 div 会画
+  五张同位同尺寸的 quad——底色那张 `border_widths` 全 0，四条边各一张、只在对应的
+  那条边上带宽度。首版断言直接拿底色 quad 查 `border_widths.top > 0`，必然失败。
+  查描边要 `filter(同矩形)` 再看边宽，别用「找到第一张」的辅助函数。
+* ⚠️ **绘制测试别拿绝对色值比色**：调色板是进程级全局槽位（`theme::set`），
+  `theme::tests::set_switches_active_palette` 和主题选择器用例在并行跑时会临时翻成
+  深色，`assert_eq!(quad.background, Background::from(theme::zebra()))` 就是随机闪断
+  （首版正是这么挂的）。改成只断**相对**关系：相邻两行不同色、隔一行同色、描边
+  alpha > 0——浅色深色两套调色板下都成立。
+* **协议图标**（`icons.rs`）：`SMB`（三节点连成网）/ `FTP`（托盘 + 上下双箭头，
+  `ftp`/`ftps`/`sftp`/`ssh` 共用）/ `WEBDAV`（一朵云，`webdav`/`dav`/`davs` 共用），
+  认不出的一律回落到 `GLOBE` 而不是空着。`protocol_icon(endpoint)` 自己切 `://` 前缀
+  并归一小写——scheme 正常由 `RemoteUrl::parse` 归一，但 `config.json` 是明文、可能被
+  手改。svg 的颜色必须显式传给 `icons::icon(data, size, color)`，不继承父级文字色。
+* **测试**：
+  * `app::tests::remembered_servers_list_has_a_frame_and_zebra_rows`——外框四角同半径
+    + 四条边都有不透明描边；三行底色奇偶交替；首行只收上面两角、末行只收下面两角、
+    中间行全直角；每行行首一枚 14×14 图标且落在地址文字之前；
+  * `icons::tests::protocol_icon_maps_scheme_aliases_and_falls_back`——别名归一、
+    大小写、无前缀与未知协议回落。

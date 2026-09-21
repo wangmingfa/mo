@@ -22,5 +22,10 @@ suppaftp.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 
+# WebDAV 后端：基于 reqwest 的异步 PROPFIND/PUT/MKCOL/DELETE/MOVE 客户端（纯 Rust）。
+reqwest_dav.workspace = true
+# PROPFIND 回的是百分号编码的 href，还原真实文件名要用它。
+percent-encoding.workspace = true
+
 [lints]
 workspace = true
