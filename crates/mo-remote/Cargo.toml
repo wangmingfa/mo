@@ -1,0 +1,22 @@
+[package]
+name = "mo-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mo-core.workspace = true
+mo-fs.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+# FTP / FTPS 客户端（Rust 实现，无本机依赖）。
+# ⚠️ 刻意只开 `tokio`、关掉默认特性：默认会引 TLS 实现（OpenSSL / ring），
+# 在三个目标平台上都是额外的本机构建负担。明文 FTP 先跑通，FTPS 后置。
+suppaftp.workspace = true
+
+[lints]
+workspace = true

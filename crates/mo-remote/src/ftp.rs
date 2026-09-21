@@ -1,0 +1,285 @@
+//! FTP 后端：把 [`AsyncFtpStream`] 包装成 [`mo_fs::FileSystem`]。
+//!
+//! ## 路径约定
+//!
+//! 传给本实现的路径一律是**远程绝对路径**（`/pub/incoming`），不是本地路径、
+//! 也不是完整的 URL——主机与凭据由本对象自己持有。这样上层只要记住
+//! 「正在浏览哪个连接」即可，不必每次都把 `ftp://user@host:port` 拼进路径。
+//!
+//! ## 为什么自己带一份 runtime
+//!
+//! TCP 连接在建 socket 时就注册到了当时的 reactor，之后所有读写都得由同一个
+//! runtime 驱动。mo-app 的共享 runtime 与 blocking 池是两个不同的池，若在这里
+//! 建连接、在那里 poll，症状是「偶尔卡住 / 偶尷超时」这种最难查的问题。
+//! 因此每个连接独占一份 current-thread runtime，所有动作统一走
+//! [`tokio::runtime::Runtime::block_on`]——包括 `async` 的 trait 方法
+//! （它们内部同步完成远程往返）。
+//!
+//! 代价是一个连接占一个线程，这与它在 `spawn_blocking` 池里被使用的方式一致。
+
+use std::io::Cursor;
+use std::path::Path;
+
+use async_trait::async_trait;
+use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
+use mo_fs::{FileSystem, ReadDirEntry};
+use suppaftp::list::{File, ListParser};
+use suppaftp::tokio::AsyncFtpStream;
+use suppaftp::FtpResult;
+use tokio::sync::Mutex;
+
+use crate::{RemoteError, RemoteUrl};
+
+/// 一个 FTP 连接。
+pub struct FtpFileSystem {
+    url: RemoteUrl,
+    /// 仅供本连接使用的 runtime（见模块文档）。
+    rt: tokio::runtime::Runtime,
+    /// FTP 控制连接：所有命令都要 `&mut`，而 trait 只给 `&self`。
+    conn: Mutex<AsyncFtpStream>,
+}
+
+impl FtpFileSystem {
+    /// 建连接并登录。
+    ///
+    /// 用户名 / 密码缺省时按匿名登录（`anonymous`）——多数公共 FTP 都接受，
+    /// 也让「地址里没写凭据」不至于直接失败。
+    pub fn connect(url: &RemoteUrl) -> Result<Self, RemoteError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RemoteError::transport("创建 runtime", e))?;
+
+        let addr = format!("{}:{}", url.host, url.port_or_default().unwrap_or(21));
+        let user = url.user.clone().unwrap_or_else(|| "anonymous".to_string());
+        let password = url
+            .password
+            .clone()
+            .unwrap_or_else(|| "anonymous@example.com".to_string());
+
+        let conn = rt.block_on(async {
+            let mut stream = AsyncFtpStream::connect(&addr)
+                .await
+                .map_err(|e| RemoteError::transport("连接", e))?;
+            stream
+                .login(&user, &password)
+                .await
+                .map_err(|e| RemoteError::transport("登录", e))?;
+            Ok::<_, RemoteError>(stream)
+        })?;
+
+        Ok(Self {
+            url: url.clone(),
+            rt,
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// 连接对应的地址（回显时不带密码）。
+    pub fn url(&self) -> &RemoteUrl {
+        &self.url
+    }
+
+    /// 把 trait 里的路径统一成远程绝对路径字符串。
+    fn remote(path: &Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if s.starts_with('/') {
+            s
+        } else {
+            format!("/{s}")
+        }
+    }
+
+    /// 列目录：优先 MLSD（机器可读、自带类型与大小），服务器不支持时回退 LIST。
+    async fn list_dir(&self, dir: &str) -> Result<Vec<File>, MoError> {
+        let mut conn = self.conn.lock().await;
+        match conn.mlsd(Some(dir)).await {
+            Ok(lines) => Ok(lines.iter().filter_map(|l| parse_mlsd(l)).collect()),
+            // 服务器不实现 MLSD 是常态（RFC 3659 是可选扩展），回退到 LIST。
+            Err(_) => {
+                let lines = conn
+                    .list(Some(dir))
+                    .await
+                    .map_err(|e| MoError::from(RemoteError::transport("列目录", e)))?;
+                Ok(lines.iter().filter_map(|l| parse_list(l)).collect())
+            }
+        }
+    }
+
+    async fn entries_in(&self, dir: &str) -> Result<Vec<ReadDirEntry>, MoError> {
+        let parent = Path::new(dir);
+        Ok(self
+            .list_dir(dir)
+            .await?
+            .into_iter()
+            .filter(|f| f.name() != "." && f.name() != "..")
+            .map(|f| {
+                let path = parent.join(file_name_only(f.name()));
+                ReadDirEntry::new(
+                    FileId::synthetic(&path),
+                    file_name_only(f.name()).to_string(),
+                    if f.is_directory() {
+                        EntryKind::Directory
+                    } else if f.is_symlink() {
+                        EntryKind::Symlink
+                    } else {
+                        EntryKind::File
+                    },
+                    path,
+                )
+            })
+            .collect())
+    }
+}
+
+/// 有些服务器在 MLSD / LIST 里回的是完整路径，只留最后一段当名字。
+fn file_name_only(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn parse_mlsd(line: &str) -> Option<File> {
+    ListParser::parse_mlsd(line.trim()).ok()
+}
+
+/// LIST 的两种主流格式：先按 POSIX（`drwxr-xr-x …`），不行再按 DOS（`01-01-70  …`）。
+fn parse_list(line: &str) -> Option<File> {
+    let l = line.trim();
+    ListParser::parse_posix(l)
+        .or_else(|_| ListParser::parse_dos(l))
+        .ok()
+}
+
+#[async_trait]
+impl FileSystem for FtpFileSystem {
+    async fn read_dir(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+        self.entries_in(&Self::remote(path)).await
+    }
+
+    fn read_dir_blocking(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+        // blocking 池里不能碰 mo-app 的 runtime；本连接自带的那份在这里正合适。
+        let dir = Self::remote(path);
+        self.rt.block_on(self.entries_in(&dir))
+    }
+
+    async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError> {
+        let remote = Self::remote(path);
+        let mut conn = self.conn.lock().await;
+        // 目录没有 SIZE 语义（多数服务器直接报错 550），失败即按目录处理。
+        let size = conn.size(&remote).await.ok().unwrap_or(0) as u64;
+        let modified = conn.mdtm(&remote).await.ok().map(system_time_from_naive);
+        Ok(FileMetadata {
+            size,
+            modified,
+            created: None,
+            permissions: Permissions::default(),
+        })
+    }
+
+    async fn create_dir(&self, path: &Path) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let mut conn = self.conn.lock().await;
+        conn.mkdir(&remote)
+            .await
+            .map_err(|e| MoError::from(RemoteError::transport("建目录", e)))
+    }
+
+    async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let mut conn = self.conn.lock().await;
+        // 「目标已存在必须失败」由调用方保证（见 trait 文档）；FTP 的 STOR 会覆盖，
+        // 这里先探一次 SIZE：有大小就认为已存在，绝不静默覆盖远端数据。
+        if conn.size(&remote).await.is_ok() {
+            return Err(MoError::Other(format!("远端已存在 {remote}——拒绝覆盖")));
+        }
+        let mut cursor = Cursor::new(contents.to_vec());
+        conn.put_file(&remote, &mut cursor)
+            .await
+            .map_err(|e| MoError::from(RemoteError::transport("上传", e)))?;
+        Ok(())
+    }
+
+    async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let mut conn = self.conn.lock().await;
+        conn.rm(&remote)
+            .await
+            .map_err(|e| MoError::from(RemoteError::transport("删除文件", e)))
+    }
+
+    async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let mut conn = self.conn.lock().await;
+        conn.rmdir(&remote)
+            .await
+            .map_err(|e| MoError::from(RemoteError::transport("删除目录", e)))
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
+        let mut conn = self.conn.lock().await;
+        conn.rename(&Self::remote(from), &Self::remote(to))
+            .await
+            .map_err(|e| MoError::from(RemoteError::transport("重命名", e)))
+    }
+}
+
+impl Drop for FtpFileSystem {
+    fn drop(&mut self) {
+        // 尽量优雅地 QUIT：失败无所谓（连接可能早就断了），但不能在 drop 里 panic。
+        self.rt.block_on(async {
+            let mut conn = self.conn.lock().await;
+            let _: FtpResult<()> = conn.quit().await;
+        });
+    }
+}
+
+/// `mdtm` 给的是 UTC 的 `NaiveDateTime`（无时区），换算成 `SystemTime`。
+fn system_time_from_naive(t: chrono::NaiveDateTime) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    let secs = t.and_utc().timestamp().max(0) as u64;
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_normalized_to_remote_absolute() {
+        assert_eq!(FtpFileSystem::remote(Path::new("/pub")), "/pub");
+        assert_eq!(FtpFileSystem::remote(Path::new("pub/x")), "/pub/x");
+        assert_eq!(
+            FtpFileSystem::remote(Path::new("pub\\x")),
+            "/pub/x",
+            "Windows 分隔符也要归一"
+        );
+    }
+
+    #[test]
+    fn list_lines_are_parsed_in_both_dialects() {
+        let posix = "-rw-r--r-- 1 user group 1234 Nov 5 13:46 example.txt";
+        let f = parse_list(posix).expect("POSIX 行应能解析");
+        assert_eq!(f.name(), "example.txt");
+        assert!(f.is_file());
+        assert_eq!(f.size(), 1234);
+
+        let dir = "drwxr-xr-x 2 user group 4096 Nov 5 13:46 incoming";
+        assert!(parse_list(dir).expect("目录行应能解析").is_directory());
+    }
+
+    #[test]
+    fn full_paths_from_servers_are_reduced_to_names() {
+        assert_eq!(file_name_only("/pub/incoming/a.txt"), "a.txt");
+        assert_eq!(file_name_only("a.txt"), "a.txt");
+    }
+
+    #[test]
+    fn unsupported_scheme_is_reported_not_panicked() {
+        let u = RemoteUrl::parse("sftp://h/tmp").expect("解析本身应当成功");
+        assert!(!crate::supports(&u.scheme));
+        let got = crate::connect(&u);
+        assert!(
+            matches!(got, Err(RemoteError::Unsupported(ref scheme)) if scheme == "sftp"),
+            "未实现的协议要给出明确错误，而不是连上去再炸"
+        );
+    }
+}

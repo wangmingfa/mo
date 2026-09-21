@@ -11,6 +11,7 @@ members = [
     "crates/mo-preview",
     "crates/mo-diff",
     "crates/mo-app",
+    "crates/mo-remote",
     "crates/mo-ui",
     "crates/mo-bench",
 ]
@@ -101,6 +102,11 @@ mo-search = { path = "crates/mo-search" }
 mo-preview = { path = "crates/mo-preview" }
 mo-diff = { path = "crates/mo-diff" }
 mo-app = { path = "crates/mo-app" }
+mo-remote = { path = "crates/mo-remote" }
+
+# 远程协议客户端。只开 tokio 异步、关默认特性以免引入本机 TLS 依赖，
+# 明文 FTP 先跑通，FTPS 待议（见 crates/mo-remote/Cargo.toml）。
+suppaftp = { version = "12", default-features = false, features = ["tokio"] }
 
 [profile.release]
 opt-level = 3

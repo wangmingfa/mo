@@ -77,8 +77,10 @@ pub fn run() {
         icon::set_dock_icon();
         let app = app.clone();
         // 沉浸式交通灯：隐藏系统标题栏（appears_transparent），内容延伸到窗口顶部，
-        // 工具栏左移留出红绿灯位置；AppKit 仍负责顶部条拖拽与双击缩放。
-        // 红绿灯垂直位置由 toolbar::TOOLBAR_HEIGHT 推导，保证在工具栏内居中。
+        // 工具栏左移留出红绿灯位置。红绿灯垂直位置由 toolbar::TOOLBAR_HEIGHT
+        // 推导，保证在工具栏内居中。
+        // 拖拽：macOS 开 app_owns_titlebar_drag 把 AppKit 请出标题栏（消掉它的
+        // 双击判定延迟），改由整条顶栏自营 —— 见 toolbar::attach_titlebar_drag。
         let (tl_x, tl_y) = toolbar::traffic_light_position();
         // 默认尺寸 1280×800，且在屏幕上居中（gpui 缺省 1000×600、左上角显示）。
         let options = gpui_kit::WindowOptions {
@@ -91,6 +93,11 @@ pub fn run() {
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(tl_x), px(tl_y))),
             }),
+            // macOS 让 AppKit 彻底退出标题栏：原生实现在按下时会先等一拍判断
+            // 是不是双击（决定要不要缩放），那一拍就是点标签时的迟滞感。
+            // 代价是拖拽与双击缩放改由应用层负责 —— 见
+            // `toolbar::attach_titlebar_drag`（挂在整条顶栏上）。
+            app_owns_titlebar_drag: true,
             ..Default::default()
         };
         cx.spawn(async move |cx| {

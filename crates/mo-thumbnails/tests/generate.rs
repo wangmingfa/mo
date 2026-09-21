@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use mo_core::FileId;
-use mo_thumbnails::{ThumbnailCache, DEFAULT_SIZE};
+use mo_thumbnails::{preview_scaled_in, ThumbnailCache, DEFAULT_SIZE, PREVIEW_MAX_EDGE};
 
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-thumb-{tag}"));
@@ -88,4 +88,70 @@ fn non_image_files_are_rejected() {
     assert!(cache
         .get_or_create(&FileId::new(1, 1), &txt, DEFAULT_SIZE)
         .is_err());
+}
+
+// ---- 快速预览的降采样副本 ----
+
+#[test]
+fn oversized_image_is_downscaled_for_preview() {
+    let dir = tmp("preview-big");
+    let root = dir.join("preview");
+    // 长边 3000 > PREVIEW_MAX_EDGE(2560)，应当生成副本。
+    let src = write_test_image(&dir, 3000, 2000);
+
+    let out = preview_scaled_in(&root, &src, PREVIEW_MAX_EDGE).expect("超尺寸图应有降采样副本");
+
+    assert!(out.exists(), "降采样副本应存在");
+    let scaled = image::open(&out).expect("降采样副本无法解码");
+    assert_eq!(
+        scaled.width(),
+        PREVIEW_MAX_EDGE,
+        "长边应贴到上限，实际 {}x{}",
+        scaled.width(),
+        scaled.height()
+    );
+    // 3000×2000 → 长边贴到 2560，短边按比例留给有向下的取整误差。
+    assert!(
+        (1706..=1708).contains(&scaled.height()),
+        "短边应按比例缩放，实际 {}x{}",
+        scaled.width(),
+        scaled.height()
+    );
+}
+
+#[test]
+fn small_image_has_no_preview_copy() {
+    let dir = tmp("preview-small");
+    let root = dir.join("preview");
+    let src = write_test_image(&dir, 800, 600);
+
+    // 本来就够小：不该多生成一份磁盘副本，直接加载原图。
+    assert_eq!(preview_scaled_in(&root, &src, PREVIEW_MAX_EDGE), None);
+    assert!(!root.exists(), "没有超尺寸时不该创建缓存目录");
+}
+
+#[test]
+fn preview_copy_is_reused_from_disk_cache() {
+    let dir = tmp("preview-cached");
+    let root = dir.join("preview");
+    let src = write_test_image(&dir, 3000, 1000);
+
+    let first = preview_scaled_in(&root, &src, PREVIEW_MAX_EDGE).unwrap();
+    let mtime = std::fs::metadata(&first).unwrap().modified().unwrap();
+    let second = preview_scaled_in(&root, &src, PREVIEW_MAX_EDGE).unwrap();
+
+    assert_eq!(first, second, "应命中同一份缓存");
+    let mtime2 = std::fs::metadata(&second).unwrap().modified().unwrap();
+    assert_eq!(mtime, mtime2, "命中缓存时不应重新解码生成");
+}
+
+#[test]
+fn preview_downscale_failures_fall_back_to_original() {
+    let dir = tmp("preview-fallback");
+    let root = dir.join("preview");
+    let txt = dir.join("note.txt");
+    std::fs::write(&txt, b"hello").unwrap();
+
+    // 非图片：指标撑不起尺寸探测，返回 None 让调用方用原图，而不是让预览失败。
+    assert_eq!(preview_scaled_in(&root, &txt, PREVIEW_MAX_EDGE), None);
 }

@@ -77,7 +77,7 @@ pub(crate) fn ensure_window(
     };
     let this = entity.clone();
     let app_task = app.clone();
-    tracing::info!(
+    tracing::trace!(
         target: "mo_ui::window",
         pane, tab, need = ?r, visible = ?visible, "fetch spawn"
     );
@@ -108,7 +108,7 @@ pub(crate) fn ensure_window(
             if cleared {
                 p.pending = None;
             }
-            tracing::info!(
+            tracing::trace!(
                 target: "mo_ui::window",
                 pane, tab, need = ?r, win_start = start, win_len = p.window.len(),
                 elapsed_ms = elapsed, cleared_pending = cleared, "fetch done"

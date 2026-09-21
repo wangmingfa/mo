@@ -50,6 +50,7 @@ use mo_operations::{
     RenameOperation, RestoreOperation, SharedOperation, Trash, TrashEntry, TrashOperation,
 };
 use mo_preview::Preview;
+use mo_remote::RemoteUrl;
 use mo_search::{crawl, FileIndex, SearchHit};
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::{Mutex, RwLock};
@@ -67,7 +68,14 @@ pub struct AppStateInner {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<AppStateInner>>,
-    fs: Arc<dyn FileSystem>,
+    /// 当前生效的底层文件系统（本地或已连接的远程后端）。
+    ///
+    /// 用 `std::sync::RwLock` 包一层 `Arc`：只在「连接 / 断开」瞬间写，目录读写
+    /// 频繁读，且不依赖异步上下文——与 mo-app 的共享 tokio runtime 解耦
+    /// （FTP 连接自带一份 runtime，`block_on` 不能在共享 runtime 上做）。
+    fs: Arc<std::sync::RwLock<Arc<dyn FileSystem>>>,
+    /// 当前连接的远程地址（`None` = 正在浏览本地）。用于地址栏回显与「断开」入口。
+    connection: Arc<std::sync::Mutex<Option<RemoteUrl>>>,
     ops: Arc<Mutex<OperationManager>>,
     bus: EventBus,
     scheduler: MetadataScheduler,
@@ -145,7 +153,8 @@ impl AppState {
                 directory: None,
                 visible_range: 0..0,
             })),
-            fs: Arc::new(LocalFileSystem),
+            fs: Arc::new(std::sync::RwLock::new(Arc::new(LocalFileSystem))),
+            connection: Arc::new(std::sync::Mutex::new(None)),
             ops: Arc::new(Mutex::new(OperationManager::new())),
             bus: EventBus::new(),
             scheduler: MetadataScheduler::new(),
@@ -192,9 +201,14 @@ impl AppState {
         &self.bus
     }
 
-    /// 底层文件系统抽象。
-    pub fn file_system(&self) -> &Arc<dyn FileSystem> {
-        &self.fs
+    /// 底层文件系统抽象（当前生效的，可能是远程连接）。
+    pub fn file_system(&self) -> Arc<dyn FileSystem> {
+        self.active_fs()
+    }
+
+    /// 当前生效的底层文件系统（本地或已连接的远程后端）。
+    fn active_fs(&self) -> Arc<dyn FileSystem> {
+        self.fs.read().unwrap().clone()
     }
 
     /// 操作管理器（提交 / 取消文件操作）。
@@ -228,7 +242,7 @@ impl AppState {
     /// * 打开瞬间先用缓存把元数据填满（stale-while-revalidate），再后台逐条校验；
     /// * 后台校验按「首屏优先」排队，用户看到的行最先补全。
     async fn load_path(&self, path: &Path) -> Result<(), MoError> {
-        let fs = self.fs.clone();
+        let fs = self.active_fs();
         let p = path.to_path_buf();
         let cache = self.cache();
         let dir_id = FileId::synthetic(path);
@@ -382,6 +396,68 @@ impl AppState {
         Ok(())
     }
 
+    // ---- 远程连接 ----
+
+    /// 按地址连上远程服务器并进入其根目录。
+    ///
+    /// 解析 `scheme://user:pass@host:port/path`，建好对应后端后**整体替换**底层
+    /// `fs`——之后所有目录读写都走远程后端，本地浏览态被清空避免历史混淆。
+    /// 连接动作会真去建 socket + 登录，必须放在 blocking 池，绝不能占用
+    /// UI / GPUI 执行器（见 `mo-remote` 的 runtime 约定）。
+    ///
+    /// 返回 `Err` 时保持原浏览态不变（不切 fs、不导航），调用方据此弹错。
+    pub async fn connect_remote(&self, input: &str) -> Result<(), String> {
+        let url = RemoteUrl::parse(input).map_err(|e| e.to_string())?;
+        if !mo_remote::supports(&url.scheme) {
+            return Err(format!("暂不支持的协议：{}（目前仅支持 ftp）", url.scheme));
+        }
+        // 建连接是阻塞 IO（带自有 runtime 的 block_on），放 blocking 池。
+        // 先 clone 一份给闭包：下面还要把原 `url` 存进 `connection`。
+        let url_for_connect = url.clone();
+        let connected = self
+            .spawn_blocking(move || mo_remote::connect(&url_for_connect).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| format!("连接任务失败：{e}"))??;
+
+        // 切换底层 fs + 记下连接标识；之后 read_dir / 列目录都走远程后端。
+        *self.fs.write().unwrap() = connected;
+        *self.connection.lock().unwrap() = Some(url);
+        // 进入远程根目录，并清空本地导航历史，避免回退混进本地路径。
+        self.inner.write().await.navigation = NavigationState::new();
+        self.open_directory(Path::new("/"))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 断开远程连接：切回本地 fs，跳回主目录，并清空导航历史。
+    pub async fn disconnect_remote(&self) -> Result<(), MoError> {
+        *self.fs.write().unwrap() = Arc::new(LocalFileSystem);
+        *self.connection.lock().unwrap() = None;
+        self.inner.write().await.navigation = NavigationState::new();
+        if let Some(home) = dirs::home_dir() {
+            self.open_directory(&home).await?;
+        }
+        Ok(())
+    }
+
+    /// 打开本地目录：若当前连着远程，先切回本地 fs（否则会用错后端、读到乱路径）。
+    ///
+    /// 侧边栏快捷访问与地址栏的本地路径输入都走这里，保证「回到本地」显式且安全。
+    pub async fn open_local(&self, path: &Path) -> Result<(), MoError> {
+        if self.connection.lock().unwrap().is_some() {
+            *self.fs.write().unwrap() = Arc::new(LocalFileSystem);
+            *self.connection.lock().unwrap() = None;
+            self.inner.write().await.navigation = NavigationState::new();
+        }
+        self.open_directory(path).await
+    }
+
+    /// 当前连接的远程地址（地址栏回显 / 侧边栏「断开」入口用）。未连接为 `None`。
+    pub fn active_connection(&self) -> Option<RemoteUrl> {
+        self.connection.lock().unwrap().clone()
+    }
+
     /// 后退栈是否非空。
     pub async fn can_go_back(&self) -> bool {
         self.inner.read().await.navigation.can_go_back()
@@ -491,7 +567,7 @@ impl AppState {
                         .and_then(|d| d.entries.iter().find(|e| e.path == path).map(|e| e.id))
                 };
                 if let Some(id) = id {
-                    if let Ok(meta) = self.fs.metadata(&path).await {
+                    if let Ok(meta) = self.active_fs().metadata(&path).await {
                         self.update_metadata(id, meta).await;
                         self.bus.publish(AppEvent::MetadataLoaded { path });
                     }
@@ -572,7 +648,7 @@ impl AppState {
     /// 与 `load_path` 不同：它**不动主目录模型**（导航栈 / 选择 / 监听目标），
     /// 只是给 UI 的一列提供名字与类型。读盘仍是阻塞 IO，走 blocking 池。
     pub async fn list_dir(&self, path: &Path) -> Result<Vec<LightEntry>, MoError> {
-        let fs = self.fs.clone();
+        let fs = self.active_fs();
         let p = path.to_path_buf();
         let raw = self
             .spawn_blocking(move || fs.read_dir_blocking(&p))
@@ -824,7 +900,7 @@ impl AppState {
         let root_after = root.clone();
         let index = self.index.clone();
         let stop = self.index_stop.clone();
-        let fs = self.fs.clone();
+        let fs = self.active_fs();
         self.spawn(async move {
             stop.store(false, Ordering::Relaxed);
             let bus_p = bus.clone();
@@ -871,6 +947,19 @@ impl AppState {
     /// 预览单个文件 / 目录（同步读取，按需提取文本 / 图片路径 / 目录摘要）。
     pub fn preview(&self, path: &Path) -> Result<Preview, MoError> {
         mo_preview::preview_path(path)
+    }
+
+    /// 图片预览的**降采样副本**：返回 `Some` 时应加载它而不是原图。
+    ///
+    /// 超过长边上限的图会先按需生成一份缓存副本（`<缓存>/mo/preview`），
+    /// 之后同路径直接命中磁盘、不再解码。详见
+    /// [`mo_thumbnails::preview_scaled`]。
+    ///
+    /// **阻塞操作**（含解码），必须在 blocking 池调用。返回 `None` 一律表示
+    /// 「用原图」——尺寸本来就够小、不是图片、或降采样失败；这是一项优化，
+    /// 失败时静默回退，绝不让预览打不开。
+    pub fn preview_image_scaled(&self, path: &Path) -> Option<PathBuf> {
+        mo_thumbnails::preview_scaled(path, mo_thumbnails::PREVIEW_MAX_EDGE)
     }
 
     /// 全部工作流：配置里写的 + 扩展清单带的（`workflows` 字段），坏定义丢弃。
@@ -1231,7 +1320,7 @@ impl AppState {
     /// `name` 为空时用「新建文件夹」。
     pub async fn create_folder(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
         let target = Self::free_path(dir, name, "新建文件夹");
-        self.fs.create_dir(&target).await?;
+        self.active_fs().create_dir(&target).await?;
         Ok(target)
     }
 
@@ -1241,7 +1330,7 @@ impl AppState {
     /// 底层 `write_file` 用的是 `create_new`——即便去重算错也不会覆盖已有文件。
     pub async fn create_file(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
         let target = Self::free_path(dir, name, "新建文本.txt");
-        self.fs.write_file(&target, b"").await?;
+        self.active_fs().write_file(&target, b"").await?;
         Ok(target)
     }
 

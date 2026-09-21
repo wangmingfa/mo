@@ -217,6 +217,7 @@ pub fn find_duplicates(roots: &[PathBuf], cancel: &AtomicBool) -> DedupReport {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -231,7 +232,7 @@ mod tests {
         d
     }
 
-    fn write(dir: &PathBuf, name: &str, bytes: &[u8]) -> PathBuf {
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let p = dir.join(name);
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent);
@@ -308,8 +309,8 @@ mod tests {
         let dir = tmp("order");
         write(&dir, "big1.bin", &vec![5u8; 9000]);
         write(&dir, "big2.bin", &vec![5u8; 9000]);
-        write(&dir, "small1.bin", &vec![6u8; 100]);
-        write(&dir, "small2.bin", &vec![6u8; 100]);
+        write(&dir, "small1.bin", &[6u8; 100]);
+        write(&dir, "small2.bin", &[6u8; 100]);
         write(&dir, "empty1.bin", b"");
         write(&dir, "empty2.bin", b"");
 

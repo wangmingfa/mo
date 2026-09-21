@@ -1,12 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
-use mo_core::{RenameSpec, SortKey};
+use mo_core::{MoError, RenameSpec, SortKey};
 use mo_operations::{HashAlgo, OperationHandle, TrashEntry};
-use mo_preview::Preview;
+use mo_preview::{Preview, PreviewKind};
 use mo_search::SearchHit;
 
 use crate::dialogs;
@@ -64,6 +64,8 @@ pub(crate) enum Modal {
     Keys,
     /// 扩展管理器（列出已加载的扩展，可启停）。
     Extensions,
+    /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
+    ConnectServer,
 }
 
 /// 命令面板中的可执行命令。
@@ -117,6 +119,10 @@ pub(crate) enum CommandId {
     KeysPicker,
     /// 扩展管理器。
     ExtensionsPicker,
+    /// 连接到服务器…（FTP 等远程协议）。
+    ConnectServer,
+    /// 断开当前远程连接，回到本地浏览。
+    DisconnectServer,
     /// 在当前目录查找重复文件。
     FindDuplicates,
     /// 文件夹同步面板。
@@ -185,6 +191,16 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             id: CommandId::ExtensionsPicker,
             title: "扩展…（查看 / 启停已加载的扩展）".to_string(),
             category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ConnectServer,
+            title: "连接到服务器…（FTP 等远程协议）".to_string(),
+            category: "导航".to_string(),
+        },
+        CmdDef {
+            id: CommandId::DisconnectServer,
+            title: "断开远程连接".to_string(),
+            category: "导航".to_string(),
         },
         CmdDef {
             id: CommandId::KeysPicker,
@@ -535,6 +551,11 @@ pub struct RootView {
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
     /// 「打开方式」二级菜单是否展开（hover 驱动）。
     pub(crate) ctx_submenu_open: bool,
+    /// 连接到服务器对话框里正在输入的地址（复用 Archive / 批量重命名那种
+    /// 纯字符串字段，按字符输入、退格删除，不依赖真实输入框组件）。
+    pub(crate) connect_url: String,
+    /// 连接失败时的错误提示（保留对话框展示）。
+    pub(crate) connect_error: Option<String>,
     /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
     /// 通过 [`RootView::notice_with_ok`] 设置，关闭提示时清回 `None`。
     pub(crate) notice_ok: Option<String>,
@@ -644,6 +665,8 @@ impl RootView {
             context_menu: None,
             open_with_apps: Vec::new(),
             ctx_submenu_open: false,
+            connect_url: String::new(),
+            connect_error: None,
             notice_ok: None,
         };
 
@@ -934,6 +957,96 @@ impl RootView {
         }
     }
 
+    // ------------------------------------------------------------ 连接到服务器
+
+    /// 打开「连接到服务器」对话框：清空上次输入与错误，准备接收地址字符。
+    pub(crate) fn open_connect_dialog(&mut self, cx: &mut Context<Self>) {
+        self.connect_url.clear();
+        self.connect_error = None;
+        self.modal = Modal::ConnectServer;
+        cx.notify();
+    }
+
+    /// 用对话框里输入的地址发起连接。失败则保留对话框并把错误显示出来，
+    /// 让用户改地址重试；成功才关掉对话框（导航由 `connect_remote` 完成）。
+    pub(crate) fn connect_submit(&mut self, cx: &mut Context<Self>) {
+        let text = self.connect_url.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let app = self.app();
+        self.connect_error = None;
+        cx.notify();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            match app.connect_remote(&text).await {
+                Ok(()) => {
+                    this.update(cx, |v, cx| {
+                        v.modal = Modal::None;
+                        v.connect_error = None;
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    this.update(cx, |v, cx| {
+                        v.connect_error = Some(e);
+                        // 保持对话框打开，避免把错误信息一闪而过。
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 「连接到服务器」对话框：地址输入框（纯字符串字段）+ 连接 / 取消按钮 + 错误区。
+    fn render_connect(&self, entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(8.0)).p(px(8.0));
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .child(text!("输入服务器地址，回车连接：".to_string())),
+        );
+        body = body.child(dialogs::field_row(
+            &self.connect_url,
+            true,
+            "connect-url".to_string(),
+        ));
+        if let Some(err) = &self.connect_error {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(diff_del_fg())
+                    .child(text!(err.clone())),
+            );
+        }
+        let mut actions = div().flex().flex_row().gap(px(8.0)).pt(px(4.0));
+        let ent = entity.clone();
+        let mut connect_btn = Self::sync_button("connect-go", "连接", true);
+        connect_btn.interactivity().on_click(move |_, _window, cx| {
+            ent.update(cx, |v, cx| v.connect_submit(cx));
+        });
+        actions = actions.child(connect_btn);
+        let ent2 = entity.clone();
+        let mut cancel_btn = Self::sync_button("connect-cancel", "取消", false);
+        cancel_btn.interactivity().on_click(move |_, _window, cx| {
+            ent2.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.connect_error = None;
+                cx.notify();
+            });
+        });
+        actions = actions.child(cancel_btn);
+        body = body.child(actions);
+        modal_card(
+            "连接到服务器",
+            "",
+            body,
+            "格式 ftp://用户:密码@主机:端口/路径 · 输入字符即填 · 回车连接 · Esc 取消",
+        )
+    }
+
     /// 地址栏回车：按输入的路径跳转，并把键盘焦点还给根视图。
     ///
     /// 焦点交还很重要：输入框一直握着焦点的话，上下键 / 输入即过滤这些
@@ -953,6 +1066,37 @@ impl RootView {
             cx.notify();
             return;
         }
+
+        // 形如 `scheme://...` 的地址 → 当成远程连接（协议是否支持由连接逻辑判定）。
+        if text.contains("://") {
+            cx.notify();
+            cx.spawn(async move |weak, cx| {
+                if let Err(e) = app.connect_remote(&text).await {
+                    let _ = weak.update(cx, |v, cx| {
+                        v.notice(format!("连接失败：{e}"), None, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
+
+        // 已连远程时，地址栏里填的是远程绝对路径（如 /pub/incoming）：
+        // 跳过本地 is_dir 判定，直接交给当前后端导航。
+        if app.active_connection().is_some() {
+            let target = PathBuf::from(&text);
+            cx.notify();
+            cx.spawn(async move |weak, cx| {
+                if let Err(e) = app.open_directory(&target).await {
+                    let _ = weak.update(cx, |v, cx| {
+                        v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
+
         let target = PathBuf::from(&text);
 
         // 先同步判定：路径不存在 / 不是文件夹 → 弹窗提示，且不发起导航
@@ -1067,7 +1211,8 @@ impl RootView {
             let Some(p) = app.selection_paths().await.into_iter().next() else {
                 return;
             };
-            if let Ok(pv) = app.preview(&p) {
+            // 翻页同样走降采样准备：方向键连按大图时不会每换一张都解码一次原图。
+            if let Ok(pv) = prepared_preview(&app, &p).await {
                 this.update(cx, |v, cx| v.show_preview(pv, cx));
             }
         })
@@ -2072,6 +2217,22 @@ impl RootView {
                 self.search_query.clear();
                 self.search_results.clear();
                 self.palette_index = 0;
+                cx.notify();
+            }
+            "server.connect" => {
+                self.open_connect_dialog(cx);
+                cx.notify();
+            }
+            "server.disconnect" => {
+                let app = self.app();
+                let entity = cx.entity().clone();
+                self.connect_error = None;
+                cx.spawn(async move |_weak, cx| {
+                    let _ = app.disconnect_remote().await;
+                    // 断开后回写 UI：侧边栏入口切回「连接到服务器…」、地址栏回落本地。
+                    entity.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
                 cx.notify();
             }
             "select.all" => {
@@ -3562,7 +3723,7 @@ async fn sync_panel(
         let p = v.panel_at_mut(pane_idx, tab_idx)?;
         // 切换目录或改过滤词后，旧窗口的下标已失效，直接作废。
         if ui_path != path || p.visible_count != count {
-            tracing::warn!(
+            tracing::debug!(
                 target: "mo_ui::window",
                 pane = pane_idx, tab = tab_idx,
                 ui_path = ?ui_path, app_path = ?path,
@@ -3685,6 +3846,7 @@ impl Render for RootView {
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
+            Modal::ConnectServer => self.render_connect(&entity),
         };
 
         let panel = self.panel();
@@ -3840,7 +4002,6 @@ impl Render for RootView {
                 }
                 k if plain && k.chars().count() == 1 => {
                     let ch = k.chars().next().unwrap();
-                    tracing::info!("[kbd] 命中 type-to-filter 兜底分支 ch={:?}", ch);
                     entity_key.update(cx, |v, cx| {
                         v.panel_mut().query.push(ch);
                         v.apply_filter(cx);
@@ -3927,6 +4088,14 @@ fn render_top_row(view: &RootView, entity: &Entity<RootView>, is_maximized: bool
         row = row
             .child(toolbar::drag_strip())
             .child(toolbar::window_controls(is_maximized));
+    } else {
+        // macOS：主窗口开了 `app_owns_titlebar_drag`，AppKit 已彻底退出标题栏
+        // （换来「点标题栏不必先等一拍判断是不是双击」的手感），代价是整条顶栏
+        // 48px 全高都得应用层自己拖。这里直接把处理器挂在行本身：按下会冒泡到它，
+        // 于是标签缝隙、`pl(80)` 留给红绿灯的那块、以及「＋」右侧都被覆盖
+        // —— 行为对齐并超过原来「只有上沿 ~28pt 归 AppKit」的那条带。
+        // 标签 / ✕ / ＋ 的点击不受影响：click 是抬起时另算的事件，照旧触发。
+        row = toolbar::attach_titlebar_drag(row);
     }
     row
 }
@@ -4502,6 +4671,26 @@ fn handle_modal_key(
                 close_modal(entity, cx);
             }
         }
+        Modal::ConnectServer => match key {
+            "escape" => entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.connect_error = None;
+                cx.notify();
+            }),
+            "enter" => entity.update(cx, |v, cx| v.connect_submit(cx)),
+            k if plain && k.chars().count() == 1 => {
+                let ch = k.chars().next().unwrap();
+                entity.update(cx, |v, cx| {
+                    v.connect_url.push(ch);
+                    cx.notify();
+                });
+            }
+            "backspace" => entity.update(cx, |v, cx| {
+                v.connect_url.pop();
+                cx.notify();
+            }),
+            _ => {}
+        },
         Modal::Duplicates => {
             // 正在扫描时 Esc 是「取消扫描」，有结果时 Esc 才是「关掉模态」。
             if key == "escape" {
@@ -4599,6 +4788,12 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 v.palette_index = 0;
                 cx.notify();
             });
+        }
+        Some(CommandId::ConnectServer) => {
+            entity.update(cx, |v, cx| v.dispatch_action("server.connect", cx));
+        }
+        Some(CommandId::DisconnectServer) => {
+            entity.update(cx, |v, cx| v.dispatch_action("server.disconnect", cx));
         }
         Some(CommandId::QuickLook) => {
             let this = entity.clone();
@@ -5003,11 +5198,39 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::ToggleSidebar
         | CommandId::ToggleStatusBar
         | CommandId::ToggleZebra
+        | CommandId::ConnectServer
+        | CommandId::DisconnectServer
         | CommandId::User(_) => {}
     }
 }
 
 /// 打开聚焦 / 选中项的快速预览。
+/// 预览内容准备：**图片可能要先降采样**。
+///
+/// 预览本身不解码（`Preview.image` 只是路径），真正的解码在 UI 加载图片时发生。
+/// 一张 7680×4320 的 JPEG 全解码约 130MB RGBA，既慢又白占一张大纹理，因此这里
+/// 先在 blocking 池按长边上限生成一份副本并缓存（见
+/// `mo_thumbnails::preview_scaled`）；之后同一张图直接命中磁盘，不再解码。
+///
+/// 降采样失败一律回退到原图路径——它是优化，不是预览能否打开的必要条件。
+async fn prepared_preview(app: &AppState, path: &Path) -> Result<Preview, MoError> {
+    let mut pv = app.preview(path)?;
+    let Some(src) = pv.image.clone() else {
+        return Ok(pv);
+    };
+    if pv.kind != PreviewKind::Image {
+        return Ok(pv);
+    }
+    let pool = app.clone();
+    if let Ok(Some(scaled)) = app
+        .spawn_blocking(move || pool.preview_image_scaled(&src))
+        .await
+    {
+        pv.image = Some(scaled);
+    }
+    Ok(pv)
+}
+
 async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let paths = app.selection_paths().await;
     let Some(p) = paths.into_iter().next() else {
@@ -5017,7 +5240,7 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
         });
         return;
     };
-    match app.preview(&p) {
+    match prepared_preview(app, &p).await {
         Ok(pv) => {
             this.update(cx, |v, cx| {
                 v.show_preview(pv, cx);

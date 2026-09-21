@@ -58,9 +58,13 @@ impl Render for PreviewWindow {
         let p = self.preview.clone();
         let text = p.text.clone().unwrap_or_default();
 
-        // 主体只有内容本身：图片直接加载原图（gpui 解码，object_fit 默认
-        // Contain 适配容器），其余是纯文本。图片容器 flex_1 + min_h_0：没有
-        // 确定高度时 Contain 无从适配。文本自己带内边距，图片铺满。
+        // 主体只有内容本身：图片加载一个降采样后的副本（见
+        // `AppState::preview_image_scaled`），object_fit 默认 Contain 适配容器。
+        // 图片容器 flex_1 + min_h_0：没有确定高度时 Contain 无从适配。
+        // 文本自己带内边距，图片铺满。
+        //
+        // 加载 / 失败都给占位：gpui 要过 LOADING_DELAY(200ms) 才肯显占位，
+        // 期间是一片空白；解码失败（损坏 / 不支持的格式）也不能让窗口空着。
         let body: AnyElement = match p.kind {
             PreviewKind::Image if p.image.is_some() => div()
                 .flex()
@@ -68,7 +72,28 @@ impl Render for PreviewWindow {
                 .min_h_0()
                 .items_center()
                 .justify_center()
-                .child(img(p.image.clone().unwrap()).size_full())
+                .child(
+                    img(p.image.clone().unwrap())
+                        .size_full()
+                        .with_loading(|| {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(text!("载入预览…".to_string()))
+                                .into_any_element()
+                        })
+                        .with_fallback(|| {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(text!("无法解码这张图片".to_string()))
+                                .into_any_element()
+                        }),
+                )
                 .into_any_element(),
             _ => div()
                 .flex_1()

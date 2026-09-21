@@ -391,7 +391,7 @@ pub fn tags(entity: &Entity<RootView>, view: &RootView) -> Div {
 }
 
 /// 一个可编辑的输入行（带光标提示）。
-fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> {
+pub(crate) fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> {
     div()
         .id(id)
         .flex()

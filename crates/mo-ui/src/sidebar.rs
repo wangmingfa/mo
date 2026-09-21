@@ -91,6 +91,83 @@ pub fn render(
         );
     }
 
+    // 远程连接区：未连接时给入口，已连接时回显地址 + 「断开连接」。
+    let connected = app.active_connection();
+    panel = panel.child(
+        div()
+            .px(px(10.0))
+            .pb(px(6.0))
+            .pt(px(10.0))
+            .text_size(px(11.0))
+            .text_color(crate::theme::muted())
+            .child(text!("远程")),
+    );
+    if let Some(url) = connected {
+        let label = url.display();
+        let app_dc = app.clone();
+        let entity_dc = entity.clone();
+        let mut item = div()
+            .id("sidebar-remote-connected")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(crate::theme::text())
+            .bg(crate::theme::accent());
+        item = item.child(crate::icons::icon(
+            crate::icons::HARD_DRIVE,
+            16.0,
+            crate::theme::text(),
+        ));
+        item = item.child(div().flex_1().min_w_0().truncate().child(text!(label)));
+        let mut disconnect = div()
+            .id("sidebar-remote-disconnect")
+            .ml_auto()
+            .pl(px(6.0))
+            .text_size(px(12.0))
+            .text_color(crate::theme::muted())
+            .child(text!("断开".to_string()));
+        disconnect.interactivity().on_click(move |_, _window, cx| {
+            let app_dc = app_dc.clone();
+            let entity_dc = entity_dc.clone();
+            cx.spawn(async move |_cx| {
+                let _ = app_dc.disconnect_remote().await;
+                entity_dc.update(_cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+        panel = panel.child(item.child(disconnect));
+    } else {
+        let entity_conn = entity.clone();
+        let mut item = div()
+            .id("sidebar-remote-connect")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(crate::theme::text())
+            .hover(|s| s.bg(crate::theme::hover_bg()));
+        item.interactivity().on_click(move |_, _window, cx| {
+            entity_conn.update(cx, |v, cx| v.open_connect_dialog(cx));
+        });
+        panel = panel.child(
+            item.child(crate::icons::icon(
+                crate::icons::HARD_DRIVE,
+                16.0,
+                crate::theme::text(),
+            ))
+            .child(text!("连接到服务器…")),
+        );
+    }
+
     // 书签区（`~/Library/Application Support/mo/config.json` 里的
     // `sidebar_bookmarks`，命令面板「添加 / 移除书签」维护）。
     let bookmarks = app.bookmarks();

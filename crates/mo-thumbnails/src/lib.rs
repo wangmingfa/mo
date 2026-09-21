@@ -37,6 +37,13 @@ pub enum ThumbnailError {
 /// 缩略图默认边长（像素）。
 pub const DEFAULT_SIZE: u32 = 128;
 
+/// 预览图的长边上限（像素）。
+///
+/// 快速预览会把超过这个尺寸的图片**先降采样**再交给 UI：一张 7680×4320 的
+/// JPEG 全解码约 130MB RGBA，而屏幕上通常只显示很小一块——原图既拖慢首次
+/// 加载，也让 GPU 端按原尺寸建了张用不上的大纹理。
+pub const PREVIEW_MAX_EDGE: u32 = 2560;
+
 /// 缩略图缓存。
 ///
 /// * **磁盘缓存**：`<用户缓存目录>/mo/thumbs/<size>/<file-id>.png`，跨会话复用；
@@ -175,4 +182,41 @@ fn default_thumb_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("mo")
         .join("thumbs")
+}
+
+/// 默认预览图缓存目录：`dirs::cache_dir()/mo/preview`。
+///
+/// 与缩略图分开存放：两者尺寸差 20 倍，混在一个目录里不利于整体清理。
+fn default_preview_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mo")
+        .join("preview")
+}
+
+/// 为**快速预览**准备一张降采样副本，落在 `root` 下；返回 `Some` 时应加载
+/// 这个路径而不是原图。
+///
+/// * 原图长边已在 `max_edge` 以内 → `None`（用原图，不必多一份磁盘副本）；
+/// * 命中缓存 → 直接返回缓存路径（**不解码**）；
+/// * 否则生成长边不超过 `max_edge` 的 PNG（`generate_to` 内部先写临时文件
+///   再 `rename`，进程被杀不会留下半张图）。
+///
+/// **阻塞操作**（含解码），必须在 blocking 池调用。任何失败都返回 `None`——
+/// 降采样属于优化，失败必须让调用方安静地回退到原图，而不是让预览失败。
+pub fn preview_scaled_in(root: &Path, src: &Path, max_edge: u32) -> Option<PathBuf> {
+    // 只读文件头拿尺寸：这里不能整图解出来，否则就失去了降采样的意义。
+    let (w, h) = image::image_dimensions(src).ok()?;
+    if w.max(h) <= max_edge {
+        return None;
+    }
+    let cache = ThumbnailCache::with_root(root.to_path_buf());
+    cache
+        .get_or_create(&FileId::synthetic(src), src, max_edge)
+        .ok()
+}
+
+/// 同上，使用默认预览缓存目录 `<用户缓存目录>/mo/preview`。
+pub fn preview_scaled(src: &Path, max_edge: u32) -> Option<PathBuf> {
+    preview_scaled_in(&default_preview_root(), src, max_edge)
 }

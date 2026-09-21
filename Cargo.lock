@@ -3798,6 +3798,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy-regex"
+version = "3.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4994ba703f78b083e2f7946dac9251abd83fd43a0365f030e99b69be5b4b9ef9"
+dependencies = [
+ "lazy-regex-proc_macros",
+ "once_cell",
+ "regex",
+]
+
+[[package]]
+name = "lazy-regex-proc_macros"
+version = "3.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd97232314824e6dbef1918a871bb93f51070455e3715bf26e19a6d01aa977a0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4226,6 +4249,7 @@ dependencies = [
  "mo-fs",
  "mo-operations",
  "mo-preview",
+ "mo-remote",
  "mo-search",
  "mo-thumbnails",
  "parking_lot",
@@ -4324,6 +4348,20 @@ dependencies = [
  "anyhow",
  "mo-core",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "mo-remote"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "mo-core",
+ "mo-fs",
+ "suppaftp",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6893,6 +6931,21 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "suppaftp"
+version = "12.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba93b140f4d07f1b3f3fb4d7264b2d422d5c8b4e925eb6a2646e1342d5d2070a"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "lazy-regex",
+ "log",
+ "pin-project",
+ "thiserror 2.0.20",
+ "tokio",
+]
 
 [[package]]
 name = "sval"

@@ -100,19 +100,20 @@ pub fn drag_strip() -> impl IntoElement {
 
 /// 标签条尾部（「＋」之后）那条占满剩余宽度的拖拽带。
 ///
-/// 为什么需要它：顶栏是自绘的 [`TOOLBAR_HEIGHT`] = 48px，但窗口没有开
-/// `WindowOptions::app_owns_titlebar_drag`（默认 `false`），拖拽权仍在 AppKit 手里，
-/// 而 AppKit 只认**原生标题栏那一条带**（macOS ≈ 28pt）。于是 48px 顶栏的下半截
-/// 没人负责拖拽——AppKit 不管、应用层也没接——标签右侧那块空白就此成为死区。
+/// 为什么需要它：顶栏是自绘的 [`TOOLBAR_HEIGHT`] = 48px，Mac 上 AppKit
+/// 只认**原生标题栏那一条带**（≈28pt），两者高度不一致时总有一截没人负责
+/// 拖拽（详见 [`attach_titlebar_drag`]）。Windows 侧更实际：Wayland / X11 下
+/// 自绘标题栏必须自己接，这里统一交给 Helper。
 ///
-/// 本函数补上应用层拖拽，按平台分两条路：
+/// 按平台分两条路：
 /// - **Windows**：打 [`WindowControlArea::Drag`]（命中测试返回 `HTCAPTION`），
 ///   拖拽 / 双击最大化交系统。
 /// - **macOS / Linux**：`WindowControlArea` 无处落地（`gpui-pre-macos` 的
 ///   `on_hit_test_window_control` 是空实现），改调 [`Window::start_window_move`]，
 ///   内部走 `performWindowDragWithEvent:`，手感与原生标题栏一致。
 ///
-/// 上沿那 ~28pt 仍归 AppKit（双击缩放的系统偏好由它判断），这里只补它下面的死区。
+/// ⚠️ 该矩形必须与任何可点击控件互不重叠——否则重叠处被判成标题栏、
+/// 子控件收不到点击（Windows 的命中测试按祖先优先）。
 pub fn drag_filler() -> impl IntoElement {
     let mut filler = div()
         .id("titlebar-drag-filler")
@@ -125,15 +126,63 @@ pub fn drag_filler() -> impl IntoElement {
 
     if cfg!(target_os = "windows") {
         filler = filler.window_control_area(WindowControlArea::Drag);
-    } else {
-        filler
-            .interactivity()
-            .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
-                window.start_window_move();
-            });
     }
 
-    filler
+    attach_titlebar_drag(filler)
+}
+
+/// 标题栏按下时应采取的窗口动作。
+///
+/// 抽成纯函数是为了**可单测**：Mac 接管标题栏后，单击「拖」与双击「缩放」的语义
+/// 全由这里决定，藏进闭包里就没人能验证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitlebarAction {
+    /// 双击 → 缩放（最大化 / 还原）：补回 macOS 原生标题栏的双击语义。
+    Zoom,
+    /// 单击按住 → 开始拖拽窗口。
+    Drag,
+    /// 交给系统：Windows 的 `HTCAPTION` 已包含拖拽与双击最大化，应用层不插手。
+    System,
+}
+
+/// 决定标题栏上一次按下要干什么。
+///
+/// `click_count` 来自 gpui 的 [`MouseDownEvent::click_count`]：连第二次按下时
+/// 它是 2，据此把双击还原成缩放，而不是再发起一次拖拽。
+pub fn titlebar_action(is_windows: bool, click_count: usize) -> TitlebarAction {
+    if is_windows {
+        TitlebarAction::System
+    } else if click_count > 1 {
+        TitlebarAction::Zoom
+    } else {
+        TitlebarAction::Drag
+    }
+}
+
+/// 给顶栏（或其中一段带子）挂上自营的标题栏拖拽。
+///
+/// 为什么要自营：macOS 主窗口开了 `WindowOptions::app_owns_titlebar_drag`，
+/// AppKit 不再参与标题栏——**好处**是消掉「点标题栏先等一拍判断是不是双击」
+/// 的那段延迟；**代价**是拖拽与双击缩放都得自己实现，漏挂一处那块就彻底拖不动。
+///
+/// Windows 不挂：`WindowControlArea::Drag` 让系统命中测试直接返回 `HTCAPTION`，
+/// 拖拽 / 双击最大化都由系统照顾，比自己拼更稳。
+pub fn attach_titlebar_drag<E: InteractiveElement>(mut d: E) -> E {
+    if cfg!(target_os = "windows") {
+        return d;
+    }
+    d.interactivity()
+        .on_mouse_down(MouseButton::Left, |ev, window, cx| {
+            // 鼠标事件内层先于外层冒泡：这里已经处理完，不要再往上传，
+            // 否则外层的同类处理器会重复发起一次拖拽。
+            cx.stop_propagation();
+            match titlebar_action(cfg!(target_os = "windows"), ev.click_count) {
+                TitlebarAction::Zoom => window.zoom_window(),
+                TitlebarAction::Drag => window.start_window_move(),
+                TitlebarAction::System => {}
+            }
+        });
+    d
 }
 
 /// 右缘的窗口控制按钮：最小化 / 最大化（或还原）/ 关闭。
@@ -294,49 +343,75 @@ fn address_bar(
 
     // 面包屑模式：一段一个可点击胶囊，中间夹「›」分隔符。
     if let Some(p) = path {
-        let segs = segments(p);
-        let n = segs.len();
-        for (i, (label, prefix)) in segs.into_iter().enumerate() {
-            let is_last = i + 1 == n;
-            if i > 0 {
-                pill = pill.child(icon(icons::CHEVRON_RIGHT, 12.0, theme::muted()));
-            }
-            let seg_app = app.clone();
-            let seg_path = prefix.clone();
+        // 已连远程：地址栏回显完整 URL（用当前远程路径替换原路径再显示），
+        // 整段可点击进入编辑（填新路径即在远程内跳转，填 `scheme://` 则切服务器）。
+        if let Some(url) = app.active_connection() {
+            let full = url.display_at(&p.display().to_string());
+            let entity_edit = entity.clone();
             let mut seg = div()
-                .id(("crumb", i))
+                .id(("crumb", 0usize))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(4.0))
                 .px(px(5.0))
-                // 高度钉死：pill 高 32，段高 24 → hover 底色上下各留 4px，
-                // 不会顶到外框（文字行高会浮动，不定高就会贴边）。
                 .h(px(24.0))
                 .overflow_hidden()
                 .rounded(px(5.0))
                 .flex_shrink_0()
-                .text_color(if is_last {
-                    theme::text()
-                } else {
-                    theme::muted()
-                })
+                .text_color(theme::text())
                 .hover(|s| s.bg(theme::hover_bg()));
-
-            seg.interactivity().on_click(move |_, _window, cx| {
-                // 阻断冒泡：别让外层「点击空白进入编辑」误触发。
+            seg.interactivity().on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                let app = seg_app.clone();
-                let target = seg_path.clone();
-                cx.spawn(async move |_cx| {
-                    let _ = app.open_directory(&target).await;
-                })
-                .detach();
+                entity_edit.update(cx, |v, cx| v.begin_address_edit(window, cx));
             });
-
-            // 段一律显示原始名称文本（不再给 Home 段换房子图标）。
-            seg = seg.child(text!(label));
+            seg = seg.child(div().flex_1().min_w_0().truncate().child(text!(full)));
             pill = pill.child(seg);
+        } else {
+            let segs = segments(p);
+            let n = segs.len();
+            for (i, (label, prefix)) in segs.into_iter().enumerate() {
+                let is_last = i + 1 == n;
+                if i > 0 {
+                    pill = pill.child(icon(icons::CHEVRON_RIGHT, 12.0, theme::muted()));
+                }
+                let seg_app = app.clone();
+                let seg_path = prefix.clone();
+                let mut seg = div()
+                    .id(("crumb", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(5.0))
+                    // 高度钉死：pill 高 32，段高 24 → hover 底色上下各留 4px，
+                    // 不会顶到外框（文字行高会浮动，不定高就会贴边）。
+                    .h(px(24.0))
+                    .overflow_hidden()
+                    .rounded(px(5.0))
+                    .flex_shrink_0()
+                    .text_color(if is_last {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
+                    .hover(|s| s.bg(theme::hover_bg()));
+
+                seg.interactivity().on_click(move |_, _window, cx| {
+                    // 阻断冒泡：别让外层「点击空白进入编辑」误触发。
+                    cx.stop_propagation();
+                    let app = seg_app.clone();
+                    let target = seg_path.clone();
+                    cx.spawn(async move |_cx| {
+                        let _ = app.open_directory(&target).await;
+                    })
+                    .detach();
+                });
+
+                // 段一律显示原始名称文本（不再给 Home 段换房子图标）。
+                seg = seg.child(text!(label));
+                pill = pill.child(seg);
+            }
         }
     }
 
@@ -484,4 +559,27 @@ fn view_mode_button(mode: ViewMode, entity: &Entity<RootView>) -> Stateful<Div> 
         });
     });
     button.child(text!(mode.label().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    // 显式列出，不能用 `use super::*`：那会把 `gpui_kit::*` 一并引进来，
+    // 其中的 `test` 模块会让 `#[test]` 属性解析成它自己…… 报
+    // “recursion limit reached while expanding #[test]”。
+    use super::{titlebar_action, TitlebarAction};
+
+    /// Mac 自营标题栏：单击拖窗口，双击缩放（补回 AppKit 原本管的双击语义）。
+    #[test]
+    fn mac_single_click_drags_and_double_click_zooms() {
+        assert_eq!(titlebar_action(false, 1), TitlebarAction::Drag);
+        assert_eq!(titlebar_action(false, 2), TitlebarAction::Zoom);
+        assert_eq!(titlebar_action(false, 3), TitlebarAction::Zoom);
+    }
+
+    /// Windows 一律交系统：`HTCAPTION` 已经包含拖拽与双击最大化。
+    #[test]
+    fn windows_hands_everything_to_the_system() {
+        assert_eq!(titlebar_action(true, 1), TitlebarAction::System);
+        assert_eq!(titlebar_action(true, 2), TitlebarAction::System);
+    }
 }
