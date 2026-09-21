@@ -274,11 +274,12 @@ mod tests {
 
     #[test]
     fn unsupported_scheme_is_reported_not_panicked() {
-        let u = RemoteUrl::parse("sftp://h/tmp").expect("解析本身应当成功");
+        // 用尚未实现的 webdav 验证「未实现协议给明确错误」，而不是连上去再炸。
+        let u = RemoteUrl::parse("webdav://h/tmp").expect("解析本身应当成功");
         assert!(!crate::supports(&u.scheme));
         let got = crate::connect(&u);
         assert!(
-            matches!(got, Err(RemoteError::Unsupported(ref scheme)) if scheme == "sftp"),
+            matches!(got, Err(RemoteError::Unsupported(ref scheme)) if scheme == "webdav"),
             "未实现的协议要给出明确错误，而不是连上去再炸"
         );
     }

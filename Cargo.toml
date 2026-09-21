@@ -107,6 +107,9 @@ mo-remote = { path = "crates/mo-remote" }
 # 远程协议客户端。只开 tokio 异步、关默认特性以免引入本机 TLS 依赖，
 # 明文 FTP 先跑通，FTPS 待议（见 crates/mo-remote/Cargo.toml）。
 suppaftp = { version = "12", default-features = false, features = ["tokio"] }
+# SFTP 后端：纯 Rust SSH 实现（默认 aws-lc-rs 加密后端，无本机 libssh2 / OpenSSL 依赖）。
+russh = { version = "0.63" }
+russh-sftp = { version = "3" }
 
 [profile.release]
 opt-level = 3

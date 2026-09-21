@@ -194,7 +194,7 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         },
         CmdDef {
             id: CommandId::ConnectServer,
-            title: "连接到服务器…（FTP 等远程协议）".to_string(),
+            title: "连接到服务器…（FTP / SFTP 等远程协议）".to_string(),
             category: "导航".to_string(),
         },
         CmdDef {
@@ -557,7 +557,7 @@ pub struct RootView {
     /// 连接失败时的错误提示（保留对话框展示）。
     pub(crate) connect_error: Option<String>,
     /// `Modal::Info` 提示框操作按钮的文字；`None` = 默认「知道了」。
-    /// 通过 [`RootView::notice_with_ok`] 设置，关闭提示时清回 `None`。
+    /// 通过 [`RootView::notice`] 的 `ok` 参数设置，关闭提示时清回 `None`。
     pub(crate) notice_ok: Option<String>,
 }
 
@@ -999,9 +999,12 @@ impl RootView {
         .detach();
     }
 
-    /// 「连接到服务器」对话框：地址输入框（纯字符串字段）+ 连接 / 取消按钮 + 错误区。
-    fn render_connect(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div().flex().flex_col().gap(px(8.0)).p(px(8.0));
+    /// 「连接到服务器」对话框：走 [`dialog_overlay`]（带遮罩的浮层，非替换中央区）。
+    ///
+    /// 它是个小对话框，不该把整个浏览区顶掉。地址是纯字符串字段——命令面板入口
+    /// 没有 `Window`，建不了真实 `InputState`；回车连接、Esc 取消见 `handle_modal_key`。
+    fn render_connect(&self, entity: &Entity<RootView>) -> impl IntoElement {
+        let mut body = div().flex().flex_col().gap(px(10.0));
         body = body.child(
             div()
                 .text_size(px(12.0))
@@ -1021,29 +1024,36 @@ impl RootView {
                     .child(text!(err.clone())),
             );
         }
-        let mut actions = div().flex().flex_row().gap(px(8.0)).pt(px(4.0));
-        let ent = entity.clone();
+
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap(px(8.0))
+            .pt(px(4.0));
+        let ent_go = entity.clone();
         let mut connect_btn = Self::sync_button("connect-go", "连接", true);
         connect_btn.interactivity().on_click(move |_, _window, cx| {
-            ent.update(cx, |v, cx| v.connect_submit(cx));
+            ent_go.update(cx, |v, cx| v.connect_submit(cx));
         });
-        actions = actions.child(connect_btn);
-        let ent2 = entity.clone();
+        let ent_cancel = entity.clone();
         let mut cancel_btn = Self::sync_button("connect-cancel", "取消", false);
         cancel_btn.interactivity().on_click(move |_, _window, cx| {
-            ent2.update(cx, |v, cx| {
+            ent_cancel.update(cx, |v, cx| {
                 v.modal = Modal::None;
                 v.connect_error = None;
                 cx.notify();
             });
         });
-        actions = actions.child(cancel_btn);
+        actions = actions.child(cancel_btn).child(connect_btn);
         body = body.child(actions);
-        modal_card(
+
+        dialog_overlay(
+            entity,
             "连接到服务器",
             "",
             body,
-            "格式 ftp://用户:密码@主机:端口/路径 · 输入字符即填 · 回车连接 · Esc 取消",
+            "格式 ftp://用户:密码@主机:端口/路径 或 sftp://… · 回车连接 · Esc 取消",
         )
     }
 
@@ -1295,10 +1305,10 @@ impl RootView {
         self.repaint_theme(cx);
     }
 
-    fn render_theme(&self, entity: &Entity<RootView>) -> Div {
+    fn render_theme(&self, entity: &Entity<RootView>) -> impl IntoElement {
         let app = self.app();
         let names = crate::theme::choices(&app.custom_themes());
-        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        let mut body = div().flex().flex_col().gap(px(2.0));
         for (i, name) in names.iter().enumerate() {
             let selected = i == self.theme_index;
             let on_click_theme = name.clone();
@@ -1378,7 +1388,8 @@ impl RootView {
                 )
                 .child(swatches),
         );
-        modal_card(
+        dialog_overlay(
+            entity,
             "主题",
             "",
             body,
@@ -1410,7 +1421,13 @@ impl RootView {
     }
 
     fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(2.0))
+            .p(px(8.0));
         if self.extensions.is_empty() {
             body = body.child(
                 div()
@@ -1474,7 +1491,7 @@ impl RootView {
             });
             body = body.child(row);
         }
-        modal_card(
+        central_view(
             "扩展",
             "",
             body,
@@ -1539,14 +1556,20 @@ impl RootView {
     }
 
     fn render_workflow(&self) -> Div {
-        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(4.0))
+            .p(px(8.0));
         if self.wf_running {
             body = body.child(
                 div()
                     .text_color(theme::muted())
                     .child(text!("正在执行…（Esc：不再继续下一步）".to_string())),
             );
-            return modal_card("自动化工作流", "", body, "执行在后台进行，可以继续浏览");
+            return central_view("自动化工作流", "", body, "执行在后台进行，可以继续浏览");
         }
         let Some(r) = self.wf_report.clone() else {
             body = body.child(
@@ -1554,7 +1577,7 @@ impl RootView {
                     .text_color(theme::muted())
                     .child(text!("（还没有执行记录）".to_string())),
             );
-            return modal_card("自动化工作流", "", body, "Esc 关闭");
+            return central_view("自动化工作流", "", body, "Esc 关闭");
         };
         let head = if let Some(f) = r.failed_at {
             format!("「{}」在第 {} 步失败", r.workflow, f + 1)
@@ -1609,7 +1632,7 @@ impl RootView {
             );
         }
         body = body.child(list);
-        modal_card(
+        central_view(
             "自动化工作流",
             "",
             body,
@@ -1856,7 +1879,13 @@ impl RootView {
 
         let src = self.panel().path.clone().unwrap_or_default();
         let paired = self.sync_pair();
-        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(4.0))
+            .p(px(8.0));
 
         body = body.child(
             div()
@@ -2018,7 +2047,7 @@ impl RootView {
                     )),
             );
         }
-        modal_card(
+        central_view(
             "文件夹同步",
             "",
             body,
@@ -2087,17 +2116,23 @@ impl RootView {
     }
 
     fn render_dedup(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(4.0))
+            .p(px(8.0));
         if self.dedup_running {
             body = body.child(
                 div()
                     .text_color(theme::muted())
                     .child(text!("正在扫描当前目录…（Esc 取消）".to_string())),
             );
-            return modal_card("重复文件", "", body, "扫描在后台进行，可以继续浏览");
+            return central_view("重复文件", "", body, "扫描在后台进行，可以继续浏览");
         }
         let Some(report) = self.dedup.clone() else {
-            return modal_card("重复文件", "", body, "还没有结果");
+            return central_view("重复文件", "", body, "还没有结果");
         };
         body = body.child(
             div()
@@ -2184,7 +2219,7 @@ impl RootView {
             list = list.child(row);
         }
         body = body.child(list);
-        modal_card(
+        central_view(
             "重复文件",
             "",
             body,
@@ -2455,7 +2490,13 @@ impl RootView {
     }
 
     fn render_keys(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div().flex().flex_col().gap(px(1.0)).p(px(6.0));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(1.0))
+            .p(px(6.0));
         body = body.child(
             div()
                 .text_size(px(11.0))
@@ -2540,7 +2581,7 @@ impl RootView {
             reset_ent.update(cx, |v, cx| v.keys_reset_all(cx));
         });
         body = body.child(list).child(reset_row);
-        modal_card(
+        central_view(
             "快捷键",
             "",
             body,
@@ -2668,8 +2709,8 @@ impl RootView {
         cx.notify();
     }
 
-    fn render_layout(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+    fn render_layout(&self, entity: &Entity<RootView>) -> impl IntoElement {
+        let mut body = div().flex().flex_col().gap(px(2.0));
         for (i, (label, value)) in self.layout_rows().into_iter().enumerate() {
             let selected = i == self.layout_index;
             let mut row = div()
@@ -2708,7 +2749,8 @@ impl RootView {
             });
             body = body.child(row);
         }
-        modal_card(
+        dialog_overlay(
+            entity,
             "布局",
             "",
             body,
@@ -3810,11 +3852,22 @@ impl Render for RootView {
         let sidebar_w = if self.ui.sidebar { SIDEBAR_WIDTH } else { 0.0 };
         let per_pane_w = ((viewport_w - sidebar_w) / visible_panes as f32 - 24.0).max(160.0);
 
-        // 模态打开时，工具栏 / 状态栏保留，中央区换成模态卡片。
-        // 例外：`Modal::Info` 是带遮罩的提示框，下层内容照常渲染（见文末浮层），
-        // 所以这里与 `None` 一样渲染正常浏览区。
+        // 模态打开时，工具栏 / 状态栏保留，中央区按模态性质二选一：
+        // * **对话框**（B 类）：带遮罩的浮层，下层照常渲染、透过遮罩可见，
+        //   所以这里与 `None` 一样渲染正常浏览区，而不是顶掉整个中央区；
+        // * **次级视图**（A 类）：内容多、要停留，正当占满中央区，
+        //   由 `central_view` 提供标题栏（见 `dialogs.rs` / 各 `render_*`）。
         let body: Div = match &self.modal {
-            Modal::None | Modal::Info(_) => {
+            // 对话框（B 类）：走带遮罩的浮层，中央区照常渲染浏览区。
+            Modal::None
+            | Modal::Info(_)
+            | Modal::ConnectServer
+            | Modal::Properties
+            | Modal::Archive
+            | Modal::Tags
+            | Modal::Theme
+            | Modal::Layout
+            | Modal::CommandPalette => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
                 if self.ui.sidebar {
@@ -3830,23 +3883,17 @@ impl Render for RootView {
                 }
                 row
             }
-            Modal::CommandPalette => self.render_command_palette(&entity),
+            // 次级视图（A 类）：占满中央区，由 `central_view` 提供标题栏。
             Modal::GlobalSearch => self.render_global_search(&entity),
             Modal::Trash => self.render_trash(),
             Modal::Diff => self.render_diff(),
-            Modal::Properties => dialogs::properties(self, &entity),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
-            Modal::Archive => dialogs::archive(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
-            Modal::Tags => dialogs::tags(&entity, self),
-            Modal::Theme => self.render_theme(&entity),
-            Modal::Layout => self.render_layout(&entity),
             Modal::Keys => self.render_keys(&entity),
             Modal::Extensions => self.render_extensions(&entity),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
-            Modal::ConnectServer => self.render_connect(&entity),
         };
 
         let panel = self.panel();
@@ -4019,15 +4066,27 @@ impl Render for RootView {
             cx.focus_self(window);
         }
 
-        // 信息提示：带遮罩的模态框。下层内容照常渲染、透过半透明遮罩可见，但被
-        // `.occlude()` 挡住点不到；居中一张卡片。点遮罩空白 / 操作按钮 / Esc 关闭。
-        // 按钮文字可经 `notice_with_ok` 自定义，默认「知道了」。
-        if let Modal::Info(msg) = self.modal.clone() {
-            let label = self
-                .notice_ok
-                .clone()
-                .unwrap_or_else(|| "知道了".to_string());
-            root = root.child(render_notice_overlay(&msg, &label, &entity));
+        // 对话框（B 类）：一律是带遮罩的浮层——下层内容照常渲染、透过半透明遮罩
+        // 可见，但被 `.occlude()` 挡住点不到；居中一张卡片。点遮罩空白 / Esc 关闭
+        // （按键路由见 `handle_modal_key`）。这里在文末挂上，画在浏览区之上。
+        match &self.modal {
+            // 信息提示：与其它对话框共用外壳，只是无标题栏；按钮文字可经
+            // `notice(text, Some(..))` 自定义，默认「知道了」。
+            Modal::Info(msg) => {
+                let label = self
+                    .notice_ok
+                    .clone()
+                    .unwrap_or_else(|| "知道了".to_string());
+                root = root.child(render_notice_overlay(msg, &label, &entity));
+            }
+            Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
+            Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
+            Modal::Archive => root = root.child(dialogs::archive(self, &entity)),
+            Modal::Tags => root = root.child(dialogs::tags(&entity, self)),
+            Modal::Theme => root = root.child(self.render_theme(&entity)),
+            Modal::Layout => root = root.child(self.render_layout(&entity)),
+            Modal::CommandPalette => root = root.child(self.render_command_palette(&entity)),
+            _ => {}
         }
 
         // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
@@ -4756,6 +4815,7 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         v.modal = Modal::None;
         v.notice_ok = None;
+        v.connect_error = None;
         v.cmd_query.clear();
         v.search_query.clear();
         v.search_results.clear();
@@ -5380,7 +5440,7 @@ fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
 // ---------- 模态卡片渲染 ----------
 
 impl RootView {
-    fn render_command_palette(&self, _entity: &Entity<RootView>) -> Div {
+    fn render_command_palette(&self, entity: &Entity<RootView>) -> impl IntoElement {
         let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
         let idx = self.palette_index;
         let mut body = div()
@@ -5403,14 +5463,14 @@ impl RootView {
                 .gap(px(8.0))
                 .p(px(6.0))
                 .bg(if selected {
-                    gpui_kit::blue()
+                    theme::selected_bg()
                 } else {
-                    gpui_kit::white()
+                    theme::surface()
                 })
                 .text_color(if selected {
-                    gpui_kit::white()
+                    theme::selected_text()
                 } else {
-                    gpui_kit::black()
+                    theme::text()
                 })
                 .child(text!(def.category.to_string()))
                 .child(text!(def.title.to_string()));
@@ -5419,7 +5479,8 @@ impl RootView {
         if list.is_empty() {
             body = body.child(text!("无匹配命令".to_string()));
         }
-        modal_card(
+        dialog_overlay(
+            entity,
             "命令面板",
             &format!("🔍 {}", self.cmd_query),
             body,
@@ -5429,12 +5490,14 @@ impl RootView {
 
     fn render_global_search(&self, _entity: &Entity<RootView>) -> Div {
         let idx = self.palette_index;
+        // 吃满中央区剩余高度（原先写死 360px 是为了配合 640px 卡片）。
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .gap(px(2.0))
-            .overflow_y_scrollbar()
-            .h(px(360.0));
+            .overflow_y_scrollbar();
         for (i, hit) in self.search_results.iter().enumerate() {
             let selected = i == idx;
             let row = div()
@@ -5445,14 +5508,14 @@ impl RootView {
                 .gap(px(8.0))
                 .p(px(6.0))
                 .bg(if selected {
-                    gpui_kit::blue()
+                    theme::selected_bg()
                 } else {
-                    gpui_kit::white()
+                    theme::surface()
                 })
                 .text_color(if selected {
-                    gpui_kit::white()
+                    theme::selected_text()
                 } else {
-                    gpui_kit::black()
+                    theme::text()
                 })
                 .child(text!(hit.name.clone()))
                 .child(text!(format!("{}", hit.path.display())));
@@ -5461,7 +5524,7 @@ impl RootView {
         if self.search_results.is_empty() {
             body = body.child(text!("输入关键词搜索整个文件系统（⌘F）".to_string()));
         }
-        modal_card(
+        central_view(
             &format!("全局搜索（已索引 {} 项）", self.indexed),
             &format!("🔍 {}", self.search_query),
             body,
@@ -5475,12 +5538,14 @@ impl RootView {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // 吃满中央区剩余高度（原先写死 360px 是为了配合 640px 卡片）。
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .gap(px(2.0))
-            .overflow_y_scrollbar()
-            .h(px(360.0));
+            .overflow_y_scrollbar();
         for (i, e) in self.trash_entries.iter().enumerate() {
             let selected = i == idx;
             let kind = if e.is_dir { "📁" } else { "📄" };
@@ -5492,14 +5557,14 @@ impl RootView {
                 .gap(px(8.0))
                 .p(px(6.0))
                 .bg(if selected {
-                    gpui_kit::blue()
+                    theme::selected_bg()
                 } else {
-                    gpui_kit::white()
+                    theme::surface()
                 })
                 .text_color(if selected {
-                    gpui_kit::white()
+                    theme::selected_text()
                 } else {
-                    gpui_kit::black()
+                    theme::text()
                 })
                 .child(text!(kind.to_string()))
                 .child(text!(e.original.to_string_lossy().to_string()))
@@ -5509,7 +5574,7 @@ impl RootView {
         if self.trash_entries.is_empty() {
             body = body.child(text!("回收站是空的".to_string()));
         }
-        modal_card(
+        central_view(
             &format!("回收站（{} 项）", self.trash_entries.len()),
             "",
             body,
@@ -5519,7 +5584,7 @@ impl RootView {
     /// 比较 / diff 模态：文件 → 行级 diff；文件夹 → 树比较清单。
     fn render_diff(&self) -> Div {
         let Some(c) = &self.diff_cache else {
-            return modal_card(
+            return central_view(
                 "比较",
                 "",
                 div().child(text!("（无结果）".to_string())),
@@ -5537,6 +5602,8 @@ impl RootView {
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .gap(px(4.0))
             .child(text!(format!("左：{}（{} 字节）", f.a.display(), f.a_size)))
             .child(text!(format!("右：{}（{} 字节）", f.b.display(), f.b_size)));
@@ -5563,9 +5630,10 @@ impl RootView {
                 let mut lines = div()
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .min_h_0()
                     .gap(px(1.0))
-                    .overflow_y_scrollbar()
-                    .h(px(380.0));
+                    .overflow_y_scrollbar();
                 'outer: for op in &td.ops {
                     match op {
                         mo_diff::DiffOp::Equal { old, new, count } => {
@@ -5631,7 +5699,7 @@ impl RootView {
                 }
             }
         }
-        modal_card("文件比较", "", body, "Esc / Space 关闭")
+        central_view("文件比较", "", body, "Esc / Space 关闭")
     }
 
     /// 文件夹 diff：统计摘要 + 按相对路径排序的条目清单。
@@ -5647,6 +5715,8 @@ impl RootView {
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .gap(px(4.0))
             .child(text!(format!("左：{}", t.left.display())))
             .child(text!(format!("右：{}", t.right.display())))
@@ -5659,9 +5729,10 @@ impl RootView {
         let mut rows = div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
             .gap(px(1.0))
-            .overflow_y_scrollbar()
-            .h(px(360.0));
+            .overflow_y_scrollbar();
         for (i, e) in t.entries.iter().enumerate() {
             let (label, fg) = match e.status {
                 mo_diff::TreeStatus::Identical => ("＝", crate::theme::muted()),
@@ -5694,7 +5765,7 @@ impl RootView {
             rows = rows.child(text!("（无条目）".to_string()));
         }
         body = body.child(rows);
-        modal_card("文件夹比较", "", body, "Esc / Space 关闭")
+        central_view("文件夹比较", "", body, "Esc / Space 关闭")
     }
 }
 
@@ -5712,48 +5783,159 @@ fn human_ago(at: u64, now: u64) -> String {
     }
 }
 
-/// 一个居中的模态卡片（标题 + 输入行 + 内容 + 底部提示）。
-pub(crate) fn modal_card(title: &str, input: &str, body: impl IntoElement, hint: &str) -> Div {
+/// **中央区视图**：占据整个中央内容区的次级视图（**不是**对话框）。
+///
+/// 用于内容多、需要停留与滚动的场景——文件 / 文件夹比较、重复文件、磁盘占用、
+/// 回收站、全局搜索、同步、工作流、批量重命名、快捷键、扩展。顶部一条标题栏
+/// （标题 + 可选副标题 + 右侧快捷键提示），下方内容区铺满，由各视图自己滚动。
+///
+/// 反过来，短小的输入 / 确认类弹窗请用 [`dialog_overlay`]——它们不该把浏览区顶掉。
+pub(crate) fn central_view(title: &str, input: &str, body: impl IntoElement, hint: &str) -> Div {
+    let mut head = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .child(div().text_size(px(14.0)).child(text!(title.to_string())));
+    if !input.is_empty() {
+        head = head.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .child(text!(input.to_string())),
+        );
+    }
     div()
         .flex()
         .flex_col()
         .flex_1()
-        .items_center()
-        .justify_center()
-        .p(px(24.0))
+        .min_w_0()
+        .min_h_0()
+        .bg(theme::surface())
+        .text_color(theme::text())
         .child(
             div()
                 .flex()
-                .flex_col()
-                .w(px(640.0))
-                .bg(gpui_kit::rgb(0xf7f7f7))
-                .rounded(px(8.0))
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .px(px(14.0))
+                .py(px(10.0))
+                .border_b_1()
+                .border_color(theme::separator())
+                .bg(theme::container())
+                .child(head)
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .p(px(10.0))
-                        .bg(gpui_kit::rgb(0xe8e8e8))
-                        .child(text!(title.to_string()))
+                        .flex_1()
+                        .min_w_0()
+                        .justify_end()
+                        .text_size(px(12.0))
+                        .text_color(theme::muted())
                         .child(text!(hint.to_string())),
-                )
-                .child(div().p(px(8.0)).child(text!(input.to_string())))
-                .child(div().p(px(8.0)).child(body)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .p(px(8.0))
+                .child(body),
         )
 }
 
-/// 信息提示的模态框：半透明遮罩 + 居中卡片。
+/// 浮层卡片及其标题栏共用的圆角半径。
 ///
-/// 与旧的「替换中央内容区」式弹窗不同——下层照常渲染、透过遮罩可见，但被
-/// `.occlude()` 挡住，模态期间点不到。点遮罩空白或「知道了」关闭（Esc / 空格
-/// 见 `handle_modal_key`）。正文区限高可滚动，长消息（如哈希结果）不撑破窗口。
-fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -> impl IntoElement {
-    let backdrop_close = entity.clone();
-    let ok_close = entity.clone();
+/// ⚠️ 两处必须一致：卡片是 `rounded(R)`，而标题栏自带底色（`theme::container()`），
+/// 是**后画的矩形**——gpui 不会把子元素裁进父级圆角（这个 fork 的 `div` 只处理
+/// `Overflow::Scroll`，`overflow_hidden()` 并不裁），所以标题栏必须自己
+/// `rounded_t(R)`，否则会把卡片上面两个角盖成直角（下面两个角没有子元素覆盖，
+/// 看着是圆的——就是「缺了 2 个圆角」那个现象）。
+const DIALOG_RADIUS: f32 = 12.0;
+
+/// **带遮罩的浮层对话框**：半透明遮罩铺满视口 + 居中卡片。
+///
+/// 所有短小的弹窗都走这里——属性、压缩、标签、主题、布局、命令面板、
+/// 连接到服务器，以及 [`Modal::Info`](Modal) 的信息提示。下层内容照常渲染、
+/// 透过遮罩可见，但被 `.occlude()` 挡住点不到。点遮罩空白 / Esc 关闭
+/// （按键路由见 `handle_modal_key`）。
+///
+/// `title` 为空 = 不画标题栏（纯正文提示，如信息提示），避免留一条空条。
+/// 卡片留白由本函数统一负责，`body` 不要再自带 `p(...)`。
+pub(crate) fn dialog_overlay(
+    entity: &Entity<RootView>,
+    title: &str,
+    input: &str,
+    body: impl IntoElement,
+    hint: &str,
+) -> impl IntoElement {
+    let mut card = div()
+        .id("dialog-card")
+        .w(px(480.0))
+        .flex()
+        .flex_col()
+        .rounded(px(DIALOG_RADIUS))
+        .bg(theme::surface())
+        .text_color(theme::text())
+        .shadow_lg();
+    if !title.is_empty() || !input.is_empty() {
+        let mut head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(div().text_size(px(14.0)).child(text!(title.to_string())));
+        if !input.is_empty() {
+            head = head.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme::muted())
+                    .child(text!(input.to_string())),
+            );
+        }
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .px(px(16.0))
+                .py(px(10.0))
+                .border_b_1()
+                .border_color(theme::separator())
+                .bg(theme::container())
+                // 顶部跟随卡片圆角（见 `DIALOG_RADIUS` 的说明）。
+                .rounded_t(px(DIALOG_RADIUS))
+                .child(head),
+        );
+    }
+    let mut card = card.child(div().p(px(14.0)).child(body));
+    if !hint.is_empty() {
+        card = card.child(
+            div()
+                .px(px(16.0))
+                .pb(px(12.0))
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .child(text!(hint.to_string())),
+        );
+    }
+
+    let card = card
+        // 测试用（release no-op）：断言对话框卡片确实画了出来。
+        .debug_selector(|| "mo-dialog-card".to_string())
+        // 点卡片本身不冒泡到遮罩，否则点内容 / 按钮会误关。
+        .on_click(|_, _window, cx| cx.stop_propagation());
+
+    let backdrop = entity.clone();
     div()
-        .id("notice-backdrop")
+        .id("dialog-backdrop")
         .absolute()
         .top_0()
         .left_0()
@@ -5763,60 +5945,63 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
         .justify_center()
         .bg(gpui_kit::rgb(0x000000).alpha(0.35))
         .occlude()
-        // 点遮罩空白处关闭。
-        .on_click(move |_, _window, cx| {
-            backdrop_close.update(cx, |v, cx| {
-                v.modal = Modal::None;
-                v.notice_ok = None;
-                cx.notify();
-            });
-        })
+        // 测试用（release no-op）：断言遮罩铺满整个视口、且关闭后消失。
+        .debug_selector(|| "mo-dialog-overlay".to_string())
+        .on_click(move |_, _window, cx| dismiss_modal(&backdrop, cx))
+        .child(card)
+}
+
+/// 关闭当前对话框，收尾与该模态的 **Esc 保持一致**。
+///
+/// 点遮罩空白与按 Esc 必须走同一套语义：主题是「↑↓ 实时预览」的，Esc 是
+/// `theme_cancel`（还原预览）；若遮罩走了通用关闭，会让没提交的预览留在配置里。
+fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
+    if matches!(entity.read(cx).modal, Modal::Theme) {
+        entity.update(cx, |v, cx| v.theme_cancel(cx));
+        return;
+    }
+    close_modal(entity, cx);
+}
+
+/// 信息提示（`Modal::Info`）的浮层。
+///
+/// 与其它对话框**共用同一套外壳**（[`dialog_overlay`]：遮罩 + 居中卡片 +
+/// 点空白 / Esc 关闭），到这里已无第二份手写浮层。差异只有两点，都靠参数表达：
+/// 无标题栏（纯提示没有标题）、底部一颗确认按钮。正文限高可滚动，长消息
+/// （如哈希结果）不撑破窗口。按钮文字可经 `notice_ok` 自定义，默认「知道了」。
+fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -> impl IntoElement {
+    let ok_close = entity.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
         .child(
             div()
-                .id("notice-card")
-                .w(px(440.0))
-                .flex()
-                .flex_col()
-                .gap(px(18.0))
-                .p(px(22.0))
-                .rounded(px(12.0))
-                .bg(theme::surface())
-                .text_color(theme::text())
-                .shadow_lg()
-                // 点卡片本身不冒泡到遮罩，否则点正文会误关。
-                .on_click(|_, _window, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .max_h(px(360.0))
-                        .overflow_y_scrollbar()
-                        .child(text!(msg.to_string())),
-                )
-                .child(
-                    div().flex().flex_row().justify_end().child(
-                        div()
-                            .id("notice-ok")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .px(px(18.0))
-                            .h(px(30.0))
-                            .rounded(px(7.0))
-                            // 主色按钮：用品牌蓝 `selected_bg`（`accent` 角色在本主题里是灰）。
-                            .bg(theme::selected_bg())
-                            .text_color(theme::selected_text())
-                            .text_size(px(13.0))
-                            .on_click(move |_, _window, cx| {
-                                ok_close.update(cx, |v, cx| {
-                                    v.modal = Modal::None;
-                                    v.notice_ok = None;
-                                    cx.notify();
-                                });
-                            })
-                            .child(text!(ok_label.to_string())),
-                    ),
-                ),
+                .text_size(px(14.0))
+                .max_h(px(360.0))
+                .overflow_y_scrollbar()
+                .child(text!(msg.to_string())),
         )
+        .child(
+            div().flex().flex_row().justify_end().child(
+                div()
+                    .id("notice-ok")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(18.0))
+                    .h(px(30.0))
+                    .rounded(px(7.0))
+                    // 主色按钮：用品牌蓝 `selected_bg`（`accent` 角色在本主题里是灰）。
+                    .bg(theme::selected_bg())
+                    .text_color(theme::selected_text())
+                    .text_size(px(13.0))
+                    // 与点遮罩空白走同一套收尾（`close_modal` 会清掉 `notice_ok`）。
+                    .on_click(move |_, _window, cx| close_modal(&ok_close, cx))
+                    .child(text!(ok_label.to_string())),
+            ),
+        );
+    dialog_overlay(entity, "", "", body, "")
 }
 
 // ---------- diff 模态辅助 ----------
@@ -6039,7 +6224,7 @@ mod tests {
     use std::path::PathBuf;
 
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, TestAppContext};
+    use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
     use super::{Modal, RootView};
@@ -6180,6 +6365,235 @@ mod tests {
             list_before, list_after,
             "右键菜单挤动了文件列表：绝对定位浮层不应当影响根容器的 flex 布局"
         );
+    }
+
+    /// 对话框（B 类）必须是**带遮罩的浮层**，而不是「替换中央区那种」：
+    /// 打开后遮罩铺满整个视口、卡片画出来，下层浏览区照常渲染且位置不变；
+    /// 关闭后遮罩消失。
+    ///
+    /// 覆盖「连接到服务器」与从替换中央区迁移过来的几个（布局 / 命令面板）——
+    /// 它们原先会顶掉整个浏览区，与「连接到服务器」是同一类缺陷。
+    #[test]
+    fn dialogs_are_full_viewport_overlays() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|window, cx| window.render_frame(cx));
+        let (vw, vh) = cx.update(|window, _cx| {
+            let s = window.viewport_size();
+            (s.width.to_f64() as f32, s.height.to_f64() as f32)
+        });
+        assert!(
+            cx.debug_bounds("mo-dialog-overlay").is_none(),
+            "没打开对话框时不该有遮罩"
+        );
+        let list_before = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+
+        /// 打开某个对话框的动作。用普通函数指针而不是闭包 trait 对象——
+        /// 这样 `cases` 是个朴素数组，不必为类型复杂度开 `allow`。
+        type OpenDialog = fn(&mut RootView, &mut Context<RootView>);
+
+        let cases: [(&str, OpenDialog); 4] = [
+            ("连接到服务器", |v, cx| v.open_connect_dialog(cx)),
+            ("信息提示", |v, cx| v.notice("测试消息", None, cx)),
+            ("布局", |v, cx| {
+                v.modal = Modal::Layout;
+                cx.notify();
+            }),
+            ("命令面板", |v, cx| {
+                v.modal = Modal::CommandPalette;
+                cx.notify();
+            }),
+        ];
+
+        for (name, open) in cases {
+            cx.update(|_window, cx| root.update(cx, open));
+            cx.update(|window, cx| window.render_frame(cx));
+
+            let overlay = cx.debug_bounds("mo-dialog-overlay").unwrap_or_else(|| {
+                panic!("「{name}」没有渲染成浮层（遮罩缺失）——对话框应当是带遮罩的模态框")
+            });
+            assert_eq!(
+                overlay.origin.x,
+                px(0.0),
+                "「{name}」遮罩没有从窗口左缘开始"
+            );
+            assert_eq!(
+                overlay.origin.y,
+                px(0.0),
+                "「{name}」遮罩没有从窗口顶部开始"
+            );
+            assert!(
+                (f32::from(overlay.size.width) - vw).abs() < 1.0
+                    && (f32::from(overlay.size.height) - vh).abs() < 1.0,
+                "「{name}」遮罩没有铺满整个视口：overlay={overlay:?} 视口={vw}x{vh}"
+            );
+            assert!(
+                cx.debug_bounds("mo-dialog-card").is_some(),
+                "「{name}」对话框卡片没有渲染（遮罩下没有内容）"
+            );
+            // 绝对定位的浮层不该挤动下层文件列表（与右键菜单同一条约束）。
+            let list_after = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+            assert_eq!(
+                list_before, list_after,
+                "「{name}」浮层挤动了文件列表：绝对定位模态不应当影响根容器的 flex 布局"
+            );
+
+            // 关闭后遮罩必须消失（否则「模态没真正关掉」）。
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.modal = Modal::None;
+                    cx.notify();
+                });
+            });
+            cx.update(|window, cx| window.render_frame(cx));
+            assert!(
+                cx.debug_bounds("mo-dialog-overlay").is_none(),
+                "「{name}」关闭后遮罩仍在——模态没有真正关闭"
+            );
+        }
+    }
+
+    /// 对话框的**标题栏必须带上卡片顶部的那两个圆角**。
+    ///
+    /// 卡片是 `rounded(12)`，但标题栏自带底色（`theme::container()`）——它是
+    /// **后画的矩形**。gpui 不会把子元素裁进父级圆角（这个 fork 的 `div` 只认
+    /// `Overflow::Scroll`，`overflow_hidden()` 没有任何地方消费），于是矩形的
+    /// 标题栏把卡片上面两个角盖成了直角，下面两个角因为没有子元素覆盖仍是圆的
+    /// ——就是「连接到服务器」弹窗「缺了 2 个圆角」那个现象。
+    ///
+    /// headless 里拿不到栅格化截图，但 `painted_quads()` 给出了每个 quad 的
+    /// `corner_radii`，足够直接断言绘制输出。
+    #[test]
+    fn dialog_header_carries_the_card_corner_radius() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_connect_dialog(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card = cx
+            .debug_bounds("mo-dialog-card")
+            .expect("对话框卡片没有渲染");
+        // `debug_bounds` 是逻辑像素，`painted_quads` 是缩放后像素。
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let card_x = f32::from(card.origin.x) * scale;
+        let card_y = f32::from(card.origin.y) * scale;
+        let card_w = f32::from(card.size.width) * scale;
+
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let same_left_top_width = |q: &gpui_kit::Quad| {
+            near(q.bounds.origin.x.as_f32(), card_x)
+                && near(q.bounds.origin.y.as_f32(), card_y)
+                && near(q.bounds.size.width.as_f32(), card_w)
+        };
+
+        // 卡片本身：四角同半径的圆角底色。
+        let card_quad = quads
+            .iter()
+            .find(|q| {
+                same_left_top_width(q)
+                    && q.corner_radii.top_left.as_f32() > 0.0
+                    && q.corner_radii.top_left == q.corner_radii.top_right
+                    && q.corner_radii.top_left == q.corner_radii.bottom_left
+            })
+            .expect("没找到卡片那张四角圆角的底色 quad");
+        let r = card_quad.corner_radii.top_left.as_f32();
+
+        // 标题栏：与卡片同左 / 同顶 / 同宽，但更矮（卡片本身是全高，已被上面的
+        // 条件排除），并且只有它这一层的顶部需要跟随圆角。
+        let header = quads
+            .iter()
+            .find(|q| {
+                same_left_top_width(q)
+                    && q.bounds.size.height.as_f32() < card_quad.bounds.size.height.as_f32() - 1.0
+            })
+            .expect("没找到对话框标题栏那一层的 quad");
+
+        assert!(
+            near(header.corner_radii.top_left.as_f32(), r)
+                && near(header.corner_radii.top_right.as_f32(), r),
+            "标题栏顶部圆角没有跟随卡片（卡片半径 {r}）——它会把卡片上面两个角\
+             盖成直角，正是「缺了 2 个圆角」：标题栏圆角={:?}",
+            header.corner_radii
+        );
+        assert_eq!(
+            header.corner_radii.bottom_left.as_f32(),
+            0.0,
+            "标题栏底部接正文，不该有圆角"
+        );
+        assert_eq!(
+            header.corner_radii.bottom_right.as_f32(),
+            0.0,
+            "标题栏底部接正文，不该有圆角"
+        );
+    }
+
+    /// 次级视图（A 类）必须**接管中央区**：浏览区（文件列表）整个让位，而不是
+    /// 像对话框那样叠一层、下层仍看得见。
+    ///
+    /// 与 `dialogs_are_full_viewport_overlays` 成对——那条守 B 类「浮层不挤动
+    /// 浏览区」，这条守 A 类「正当占满中央区」。两条一起钉住这次拆分的边界：
+    /// 短对话框与长视图不再共用同一张 640px 固定宽卡片。
+    #[test]
+    fn central_views_take_over_the_browsing_area() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-file-list").is_some(),
+            "初始应当渲染浏览区（文件列表）"
+        );
+
+        let cases: [(&str, Modal); 3] = [
+            ("全局搜索", Modal::GlobalSearch),
+            ("快捷键", Modal::Keys),
+            ("扩展", Modal::Extensions),
+        ];
+        for (name, modal) in cases {
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.modal = modal;
+                    cx.notify();
+                });
+            });
+            cx.update(|window, cx| window.render_frame(cx));
+
+            assert!(
+                cx.debug_bounds("mo-file-list").is_none(),
+                "「{name}」没有接管中央区：文件列表还在渲染（它应当占满中央区）"
+            );
+            assert!(
+                cx.debug_bounds("mo-dialog-overlay").is_none(),
+                "「{name}」是次级视图，不该用带遮罩的浮层"
+            );
+
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.modal = Modal::None;
+                    cx.notify();
+                });
+            });
+            cx.update(|window, cx| window.render_frame(cx));
+            assert!(
+                cx.debug_bounds("mo-file-list").is_some(),
+                "「{name}」关闭后浏览区没有回来"
+            );
+        }
     }
 
     /// 贴着右下角打开时，菜单必须被钳回视口内（否则会被窗口边缘切掉）。

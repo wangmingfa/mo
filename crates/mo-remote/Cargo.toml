@@ -18,5 +18,9 @@ tracing.workspace = true
 # 在三个目标平台上都是额外的本机构建负担。明文 FTP 先跑通，FTPS 后置。
 suppaftp.workspace = true
 
+# SFTP 后端：纯 Rust SSH（russh），默认 aws-lc-rs 加密后端，无本机系统依赖。
+russh.workspace = true
+russh-sftp.workspace = true
+
 [lints]
 workspace = true

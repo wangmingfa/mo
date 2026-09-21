@@ -3,13 +3,20 @@
 //! 统一套路：`RootView` 只持有**表单状态**（当前字段、文本、选项），
 //! 这里负责渲染 + 把按键结果写回。所有提交动作都通过 `AppState` 发命令，
 //! UI 不直接碰文件系统。
+//!
+//! 两类壳的归属见 `crate::app`：
+//! * `central_view`——占满中央区的次级视图（批量重命名 / 磁盘用量）；
+//! * `dialog_overlay`——带遮罩的浮层对话框（属性 / 压缩 / 标签）。
 
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_core::plan_batch_rename;
 use mo_operations::mode_string;
 
-use crate::{app::modal_card, theme, RootView};
+use crate::{
+    app::{central_view, dialog_overlay},
+    theme, RootView,
+};
 
 /// 属性面板里的可编辑状态。
 #[derive(Clone)]
@@ -34,12 +41,12 @@ impl PropEdit {
     }
 }
 
-/// 属性 / 权限面板。
-pub fn properties(view: &RootView, entity: &Entity<RootView>) -> Div {
+/// 属性 / 权限面板（浮层对话框）。
+pub fn properties(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
     let Some(p) = &view.prop else {
-        return modal_card("属性", "", div(), "Esc 关闭");
+        return dialog_overlay(entity, "属性", "", div(), "Esc 关闭");
     };
-    let mut body = div().flex().flex_col().gap(px(6.0)).p(px(8.0));
+    let mut body = div().flex().flex_col().gap(px(6.0));
 
     // 1) 文件名（可编辑）
     body = body
@@ -107,7 +114,8 @@ pub fn properties(view: &RootView, entity: &Entity<RootView>) -> Div {
             .child(text!(p.info.clone())),
     );
 
-    modal_card(
+    dialog_overlay(
+        entity,
         "属性与权限",
         "",
         body,
@@ -115,7 +123,7 @@ pub fn properties(view: &RootView, entity: &Entity<RootView>) -> Div {
     )
 }
 
-/// 批量重命名：规则表单 + 实时预览。
+/// 批量重命名：规则表单 + 实时预览（占满中央区的次级视图）。
 pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
     let spec = &view.rename_spec;
     let names: Vec<String> = view
@@ -129,7 +137,13 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         .collect();
     let preview = plan_batch_rename(&names, spec);
 
-    let mut body = div().flex().flex_col().gap(px(4.0)).p(px(8.0));
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .gap(px(4.0))
+        .p(px(8.0));
     let fields: [(&str, String, usize); 4] = [
         ("查找", spec.find.clone(), 0),
         ("替换为", spec.replace.clone(), 1),
@@ -178,12 +192,14 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         );
     }
 
+    // 预览列表吃满剩余高度（原先写死 200px，去了卡片壳后要撑满中央区）。
     let mut list = div()
         .flex()
         .flex_col()
+        .flex_1()
+        .min_h_0()
         .gap(px(2.0))
-        .overflow_y_scrollbar()
-        .h(px(200.0));
+        .overflow_y_scrollbar();
     for (i, (old, new)) in names.iter().zip(preview.iter()).take(12).enumerate() {
         list = list.child(
             div()
@@ -212,7 +228,7 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         )
         .child(list);
 
-    modal_card(
+    central_view(
         "批量重命名",
         "",
         body,
@@ -220,8 +236,8 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
     )
 }
 
-/// 压缩：输入目标文件名（后缀决定格式）。
-pub fn archive(view: &RootView, _entity: &Entity<RootView>) -> Div {
+/// 压缩：输入目标文件名（后缀决定格式）——浮层对话框。
+pub fn archive(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
     let names: Vec<String> = view
         .rename_paths
         .iter()
@@ -231,7 +247,7 @@ pub fn archive(view: &RootView, _entity: &Entity<RootView>) -> Div {
                 .unwrap_or_default()
         })
         .collect();
-    let mut body = div().flex().flex_col().gap(px(6.0)).p(px(8.0));
+    let mut body = div().flex().flex_col().gap(px(6.0));
     body = body
         .child(
             div()
@@ -257,20 +273,28 @@ pub fn archive(view: &RootView, _entity: &Entity<RootView>) -> Div {
                 .child(text!(n.clone())),
         );
     }
-    modal_card("压缩", "", body, "输入文件名 · Enter 执行 · Esc 取消")
+    dialog_overlay(
+        entity,
+        "压缩",
+        "",
+        body,
+        "输入文件名 · Enter 执行 · Esc 取消",
+    )
 }
 
-/// 磁盘空间分析：按大小排序的横向条形图。
+/// 磁盘空间分析：按大小排序的横向条形图（占满中央区的次级视图）。
 pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
     let usage = &view.usage;
     let total: u64 = usage.iter().map(|u| u.size).sum::<u64>().max(1);
+    // 吃满中央区剩余高度（原先写死 380px 是为了配合 640px 卡片）。
     let mut body = div()
         .flex()
         .flex_col()
+        .flex_1()
+        .min_h_0()
         .gap(px(4.0))
         .p(px(8.0))
-        .overflow_y_scrollbar()
-        .h(px(380.0));
+        .overflow_y_scrollbar();
     if usage.is_empty() {
         body = body.child(text!("（正在统计…）".to_string()));
     }
@@ -332,7 +356,7 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
         });
         body = body.child(row);
     }
-    modal_card(
+    central_view(
         "磁盘空间分析",
         &format!("合计 {}", human_size(total)),
         body,
@@ -340,9 +364,9 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
     )
 }
 
-/// 标签：给选中项选一个颜色。
-pub fn tags(entity: &Entity<RootView>, view: &RootView) -> Div {
-    let mut body = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+/// 标签：给选中项选一个颜色（浮层对话框）。
+pub fn tags(entity: &Entity<RootView>, view: &RootView) -> impl IntoElement {
+    let mut body = div().flex().flex_col().gap(px(2.0));
     for (i, (key, label)) in mo_app::TAG_COLORS.iter().enumerate() {
         let active = view.form_index == i;
         let color = tag_color(key);
@@ -382,7 +406,8 @@ pub fn tags(entity: &Entity<RootView>, view: &RootView) -> Div {
         });
         body = body.child(row);
     }
-    modal_card(
+    dialog_overlay(
+        entity,
         "文件标签",
         "",
         body,

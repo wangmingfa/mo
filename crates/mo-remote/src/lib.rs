@@ -24,8 +24,8 @@
 //!
 //! FTP 的每个动作都能一对一映射到 [`mo_fs::FileSystem`] 的方法（列目录 / 建目录 /
 //! 上传 / 下载 / 改名 / 删除），而且 `suppaftp` 是纯 Rust、无本机依赖，
-//! 三平台都能编。它作为「这条路走得通」的验证：后续 SFTP / WebDAV 按同样
-//! 的形状实现即可。
+//! 三平台都能编。它作为「这条路走得通」的验证：SFTP 后端已按同样的形状接好
+//! （见 [`sftp`]），WebDAV / 云存储待议。
 //!
 //! ## ⚠️ 每个连接自带 runtime
 //!
@@ -39,6 +39,7 @@
 //! 刚好一致（见 `mo_fs::FileSystem::read_dir_blocking`）。
 
 pub mod ftp;
+pub mod sftp;
 mod url;
 
 pub use self::url::{RemoteUrl, DEFAULT_PORTS};
@@ -83,7 +84,7 @@ impl From<RemoteError> for MoError {
 
 /// 是否已有可用于该协议的后端。
 pub fn supports(scheme: &str) -> bool {
-    matches!(scheme, "ftp")
+    matches!(scheme, "ftp" | "sftp")
 }
 
 /// 按给定地址建一条远程连接。
@@ -93,6 +94,7 @@ pub fn supports(scheme: &str) -> bool {
 pub fn connect(url: &RemoteUrl) -> Result<Arc<dyn mo_fs::FileSystem>, RemoteError> {
     match url.scheme.as_str() {
         "ftp" => Ok(Arc::new(ftp::FtpFileSystem::connect(url)?)),
+        "sftp" => Ok(Arc::new(sftp::SftpFileSystem::connect(url)?)),
         s => Err(RemoteError::Unsupported(s.to_string())),
     }
 }
