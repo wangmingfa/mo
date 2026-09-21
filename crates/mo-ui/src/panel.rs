@@ -213,6 +213,18 @@ impl Panel {
         }
     }
 
+    /// 标签页上的远程徽标：正在浏览远程时给出 `host[:port]`，本地为 `None`。
+    ///
+    /// 用户要求「访问 FTP 时标签页上要显示出来」。判据抽在这里（徽标怎么画——
+    /// 地球图标 + 这个串——在 `render_tab_bar`），是因为这一半能单测，
+    /// 而「标签上有没有画出那个图标」headless 下读不出文本、测不了。
+    ///
+    /// 只看**当前是否在浏览远程**：切回本地后会话可能还活着（`open_local` 不断开），
+    /// 但那时标签页显示的是本地目录，不该再挂远程徽标。
+    pub fn remote_badge(&self) -> Option<String> {
+        self.app.remote_url().map(|u| u.authority())
+    }
+
     /// 窗口快照是否完整覆盖 `[start, end)`。
     pub fn covered(&self, start: usize, end: usize) -> bool {
         !self.window.is_empty()

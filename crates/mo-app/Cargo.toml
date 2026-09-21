@@ -34,5 +34,10 @@ windows-sys = { version = "0.52", features = [
 ] }
 winreg = "0.55"
 
+[dev-dependencies]
+# 测试里的「假远程后端」要实现 `mo_fs::FileSystem`（该 trait 用 async_trait 宏），
+# 用于验证「本地位置在远程会话下必须走 open_local」，见 tests/remote_local.rs。
+async-trait.workspace = true
+
 [lints]
 workspace = true

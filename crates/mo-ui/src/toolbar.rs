@@ -343,10 +343,15 @@ fn address_bar(
 
     // 面包屑模式：一段一个可点击胶囊，中间夹「›」分隔符。
     if let Some(p) = path {
-        // 已连远程：地址栏回显完整 URL（用当前远程路径替换原路径再显示），
+        // **正在看**远程时：地址栏回显完整 URL（当前远程路径替换原路径）。
+        // 用 `remote_url()`（**正在浏览**的那条）而不是 `live_connections()`（活着的
+        // 全部连接）——切回本地后连接还活着，那时地址栏该显示本地路径，而不是拿本地
+        // 路径去拼一个远程 URL。
         // 整段可点击进入编辑（填新路径即在远程内跳转，填 `scheme://` 则切服务器）。
-        if let Some(url) = app.active_connection() {
-            let full = url.display_at(&p.display().to_string());
+        if let Some(url) = app.remote_url() {
+            // `address_at` 不回显用户名：地址栏要的是「哪台机器的哪个目录」，
+            // 用户名只参与登录（用户明确要求过别显示）。
+            let full = url.address_at(&p.display().to_string());
             let entity_edit = entity.clone();
             let mut seg = div()
                 .id(("crumb", 0usize))

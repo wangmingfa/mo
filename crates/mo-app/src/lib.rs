@@ -39,7 +39,7 @@ pub use workflows::{run_workflow, StepResult, WorkflowReport};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,14 +72,19 @@ pub struct AppStateInner {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<AppStateInner>>,
-    /// 当前生效的底层文件系统（本地或已连接的远程后端）。
+    /// 本标签页在看哪一边：本地，还是注册表里的某一条远程会话。
     ///
-    /// 用 `std::sync::RwLock` 包一层 `Arc`：只在「连接 / 断开」瞬间写，目录读写
-    /// 频繁读，且不依赖异步上下文——与 mo-app 的共享 tokio runtime 解耦
-    /// （FTP 连接自带一份 runtime，`block_on` 不能在共享 runtime 上做）。
-    fs: Arc<std::sync::RwLock<Arc<dyn FileSystem>>>,
-    /// 当前连接的远程地址（`None` = 正在浏览本地）。用于地址栏回显与「断开」入口。
-    connection: Arc<std::sync::Mutex<Option<RemoteUrl>>>,
+    /// 这里**只有「哪一条」**，连接对象本身活在 [`SessionRegistry`] 里——那个比标签页
+    /// 活得久（用户要的是「关标签页不断开，只有退出应用才断开」）。用一个
+    /// `std::sync::Mutex` 而不是 tokio 的：只在切来源那一瞬间写，读也极短（取一个
+    /// id），而且 `active_fs()` 会在非异步上下文被调用。与 mo-app 的共享 tokio runtime
+    /// 解耦也靠它（FTP 连接自带一份 runtime，`block_on` 不能在共享 runtime 上做）。
+    source: Arc<std::sync::Mutex<Source>>,
+    /// 进程级会话注册表。
+    ///
+    /// 做成字段（而不是每次调全局函数）是为了让测试能塞一份独占的进来：并行跑的
+    /// 用例共享进程级单例会互相串味（一个用例装上的假服务器，另一个也看得见）。
+    sessions: Arc<SessionRegistry>,
     ops: Arc<Mutex<OperationManager>>,
     bus: EventBus,
     scheduler: MetadataScheduler,
@@ -92,6 +97,8 @@ pub struct AppState {
     /// 元数据是逐条回填的，一万条目就是一万次变更；若每变一条就广播一次，
     /// UI 会被刷爆。这里只置位，由刷新泵按固定节拍合并成一次广播。
     dirty: Arc<AtomicBool>,
+    /// 后台泵是否该收工（关标签页时置位）。见 [`AppState::stop_pumps`]。
+    stopped: Arc<AtomicBool>,
     /// 全局搜索索引（内存 SQLite）。跨目录搜索的数据源。
     index: Arc<PlMutex<FileIndex>>,
     /// 中断后台索引爬取的开关。
@@ -161,6 +168,176 @@ pub enum ConnectFailure {
     },
 }
 
+/// 一条活着的远程会话的编号。
+///
+/// 会话活在 [`SessionRegistry`] 里，界面只拿这个编号指代「哪一条连接」：侧边栏按它
+/// 列出多条、点哪条切哪条、按哪个图标断开哪条。
+pub type SessionId = u64;
+
+/// 一条活着的远程会话。
+///
+/// 连接对象（FTP 的 socket、它自带的 runtime）就活在这里。**它不随标签页消失**：
+/// 会话挂在注册表上，关标签页只是不再有人看它，连接照旧。终点只有一个——
+/// 显式「断开」（[`AppState::disconnect_connection`]），或进程退出。
+#[derive(Clone)]
+struct RemoteSession {
+    id: SessionId,
+    /// 连接时的地址（含登录用户名；密码在 `display()` 里已被刻意丢掉）。
+    url: RemoteUrl,
+    /// 这条会话的后端，即上层的连接对象。
+    fs: Arc<dyn FileSystem>,
+    /// 这条会话最后待过的远程目录。
+    ///
+    /// 切回本地再切回来时回到这里，而不是每次都掉回根目录——「会话还活着」的
+    /// 体感一半来自不重登，另一半来自位置还在。
+    path: String,
+}
+
+/// 活着的连接一览（侧边栏「远程」区按这个列表渲染）。
+#[derive(Clone, Debug)]
+pub struct LiveConnection {
+    /// 编号：点它 / 断开它时用来指代这条连接。
+    pub id: SessionId,
+    /// 连接地址（含用户名；密码不回显）。
+    pub url: RemoteUrl,
+}
+
+/// 进程级会话注册表：远程连接活在这里，而不是活在某一个标签页里。
+///
+/// 用户要的语义是「切回本地不断开、**关标签页也不断开**，只有退出应用才断开」，而每个
+/// 标签页各自持有一份 `AppState`——会话若挂在 `AppState` 上，就会被标签页一起带走。
+/// 所以连接上移到这里，`AppState` 只记「我看的是哪一条」。注册表是进程级的
+/// （[`session_registry`]），于是新开的标签页天然看得见已经连着的服务器。
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: std::sync::Mutex<Vec<RemoteSession>>,
+    /// 编号分配器：从 1 起，**永不复用**——断开又新建时，界面手里那个旧编号
+    /// 不会认到新连接上。
+    next_id: AtomicU64,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登入一条新会话，返回它的编号。
+    fn add(&self, url: RemoteUrl, fs: Arc<dyn FileSystem>) -> SessionId {
+        let mut list = self.sessions.lock().unwrap();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        list.push(RemoteSession {
+            id,
+            url,
+            fs,
+            path: "/".to_string(),
+        });
+        id
+    }
+
+    /// 能直接复用的活会话：端点、用户名都对得上，且没给一个**不同**的密码。
+    ///
+    /// 地址里显式写了另一个密码，说明用户就是想换凭据重登，那就真连；不带密码
+    /// （走钥匙串或匿名）才对得上「就是它，接着用」。见 [`RemoteUrl::endpoint`]。
+    fn find(&self, url: &RemoteUrl) -> Option<SessionId> {
+        self.sessions.lock().unwrap().iter().find_map(|s| {
+            let same_user = s.url.endpoint() == url.endpoint() && s.url.user == url.user;
+            let same_password = match &url.password {
+                Some(pw) => s.url.password.as_ref() == Some(pw),
+                None => true,
+            };
+            (same_user && same_password).then_some(s.id)
+        })
+    }
+
+    /// 取一条会话的副本（`None` = 已经断开了）。
+    fn entry(&self, id: SessionId) -> Option<RemoteSession> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+    }
+
+    fn fs_of(&self, id: SessionId) -> Option<Arc<dyn FileSystem>> {
+        self.entry(id).map(|s| s.fs)
+    }
+
+    fn url_of(&self, id: SessionId) -> Option<RemoteUrl> {
+        self.entry(id).map(|s| s.url)
+    }
+
+    fn path_of(&self, id: SessionId) -> Option<String> {
+        self.entry(id).map(|s| s.path)
+    }
+
+    fn set_path(&self, id: SessionId, path: String) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.id == id)
+        {
+            s.path = path;
+        }
+    }
+
+    /// 断开一条：从表里摘掉，连接对象随之关闭。
+    fn remove(&self, id: SessionId) -> bool {
+        let mut list = self.sessions.lock().unwrap();
+        let before = list.len();
+        list.retain(|s| s.id != id);
+        list.len() != before
+    }
+
+    /// 活着的连接一览（按建立顺序）。
+    fn snapshot(&self) -> Vec<LiveConnection> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| LiveConnection {
+                id: s.id,
+                url: s.url.clone(),
+            })
+            .collect()
+    }
+
+    /// 还有几条活着。
+    pub fn len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 本进程的会话注册表。
+///
+/// 与共享 tokio runtime 同理：会话的生命周期就是进程的生命周期——「只有退出应用才
+/// 断开」就是它。`AppState::new` / `with_trash` 默认取这一份，所以每个标签页看到的是
+/// 同一张表；测试要隔离就用 [`AppState::with_isolated_sessions`]。
+pub fn session_registry() -> Arc<SessionRegistry> {
+    static REG: std::sync::OnceLock<Arc<SessionRegistry>> = std::sync::OnceLock::new();
+    REG.get_or_init(|| Arc::new(SessionRegistry::new())).clone()
+}
+
+/// 本标签页在看哪一边。
+///
+/// 会话本身不在这里（见 [`SessionRegistry`]），这里只剩「看的是哪一条」。
+#[derive(Default)]
+struct Source {
+    /// 本标签页看着的那条会话。
+    ///
+    /// **切回本地不清它**：`on_remote` 才是「现在在哪」。留着这个编号，点回远程
+    /// 时才知道该回到哪一条（见 [`AppState::open_remote`]）。
+    active: Option<SessionId>,
+    /// 当前生效的是不是那条会话（`false` = 本地）。
+    on_remote: bool,
+}
+
 impl AppState {
     /// 默认回收站根目录：用户主目录下的 `.mo-trash`。
     fn default_trash_root() -> PathBuf {
@@ -175,7 +352,25 @@ impl AppState {
     }
 
     /// 以指定回收站根目录构造（测试可传入临时目录以保持隔离）。
+    ///
+    /// 会话表用**进程级**那一份：同一进程里的所有标签页共享同一批远程连接，
+    /// 这正是「关标签页不断开」的实现基础。
     pub fn with_trash(trash_root: PathBuf) -> Self {
+        Self::build(trash_root, session_registry())
+    }
+
+    /// ⚠️ 仅供测试 / 需要显式指定会话表时用。
+    ///
+    /// 传一份**独占的** [`SessionRegistry`] 就是隔离（并行跑的用例共享进程级单例会
+    /// 互相串味：一个用例装上的假服务器，另一个也看得见）；传同一个 `Arc` 给两个
+    /// `AppState`，就等于两个标签页——这正是「关标签页不断开」的验证方式。
+    #[doc(hidden)]
+    pub fn with_sessions(trash_root: PathBuf, sessions: Arc<SessionRegistry>) -> Self {
+        Self::build(trash_root, sessions)
+    }
+
+    /// 以指定回收站与会话表构造（两个公开构造器共用）。
+    fn build(trash_root: PathBuf, sessions: Arc<SessionRegistry>) -> Self {
         let cache = match MetadataCache::open_default() {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
@@ -191,8 +386,8 @@ impl AppState {
                 directory: None,
                 visible_range: 0..0,
             })),
-            fs: Arc::new(std::sync::RwLock::new(Arc::new(LocalFileSystem))),
-            connection: Arc::new(std::sync::Mutex::new(None)),
+            source: Arc::new(std::sync::Mutex::new(Source::default())),
+            sessions,
             ops: Arc::new(Mutex::new(OperationManager::new())),
             bus: EventBus::new(),
             scheduler: MetadataScheduler::new(),
@@ -204,6 +399,7 @@ impl AppState {
                 FileIndex::open_in_memory().expect("open index"),
             )),
             index_stop: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
             history: Arc::new(PlMutex::new(Vec::new())),
             trash,
             undo_stack: Arc::new(PlMutex::new(Vec::new())),
@@ -239,14 +435,44 @@ impl AppState {
         &self.bus
     }
 
+    /// 本 `AppState` 的后台泵是否该收工了。
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// 让本 `AppState` 的后台泵退出（关标签页时调用，见 `RootView::close_tab`）。
+    ///
+    /// 泵各自握着一份 `AppState` 克隆并在 `loop` 里永不返回，所以「标签页被移出
+    /// 列表」并不会释放它。置位后各泵在下一轮自退。
+    ///
+    /// 远程连接**不在这里收尾**：会话活在 [`SessionRegistry`] 里，关标签页不断开
+    /// （用户要的语义），只有 [`AppState::disconnect_connection`] 与进程退出才关。
+    pub fn stop_pumps(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
     /// 底层文件系统抽象（当前生效的，可能是远程连接）。
     pub fn file_system(&self) -> Arc<dyn FileSystem> {
         self.active_fs()
     }
 
-    /// 当前生效的底层文件系统（本地或已连接的远程后端）。
+    /// 当前生效的底层文件系统（本地，或**正在浏览**的那条远程会话）。
+    ///
+    /// 会话在浏览期间被别处断开时回落本地：绝不返回一条已经关掉的连接。
     fn active_fs(&self) -> Arc<dyn FileSystem> {
-        self.fs.read().unwrap().clone()
+        self.active_session()
+            .and_then(|id| self.sessions.fs_of(id))
+            .unwrap_or_else(|| Arc::new(LocalFileSystem))
+    }
+
+    /// 本标签页当前生效的会话编号（在看本地、或那条会话已被断开时为 `None`）。
+    fn active_session(&self) -> Option<SessionId> {
+        let src = self.source.lock().unwrap();
+        if src.on_remote {
+            src.active
+        } else {
+            None
+        }
     }
 
     /// 操作管理器（提交 / 取消文件操作）。
@@ -318,6 +544,13 @@ impl AppState {
             sel.clear();
             inner.directory = Some(dir);
             inner.selection = sel;
+        }
+
+        // 记下这条会话待过的地方：切回本地再回来时回到同一层（见 `use_session`）。
+        // 只在真读成功之后记，路径打错不该覆盖上次的位置。
+        if let Some(id) = self.active_session() {
+            self.sessions
+                .set_path(id, path.to_string_lossy().to_string());
         }
 
         // 切换监听目标：新目录替换旧 watcher，旧 watcher 被 drop 即停止监听。
@@ -491,7 +724,20 @@ impl AppState {
     /// 建连接 + 切换浏览态（首次连接与带凭据重试共用同一条路）。
     async fn finish_connect(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
         let endpoint = url.endpoint();
-        // 先 clone 一份给闭包：下面还要把原 `url` 存进 `connection`。
+
+        // 已经有一条能直接复用的会话（同主机 + 同用户名 + 同密码）？别再登一次。
+        //
+        // 这是「切回本地不断开连接」省下的另一半：从本地切回远程时不只省掉登录，
+        // 连 socket 都不重建。用户名或密码变了说明用户想换凭据，那必须真连（走下面）。
+        if let Some(id) = self.sessions.find(&url) {
+            let path = url.path.clone();
+            return self
+                .use_session(id, Some(&path))
+                .await
+                .map_err(|e| ConnectFailure::Message(e.to_string()));
+        }
+
+        // 先 clone 一份给闭包：下面还要把原 `url` 存进会话。
         let url_for_connect = url.clone();
         let connected = self
             .spawn_blocking(move || mo_remote::connect(&url_for_connect))
@@ -509,9 +755,16 @@ impl AppState {
                 other => ConnectFailure::Message(other.to_string()),
             })?;
 
-        // 切换底层 fs + 记下连接标识；之后 read_dir / 列目录都走远程后端。
-        *self.fs.write().unwrap() = connected;
-        *self.connection.lock().unwrap() = Some(url);
+        // 登记成一条新会话，并切到这个标签页看它。
+        //
+        // **不动已有的会话**：别的标签页可能正看着它们，即便是同一台机器，也可能是
+        // 另一个账号（注册表允许同端点多个账号并存）。断开只走显式那条路。
+        let id = self.sessions.add(url, connected);
+        {
+            let mut src = self.source.lock().unwrap();
+            src.active = Some(id);
+            src.on_remote = true;
+        }
         // 进入远程根目录，并清空本地导航历史，避免回退混进本地路径。
         self.inner.write().await.navigation = NavigationState::new();
         self.open_directory(Path::new("/"))
@@ -570,32 +823,151 @@ impl AppState {
         credentials::forget(endpoint)
     }
 
-    /// 断开远程连接：切回本地 fs，跳回主目录，并清空导航历史。
-    pub async fn disconnect_remote(&self) -> Result<(), MoError> {
-        *self.fs.write().unwrap() = Arc::new(LocalFileSystem);
-        *self.connection.lock().unwrap() = None;
-        self.inner.write().await.navigation = NavigationState::new();
-        if let Some(home) = dirs::home_dir() {
-            self.open_directory(&home).await?;
+    /// 断开一条远程连接：把它从注册表里摘掉（连接随之关闭）。
+    ///
+    /// 本标签页若正看着它，就切回本地主目录；别的标签页若还看着它，下一次读目录会
+    /// 因为会话不在了而回落本地（见 [`Self::active_fs`]）。
+    ///
+    /// 这正是「只有退出应用才断开」之外**唯一**会主动关连接的地方——关标签页不算。
+    pub async fn disconnect_connection(&self, id: SessionId) -> Result<(), MoError> {
+        let dropped_current = {
+            let mut src = self.source.lock().unwrap();
+            if src.active == Some(id) {
+                // 连「本标签页刚才在看它、现在切到本地了」也要清：那条连接已经没了。
+                let was_browsing = src.on_remote;
+                src.active = None;
+                src.on_remote = false;
+                was_browsing
+            } else {
+                false
+            }
+        };
+        self.sessions.remove(id);
+        if dropped_current {
+            self.inner.write().await.navigation = NavigationState::new();
+            if let Some(home) = dirs::home_dir() {
+                self.open_directory(&home).await?;
+            }
         }
         Ok(())
     }
 
-    /// 打开本地目录：若当前连着远程，先切回本地 fs（否则会用错后端、读到乱路径）。
+    /// 断开本标签页当前那条远程连接（命令面板「断开远程连接」走这里）。
+    ///
+    /// 侧边栏是按行断开的（每行一个图标），走的是 [`Self::disconnect_connection`]。
+    /// **只是切回本地不算断开**——那是 [`Self::open_local`]。
+    pub async fn disconnect_remote(&self) -> Result<(), MoError> {
+        let id = self.source.lock().unwrap().active;
+        match id {
+            Some(id) => self.disconnect_connection(id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// 打开本地目录。
+    ///
+    /// 当前在看远程时**只把「看哪边」切回本地，连接留着**：切来源要重置导航栈
+    /// （本地路径与远程路径不能混在一个栈里回退），但会话不关——点侧边栏那条连接
+    /// （[`Self::open_connection`]）就能接着用，不用重新登录。
     ///
     /// 侧边栏快捷访问与地址栏的本地路径输入都走这里，保证「回到本地」显式且安全。
     pub async fn open_local(&self, path: &Path) -> Result<(), MoError> {
-        if self.connection.lock().unwrap().is_some() {
-            *self.fs.write().unwrap() = Arc::new(LocalFileSystem);
-            *self.connection.lock().unwrap() = None;
+        let switched = {
+            let mut src = self.source.lock().unwrap();
+            let was_remote = src.on_remote;
+            src.on_remote = false;
+            was_remote
+        };
+        if switched {
             self.inner.write().await.navigation = NavigationState::new();
         }
         self.open_directory(path).await
     }
 
-    /// 当前连接的远程地址（地址栏回显 / 侧边栏「断开」入口用）。未连接为 `None`。
-    pub fn active_connection(&self) -> Option<RemoteUrl> {
-        self.connection.lock().unwrap().clone()
+    /// 切到指定会话（侧边栏那条连接点一下走这里）：不重新登录、不重建 socket，
+    /// 只是把浏览态切过去，并回到它上次待过的目录。
+    pub async fn open_connection(&self, id: SessionId) -> Result<(), MoError> {
+        self.use_session(id, None).await
+    }
+
+    /// 切回本标签页刚才待过的那条会话（`Ok` 时当前就在远程了）。
+    pub async fn open_remote(&self) -> Result<(), MoError> {
+        // 已经在这条会话里了：什么也不做。否则「再看一眼当前目录」会把导航栈
+        // 清掉——只有**换来源**才该重置历史。
+        if self.browsing_remote() {
+            return Ok(());
+        }
+        let id = self
+            .source
+            .lock()
+            .unwrap()
+            .active
+            .ok_or_else(|| MoError::Other("当前没有远程连接".to_string()))?;
+        self.use_session(id, None).await
+    }
+
+    /// 切到指定会话；`path` 为 `None` 时回到它上次待过的目录。
+    ///
+    /// 只改「当前在哪」，不碰连接对象本身。
+    async fn use_session(&self, id: SessionId, path: Option<&str>) -> Result<(), MoError> {
+        // 会话可能已经被别处断开了（侧边栏、命令面板、或者另一个标签页）。
+        // 先确认它还在——这一步拿注册表的锁，**不要**同时持着 `source` 的锁。
+        let remembered = self
+            .sessions
+            .path_of(id)
+            .ok_or_else(|| MoError::Other("这条远程连接已经断开了".to_string()))?;
+        let target = match path {
+            Some(p) => {
+                self.sessions.set_path(id, p.to_string());
+                p.to_string()
+            }
+            None => remembered,
+        };
+        {
+            let mut src = self.source.lock().unwrap();
+            src.active = Some(id);
+            src.on_remote = true;
+        }
+        // 换来源 = 换了一套路径命名空间：导航栈必须重置，否则「后退」会拿远程路径
+        // 去本地读、或反过来。
+        self.inner.write().await.navigation = NavigationState::new();
+        self.open_directory(Path::new(&target)).await
+    }
+
+    /// 活着的全部连接（侧边栏「远程」区按它渲染；任何标签页看到的都是同一张表）。
+    pub fn live_connections(&self) -> Vec<LiveConnection> {
+        self.sessions.snapshot()
+    }
+
+    /// 本标签页正在浏览的那条连接的编号（侧边栏据此高亮当前那条）。
+    pub fn active_connection_id(&self) -> Option<SessionId> {
+        let id = self.active_session()?;
+        // 会话在浏览中途被断开时，`active` 还留着旧编号——那时不该报「正在看它」。
+        self.sessions.url_of(id).map(|_| id)
+    }
+
+    /// 当前**正在浏览**的远程地址（看本地时是 `None`）。地址栏回显 / 标签页徽标用它。
+    pub fn remote_url(&self) -> Option<RemoteUrl> {
+        self.active_session()
+            .and_then(|id| self.sessions.url_of(id))
+    }
+
+    /// 当前是否在看远程（标签页徽标 / 地址栏的回车语义用它）。
+    pub fn browsing_remote(&self) -> bool {
+        self.remote_url().is_some()
+    }
+
+    /// ⚠️ 仅供测试：直接登入一条「已连接」的会话，避免单测真去建 socket + 登录。
+    ///
+    /// 生产路径只有 [`Self::finish_connect`]（真连 → 登记会话 → 进远程根）。
+    /// `url` 只用于回显，形如 `ftp://example.com:2121`。
+    #[doc(hidden)]
+    pub fn install_backend_for_test(&self, fs: Arc<dyn FileSystem>, url: &str) {
+        let url = RemoteUrl::parse(url).expect("测试用的远程地址应当能解析");
+        let id = self.sessions.add(url, fs);
+        let mut src = self.source.lock().unwrap();
+        src.active = Some(id);
+        src.on_remote = true;
     }
 
     /// 后退栈是否非空。
@@ -616,6 +988,11 @@ impl AppState {
         let app = self.clone();
         self.spawn(async move {
             loop {
+                // 标签页已关：收工。泵握着 `AppState` 的克隆，不退出的话这份
+                // `AppState`（以及它持有的注册表 `Arc`）就跟着一起被拖着不放。
+                if app.stopped() {
+                    return;
+                }
                 let events = {
                     let guard = app.watcher.lock().await;
                     let mut out = Vec::new();
@@ -917,6 +1294,9 @@ impl AppState {
         self.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(120)).await;
+                if app.stopped() {
+                    return;
+                }
                 if app.dirty.swap(false, Ordering::Relaxed) {
                     app.bus.publish(AppEvent::MetadataLoaded {
                         path: PathBuf::new(),

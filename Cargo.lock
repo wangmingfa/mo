@@ -4785,6 +4785,7 @@ name = "mo-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
  "keyring",
  "mo-cache",

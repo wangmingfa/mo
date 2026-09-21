@@ -110,7 +110,10 @@ impl RemoteUrl {
     /// 抽出来是因为 [`RemoteUrl::display`] 与 [`RemoteUrl::endpoint`] 必须共用
     /// 同一套写法——否则同一个连接会在「已连接的地址」和「记住的服务器」里
     /// 长出两个样子，钥匙串条目也就跟着对不上了。
-    fn authority(&self) -> String {
+    ///
+    /// 公开给 UI：标签页上的远程徽标只要主机名（`example.com:2121`），
+    /// 不要把 `ftp://` 前缀和路径也搬上去。
+    pub fn authority(&self) -> String {
         let host_part = match self.host.contains(':') && !self.host.starts_with('[') {
             true => format!("[{}]", self.host),
             false => self.host.clone(),
@@ -123,15 +126,34 @@ impl RemoteUrl {
         format!("{host_part}{port_part}")
     }
 
-    /// 回显成地址串：默认端口与密码都不会写回来。
+    /// 回显成地址串：**带用户名**，不带密码与默认端口。
+    ///
+    /// 这条串表示「以谁的什么身份连着哪台机器」，侧边栏的已连接条目用它——
+    /// 同一台机器换个账号登录，凭这一眼就能分辨。
     ///
     /// 密码不回显是有意的——这个串会进 UI（侧边栏 / 标题栏）与日志。
     pub fn display(&self) -> String {
-        let user_part = self
-            .user
-            .as_ref()
-            .map(|u| format!("{u}@"))
-            .unwrap_or_default();
+        self.render(true)
+    }
+
+    /// 地址栏回显：`scheme://host[:port]/path`，**不含用户名**。
+    ///
+    /// 地址栏回答的是「我在哪台机器的哪个目录」，用户名只参与登录、不是位置的一部分：
+    /// 写进去既白占宽度，也会在截图 / 录屏里顺手泄露账号。密码本来就不回显。
+    ///
+    /// 与编辑态的初值（`panel.path`，远程绝对路径）也因此一致——都是不含凭据的位置。
+    pub fn address_at(&self, path: &str) -> String {
+        let mut u = self.clone();
+        u.path = path.to_string();
+        u.render(false)
+    }
+
+    /// 拼出回显串；`with_user` 决定要不要带上 `user@`。
+    fn render(&self, with_user: bool) -> String {
+        let user_part = match (with_user, &self.user) {
+            (true, Some(u)) => format!("{u}@"),
+            _ => String::new(),
+        };
         format!(
             "{}://{}{}{}",
             self.scheme,
@@ -155,16 +177,6 @@ impl RemoteUrl {
         let mut stripped = self.clone();
         stripped.path = "/".to_string();
         stripped.display()
-    }
-
-    /// 地址栏回显：用给定路径替换原路径后再回显（不写密码、不写默认端口）。
-    ///
-    /// 浏览远程目录时 `panel.path` 是远程绝对路径（如 `/pub`），需要把它拼回
-    /// `scheme://host` 上得到完整、可复制的 URL 显示给用户。
-    pub fn display_at(&self, path: &str) -> String {
-        let mut u = self.clone();
-        u.path = path.to_string();
-        u.display()
     }
 }
 
@@ -302,6 +314,25 @@ mod tests {
         assert_eq!(u2.display(), "ftp://h:2121/pub", "非默认端口要保留");
     }
 
+    /// 地址栏回显**不带用户名**：它回答的是「在哪台机器的哪个目录」。
+    ///
+    /// 用户名只参与登录，写进地址栏既占宽度，也会在截图 / 录屏里泄露账号
+    /// （用户明确要求过这条）。
+    #[test]
+    fn address_at_omits_the_username() {
+        let u = RemoteUrl::parse("ftp://alice:s3cr3t@h:21/pub").expect("应解析成功");
+        assert_eq!(u.address_at("/pub/incoming"), "ftp://h/pub/incoming");
+        // 侧边栏用的 `display()` 保留用户名：那一行要能分辨「用的哪个账号」。
+        assert_eq!(u.display(), "ftp://alice@h/pub");
+    }
+
+    /// 非默认端口要留在地址栏里——否则用户看不出连的是哪台。
+    #[test]
+    fn address_at_keeps_a_non_default_port() {
+        let u = RemoteUrl::parse("ftp://bob@h:2121/pub").expect("应解析成功");
+        assert_eq!(u.address_at("/"), "ftp://h:2121/");
+    }
+
     #[test]
     fn ipv6_display_adds_brackets() {
         let u = RemoteUrl::parse("ftp://[::1]/pub").expect("应解析成功");
@@ -312,13 +343,6 @@ mod tests {
     fn base_strips_the_path() {
         let u = RemoteUrl::parse("ftp://alice@h:21/pub/deep/file.txt").expect("应解析成功");
         assert_eq!(u.base(), "ftp://alice@h/");
-    }
-
-    #[test]
-    fn display_at_replaces_only_the_path() {
-        let u = RemoteUrl::parse("ftp://alice@h:21/pub").expect("应解析成功");
-        // 密码 / 默认端口不回显，但路径换成当前浏览位置。
-        assert_eq!(u.display_at("/pub/incoming"), "ftp://alice@h/pub/incoming");
     }
 
     #[test]

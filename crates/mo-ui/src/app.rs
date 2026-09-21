@@ -854,6 +854,15 @@ impl RootView {
             }
             return false;
         }
+        // 关标签页**不动远程连接**：用户纠正过的语义是「关标签页不断开，只有退出应用
+        // 才断开」，所以连接活在进程级 `SessionRegistry` 里，比标签页活得久——侧边栏
+        // 那条列表在别的标签页里照样看得见、点得回去。
+        //
+        // 但后台泵得停：`Panel` 掉出 `Vec` 并不等于 `AppState` 被释放，泵各自握着一份
+        // 克隆且在 `loop` 里永不返回，不置停止位就一直空转着。
+        if let Some(tab) = pane.tabs.get(tab_idx) {
+            tab.app.stop_pumps();
+        }
         pane.tabs.remove(tab_idx);
         pane.active = pane.active.min(pane.tabs.len() - 1);
         false
@@ -1331,7 +1340,9 @@ impl RootView {
 
     /// 连接成功后把这台服务器记进「记住的服务器」（不含密码）。
     fn remember_active_server(&self, cx: &mut Context<Self>) {
-        let Some(url) = self.app().active_connection() else {
+        // 刚连上，所以「正在浏览的那条」就是刚建的这条；这里要的是它的地址
+        // （含用户名），用来填「记住的服务器」那一行。
+        let Some(url) = self.app().remote_url() else {
             return;
         };
         let endpoint = url.endpoint();
@@ -1776,9 +1787,9 @@ impl RootView {
             return;
         }
 
-        // 已连远程时，地址栏里填的是远程绝对路径（如 /pub/incoming）：
+        // 正在看远程时，地址栏里填的是远程绝对路径（如 /pub/incoming）：
         // 跳过本地 is_dir 判定，直接交给当前后端导航。
-        if app.active_connection().is_some() {
+        if app.browsing_remote() {
             let target = PathBuf::from(&text);
             cx.notify();
             cx.spawn(async move |weak, cx| {
@@ -5004,6 +5015,27 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
                 cx.notify();
             });
         });
+        // 远程标签：前面挂一枚地球图标 + 主机名，让「这个标签在看 FTP」一眼可见。
+        // 用 `flex_shrink_0` 而不是并进标题串里：主机名不参与截断，被压缩的只该是
+        // 后面的目录名（否则长主机名会把两边都挤没）。
+        if let Some(host) = tab.remote_badge() {
+            item = item.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(3.0))
+                    .flex_shrink_0()
+                    .text_size(px(11.5))
+                    .text_color(theme::muted())
+                    .child(crate::icons::icon(
+                        crate::icons::GLOBE,
+                        12.0,
+                        theme::muted(),
+                    ))
+                    .child(text!(host)),
+            );
+        }
         item = item.child(
             div()
                 .flex_1()
@@ -5305,7 +5337,9 @@ fn handle_modal_key(
                 if let Some(u) = entity.read(cx).usage.get(idx).cloned() {
                     if u.path.is_dir() {
                         cx.spawn(async move |_cx| {
-                            let _ = app.open_directory(&u.path).await;
+                            // 磁盘分析扫的是**本地**路径：连远程时也得先切回本地，
+                            // 否则拿本地路径去远程后端读必然失败（同侧边栏快捷访问）。
+                            let _ = app.open_local(&u.path).await;
                         })
                         .detach();
                     }
@@ -5857,7 +5891,9 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
         let this = entity.clone();
         cx.spawn(async move |cx| {
             if h.kind.is_dir() {
-                let _ = app.open_directory(&h.path).await;
+                // 搜索索引是**本地**爬的，命中必然是本地路径：连远程时先切回本地，
+                // 否则拿本地路径去远程后端读必然失败（同侧边栏快捷访问）。
+                let _ = app.open_local(&h.path).await;
                 this.update(cx, |v, cx| {
                     v.modal = Modal::None;
                     v.search_query.clear();
@@ -6932,12 +6968,14 @@ mod tests {
     // 展开时直接撞递归上限（`recursion limit reached while expanding #[test]`）。
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
     use super::{ConnectAuthState, Modal, RootView};
+    use crate::panel::Panel;
 
     /// 进入地址栏编辑态：路径要**预填**，且内容要**整条被选中**。
     ///
@@ -7943,5 +7981,47 @@ mod tests {
         });
         let after = cx.update(|_w, cx| root.update(cx, |v, _cx| v.pane().tabs.len()));
         assert_eq!(after, before + 1, "tab.new 应当新建标签页");
+    }
+
+    /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。
+    ///
+    /// 用户要求「访问 FTP 时标签页上要显示出来」。图标与主机名具体怎么画在
+    /// `render_tab_bar` 里（headless 读不出文本，测不了），但**什么时候该挂**
+    /// 这条判据在模型层，可以钉住——尤其是切回本地之后不该再挂：那时会话
+    /// 仍活着（`open_local` 不断开），可这个标签看的已经是本地目录了。
+    #[test]
+    fn tab_badge_shows_only_while_browsing_a_remote() {
+        crate::isolate_config_for_tests();
+        // 独占会话表：库测试并行跑，共享进程级注册表会互相看见对方装的假服务器。
+        let app = AppState::with_sessions(
+            std::env::temp_dir().join("mo-ui-badge-trash"),
+            Arc::new(mo_app::SessionRegistry::new()),
+        );
+        let panel = Panel::new(app.clone());
+        assert_eq!(panel.remote_badge(), None, "本地标签不该有远程徽标");
+
+        // 徽标只读地址，不必真连：拿本地 fs 当「已连接的后端」的替身。
+        app.install_backend_for_test(Arc::new(mo_fs::LocalFileSystem), "ftp://example.com:2121");
+        assert_eq!(
+            panel.remote_badge().as_deref(),
+            Some("example.com:2121"),
+            "浏览远程时标签页要标出主机（省略默认端口，不带 ftp:// 前缀）"
+        );
+
+        // 切回本地：会话还活着，但标签页看的是本地 → 徽标应当消失。
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir();
+        rt.block_on(app.open_local(&dir))
+            .expect("本地目录应当能打开");
+        assert_eq!(
+            app.live_connections().len(),
+            1,
+            "前置条件：切到本地不该丢掉连接"
+        );
+        assert_eq!(
+            panel.remote_badge(),
+            None,
+            "当前看的是本地，标签页不该还挂着远程徽标"
+        );
     }
 }
