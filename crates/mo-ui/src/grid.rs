@@ -11,6 +11,9 @@ use mo_core::{Entry, MetadataState, ThumbnailState};
 use crate::listing::{self, row_height, BUFFER};
 use crate::panel::ViewMode;
 
+/// 网格内容四周的留白（与 `columns_for` 里扣掉的 24pt 对得上）。
+const PAD: f32 = 12.0;
+
 /// 把本地选择变化同步到 `AppState` 的动作（语义同 `file_list`）。
 enum SelSync {
     Select(mo_core::FileId),
@@ -81,7 +84,11 @@ pub fn render(
     })
     // ⚠️ 必需：列表项只在 prepaint 渲染，布局期 taffy 看到 0 子节点会把高算成 0。
     .flex_1()
-    .px(px(12.0))
+    // 四周留白：首行不顶工具栏，滚到底最后一行下面也留得出来。
+    // 上下这 12pt 由 list 元素自己算进滚动内容高度（`padding.top` 加到条目起点、
+    // 上下都算进 content 高度与 scroll_max），所以底部那截是真留出来的，
+    // 不是只把首行往下推。原来这里只有 `px`（左右），上下是贴边的。
+    .p(px(PAD))
     .track_scroll(scroll)
     .debug_selector(|| "mo-grid".to_string());
 
@@ -157,7 +164,9 @@ fn cell(
             crate::theme::selected_bg()
         } else {
             crate::theme::surface()
-        });
+        })
+        // 测试用（release no-op）：按序号定位某个单元（守留白与居中的布局断言）。
+        .debug_selector(move || format!("mo-grid-cell-{global_idx}"));
     if !selected {
         c = c.hover(|s| s.bg(crate::theme::hover_bg()));
     }
@@ -244,8 +253,14 @@ fn cell(
 
     c.child(visual)
         .child(
+            // 名称：作为 cell（`flex_col` + `items_center`）里的一个**收缩到内容宽**的
+            // 块，靠 `items_center` 水平居中——与图标同一套机制。
+            // ⚠️ 别改成 `w_full` + `text_center()`：那样盒子被拉满整格，居中与否量不出来
+            // （实测名字仍然贴左）。gpui 的 `TextLayout::paint` 是按
+            // `window.text_style().text_align` 在盒子内对齐的，这条路在这里不生效。
+            // `max_w_full` + `truncate` 让长名字截成省略号，而不是溢出到隔壁格。
             div()
-                .w_full()
+                .max_w_full()
                 .text_size(px(12.0))
                 .text_color(if selected {
                     crate::theme::selected_text()
@@ -254,6 +269,8 @@ fn cell(
                 })
                 .overflow_hidden()
                 .truncate()
+                // 测试用（release no-op）：断言名称相对 cell 居中。
+                .debug_selector(move || format!("mo-grid-name-{global_idx}"))
                 .child(text!(entry.name.clone())),
         )
         .child(

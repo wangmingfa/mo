@@ -362,3 +362,33 @@
     中间行全直角；每行行首一枚 14×14 图标且落在地址文字之前；
   * `icons::tests::protocol_icon_maps_scheme_aliases_and_falls_back`——别名归一、
     大小写、无前缀与未知协议回落。
+
+## 25. 网格视图四周留白 + 名称居中
+
+* **需求**：网格视图首行顶着工具栏、滚到底最后一行贴着状态栏（原来 list 只给了
+  `px` 左右留白），名称还贴着格的左缘、跟居中的图标对不齐；下一轮用户又指出画廊
+  名字也没居中（同一份 `cell` 代码，见下）。
+* **`uniform_list` 的 padding 四个方向都吃**，上下不只是装饰：`padding.top` 加到条目
+  起点，上下都算进滚动内容高度与 `scroll_max`（`elements/list.rs` 的
+  `layout_items` / `prepaint_items`），所以底部那截在滚到底时真留得出来。改成 `.p(12)`
+  一条就够，**不需要**再往每行塞 `px`。
+* ⚠️ 反面教训：读 `prepaint_items` 里那句 `item_origin = bounds.origin + (0, padding.top)`
+  就断定「条目原点不加 `padding.left`，水平 padding 不被消费」，于是给每行加了 `px`
+  ——真跑断言时左侧量出来是 24。原点那一行确实只加 `padding.top`，但水平那两侧是在
+  `layout_items` 的可用宽度里扣掉的，两处分开处理。**先用一条 headless 断言量一下
+  再下结论**，别按单行代码推断。
+* **名称居中：靠 flex，别靠 `text_center()`**。第一版给名字那层加 `.text_center()`，
+  用户验收回来说画廊（其实网格一样）名字仍贴左。gpui 的 `TextLayout::paint` 是按
+  `window.text_style().text_align` 在盒子内对齐的，这条路在 `text!` 上实测不生效。
+  改成让这一层**收缩到内容宽**（`max_w_full` + `truncate`，去掉 `w_full`），由 cell 的
+  `items_center` 居中——与图标同一套机制，图标能居中早就证明了它有效。
+* ⚠️ **居中的断言会假绿**：名字那层是 `w_full` 时，盒子铺满整格，拿它和 cell 比中点
+  永远相等，文字贴左也测不出来。所以除了「中点对齐」，必须再加一条**盒子确实窄于单元**
+  （短名字）的前置断言。实测：`w_full` 版名字层 843 vs 单元 851（铺满，断言无意义）；
+  `max_w_full` 版收缩到内容宽，居中断言才真正在守东西。凡是断言「某元素居中 / 对齐」，
+  先确认那个元素本身不是铺满的。
+* **测试**：`app::tests::grid_and_gallery_inset_content_and_center_names`——往 panel 里塞
+  两个假条目（`covered` 命中就不发取窗任务，快照不会被异步结果冲掉），一条长名字一条
+  单字符，网格与画廊各跑一遍（两者共用 `grid::cell`，用户就是先看到网格再看到画廊的），
+  量出「单元相对 list 左上各留 12pt」「长名字不溢出单元」「短名字收缩到内容宽且相对
+  单元居中」。

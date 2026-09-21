@@ -8437,4 +8437,107 @@ mod tests {
             "当前看的是本地，标签页不该还挂着远程徽标"
         );
     }
+
+    /// 网格 / 画廊视图：内容四周要留白，单元名称要水平居中（长名字截断不溢出）。
+    ///
+    /// 两条都是肉眼验收时点出来的——原来 list 只给了左右 `px`，首行顶着工具栏、
+    /// 滚到底最后一行贴着状态栏；名称贴着格的左缘而图标是居中的，看着就是歪。
+    /// 画廊与网格共用同一个 `grid::cell`，两种模式各跑一遍（「画廊也没居中」是
+    /// 用户第二次点出来的，别只测网格）。
+    #[test]
+    fn grid_and_gallery_inset_content_and_center_names() {
+        for mode in [
+            crate::panel::ViewMode::Grid,
+            crate::panel::ViewMode::Gallery,
+        ] {
+            let tag = format!("{mode:?}");
+            crate::isolate_config_for_tests();
+            let mut cx = TestAppContext::single();
+            cx.update(gpui_kit::init);
+            let app = AppState::new();
+            let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+            let root = root.clone();
+
+            // 直接塞两个假条目再切视图：可见范围已被 `Panel::covered` 命中，
+            // `ensure_window` 不会派生取窗任务把这份快照冲掉。
+            // 一条名字很长（验证截断不溢出），一条只有一个字符（验证真的收缩到内容宽）。
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    let p = v.panel_mut();
+                    p.view_mode = mode;
+                    p.path = Some(PathBuf::from("/mo-grid-test"));
+                    p.window_start = 0;
+                    p.window = ["一个很长名字的文件夹，用来同时验证截断与居中", "b"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            mo_core::Entry::new(
+                                mo_core::FileId::new(0, i as u128),
+                                name.to_string(),
+                                mo_core::EntryKind::Directory,
+                                PathBuf::from(format!("/mo-grid-test/{i}")),
+                            )
+                        })
+                        .collect();
+                    p.visible_count = p.window.len();
+                    cx.notify();
+                })
+            });
+            cx.update(|window, cx| window.render_frame(cx));
+
+            let grid = cx
+                .debug_bounds("mo-grid")
+                .unwrap_or_else(|| panic!("{tag} 视图没有渲染（view_mode 没切过去？）"));
+            let cell0 = cx
+                .debug_bounds("mo-grid-cell-0")
+                .expect("第一个单元没有渲染");
+            let cell1 = cx
+                .debug_bounds("mo-grid-cell-1")
+                .expect("第二个单元没有渲染");
+            let name0 = cx
+                .debug_bounds("mo-grid-name-0")
+                .expect("第一个单元的名称没有渲染");
+            let name1 = cx
+                .debug_bounds("mo-grid-name-1")
+                .expect("第二个单元的名称没有渲染");
+
+            // ---- 四周留白（挂在 list 的 padding 上）。
+            let left = f32::from(cell0.origin.x - grid.origin.x);
+            let top = f32::from(cell0.origin.y - grid.origin.y);
+            assert!(
+                (left - 12.0).abs() < 0.51,
+                "{tag}：左侧留白 {left}，应为 12"
+            );
+            assert!(
+                (top - 12.0).abs() < 0.51,
+                "{tag}：顶部留白 {top}，应为 12（首行顶着工具栏了）"
+            );
+
+            // ---- 名称居中。
+            let center = |b: &gpui_kit::Bounds<gpui_kit::Pixels>| {
+                f32::from(b.origin.x) + f32::from(b.size.width) / 2.0
+            };
+            for (name, cell, what) in [(name0, cell0, "长名字"), (name1, cell1, "短名字")] {
+                assert!(
+                    (center(&name) - center(&cell)).abs() < 0.51,
+                    "{tag}：{what}没有水平居中：name={name:?} cell={cell:?}"
+                );
+            }
+            // 长名字不许溢出到隔壁格（cell 自身有 4pt 内边距）。
+            assert!(
+                f32::from(name0.size.width) <= f32::from(cell0.size.width) - 8.0 + 0.51,
+                "{tag}：长名字没被截断，宽度 {} 超出单元内容宽 {}",
+                f32::from(name0.size.width),
+                f32::from(cell0.size.width) - 8.0
+            );
+            // 短名字必须真的收缩到内容宽：否则「居中」是拿一个铺满的盒子比中点，
+            // 文字照样贴左也测不出来（`text_center` 那版就是这么假绿的）。
+            assert!(
+                f32::from(name1.size.width) < f32::from(cell1.size.width) - 8.0 - 0.5,
+                "{tag}：短名字那一层的宽度 {} 几乎铺满单元 {}——没收缩，居中断言无意义",
+                f32::from(name1.size.width),
+                f32::from(cell1.size.width)
+            );
+        }
+    }
 }
