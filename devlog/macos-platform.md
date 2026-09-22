@@ -91,3 +91,23 @@
 * **修法**：`mo-platform` 暴露 `is_main_thread()`（macOS 走 `NSThread.isMainThread`，非 macOS 恒 `true`——非 macOS 那边 `file_icon` 直接返 `None`、无 `dispatch_sync` 死锁）。`AppState::file_icon` 在缓存未命中分支、**调平台之前**加守卫：`if !mo_platform::is_main_thread() { return None; }`——非主线程（测试 / 后台任务）跳过平台调用、回退内置 SVG（系统图标只是视觉加成，不致命）。
 * **为什么安全**：GPUI 事件循环（含渲染）跑在 OS 主线程，真机 `is_main_thread()` 为 `true` → 照常出系统图标；测试把渲染跑在子线程 → `false` → 跳过、不死锁。已验证 `file_list_rows_are_inset_from_the_edges` 从 60s 死锁变 0.06s 通过。
 * **反向验证**：把 `file_list` 里的 `file_icon` 调用临时改成 `None` 重跑，确认布局/图标相关测试行为不变 → 守卫不影响真机路径。
+
+## 14. 系统图标别把原始尺寸转 PNG（「启动后特别卡、鼠标一直转圈」的根因，2026-09-22）
+
+* 现象：`cargo run` 起来后整个应用卡住、沙滩球不断。真机探针量出**40 个条目 10.77 秒**
+  （单张 250–540ms）——而 `file_icon` 是在 `file_list` 的 `uniform_list` 渲染回调里**逐行**调的
+  （`file_list.rs` 里 `app.file_icon(&entry.path)`），一屏几十行就是 10 秒级的主线程阻塞。
+* 根因：`NSWorkspace.iconForFile:` 给的是**原始尺寸** NSImage（512×512 起），
+  `TIFFRepresentation` → `NSBitmapImageRep` → PNG 整条链都在处理几百 KB 的位图。
+  实测对普通文件出 103KB / 对目录出 787KB 的 PNG。
+* ⚠️ `setSize:` **没用**：它只改「逻辑尺寸」，`TIFFRepresentation` 照样按原始像素出图
+  （实测 PNG 仍是 787KB、耗时几乎没降）。必须**真画一张小的**：
+  ``[[NSImage alloc] initWithSize:40×40]`` → `lockFocus` → 原图 `drawInRect:` → `unlockFocus`
+  → 再 `TIFFRepresentation` → PNG。`objc` 里要自己补 `NSSize` / `NSPoint` / `NSRect`
+  （`{CGSize=dd}` / `{CGRect={CGPoint=dd}{CGSize=dd}}` + `Encoding::from_str`），
+  且 `alloc` / `initWithSize:` 的对象没开 ARC、画完要 `release`。
+* 效果：40 张 **10.77s → 0.123s**（稳态 1.2ms/张，首张 65ms 是一次性初始化），
+  PNG **787KB → 6.7KB / 21KB**。列表行只要 20pt（@2x 取 40px），再大纯属浪费。
+* 纪律：**渲染路径上不许出现 AppKit 调用 + 位图编码 + 写盘**。⚠️ 这条调用还必须在主线程
+  （`on_main_thread`），所以放后台也只是把它 `dispatch_sync` 回主线程——省不掉，只能让它
+  足够小、并且靠缓存命中（`AppState::file_icon` 的路径键缓存）来避开重复生成。

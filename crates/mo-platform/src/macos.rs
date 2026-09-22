@@ -44,6 +44,51 @@ use crate::{PlatformError, Volume};
 /// `NSPNGFileType` 在 AppKit 头里是 `4`（`NSBitmapImageFileType` 是 `NSUInteger`）。
 const NSPNG_FILE_TYPE: usize = 4;
 
+/// 系统图标要出的像素尺寸。
+///
+/// 列表行是 20pt 见方（`file_item` 里 `img(...).w(px(20.0)).h(px(20.0))`），
+/// 按 @2x 屏幕取 40px——再大就是白白多花编码时间与内存。
+const ICON_PX: f64 = 40.0;
+
+/// AppKit 的 `NSSize`（两个 `double`，与 `CGSize` 同构）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSSize {
+    width: f64,
+    height: f64,
+}
+
+// SAFETY: 布局与 ObjC 的 `CGSize` / `NSSize` 一致（`{CGSize=dd}`，字段都是 `double`），
+// 所以按值把 `&self` 以外的这份结构体传给 `msg_send!` 是安全的。
+unsafe impl objc::Encode for NSSize {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{CGSize=dd}") }
+    }
+}
+
+/// CoreGraphics 的 `CGPoint`（与 AppKit 的 `NSPoint` 同构）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+/// CoreGraphics 的 `CGRect`（与 AppKit 的 `NSRect` 同构）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSRect {
+    origin: NSPoint,
+    size: NSSize,
+}
+
+// SAFETY: 布局与 ObjC 的 `CGRect` / `NSRect` 一致（四个 `double`）。
+unsafe impl objc::Encode for NSRect {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+    }
+}
+
 /// 把一批路径送进**系统**废纸篓（访达里那份）。
 ///
 /// 用 `NSFileManager.trashItemAtURL:resultingItemURL:error:` 而不是
@@ -300,8 +345,34 @@ pub fn file_icon(path: &Path) -> Option<Vec<u8>> {
         if image.is_null() {
             return None;
         }
+        // ⚠️ `iconForFile:` 给的是**原始尺寸**的 NSImage（512×512 起，转出来的 PNG 常有
+        // 几百 KB）。实测每张要 250–500ms——而列表一屏要几十张，直接编码就是几秒的
+        // 沙滩球（用户报的「启动后完全卡住、鼠标一直转圈」）。
+        //
+        // `setSize:` 只改逻辑尺寸，`TIFFRepresentation` 照样按原始像素出图（试过：PNG
+        // 仍是 787KB、耗时几乎没降），所以要**真画一张小的**：新建 40px 画布 → 把原图
+        // `drawInRect:` 进去 → 再走 TIFF → PNG。PNG 从几百 KB 掉到几 KB。
+        let size = NSSize {
+            width: ICON_PX,
+            height: ICON_PX,
+        };
+        let small: *mut Object = msg_send![class("NSImage").ok()?, alloc];
+        let small: *mut Object = msg_send![small, initWithSize: size];
+        if small.is_null() {
+            return None;
+        }
+        // `lockFocus` 把这张新图设成当前绘图上下文（AppKit 要求主线程，我们就在主线程）。
+        let rect = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size,
+        };
+        let _: () = msg_send![small, lockFocus];
+        let _: () = msg_send![image, drawInRect: rect];
+        let _: () = msg_send![small, unlockFocus];
         // NSImage → TIFF 数据（通用中间格式，任何 NSImage 都有）。
-        let tiff: *mut Object = msg_send![image, TIFFRepresentation];
+        let tiff: *mut Object = msg_send![small, TIFFRepresentation];
+        // `alloc` / `initWithSize:` 的持有权在我们手里（没开 ARC），画完就还。
+        let _: () = msg_send![small, release];
         if tiff.is_null() {
             return None;
         }
