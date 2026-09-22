@@ -1,11 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
-use mo_core::{MoError, RenameSpec, SortKey};
+use mo_core::{RenameSpec, SortKey};
 use mo_operations::{HashAlgo, OperationHandle, TrashEntry};
 use mo_preview::{Preview, PreviewKind};
 use mo_search::SearchHit;
@@ -575,6 +575,11 @@ pub struct RootView {
     search_results: Vec<SearchHit>,
     /// 快速预览独立窗口（`None` = 未开；已开时复用换内容，不重复开）。
     preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
+    /// 预览**代际**：每次 `show_preview` 递增。
+    ///
+    /// 图片的降采样副本在后台生成，回来时可能已经换了预览对象（翻页）——
+    /// 带上代际比对，对不上就丢弃，否则会把上一张的图贴到当前预览上。
+    preview_seq: u64,
     /// 当前生效的主题名（`light` / `dark` / `system` / 自定义 key）。
     ///
     /// 缓存在这里而不是每帧读配置：`AppState::config()` 每次都要读一遍 JSON，
@@ -746,6 +751,7 @@ impl RootView {
             search_query: String::new(),
             search_results: Vec::new(),
             preview_window: None,
+            preview_seq: 0,
             theme_name: theme_name.clone(),
             appearance_dark: false,
             // 选择器光标停在当前主题上。
@@ -2102,6 +2108,9 @@ impl RootView {
     /// 已开着预览窗口就只换内容并置前（Quick Look 习惯：连按空格翻文件不叠窗口）；
     /// 窗口已被用户关掉（`update` 报错）则当作没开重新创建。
     pub(crate) fn show_preview(&mut self, pv: Preview, cx: &mut Context<Self>) {
+        // 新的一代：后台还在为上一张准备的降采样副本据此作废（见 `preview_seq`）。
+        self.preview_seq += 1;
+
         if let Some(handle) = self.preview_window {
             // 复用同一个窗口：换内容（标题在 `set_preview` 里一起改）+ 置前。
             let updated = handle.update(cx, |v, window, c| {
@@ -2124,27 +2133,42 @@ impl RootView {
             }),
             ..Default::default()
         };
-        let this = cx.entity().clone();
-        // 建窗闭包要把主视图交给 PreviewWindow（方向键回调），单独克隆一份，
-        // 免得 `this` 被移走后拿不到回写句柄。
-        let root_for_window = this.clone();
-        cx.spawn(async move |_weak, cx| {
-            let opened = cx.open_window(options, move |_, cx| {
-                cx.new(|cx| crate::preview::PreviewWindow::new(pv, root_for_window, cx))
-            });
-            match opened {
-                Ok(handle) => {
-                    this.update(cx, |v, _cx| v.preview_window = Some(handle));
-                }
-                Err(e) => {
-                    this.update(cx, |v, cx| {
-                        v.modal = Modal::Info(format!("打开预览窗口失败：{e}"));
-                        cx.notify();
-                    });
-                }
+        // ⚠️ **同步**开窗——原来包在 `cx.spawn` 里，要下一拍才真的建。两个理由：
+        // ① 按空格到窗口出现之间不再白等一拍（`preview_step` 走的是复用分支，无影响）；
+        // ② 建完就能拿到 `preview_window`：`open_quick_look` 的降采样任务可能比开窗
+        //    还快（小图 0.3ms 就返回），异步开窗时那种情况会「贴图时窗口还不存在」，
+        //    结果图永远贴不上、窗口停在占位。
+        // 建窗闭包要把主视图交给 PreviewWindow（方向键回调）。
+        let root_for_window = cx.entity();
+        match cx.open_window(options, move |_, cx| {
+            cx.new(|cx| crate::preview::PreviewWindow::new(pv, root_for_window, cx))
+        }) {
+            Ok(handle) => self.preview_window = Some(handle),
+            Err(e) => {
+                self.modal = Modal::Info(format!("打开预览窗口失败：{e}"));
+                cx.notify();
             }
-        })
-        .detach();
+        }
+    }
+
+    /// 把已开着的预览窗里的图片换成刚准备好的降采样副本。
+    ///
+    /// `seq` 是发起准备时的预览代际：这期间用户可能已经翻页或关掉了窗口，
+    /// 代际对不上就直接丢弃（否则会把上一张的图贴到当前预览上）。
+    /// 窗口关闭走的是 `update` 报错——顺手把句柄清掉。
+    pub(crate) fn set_preview_image(&mut self, seq: u64, image: PathBuf, cx: &mut Context<Self>) {
+        if seq != self.preview_seq {
+            return;
+        }
+        let Some(handle) = self.preview_window else {
+            return;
+        };
+        if handle
+            .update(cx, |v, _window, cx| v.set_image(image, cx))
+            .is_err()
+        {
+            self.preview_window = None;
+        }
     }
 
     /// 预览窗口里按方向键：移动列表焦点并换预览内容。
@@ -2164,9 +2188,11 @@ impl RootView {
             let Some(p) = app.selection_paths().await.into_iter().next() else {
                 return;
             };
-            // 翻页同样走降采样准备：方向键连按大图时不会每换一张都解码一次原图。
-            if let Ok(pv) = prepared_preview(&app, &p).await {
-                this.update(cx, |v, cx| v.show_preview(pv, cx));
+            // 翻页与首次打开共用一条**两拍**路径：先把窗口切到新文件（副本还没好时
+            // 显示「载入预览…」），降采样在后台跑。以前是「先 await 降采样、再换内容」，
+            // 于是按方向键后窗口里还挂着**上一张**的图，直到新图就绪才跳变。
+            if let Ok(pv) = app.preview(&p) {
+                show_preview_twopass(&app, &this, pv, cx);
             }
         })
         .detach();
@@ -6294,8 +6320,9 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
                             v.modal = Modal::None;
                             v.search_query.clear();
                             v.search_results.clear();
-                            v.show_preview(pv, cx);
+                            cx.notify();
                         });
+                        show_preview_twopass(&app, &this, pv, cx);
                     }
                     Err(e) => {
                         this.update(cx, |v, cx| {
@@ -6399,32 +6426,6 @@ async fn run_command(id: CommandId, app: &AppState) {
 }
 
 /// 打开聚焦 / 选中项的快速预览。
-/// 预览内容准备：**图片可能要先降采样**。
-///
-/// 预览本身不解码（`Preview.image` 只是路径），真正的解码在 UI 加载图片时发生。
-/// 一张 7680×4320 的 JPEG 全解码约 130MB RGBA，既慢又白占一张大纹理，因此这里
-/// 先在 blocking 池按长边上限生成一份副本并缓存（见
-/// `mo_thumbnails::preview_scaled`）；之后同一张图直接命中磁盘，不再解码。
-///
-/// 降采样失败一律回退到原图路径——它是优化，不是预览能否打开的必要条件。
-async fn prepared_preview(app: &AppState, path: &Path) -> Result<Preview, MoError> {
-    let mut pv = app.preview(path)?;
-    let Some(src) = pv.image.clone() else {
-        return Ok(pv);
-    };
-    if pv.kind != PreviewKind::Image {
-        return Ok(pv);
-    }
-    let pool = app.clone();
-    if let Ok(Some(scaled)) = app
-        .spawn_blocking(move || pool.preview_image_scaled(&src))
-        .await
-    {
-        pv.image = Some(scaled);
-    }
-    Ok(pv)
-}
-
 async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp) {
     let paths = app.selection_paths().await;
     let Some(p) = paths.into_iter().next() else {
@@ -6434,12 +6435,8 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
         });
         return;
     };
-    match prepared_preview(app, &p).await {
-        Ok(pv) => {
-            this.update(cx, |v, cx| {
-                v.show_preview(pv, cx);
-            });
-        }
+    match app.preview(&p) {
+        Ok(pv) => show_preview_twopass(app, this, pv, cx),
         Err(e) => {
             this.update(cx, |v, cx| {
                 v.modal = Modal::Info(format!("无法预览 {p:?}：{e}"));
@@ -6447,6 +6444,68 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
             });
         }
     }
+}
+
+/// 换预览内容：**窗口立刻切到新内容**，图片的降采样副本随后到。
+///
+/// 三个入口共用它：按空格（`open_quick_look`）、方向键翻页（`preview_step`）、
+/// 搜索面板里回车预览。
+///
+/// ⚠️ 图片必须分两拍——先把 `image` 清掉，让 [`crate::preview::PreviewWindow`] 画
+/// 「载入预览…」，副本生成好再 [`RootView::set_preview_image`] 换上。写成「先 await
+/// 降采样、再换内容」会有两个后果：
+///
+/// * 首次打开时窗口要等副本生成完才出现（按空格后像没反应）；
+/// * **翻页时窗口里一直挂着上一张的图**，直到新图就绪才跳变——按方向键看到的是旧图，
+///   体感就是「切换有延迟」。
+///
+/// 预览本身不解码（`Preview.image` 只是路径），真正的解码在 UI 加载图片时发生。一张
+/// 7680×4320 的 JPEG 全解码约 130MB RGBA，既慢又白占一张大纹理，所以这里先在 blocking
+/// 池按长边上限生成一份副本并缓存（见 `mo_thumbnails::preview_scaled`）；之后同一张图
+/// 直接命中磁盘，不再解码。降采样失败一律回退到原图路径——它是优化，不是预览能否
+/// 打开的必要条件。
+///
+/// 快速连按时只有最后一张能贴上：`preview_seq` 代际校验在
+/// [`RootView::set_preview_image`]。
+/// 把一份预览拆成「可以立刻显示的那一半」与「还要后台补的图片源路径」。
+///
+/// ⚠️ 图片预览**必须**在这里把 `image` 摘掉：留着它，窗口就会继续显示**上一张**的图
+/// （本轮修的体验问题），永远走不到占位分支。摘出来的路径拿去后台降采样，回来再由
+/// [`crate::preview::PreviewWindow::set_image`] 补上。非图片预览一次给全，第二拍为空。
+fn split_preview_for_two_pass(mut pv: Preview) -> (Preview, Option<PathBuf>) {
+    let src = match pv.kind {
+        PreviewKind::Image => pv.image.take(),
+        _ => None,
+    };
+    (pv, src)
+}
+
+fn show_preview_twopass(app: &AppState, this: &Entity<RootView>, pv: Preview, cx: &mut AsyncApp) {
+    let (head, src) = split_preview_for_two_pass(pv);
+    // 立刻换内容（窗口已开着就复用，没开就现在开）——这一步不等任何 IO。
+    let seq = this.update(cx, |v, cx| {
+        v.show_preview(head, cx);
+        v.preview_seq
+    });
+    let Some(src) = src else {
+        return; // 文本 / 目录：本来就一次给全了。
+    };
+    let pool = app.clone();
+    let this = this.clone();
+    cx.spawn(async move |cx| {
+        let inner = pool.clone();
+        let probe = src.clone();
+        let scaled = pool
+            .spawn_blocking(move || inner.preview_image_scaled(&probe))
+            .await
+            .ok()
+            .flatten();
+        // `None` 是「用原图」（长边本来就没超上限 / 不是图片 / 降采样失败）——
+        // 必须回落到原图路径，否则窗口会永远停在占位上。
+        let show = scaled.unwrap_or(src);
+        this.update(cx, |v, cx| v.set_preview_image(seq, show, cx));
+    })
+    .detach();
 }
 
 /// 计算选中文件的哈希并展示。
@@ -8908,5 +8967,54 @@ mod tests {
             (top - 12.0).abs() < 0.51,
             "列表顶部留白 {top}，应为 12：首行顶着表头了"
         );
+    }
+
+    /// 图片预览在换上降采样副本之前，**必须先摘掉 `image`**。
+    ///
+    /// 不摘的后果正是本轮修的体验问题：翻页时窗口里还挂着上一张的图，用户按了方向键
+    /// 看到的还是旧图、隔一拍才跳变。摘掉之后 `PreviewWindow` 才会走到占位分支画
+    /// 「载入预览…」。非图片预览一次给全，第二拍必须为空——否则会白跑一次降采样
+    /// （图片之外的类型没有可降采样的东西）。
+    #[test]
+    fn only_images_are_split_into_two_passes() {
+        let photo = std::path::Path::new("/tmp/mo/photo.jpg");
+
+        let image = mo_preview::Preview {
+            kind: mo_preview::PreviewKind::Image,
+            title: "photo.jpg".to_string(),
+            text: None,
+            image: Some(photo.to_path_buf()),
+            size: 1024,
+        };
+        let (head, src) = super::split_preview_for_two_pass(image);
+        assert_eq!(
+            src.as_deref(),
+            Some(photo),
+            "图片的源路径要交给第二拍去降采样"
+        );
+        assert!(
+            head.image.is_none(),
+            "第一拍必须不带图片路径，否则窗口会继续显示上一张图、永远走不到占位分支"
+        );
+        assert_eq!(
+            head.kind,
+            mo_preview::PreviewKind::Image,
+            "类型不能变——占位分支就在图片这一支里"
+        );
+        assert_eq!(
+            head.title, "photo.jpg",
+            "标题照旧：占位期间标题不该闪成空白"
+        );
+
+        let text = mo_preview::Preview {
+            kind: mo_preview::PreviewKind::Text,
+            title: "notes.txt".to_string(),
+            text: Some("hello".to_string()),
+            image: None,
+            size: 5,
+        };
+        let (head, src) = super::split_preview_for_two_pass(text);
+        assert!(src.is_none(), "文本预览没有第二拍");
+        assert_eq!(head.text.as_deref(), Some("hello"), "文本要原样留着");
     }
 }

@@ -12,6 +12,9 @@
 //! * ← ↑ / → ↓ 在目录里**逐个切换预览对象**——焦点仍走 app 侧的选择模型，
 //!   所以主列表的高亮与滚动会跟着一起走（Finder 的 Quick Look 行为）。
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_preview::{Preview, PreviewKind};
@@ -51,6 +54,18 @@ impl PreviewWindow {
         window.set_window_title(&title);
         cx.notify();
     }
+
+    /// 降采样副本到了：把窗口里的「载入预览…」占位换成真图（窗口已经开着）。
+    ///
+    /// 与 `set_preview` 的区别：那只换图片路径，标题与文本都不动——文件名没变，
+    /// 变的只是「这张图现在有合适的尺寸可显示了」。翻页时同理：`set_preview` 先把
+    /// 窗口切到新文件（图先空着、显示占位），等新那一张的副本到了再由这里补上。
+    /// 是否还属于当前预览由代际校验决定，见 [`crate::RootView::set_preview_image`]；
+    /// 这里只管渲染。
+    pub fn set_image(&mut self, image: PathBuf, cx: &mut Context<Self>) {
+        self.preview.image = Some(image);
+        cx.notify();
+    }
 }
 
 impl Render for PreviewWindow {
@@ -66,35 +81,49 @@ impl Render for PreviewWindow {
         // 加载 / 失败都给占位：gpui 要过 LOADING_DELAY(200ms) 才肯显占位，
         // 期间是一片空白；解码失败（损坏 / 不支持的格式）也不能让窗口空着。
         let body: AnyElement = match p.kind {
-            PreviewKind::Image if p.image.is_some() => div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .child(
-                    img(p.image.clone().unwrap())
+            PreviewKind::Image => {
+                let inner: AnyElement = match p.image.clone() {
+                    Some(path) => img(path)
                         .size_full()
-                        .with_loading(|| {
-                            div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(text!("载入预览…".to_string()))
-                                .into_any_element()
-                        })
-                        .with_fallback(|| {
-                            div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(text!("无法解码这张图片".to_string()))
-                                .into_any_element()
-                        }),
-                )
-                .into_any_element(),
+                        .with_loading(|| centered_note("载入预览…"))
+                        .with_fallback(|| centered_note("无法解码这张图片"))
+                        .into_any_element(),
+                    // 降采样副本还在后台生成（见 `RootView::open_quick_look`）：
+                    // 窗口先开、内容后到，别让窗口空着。
+                    None => centered_note("载入预览…"),
+                };
+                // 入场动画：内容从 8 成大小长到满 + 淡入，对应访达快速预览的展开感。
+                // gpui 这版没有 element 级 `scale`（只有 `opacity`），所以「缩放」用
+                // **相对尺寸**驱动——图片是 Contain 适配容器，容器从小变大，
+                // 观感就是图片从中心长出来。
+                //
+                // `with_animation` 按 `ElementId` 记住进度、oneshot 只播一次
+                // （换内容/翻页不会重播），并且自动尊重系统「减弱动态效果」。
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(inner)
+                            .with_animation(
+                                ElementId::Name("preview.enter".into()),
+                                Animation::new(Duration::from_millis(200))
+                                    .with_easing(ease_out_quint()),
+                                |el, t| {
+                                    el.w(relative(0.86 + 0.14 * t))
+                                        .h(relative(0.86 + 0.14 * t))
+                                        .opacity(t)
+                                },
+                            ),
+                    )
+                    .into_any_element()
+            }
             _ => div()
                 .flex_1()
                 .min_h_0()
@@ -135,4 +164,15 @@ impl Render for PreviewWindow {
 
         root
     }
+}
+
+/// 预览里的居中提示（载入中 / 解码失败）。占满容器，免得提示缩在角落。
+fn centered_note(msg: &'static str) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(text!(msg.to_string()))
+        .into_any_element()
 }

@@ -175,6 +175,75 @@ fn preview_copy_is_reused_from_disk_cache() {
     assert_eq!(mtime, mtime2, "命中缓存时不应重新解码生成");
 }
 
+/// 写一张大 JPEG（照片场景）。
+fn write_test_jpeg(dir: &Path, w: u32, h: u32) -> PathBuf {
+    let path = dir.join("photo.jpg");
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        image::Rgb([(x % 255) as u8, (y % 255) as u8, 128])
+    });
+    img.save_with_format(&path, image::ImageFormat::Jpeg)
+        .expect("写入测试 JPEG 失败");
+    path
+}
+
+/// 写一张带 alpha 的大 PNG（截图场景）。
+fn write_test_rgba_png(dir: &Path, w: u32, h: u32) -> PathBuf {
+    let path = dir.join("shot.png");
+    let img = image::RgbaImage::from_fn(w, h, |x, _y| image::Rgba([(x % 255) as u8, 64, 200, 128]));
+    img.save(&path).expect("写入测试 PNG 失败");
+    path
+}
+
+/// 预览产物的编码格式必须跟源图语义匹配。
+///
+/// 照片（JPEG）走 JPEG：debug 构建下 PNG 编码一张 2560 的副本要 1.28s、产物 5MB，
+/// 换 JPEG q85 后 0.32s / 1.1MB（见 `mo_thumbnails::Encoded`）。
+/// 带 alpha 的必须留在 PNG——转 JPEG 会把透明区压成黑底。
+///
+/// 扩展名不只是好看：上层用 gpui 的 `img(path)` 加载，它**按扩展名**挑解码器
+/// （`gpui::Img::extensions()`），扩展名与真实内容对不上会直接解码失败。
+#[test]
+fn preview_copy_encoding_follows_the_source() {
+    let dir = tmp("preview-encoding");
+    let root = dir.join("preview");
+
+    // 照片 → JPEG，且内容真的是 JPEG（SOI 标记），缓存键也认得出来。
+    let jpg = write_test_jpeg(&dir, 3000, 2000);
+    let from_jpeg = preview_scaled_in(&root, &jpg, PREVIEW_MAX_EDGE).expect("JPEG 应有降采样副本");
+    assert_eq!(
+        from_jpeg.extension().and_then(|e| e.to_str()),
+        Some("jpg"),
+        "照片的副本应为 JPEG（PNG 在 debug 下编码要 1.28s、产物 5MB）"
+    );
+    let bytes = std::fs::read(&from_jpeg).expect("读副本失败");
+    assert_eq!(
+        &bytes[..2],
+        &[0xFF, 0xD8],
+        "后缀写了 jpg，内容也必须是 JPEG"
+    );
+    assert_eq!(
+        preview_scaled_in(&root, &jpg, PREVIEW_MAX_EDGE),
+        Some(from_jpeg.clone()),
+        "同格式应命中同一份缓存"
+    );
+
+    // 带 alpha 的 PNG → 留在 PNG。
+    let png = write_test_rgba_png(&dir, 3000, 800);
+    let from_png = preview_scaled_in(&root, &png, PREVIEW_MAX_EDGE).expect("PNG 应有降采样副本");
+    assert_eq!(
+        from_png.extension().and_then(|e| e.to_str()),
+        Some("png"),
+        "带 alpha 的源必须留在 PNG 里，否则透明区会被压成黑底"
+    );
+    let bytes = std::fs::read(&from_png).expect("读副本失败");
+    assert_eq!(
+        &bytes[..4],
+        &[0x89, b'P', b'N', b'G'],
+        "后缀写了 png，内容也必须是 PNG"
+    );
+    assert_ne!(from_jpeg, from_png, "两种编码的缓存文件不该撞名");
+}
+
 #[test]
 fn preview_downscale_failures_fall_back_to_original() {
     let dir = tmp("preview-fallback");
