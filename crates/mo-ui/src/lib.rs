@@ -16,6 +16,7 @@ mod keys;
 mod list_columns;
 mod listing;
 mod panel;
+mod path_label;
 mod preview;
 mod progress_panel;
 mod sidebar;

@@ -543,3 +543,36 @@ const GLYPH_PX: f32 = 12.0;  // 内置 Lucide 描边 SVG 的绘制尺寸
 它们守的不是这块）。⚠️ 异步 `push` 测不到（headless 不驱动 `AppState` 自己的 runtime，
 `list_dir` 永远不返回），所以三条断言都落在**同步可观测的状态**上（列栈长度 / `column_busy`）。
 
+## 30. 列头去掉完整路径：只显示目录最后一段，固定单行（2026-09-22）
+
+**现象**：用户截图——列视图每列顶部都铺着完整绝对路径，长的那几列（如
+`/Users/11048490/.bluecode-desktop/change-sessions`）折成 3–4 行。视觉噪音之外还有
+两个副作用：相邻列的前缀本来就重复（三列各写一遍 `/Users/11048490/.bluecode-desktop`），
+而且**各列头部高度不一 → 列内容的起始线参差**。
+
+**修法**（`mo-ui/src/path_label.rs` + `columns.rs`）：
+
+* 新增共用 helper `path_label::last_segment(path)`：只取 `file_name()`；根路径（没有
+  最后一段）退回整条 `display()`。列头要回答的是「这一列是哪一级」，不是「它的完整
+  路径」——Finder 的列头也是这么做的。
+* **顺手收口**：同一个「取最后一段，没有就退回整条」的逻辑在 UI 里被独立写过三遍
+  （列视图列头、中央区「正在读取 …」提示条 `app.rs::opening_bar`、侧栏书签项
+  `sidebar.rs`），一并换成这个 helper —— 三处行为本来就一致，只是各写各的。
+  ⚠️ 反过来**不该**收口的是**地址栏**（面包屑要完整路径）与对话框里的路径。
+* 列头从 `.py(px(4.0))`（内容多高就多高）改成 `.h(px(HEAD_HEIGHT = 22.0))` 固定单行 +
+  内层 `flex_1().min_w_0().truncate()`（超长名字省略而不折行）。
+* 加 `debug_selector("mo-col-head-{pane}-{tab}-{index}")` 供测试定位。
+
+**守卫**（语义与几何分开守，因为文本测不到）：
+
+| 用例 | 位置 | 钉什么 |
+|---|---|---|
+| `keeps_only_the_last_segment` | `path_label.rs` | `/Users/11048490` → `11048490`；深路径 → `change-sessions`；**尾部斜杠** `…/Downloads/` → `Downloads`（不变成空标签） |
+| `falls_back_to_root_path` | `path_label.rs` | `/` → `/`（没有最后一段则退回整条） |
+| `column_headers_are_single_line_regardless_of_path_depth` | `app.rs`（headless） | 三列路径深度差很大 → 三个列头高度**都等于** `columns::HEAD_HEIGHT` |
+
+⚠️ 「列头显示的是最后一段而不是完整路径」**在 headless 里测不到**：gpui 测试通道只给
+`painted_quads()`，文本走 glyph sprite 不在 `Quad` 里（同 §28）。所以语义靠纯函数单测守，
+headless 那条只钉几何（折行就是高度变）。反向验证：把列头改回「完整路径 + `py(4.0)`」→
+`app.rs` 那条变红（27px ≠ 22px）。
+

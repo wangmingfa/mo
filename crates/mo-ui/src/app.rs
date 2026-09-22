@@ -6652,10 +6652,7 @@ fn opening_bar(path: Option<&std::path::Path>) -> Div {
         // 空闲时不占高度。
         return div().h(px(0.0));
     };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
+    let name = crate::path_label::last_segment(path);
     div()
         .flex()
         .flex_row()
@@ -9138,6 +9135,59 @@ mod tests {
                 assert_eq!(p.columns.len(), 2, "读回来之前不该动列栈");
             });
         });
+    }
+
+    /// 列头是**固定单行**的短标签：不管路径多长，各列头部高度都一致。
+    ///
+    /// 回归：列头原来直接渲染完整绝对路径（`/Users/11048490/.bluecode-desktop`），
+    /// 在 210px 列宽 + 11px 字号下折成 3–4 行 —— 相邻列的前缀本来就是重复内容，
+    /// 折行还让各列头部高度不一、列内容的起始线参差。现在只显示目录最后一段。
+    ///
+    /// ⚠️ 「显示的是最后一段而不是完整路径」这件事**测不到**：gpui 的测试通道只给
+    /// `painted_quads()`，文本走 glyph sprite 不在 `Quad` 里。语义由 `path_label.rs`
+    /// 的 `last_segment` 单测守（`keeps_only_the_last_segment` /
+    /// `falls_back_to_root_path`），这里只钉几何（固定高度 = 不折行）。
+    #[test]
+    fn column_headers_are_single_line_regardless_of_path_depth() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let state = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
+        let root = root.clone();
+
+        // 三列，路径长度差很大：短 / 中 / 长（深）。第 0 列即当前目录，
+        // 免得 `ensure_columns` 判根列过期把列栈清掉。
+        cx.update(|_window, app| {
+            seed_column_panel(
+                &root,
+                app,
+                "/a",
+                &[
+                    "/a",
+                    "/Users/11048490/.bluecode-desktop",
+                    "/Users/11048490/.bluecode-desktop/change-sessions",
+                ],
+            );
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let heads = [
+            "mo-col-head-0-0-0",
+            "mo-col-head-0-0-1",
+            "mo-col-head-0-0-2",
+        ]
+        .iter()
+        .map(|id| cx.debug_bounds(id).unwrap_or_else(|| panic!("{id} 没渲染")))
+        .collect::<Vec<_>>();
+        for (i, b) in heads.iter().enumerate() {
+            assert!(
+                (f32::from(b.size.height) - crate::columns::HEAD_HEIGHT).abs() < 0.51,
+                "第 {i} 列的列头高 {}，应为固定单行 {}（折行就是回归）",
+                f32::from(b.size.height),
+                crate::columns::HEAD_HEIGHT,
+            );
+        }
     }
 
     /// 列表视图的行也要留出四周的呼吸空间：首行不顶表头、左右不贴窗口边缘。

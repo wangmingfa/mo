@@ -21,6 +21,9 @@ const MAX_PER_COLUMN: usize = 2000;
 const COLUMN_WIDTH: f32 = 210.0;
 const ROW_HEIGHT: f32 = 24.0;
 
+/// 列头高度：**固定一行**，不随路径长度变化。
+pub(crate) const HEAD_HEIGHT: f32 = 22.0;
+
 pub fn render(
     entity: &Entity<RootView>,
     pane: usize,
@@ -72,15 +75,30 @@ fn column_box(
         .border_color(theme::separator())
         .bg(theme::surface());
 
+    // 列头＝这一列是哪一级（目录最后一段），不是完整路径：210px 宽 + 11px 字号下
+    // 完整路径要折成 3–4 行，而相邻列的前缀本来就重复；折行还会让各列头部高度不一、
+    // 列内容的起始线参差。取名字的规则见 `crate::path_label`。
     col = col.child(
         div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(HEAD_HEIGHT))
             .px(px(8.0))
-            .py(px(4.0))
             .border_b_1()
             .border_color(theme::separator())
             .text_size(px(11.0))
             .text_color(theme::muted())
-            .child(text!(data.path.display().to_string())),
+            // `truncate` 兜住超长名字：列头必须保持单行（高度已钉成 `HEAD_HEIGHT`）。
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(text!(crate::path_label::last_segment(&data.path))),
+            )
+            .debug_selector(move || format!("mo-col-head-{pane}-{tab}-{index}")),
     );
 
     let mut body = div()
