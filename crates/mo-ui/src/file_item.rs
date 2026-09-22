@@ -5,6 +5,18 @@ use std::time::SystemTime;
 
 use crate::list_columns::{ColId, ColumnLayout};
 
+/// 列表行的图标槽位边长（同时也是系统图标 / 缩略图这类光栅图标的绘制尺寸）。
+///
+/// 定得比行高（`listing::row_height` = 24px）小一圈，上下才留得出呼吸；
+/// 槽位定宽是因为 SVG 图标与位图缩略图的自然宽度不同，不定宽的话
+/// 缩略图一加载文件名就会左右抖动。
+const ICON_PX: f32 = 16.0;
+
+/// 内置 Lucide 单色 SVG 的绘制尺寸。比槽位再小一圈：描边图形的**视觉**边界
+/// 比它的绘制框小（`icon()` 的 viewBox 自带留白），跟铺满槽位的位图图标
+/// 摆在一起才显得一样大。
+const GLYPH_PX: f32 = 12.0;
+
 /// 单个文件 / 文件夹行的纯展示（不含交互；交互在 `file_list` 中处理）。
 ///
 /// 列顺序 / 宽度全部取自 `layout`（表头与数据行共用同一份，保证上下对齐）：
@@ -49,8 +61,8 @@ pub fn view(
             .flex()
             .items_center()
             .justify_center()
-            .w(px(20.0))
-            .h(px(20.0))
+            .w(px(ICON_PX))
+            .h(px(ICON_PX))
             .flex_shrink_0()
             .overflow_hidden()
             .child(child)
@@ -69,8 +81,8 @@ pub fn view(
     name_cell = match &entry.thumbnail {
         ThumbnailState::Loaded(path) => name_cell.child(icon_slot(
             img(path.as_path())
-                .w(px(20.0))
-                .h(px(20.0))
+                .w(px(ICON_PX))
+                .h(px(ICON_PX))
                 .into_any_element(),
         )),
         ThumbnailState::Loading => {
@@ -81,8 +93,11 @@ pub fn view(
             // 否则退回内置 Lucide 单色 SVG。系统图标是光栅 PNG，没法随选中态改色，
             // 但胜在「.app 是真 App 图标、文档是所属 App 图标」，与系统一致。
             let icon = match &system_icon {
-                Some(p) => img(p.as_path()).w(px(20.0)).h(px(20.0)).into_any_element(),
-                None => crate::icons::icon(icon_data, 16.0, icon_color).into_any_element(),
+                Some(p) => img(p.as_path())
+                    .w(px(ICON_PX))
+                    .h(px(ICON_PX))
+                    .into_any_element(),
+                None => crate::icons::icon(icon_data, GLYPH_PX, icon_color).into_any_element(),
             };
             name_cell.child(icon_slot(icon))
         }
