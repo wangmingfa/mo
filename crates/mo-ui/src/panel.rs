@@ -33,6 +33,17 @@ pub enum ViewMode {
 }
 
 impl ViewMode {
+    /// 全部模式，顺序 = `⌘1..⌘4` 的顺序 = 工具栏平铺按钮的顺序。
+    ///
+    /// 加新模式时改这里一处即可：工具栏按钮组、图标表（`icons::view_mode_icon`）
+    /// 都按它遍历 / 匹配。
+    pub const ALL: [ViewMode; 4] = [
+        ViewMode::List,
+        ViewMode::Grid,
+        ViewMode::Gallery,
+        ViewMode::Columns,
+    ];
+
     pub fn label(&self) -> &'static str {
         match self {
             ViewMode::List => "列表",
@@ -42,7 +53,10 @@ impl ViewMode {
         }
     }
 
-    /// 切换顺序（⌘1..4 或工具栏循环切换时使用）。
+    /// 下一个模式（顺序与 `ALL` 一致）。
+    ///
+    /// 只有**布局设置器**里那行「新标签页默认视图」按它循环；⌘1..⌘4 与工具栏平铺
+    /// 按钮都是**直接切**到指定模式，不走这里。
     pub fn next(&self) -> Self {
         match self {
             ViewMode::List => ViewMode::Grid,
@@ -237,5 +251,51 @@ impl Panel {
         !self.window.is_empty()
             && start >= self.window_start
             && end <= self.window_start + self.window.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ⚠️ 不能 `use super::*`：会把 `gpui_kit::*` 一并 glob 进来，它的 `test` 与
+    // `#[test]` 属性撞名（同 toolbar.rs 里那条注释）。
+    use super::ViewMode;
+
+    /// `next()` 必须与 `ALL` 同序。
+    ///
+    /// 两处消费者：工具栏按钮组按 `ALL` 平铺（⌘1..⌘4 的顺序），布局设置器那行
+    /// 「新标签页默认视图」按 `next()` 循环。两者一旦分叉，用户按 ⌘3 拿到的
+    /// 和设置器里滚出来就数不到同一个模式了。
+    #[test]
+    fn next_cycles_in_all_order() {
+        let mut m = ViewMode::ALL[0];
+        let steps = ViewMode::ALL
+            .iter()
+            .cycle()
+            .skip(1)
+            .take(ViewMode::ALL.len());
+        for (i, expected) in steps.enumerate() {
+            m = m.next();
+            assert_eq!(
+                &m,
+                expected,
+                "第 {} 次 next() 落到了 {m:?}，按 ALL 应是 {expected:?}",
+                i + 1
+            );
+        }
+        assert_eq!(m, ViewMode::ALL[0], "转一圈之后应回到起点");
+    }
+
+    /// 配置键名往返：`key()` 写进配置，`from_key()` 读回来必须还是同一个。
+    #[test]
+    fn key_round_trips_for_every_mode() {
+        for m in ViewMode::ALL {
+            assert_eq!(
+                ViewMode::from_key(m.key()),
+                Some(m),
+                "{m:?} 的配置键 `{}` 往返丢了",
+                m.key()
+            );
+        }
+        assert_eq!(ViewMode::from_key("nope"), None, "认不出的键要返回 None");
     }
 }

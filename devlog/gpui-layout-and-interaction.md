@@ -576,3 +576,106 @@ const GLYPH_PX: f32 = 12.0;  // 内置 Lucide 描边 SVG 的绘制尺寸
 headless 那条只钉几何（折行就是高度变）。反向验证：把列头改回「完整路径 + `py(4.0)`」→
 `app.rs` 那条变红（27px ≠ 22px）。
 
+## 31. 视图模式按钮平铺成一排（Finder 工具栏那样）（2026-09-22）
+
+**诉求**：用户拿 Finder 截图来——工具栏正中那组四个视图图标。Mo 原来只有**一枚**按钮，
+显示当前模式名（「列表」），点击**循环**到下一个模式（`view_mode_button`）：用户既看不出
+一共几种模式、也没法一步点到想去的那个（要连点两下才从列表到画廊）。
+
+**修法**（`panel.rs` + `icons.rs` + `toolbar.rs`）：
+
+* `ViewMode::ALL: [ViewMode; 4]`：顺序 = `⌘1..⌘4` = 平铺顺序。加新模式只改这一处
+  （按钮组按它遍历、图标表按它匹配）。
+* `icons::{VIEW_LIST, VIEW_GRID, VIEW_GALLERY, VIEW_COLUMNS}` + `view_mode_icon(mode)`：
+  取 Lucide 的 `list` / `layout-grid` / `gallery-thumbnails` / `columns-3`——和 Finder
+  那组的选型一致。图标表集中一处，和 `quick_access_icon` 同理。
+* `toolbar::view_mode_buttons()`：按 `ALL` 平铺四枚图标按钮（`gap 2`，`flex_shrink_0`
+  ——地址栏是弹性的，按钮组不许被压扁），点哪个切哪个，不再有「循环」语义。
+  * 高亮用 `theme::accent()` 打底（**不是** `hover_bg()`）：工具栏底色是 `container()`
+    浅色下 `#f6f6f7`、`hover_bg()` 是 `#f0f0f1`，差 6/255——看不出「现在在哪个视图」。
+    未选中压成 `muted()` 图标色、hover 才给 `hover_bg()` 底。
+  * 每枚都要唯一 `.id()`（同 §28 的 a11y 理由）+ `debug_selector("mo-view-mode-{key}")`。
+  * 点击里 `cx.stop_propagation()`：顶栏自营拖拽 / 双击缩放（见 `attach_titlebar_drag`），
+    别让点按钮的事件穿透上去。
+* **整组共用一条外框**（补记）：四枚按钮分别长在工具栏里时，和旁边的刷新 / 搜索按钮
+  没有任何区别，读不出它们是**互斥**的一组。所以组容器自己画框：
+  `surface()` 底 + 1px `separator()` 描边 + `rounded(8)`，内部 `p(GROUP_PAD = 2)` 内衬、
+  `gap 2`、单枚 `BUTTON_SIZE = 26`，组高钉死 `GROUP_HEIGHT = 32` —— **与地址栏那枚
+  胶囊同高同描边**，工具栏里两个控件视觉成套。
+  * 内衬不是「好看」而是语义：高亮块与描边之间留白，才读得出选中块是**嵌在框里**
+    的一段，而不是「框里的一个独立按钮」。
+  * 组高用常量钉死（不靠 padding 撑）：别让 `border_1()` 是否计入 box 尺寸这件事
+    决定按钮组和地址栏登不登高。
+
+**守卫**：
+
+| 用例 | 位置 | 钉什么 |
+|---|---|---|
+| `view_mode_buttons_are_tiled_with_exactly_one_active` | `app.rs`（headless） | 四枚**同宽同高同一行、间距均匀**；`painted_quads()` 里与按钮同位同尺寸的底色 quad **恰好 1 个**；切到 Grid 后高亮跟着走。**外框**：组容器四边都在按钮外侧（内衬 ≥ `GROUP_PAD`）、组高 == `GROUP_HEIGHT`、且存在一个几乎铺满组容器的 quad（框真的画了） |
+| `next_cycles_in_all_order` | `panel.rs` | `next()` 的顺序必须与 `ALL` 一致（工具栏按 `ALL` 平铺、布局设置器按 `next()` 循环，分叉就数不到同一个模式） |
+| `key_round_trips_for_every_mode` | `panel.rs` | `key()` / `from_key()` 往返不丢（配置里存的是键名，不是中文标签） |
+
+反向验证：把选中态改成「四枚全部高亮」→ 第一条报出
+`实际有底色的是 ["list", "grid", "gallery", "columns"]`，恢复后回绿。
+外框那两条也各自反向验证过：撤掉 `.p(GROUP_PAD)`（留框）→ 报「外框左侧没内衬：
+按钮起点 1801、框起点 1800」；撤掉 `.bg()/.border_1()`（留内衬）→ 报「按钮组没画出
+外框（底色 / 描边），看起来还是四个裸图标」。**两条是分开的守卫**——只加 padding
+不画框、或只画框不加内衬，都过不去。
+
+⚠️ 两个测试 API 上的坑：
+
+* `VisualTestContext::debug_bounds()` 只收 **`&'static str`**，所以测试里要用
+  `const IDS: [(&str, &str); 4]` 这种字面量表，不能 `format!("mo-view-mode-{k}")`
+  （E0716 临时值借用不过关）。
+* `add_window_view()` 返回的那个 `cx` 本身已经是 **`&mut VisualTestContext`**，把它
+  交给辅助函数时写 `snapshot(cx, ..)`，写 `&mut cx` 会 E0596（多了一层借用）。
+* `painted_quads()` 是**物理像素**、`debug_bounds()` 是**逻辑像素**，比对前要乘
+  `scale_factor()`（同 §28 的写法）。
+
+**补记：高亮改成会滑动的指示块**（用户：「切换的时候，需要有那种滑块滑动过去的效果」）
+
+原来高亮画在选中那枚按钮**自己**的底色上 —— 切换时「灭了又亮」，看不出指针从哪挪
+到哪。改成组容器里一个**独立**的滑块（`debug_selector("mo-view-indicator")`），用
+`with_spring` 驱动它的 `left`：
+
+```rust
+SpringAnimation::new(SLIDE_SPRING)          // SpringConfig::new(700.0, 40.0, 1.0)
+    .with_epsilon(SLIDE_EPSILON)            // 0.5px
+    .to(px(GROUP_PAD + segment_offset(active_index)))
+```
+
+* **`ElementId` 必须固定**（`ElementId::Name("view-mode-indicator")`）：框架把
+  `SpringElementState` 按 global element id 存在窗口里，id 稳定才谈得上「跨帧保留
+  位置与速度」。所以切换时元素**不重建**，只是把 **target** 挪一格 —— 滑块自己滑
+  过去；连点两下也不跳，速度接着用。这是弹簧相对 `with_animation` 的关键区别：后者
+  每次都得换 id 才重播（等于每段重新起步）。
+* **新挂载 = 直接停在 target**（框架约定；`SpringAnimation::from` 可改成从别处起步）。
+  所以应用刚打开时没有入场滑动 —— 也正是「首帧就与列表那枚重合」这条断言的依据。
+* 系统「减弱动态效果」（`reduce_motion`）下框架直接跳到 target，不用自己分支。
+* ⚠️ **`epsilon` 默认 0.001 太严**：对 84px 位移要跑 600ms 才判 settled，肉眼早就到位
+  了却还在逐帧请求重绘。放到 0.5px。
+* ⚠️ **指示块必须是第一个 child**：gpui 按 child 顺序绘制，先画的在下层。反过来画，
+  那块灰底会盖掉选中那枚的图标。
+* 选中那枚按钮**不再画自己的底色**，否则叠出「一块跟着滑、一块死死钉住」的双影。
+
+守卫（同一条用例扩写）：
+
+| 断言 | 钉什么 |
+|---|---|
+| 首帧 `indicator` 与第 0 枚同位同尺寸 | 初始直接停在 target（没有入场滑动） |
+| 切换后**第一帧** `filled` 不含 `"grid"` | **不是瞬移**：滑块还没到新位置 |
+| `settle_slide` 之后 `filled == ["grid"]` / `["columns"]` | 落得准（顺带钉住 `segment_offset` 与按钮排布一致；末段是最远位移 84px） |
+
+反向验证：① 换成瞬移（去掉 `with_spring`，直接 `left` 到目标）→「第一帧就已经在新
+位置」变红；② 弹簧改极慢（`SpringConfig::new(2.0, 2.0, 1.0)`）→ 落定那条变红、首帧
+那条仍绿（说明两条互相独立，不是同一条断言的两种说法）。
+
+⚠️ **测动画必须推真实时间**：弹簧按 `Instant::now()` 步进（不是测试时钟），headless
+里也没有自动帧驱动 —— 只能 `sleep(60ms)` + `render_frame` 推 6 轮（360ms > 250ms 的
+落定时间）。好在 `render_frame` 一帧只要零点几毫秒，「切换后第一帧仍在旧位置」这条
+不会被误伤（要滑到 1px 以内得 240ms）。
+
+⚠️ **z 序测不到**：「指示块在按钮下层」没有守卫 —— 二者同几何时 `painted_quads()` 里
+那两个 quad 无法区分谁是谁（`background` 是 `pub(crate)`，不能按色值挑）。靠注释 +
+人工看一眼图标有没有被灰块盖住。
+

@@ -8,6 +8,8 @@ use std::path::Path;
 use gpui_kit::{px, svg, Rgba, Styled, Svg};
 use mo_core::{Entry, EntryKind};
 
+use crate::panel::ViewMode;
+
 pub const ARROW_LEFT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>"##;
 
 pub const ARROW_RIGHT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>"##;
@@ -133,6 +135,37 @@ pub fn protocol_icon(endpoint: &str) -> &'static [u8] {
 pub const QA_DESKTOP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>"##;
 
 pub const QA_DOWNLOAD: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>"##;
+
+// ── 视图模式按钮组（工具栏里平铺的那一排）───────────────────────────
+//
+// 四枚对应 [`ViewMode`] 的四个变体，顺序与 `⌘1..⌘4` 一致（见 `ViewMode::ALL`）。
+// 前三个取自 Lucide 的 `list` / `layout-grid` / `gallery-thumbnails`，列视图用
+// `columns-3`——Finder 工具栏那组也是这个选型。
+
+/// 列表视图（Lucide `list`）：行首小点 + 三条横线。
+pub const VIEW_LIST: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/></svg>"##;
+
+/// 网格视图（Lucide `layout-grid`）：四个等大方块。
+pub const VIEW_GRID: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>"##;
+
+/// 画廊视图（Lucide `gallery-thumbnails`）：大预览 + 底部一排缩略图标记。
+pub const VIEW_GALLERY: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="14" x="3" y="3" rx="2"/><path d="M4 21h1"/><path d="M9 21h1"/><path d="M14 21h1"/><path d="M19 21h1"/></svg>"##;
+
+/// 列视图（Lucide `columns-3`）：三条竖栏。
+pub const VIEW_COLUMNS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>"##;
+
+/// 视图模式 → 工具栏图标。
+///
+/// 放这里和 [`quick_access_icon`] 同理：图标表集中一处，加视图模式时只改本函数 +
+/// [`ViewMode::ALL`]，不用去翻工具栏。
+pub fn view_mode_icon(mode: ViewMode) -> &'static [u8] {
+    match mode {
+        ViewMode::List => VIEW_LIST,
+        ViewMode::Grid => VIEW_GRID,
+        ViewMode::Gallery => VIEW_GALLERY,
+        ViewMode::Columns => VIEW_COLUMNS,
+    }
+}
 
 /// 根据条目种类 + 文件名挑选图标（`Entry` / `LightEntry` 都可直接拆出这两个字段）。
 pub fn icon_for_kind_and_name(kind: EntryKind, name: &str) -> &'static [u8] {

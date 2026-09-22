@@ -79,8 +79,8 @@ pub fn render(
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
-        // 视图模式：点击在列表 / 网格 / 画廊 / 列视图之间循环。
-        .child(view_mode_button(view_mode, entity))
+        // 视图模式：四个模式**平铺**成一排图标按钮（Finder 工具栏那组），当前模式高亮。
+        .child(view_mode_buttons(view_mode, entity))
 }
 
 /// 顶栏里一段可拖拽的空白条带（仅 Windows / Linux 使用）。
@@ -541,29 +541,138 @@ fn icon_button(
     }
 }
 
-/// 视图模式按钮：显示当前模式名，点击切到下一个模式。
-fn view_mode_button(mode: ViewMode, entity: &Entity<RootView>) -> Stateful<Div> {
-    let next = mode.next();
-    let mut button = div()
-        .id("view-mode")
+/// 视图模式按钮组的固定高度：与地址栏那枚胶囊取同一值，工具栏两处控件等高。
+pub(crate) const GROUP_HEIGHT: f32 = 32.0;
+
+/// 外框内衬：高亮块与描边之间的留白。
+pub(crate) const GROUP_PAD: f32 = 2.0;
+
+/// 组内单枚按钮的边长（`GROUP_HEIGHT` 减掉上下内衬与描边）。
+pub(crate) const BUTTON_SIZE: f32 = 26.0;
+
+/// 组内相邻按钮的间距。
+pub(crate) const BUTTON_GAP: f32 = 2.0;
+
+/// 高亮指示块的弹簧参数：略欠阻尼（ζ ≈ 0.76），滑到位带一点点回弹，手感与系统
+/// 分段控件一致；ω₀ ≈ 26 rad/s，最远的第 4 段（位移 84px）约 250ms 落定。
+const SLIDE_SPRING: SpringConfig = SpringConfig::new(700.0, 40.0, 1.0);
+
+/// 弹簧落定公差（px）。默认的 0.001 对 84px 位移要跑 600ms —— 肉眼早就到位了，
+/// 却还在逐帧请求重绘、白烧 300ms 的电；放到半像素，看不出停在哪一步。
+const SLIDE_EPSILON: f32 = 0.5;
+
+/// 第 `index` 段按钮左边缘相对**内容区**起点的偏移。
+///
+/// 与 `gap` 共用 [`BUTTON_GAP`]，所以指示块和按钮一定落在同一列上 ——
+/// 二者错一次 1px 就会被 `view_mode_buttons_are_tiled_with_exactly_one_active`
+/// 的「同位」断言抓住。
+pub(crate) fn segment_offset(index: usize) -> f32 {
+    index as f32 * (BUTTON_SIZE + BUTTON_GAP)
+}
+
+/// 视图模式按钮组：四个模式**平铺**成一排图标按钮，当前模式高亮。
+///
+/// 单个按钮是「点击切到下一个模式」的循环式（原来那个显示模式名的按钮），
+/// 用户看不出还有哪些模式、也点不准想去的那个。现在按 [`ViewMode::ALL`] 平铺
+/// （顺序与 `⌘1..⌘4` 一致），点哪个切哪个。
+///
+/// 高亮**不是画在按钮上**的，而是下面一个独立的滑块（[`SLIDE_SPRING`] 驱动）：
+/// 切换视图时它从旧的一段滑到新的一段 —— 读起来是「我把指针挪到了第几段」，
+/// 而不是「这里刚换了张图」。底色用 `theme::accent()` 而不是 `hover_bg()`：
+/// 工具栏底色是 `container()`（浅色下 `#f6f6f7`），而 `hover_bg()` 是 `#f0f0f1`
+/// —— 差 6/255，看不出「当前在哪个视图」。图标色同时从 `muted()` 提到 `text()`，
+/// 未选中的才压暗。
+///
+/// **整组共用一条外框**（`separator()` 描边 + `surface()` 底 + [`GROUP_PAD`] 内衬），
+/// 读起来是「一个四段的切换控件」而不是四个各自独立的按钮 —— 没有框时它们和旁边
+/// 的刷新 / 搜索按钮长得一模一样，看不出这四个是**互斥**的一组。外框用的是地址栏
+/// 那枚胶囊同一套描边（`separator()` + `rounded(8)`），工具栏里两处控件因此统一。
+fn view_mode_buttons(mode: ViewMode, entity: &Entity<RootView>) -> impl IntoElement {
+    let active_index = ViewMode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
+    let mut group = div()
+        .id("view-mode-group")
+        // 指示块是 absolute：需要一个定位上下文。
+        .relative()
         .flex()
+        .flex_row()
         .items_center()
-        .justify_center()
-        .px(px(8.0))
-        .h(px(28.0))
-        .rounded(px(6.0))
+        .gap(px(BUTTON_GAP))
+        // 内衬：让高亮块与描边之间留出呼吸，也让「选中块」看起来是**嵌在**框里。
+        .p(px(GROUP_PAD))
+        .h(px(GROUP_HEIGHT))
+        .rounded(px(8.0))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::separator())
+        // 地址栏是弹性的，按钮组必须固定：窗口窄时不许被压扁。
         .flex_shrink_0()
-        .text_size(px(12.0))
-        .text_color(theme::muted())
-        .hover(|s| s.bg(theme::hover_bg()));
-    let cycle = entity.clone();
-    button.interactivity().on_click(move |_, _window, cx| {
-        cycle.update(cx, |v, cx| {
-            v.panel_mut().view_mode = next;
-            cx.notify();
+        .debug_selector(|| "mo-view-mode-group".to_string())
+        // 高亮块**先**画（gpui 按 child 顺序绘制，先画的在下层），四枚按钮压在上面 ——
+        // 反过来那块灰底会盖掉选中那枚的图标。
+        //
+        // 它是全局唯一的一个元素（`ElementId` 固定），`with_spring` 因此跨帧保留
+        // **位置与速度**：切换视图时不重建，只把 target 挪一格，块自己从旧位置滑
+        // 过去（连点两下也不会跳，速度接着用）。首帧直接停在 target（框架约定），
+        // 所以进应用时没有入场滑动。`reduce_motion` 下框架会直接跳到 target。
+        .child(
+            div()
+                .absolute()
+                .top(px(GROUP_PAD))
+                .size(px(BUTTON_SIZE))
+                .rounded(px(6.0))
+                .bg(theme::accent())
+                .debug_selector(|| "mo-view-indicator".to_string())
+                .with_spring(
+                    ElementId::Name("view-mode-indicator".into()),
+                    SpringAnimation::new(SLIDE_SPRING)
+                        .with_epsilon(SLIDE_EPSILON)
+                        .to(px(GROUP_PAD + segment_offset(active_index))),
+                    |el, x| el.left(x),
+                ),
+        );
+
+    for (index, m) in ViewMode::ALL.into_iter().enumerate() {
+        let active = index == active_index;
+        let key = m.key();
+        let mut button = div()
+            // ⚠️ 每个按钮都要唯一 ID：同一 `text!`/`svg` 站点会重复渲染多次，
+            // 没有 ID 链就会产生相同的 a11y NodeId。
+            .id(format!("view-mode-{key}"))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(BUTTON_SIZE))
+            .rounded(px(6.0))
+            .flex_shrink_0()
+            // 测试用（release no-op）：断言四个按钮平铺且只有一个有底色。
+            .debug_selector(move || format!("mo-view-mode-{key}"));
+        // 选中的那枚**不画**底色：高亮归下层那个会滑动的指示块，否则会叠出
+        // 「一块跟着滑、一块死死钉在原处」的双影。
+        if !active {
+            button = button.hover(|s| s.bg(theme::hover_bg()));
+        }
+        let target = entity.clone();
+        button.interactivity().on_click(move |_, _window, cx| {
+            target.update(cx, |v, cx| {
+                if v.panel().view_mode != m {
+                    v.panel_mut().view_mode = m;
+                    cx.notify();
+                }
+            });
+            // 点按钮属于「点进控件」：别让事件继续冒泡到顶栏的拖拽 / 双击缩放。
+            cx.stop_propagation();
         });
-    });
-    button.child(text!(mode.label().to_string()))
+        group = group.child(button.child(icons::icon(
+            icons::view_mode_icon(m),
+            16.0,
+            if active {
+                theme::text()
+            } else {
+                theme::muted()
+            },
+        )));
+    }
+    group
 }
 
 #[cfg(test)]

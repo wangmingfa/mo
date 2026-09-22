@@ -9190,6 +9190,264 @@ mod tests {
         }
     }
 
+    /// 视图模式按钮是**平铺**的一排（Finder 工具栏那组）：四枚等宽同高、等距，
+    /// 并且**恰好只有当前模式那一枚画了底色** —— 只有一个高亮才看得出「现在在哪」。
+    ///
+    /// 老实现是单枚按钮显示模式名、点击循环到下一个：用户既看不出还有哪些模式，
+    /// 也没法一步点到想去的那个（回归现场是用户拿 Finder 截图来对）。
+    #[test]
+    fn view_mode_buttons_are_tiled_with_exactly_one_active() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        // 切视图会重画中央区（可能派生补窗 / 缩略图任务），开一次官方豁免。
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let state = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
+        let root = root.clone();
+
+        // ⚠️ `debug_bounds` 只收 `&'static str`，所以这里用字面量表，不能 `format!`。
+        const IDS: [(&str, &str); 4] = [
+            ("list", "mo-view-mode-list"),
+            ("grid", "mo-view-mode-grid"),
+            ("gallery", "mo-view-mode-gallery"),
+            ("columns", "mo-view-mode-columns"),
+        ];
+
+        /// bounds（逻辑像素）→ 物理像素四元组，用来在 `painted_quads` 里找同位的 quad。
+        fn quad_of(b: &gpui_kit::Bounds<gpui_kit::Pixels>, scale: f32) -> (f32, f32, f32, f32) {
+            // ⚠️ `painted_quads` 是物理像素、`debug_bounds` 是逻辑像素。
+            (
+                f32::from(b.origin.x) * scale,
+                f32::from(b.origin.y) * scale,
+                f32::from(b.size.width) * scale,
+                f32::from(b.size.height) * scale,
+            )
+        }
+
+        /// 两个 bounds 是否「同位同尺寸」（容差 1px）。
+        fn aligned(
+            a: &gpui_kit::Bounds<gpui_kit::Pixels>,
+            b: &gpui_kit::Bounds<gpui_kit::Pixels>,
+        ) -> bool {
+            let near = |x: f32, y: f32| (x - y).abs() < 1.0;
+            near(f32::from(a.origin.x), f32::from(b.origin.x))
+                && near(f32::from(a.origin.y), f32::from(b.origin.y))
+                && near(f32::from(a.size.width), f32::from(b.size.width))
+                && near(f32::from(a.size.height), f32::from(b.size.height))
+        }
+
+        fn set_mode(
+            cx: &mut gpui_kit::VisualTestContext,
+            root: &gpui_kit::Entity<RootView>,
+            mode: crate::panel::ViewMode,
+        ) {
+            cx.update(|_window, app| {
+                root.update(app, |v, cx| {
+                    v.panel_mut().view_mode = mode;
+                    cx.notify();
+                });
+            });
+        }
+
+        /// 渲染一帧并读出：四枚按钮的 bounds、有底色的那几枚、指示块的 bounds。
+        fn measure(
+            cx: &mut gpui_kit::VisualTestContext,
+        ) -> (
+            Vec<gpui_kit::Bounds<gpui_kit::Pixels>>,
+            Vec<&'static str>,
+            gpui_kit::Bounds<gpui_kit::Pixels>,
+        ) {
+            cx.update(|window, cx| window.render_frame(cx));
+
+            let bounds = IDS
+                .iter()
+                .map(|(k, id)| {
+                    cx.debug_bounds(id)
+                        .unwrap_or_else(|| panic!("视图按钮 {k} 没渲染"))
+                })
+                .collect::<Vec<_>>();
+            let indicator = cx
+                .debug_bounds("mo-view-indicator")
+                .expect("指示块没渲染 —— 高亮就是它画的");
+
+            let scale = cx.update(|window, _cx| window.scale_factor());
+            let quads = cx.update(|window, _cx| window.painted_quads());
+            let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+            let filled = IDS
+                .iter()
+                .zip(&bounds)
+                .filter(|(_, b)| {
+                    let (x, y, w, h) = quad_of(b, scale);
+                    quads.iter().any(|q| {
+                        near(q.bounds.origin.x.as_f32(), x)
+                            && near(q.bounds.origin.y.as_f32(), y)
+                            && near(q.bounds.size.width.as_f32(), w)
+                            && near(q.bounds.size.height.as_f32(), h)
+                    })
+                })
+                .map(|((k, _), _)| *k)
+                .collect::<Vec<_>>();
+            (bounds, filled, indicator)
+        }
+
+        /// 把指示块的弹簧推到落定。
+        ///
+        /// 弹簧按**真实时钟**步进（`Instant::now()`，不是测试时钟），headless 里
+        /// 也没有自动帧驱动 —— 所以只能真的等一会儿、再手动渲染几帧。按
+        /// `SLIDE_SPRING` 的参数，最远一段（84px）约 250ms 落定，这里给 360ms 余量。
+        fn settle_slide(cx: &mut gpui_kit::VisualTestContext) {
+            for _ in 0..6 {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                cx.update(|window, cx| window.render_frame(cx));
+            }
+        }
+
+        // 首帧：初始态**直接**停在「列表」那枚上（新挂载的弹簧 = target），没有
+        // 入场滑动 —— 刚打开应用时不该看到一块灰底从别处滑过来。
+        let (bounds, filled, indicator) = measure(cx);
+        assert!(
+            aligned(&indicator, &bounds[0]),
+            "首帧指示块 {indicator:?} 没停在列表那枚 {:?} 上",
+            bounds[0]
+        );
+
+        // 平铺：同高、同宽、同一行、等距。
+        let (h0, w0) = (
+            f32::from(bounds[0].size.height),
+            f32::from(bounds[0].size.width),
+        );
+        assert!(w0 > 0.0, "按钮宽度是 0（被压扁了？）");
+        for (i, b) in bounds.iter().enumerate() {
+            assert!(
+                (f32::from(b.size.height) - h0).abs() < 0.51
+                    && (f32::from(b.size.width) - w0).abs() < 0.51,
+                "第 {i} 枚按钮尺寸与第 0 枚不同：{}×{} vs {}×{w0}",
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+                f32::from(bounds[0].size.width),
+            );
+            assert!(
+                (f32::from(b.origin.y) - f32::from(bounds[0].origin.y)).abs() < 0.51,
+                "第 {i} 枚按钮没和第 0 枚排在同一行"
+            );
+            if i > 0 {
+                assert!(
+                    f32::from(b.origin.x) > f32::from(bounds[i - 1].origin.x),
+                    "第 {i} 枚按钮没排在第 {} 枚右边",
+                    i - 1
+                );
+            }
+        }
+        let gaps = (1..bounds.len())
+            .map(|i| f32::from(bounds[i].origin.x) - f32::from(bounds[i - 1].origin.x) - w0)
+            .collect::<Vec<_>>();
+        for g in &gaps {
+            assert!(
+                (g - gaps[0]).abs() < 0.51,
+                "按钮间距不均匀：{gaps:?}（看着就不像一组）"
+            );
+        }
+
+        assert_eq!(
+            filled,
+            vec!["list"],
+            "应恰好只有当前模式（列表）那枚有底色，实际有底色的是 {filled:?}"
+        );
+
+        // 「一个整体」：四枚按钮要被**同一个外框**包住（左右上下都有内衬）。
+        //
+        // 没有框时这四枚与右边的刷新 / 搜索按钮长得一模一样，读不出它们是**互斥**的
+        // 一组（用户的回归现场就是「一排放着，各是各的」）。框画在 `view-mode-group`
+        // 这个容器上，所以既断几何（包住 + 内衬 + 与地址栏胶囊等高），也断「它真的
+        // 画了底色 / 描边」——只在容器上加 padding 而不画框是骗不过去的。
+        let g = cx
+            .debug_bounds("mo-view-mode-group")
+            .expect("按钮组容器没渲染 —— 那个外框就是它画的");
+        let (gx, gy) = (f32::from(g.origin.x), f32::from(g.origin.y));
+        let (gw, gh) = (f32::from(g.size.width), f32::from(g.size.height));
+        let (x0, y0) = (f32::from(bounds[0].origin.x), f32::from(bounds[0].origin.y));
+        let (x1, y1) = (
+            f32::from(bounds[3].origin.x) + f32::from(bounds[3].size.width),
+            f32::from(bounds[3].origin.y) + f32::from(bounds[3].size.height),
+        );
+        let pad = crate::toolbar::GROUP_PAD - 0.51;
+        assert!(x0 - gx >= pad, "外框左侧没内衬：按钮起点 {x0}、框起点 {gx}");
+        assert!(
+            gx + gw - x1 >= pad,
+            "外框右侧没内衬：按钮终点 {x1}、框终点 {}",
+            gx + gw
+        );
+        assert!(
+            y0 - gy >= pad && gy + gh - y1 >= pad,
+            "外框上下没内衬：按钮 y {y0}..{y1}、框 y {gy}..{}",
+            gy + gh
+        );
+        assert!(
+            (gh - crate::toolbar::GROUP_HEIGHT).abs() < 0.51,
+            "按钮组高 {gh} ≠ {}（应与地址栏那枚胶囊等高）",
+            crate::toolbar::GROUP_HEIGHT
+        );
+
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let framed = quads.iter().any(|q| {
+            let (qx, qy) = (q.bounds.origin.x.as_f32(), q.bounds.origin.y.as_f32());
+            let (qw, qh) = (q.bounds.size.width.as_f32(), q.bounds.size.height.as_f32());
+            // ⚠️ 别按色值找 quad（`background` 是 `pub(crate)`），按几何：这个 quad
+            // 落在组容器的范围内、且几乎铺满它 —— 那就是外框的底色（描边同属它）。
+            // 容差不取 0：背景绘制范围可能与布局 bounds 差 1px 边框。
+            qx >= gx * scale - 1.0
+                && qy >= gy * scale - 1.0
+                && qx + qw <= (gx + gw) * scale + 1.0
+                && qy + qh <= (gy + gh) * scale + 1.0
+                && qw >= gw * scale * 0.8
+                && qh >= gh * scale * 0.8
+        });
+        assert!(
+            framed,
+            "按钮组没画出外框（底色 / 描边），看起来还是四个裸图标"
+        );
+
+        // 切到网格：**第一帧不该已经到位** —— 到位就说明是瞬移，没有滑动过程。
+        set_mode(cx, &root, crate::panel::ViewMode::Grid);
+        let (_, in_flight, _) = measure(cx);
+        assert!(
+            !in_flight.contains(&"grid"),
+            "切到网格的第一帧高亮就已经在新位置了（{in_flight:?}）—— 这是瞬移，不是滑动"
+        );
+
+        // 推时间让它落定：必须**精确**停在网格那枚上（同时钉住 `segment_offset`
+        // 与按钮的实际排布一致）。
+        settle_slide(cx);
+        let (_, filled, indicator) = measure(cx);
+        assert_eq!(
+            filled,
+            vec!["grid"],
+            "滑动落定后高亮不在网格那枚上：{filled:?}"
+        );
+        assert!(
+            aligned(&indicator, &bounds[1]),
+            "落定后指示块 {indicator:?} 与网格那枚 {:?} 不重合",
+            bounds[1]
+        );
+
+        // 最远的一段（列视图，位移 84px）也要落得准。
+        set_mode(cx, &root, crate::panel::ViewMode::Columns);
+        settle_slide(cx);
+        let (_, filled, indicator) = measure(cx);
+        assert_eq!(
+            filled,
+            vec!["columns"],
+            "滑动落定后高亮不在列视图那枚上：{filled:?}"
+        );
+        assert!(
+            aligned(&indicator, &bounds[3]),
+            "落定后指示块 {indicator:?} 与列视图那枚 {:?} 不重合",
+            bounds[3]
+        );
+    }
+
     /// 列表视图的行也要留出四周的呼吸空间：首行不顶表头、左右不贴窗口边缘。
     ///
     /// 与 `grid_and_gallery_inset_content_and_center_names` 同源——`uniform_list`
