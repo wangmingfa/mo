@@ -4,6 +4,7 @@ use mo_core::{Entry, SortDir, SortKey, ThumbnailState};
 
 use crate::list_columns::{ColId, ColumnLayout};
 use crate::listing::BUFFER;
+use crate::panel::ViewMode;
 use crate::RootView;
 
 /// 表头单元格之间的水平间距（必须与数据行的 `gap` 一致，否则列会错位）。
@@ -499,17 +500,17 @@ pub fn render(
             if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
                 want_thumbs.push(entry.clone());
             }
-            // 系统图标（访达同款 PNG）：远程条目本机没有文件，平台给不出，
-            // `file_icon` 直接返回 None，这里退回内置 SVG。
+            // 系统图标（访达同款 PNG）：判据与取图都收在 `file_item::system_icon` 里
+            // ——**四个视图共用同一条链路**（列视图 / 网格 / 画廊见各自的 mod 文档），
+            // 那边一句话说清了「有缩略图的行不问」「查表命不中只记账」。
             //
-            // 两件事都在这一句里：
-            // * 有缩略图的行**不要**系统图标——那行画的是缩略图，白问系统一次
-            //   （每张 1.5–12ms 的活，攒起来正是进目录时那一下卡顿）；
-            // * `file_icon` 是纯查表，没命中就只记账、返回 None，真活交给后台图标泵。
-            let system_icon = match entry.thumbnail {
-                ThumbnailState::Loaded(_) | ThumbnailState::Loading => None,
-                _ => app.as_ref().and_then(|a| a.file_icon(&entry.path, is_dir)),
-            };
+            // 槽位按 `listing::icon_slot` 那张表取：系统图标是光栅图，16pt 的行有
+            // 40px 的位图就够了，不必替它去取画廊（96pt 方框）要的那一档。
+            let system_icon = crate::file_item::entry_system_icon(
+                app.as_ref(),
+                entry,
+                crate::listing::icon_slot(ViewMode::List),
+            );
             rows.push(
                 row.child(crate::file_item::view(
                     entry,

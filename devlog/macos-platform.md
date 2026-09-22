@@ -76,7 +76,38 @@
 * `mo_platform::file_icon(path) -> Option<Vec<u8>>`：拿到访达同款真实图标（`.app` 是真 App 图标、文档是所属 App 图标），比内置 Lucide 单色 SVG 准。转 PNG 链路：`NSWorkspace.iconForFile:` → `TIFFRepresentation` → `NSBitmapImageRep` → `representationUsingType:properties:`（`NSPNGFileType = 4`，`properties` 传 `nil`）。
 * 缓存：`AppState::file_icon` 把 PNG 写进 `temp_dir()/mo-icons/<hash>.png`，按路径键、封顶 4000 清空，列表行用 `img(path)` 加载（光栅图没法用文字色描边）。远程页（`browsing_remote()`）直接返 None 退回内置 SVG。
 * ⚠️ **`?` 运算符陷阱（这一轮真踩了）**：`on_main_thread(move || …)` 的闭包若返回 `Option<_>`，里面**不能**写 `workspace()?` / `class(..)?`（那是 `Result`，`?` 要求返回类型是 `Result`）——要 `workspace().ok()?` / `class(..).ok()?`。返回 `Result` 的闭包（`reveal`/`eject`）才直接 `?`。这处编译期才发现，但本轮回合一开始写错、靠通读抓回。
-* 只接了主列表（`file_item::view` 加 `system_icon: Option<PathBuf>` 参数 + `file_list` 调用）；grid / columns 仍是内置 SVG，要一致再补。
+* 只接了主列表（`file_item::view` 加 `system_icon: Option<PathBuf>` 参数 + `file_list` 调用）；grid / columns 当初仍是内置 SVG，见下面的补记。
+
+### 11.1 补记：四个视图统一，位图按槽位分两档（2026-09-22 晚）
+
+**诉求**（用户）：「现在好像只有列表视图才有系统图标吧，其它 3 个模式还是用的自绘图标，没有统一」。
+
+* **四个视图走同一条链路**：`file_item::{system_icon, entry_system_icon}`。
+  * `entry_system_icon(app, entry, slot_pt)` 给有 `Entry` 的视图（列表 / 网格 / 画廊），内含「有缩略图的行不问」那道判据；
+  * `system_icon(app, path, is_dir, slot_pt)` 是底层那层纯查表，**列视图用**它——列视图的条目是 `LightEntry`（`name/kind/path`，压根没有缩略图状态，也不画缩略图），不必过那道判据。
+  * 落点：`file_list`（改调 `entry_system_icon`）、`grid::cell`（网格 + 画廊）、`columns::column_box`（`columns::render` 多收一个 `&AppState`，因为列视图的数据不走主目录模型、拿不到 `panel.app` 以外的来源）。
+* **位图铺满、描边缩一圈**：网格 / 画廊里那块方框（`listing::visual_box` = 36 / 96pt）由缩略图**或**系统图标铺满，内置描边 SVG 按 0.6 缩着画——与列表行（位图 16 / 描边 12）同一条约定。为此把 `grid::cell` 里「上半部分那块方框」抽成 `grid::visual()`，好处是它能被单独摆进测试（`cell()` 要 `Entity<RootView>`，不好测）。
+* **槽位 → 位图档位**（这一轮的主要内容）：`mo_platform::file_icon_raster(path, px)` 多了 `px`（原来是模块内写死的 `ICON_PX = 40`）。档位在 `mo_app::icon`：
+  * `ICON_PX_SMALL = 40` / `ICON_PX_LARGE = 128` + `icon_px_for_slot(slot_pt)`，阈值 24pt；
+  * **档位是缓存键的一部分**（`IconKey::Path(PathBuf, u32)` / `Type(String, u32)`，两张表的主键也跟着带上），两档各存各的、互不串用——代价是切视图模式时新槽位要重新问一轮（一屏几十张、每种类型 / 路径只问一次）。
+  * 为什么不一刀切：**全按 40px** 取，画廊那个 96pt 的方框里就是近 5 倍上采样（糊）；**全按 128px** 取，主线程那段（`iconForFile:` + 重绘 + 拷像素）按**面积**涨约 10 倍，而列表里 16pt 的小图标根本用不上。大档取 128 是与缩略图同数（`mo_thumbnails::DEFAULT_SIZE`）：画廊方框按 @2x 要 192px，128px 是 1.5 倍上采样，**与缩略图同等**，所以「有缩略图的行」和「只有图标的行」看不出差别。
+* **视图侧只有一张槽位表**：`listing::icon_slot(mode)`（列表 / 列视图 = `file_item::ICON_PX` 16；网格 / 画廊 = 自己那个方框）+ `listing::visual_box(mode)`。视图别写死数字，也别自己算像素（`AppState::file_icon` 只收槽位大小）。
+
+**守卫**：
+
+| 用例 | 位置 | 钉什么 |
+|---|---|---|
+| `small_slots_take_small_rasters_and_big_slots_take_large` | `mo-app/icon.rs` | 阈值：≤24pt 取 40px，36 / 96pt 取 128px；顺带编译期断言「大档 > 小档」 |
+| `the_two_buckets_never_cross_serve` | `mo-app/icon.rs` | 档位是缓存键的一部分：按类型（`.txt`）与按路径（目录）两种键都验「小档的图填不了大槽位」 |
+| `every_view_mode_maps_to_the_expected_icon_bucket` | `mo-ui/listing.rs` | **穷举 `ViewMode::ALL`**，把视图槽位表与 `icon_px_for_slot` **组合**起来断言。这是「四个视图统一」唯一能自动验的一环 |
+| `the_bitmap_slot_fills_the_box_in_grid_and_gallery` | `mo-ui/listing.rs` | 槽位与方框的关系：网格 / 画廊铺满方框，列表 / 列视图没有方框 |
+| `the_visual_box_holds_a_full_bleed_bitmap_or_a_smaller_glyph` | `mo-ui/grid.rs` | 四格（缩略图 / 系统图标 / 内置 SVG / 加载占位）× 两种模式：方框一样大、位图铺满、描边 0.6、没给系统图标绝不画位图。用 `mo-grid-raster` / `mo-grid-glyph` 两个 selector 区分走了哪条分支 |
+
+反向验证（逐条改坏确认变红，6/6）：阈值 → 1000（红 3 条）、查表丢档位（红）、`icon_slot(Gallery)` 退回 16（红）、位图按 0.5 画（红）、系统图标分支改走描边（红）、外层方框不定宽（红）。
+
+⚠️ **有一处测不到**：「某个视图是否真把 `listing::icon_slot(mode)` 传下去了」——那是最外层一行的接线。headless 里缓存永远是空的（`AppState::file_icon` 恒返 `None`，真活在不存在的图标泵里），「接了」和「没接」渲染出来一模一样。靠注释 + 真机看一眼（网格 / 画廊里该是彩色真实图标，而不是单色描边图）。同 `gpui-layout-and-interaction.md` §31 里「z 序测不到」那条一个道理。
+
+⚠️ **`px` 必须由调用方给，且要跟缓存键一致**：泵取图时用的是 `key.px()`（键里存的档位），不是某个全局默认值——不然列表问来的 40px 会写进画廊要的那一格。`CGBitmapContextCreate` 拿到 0 长度缓冲会失败，所以 `px.max(1)`。
 
 ## 12. 隐藏文件判据（2026-09-22）
 

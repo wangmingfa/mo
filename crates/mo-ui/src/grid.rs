@@ -7,12 +7,18 @@
 use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
 use mo_core::{Entry, MetadataState, ThumbnailState};
+use std::path::{Path, PathBuf};
 
 use crate::listing::{self, row_height, BUFFER};
 use crate::panel::ViewMode;
 
 /// 网格内容四周的留白（与 `columns_for` 里扣掉的 24pt 对得上）。
 const PAD: f32 = 12.0;
+
+/// 内置描边 SVG 画成方框边长的几成：描边图形的**视觉**边界比它的绘制框小
+/// （`icon()` 的 viewBox 自带留白），缩一圈才和铺满方框的位图（缩略图 / 系统图标）
+/// 显得一样大——与列表行 `file_item::GLYPH_PX` 同一条约定。
+const ICON_IN_BOX: f32 = 0.6;
 
 /// 把本地选择变化同步到 `AppState` 的动作（语义同 `file_list`）。
 enum SelSync {
@@ -80,6 +86,14 @@ pub fn render(
                 if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
                     want_thumbs.push(entry.clone());
                 }
+                // 系统图标（访达同款 PNG）：与列表行**同一条链路**
+                // （`file_item::system_icon`，里面已含「有缩略图的行不问」）。
+                // 槽位是本模式的方框边长：网格 / 画廊的位图和缩略图一样铺满方框。
+                let system_icon = crate::file_item::entry_system_icon(
+                    Some(&panel.app),
+                    entry,
+                    listing::icon_slot(mode),
+                );
                 row = row.child(cell(
                     entry,
                     mode,
@@ -88,6 +102,7 @@ pub fn render(
                     pane,
                     tab,
                     idx,
+                    system_icon,
                 ));
             }
             rows.push(row.into_any_element());
@@ -133,34 +148,9 @@ fn cell(
     pane: usize,
     tab: usize,
     global_idx: usize,
+    system_icon: Option<PathBuf>,
 ) -> Stateful<Div> {
-    let (thumb, icon_data) = match mode {
-        ViewMode::Grid => (36.0, kind_icon(entry)),
-        ViewMode::Gallery => (96.0, kind_icon(entry)),
-        _ => (36.0, kind_icon(entry)),
-    };
-    let icon_color = if selected {
-        crate::theme::selected_text()
-    } else {
-        crate::theme::text()
-    };
-
-    let visual: AnyElement = match &entry.thumbnail {
-        ThumbnailState::Loaded(p) => img(p.as_path())
-            .w(px(thumb))
-            .h(px(thumb))
-            .rounded(px(4.0))
-            .into_any_element(),
-        ThumbnailState::Loading => text!("⏳".to_string()).into_any_element(),
-        _ => div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(thumb))
-            .h(px(thumb))
-            .child(crate::icons::icon(icon_data, thumb * 0.6, icon_color).into_any_element())
-            .into_any_element(),
-    };
+    let visual = visual(entry, mode, selected, system_icon);
 
     // 元数据未就绪时不显示大小，避免把「还没加载」误读成「空文件」。
     let sub = match &entry.metadata {
@@ -308,4 +298,250 @@ fn cell(
 
 fn kind_icon(entry: &Entry) -> &'static [u8] {
     crate::icons::entry_icon(entry)
+}
+
+/// 单元上半部分那块**方框**里的东西：缩略图 / 系统图标 / 内置 SVG 三选一。
+///
+/// 抽出来是为了单独渲染断言（`#[cfg(test)] mod tests` 里的探针）——`cell()` 要
+/// `Entity<RootView>`，不好直接摆到测试里。
+///
+/// ⚠️ **三种情况占同样大的方框**：缩略图和系统图标都是异步到的（晚一两帧才浮现），
+/// 方框要是跟着内容变大小，文件名就会在那两帧之间上下抖一下。所以外层这个
+/// `mo-grid-visual` 容器是固定 `visual_box` 见方的，变的只是它里面装什么。
+///
+/// 位图（缩略图 / 系统图标）铺满方框、描边 SVG 缩一圈（[`ICON_IN_BOX`]）——与列表
+/// 行的 `file_item`（位图 16 / 描边 12）是同一条约定。
+fn visual(
+    entry: &Entry,
+    mode: ViewMode,
+    selected: bool,
+    system_icon: Option<PathBuf>,
+) -> AnyElement {
+    let box_px = listing::visual_box(mode);
+    // 位图铺满方框，圆角与缩略图一致（系统图标也是位图，不能一个圆角一个直角）。
+    let raster = |p: &Path| {
+        img(p)
+            .w(px(box_px))
+            .h(px(box_px))
+            .rounded(px(4.0))
+            // 测试用（release no-op）：区分「画的是位图」还是「画的是描边图」。
+            .debug_selector(|| "mo-grid-raster".to_string())
+            .into_any_element()
+    };
+    let inner: AnyElement = match &entry.thumbnail {
+        ThumbnailState::Loaded(p) => raster(p.as_path()),
+        ThumbnailState::Loading => text!("⏳".to_string()).into_any_element(),
+        // 没有缩略图时优先用**系统**图标（与列表行同一条链路，见
+        // `file_item::entry_system_icon`），再没有才退回内置 SVG。
+        _ => match system_icon {
+            Some(p) => raster(p.as_path()),
+            None => crate::icons::icon(
+                kind_icon(entry),
+                box_px * ICON_IN_BOX,
+                if selected {
+                    crate::theme::selected_text()
+                } else {
+                    crate::theme::text()
+                },
+            )
+            .debug_selector(|| "mo-grid-glyph".to_string())
+            .into_any_element(),
+        },
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(box_px))
+        .h(px(box_px))
+        .flex_shrink_0()
+        // 测试用（release no-op）：本文件的单测摆一格出来，断言三种内容方框一样大。
+        .debug_selector(|| "mo-grid-visual".to_string())
+        .child(inner)
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    // ⚠️ 不能 `use super::*`：会把 `gpui_kit::*` 一并 glob 进来，它的 `test` 与
+    // `#[test]` 属性撞名（同 `file_item.rs` 里那条注释）。
+    use super::{visual, ICON_IN_BOX};
+    use crate::panel::ViewMode;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        div, px, size, Context, IntoElement, ParentElement, Render, Styled, TestAppContext,
+        VisualTestContext, Window,
+    };
+    use mo_core::{Entry, EntryKind, FileId, MetadataState, ThumbnailState};
+    use std::path::PathBuf;
+
+    /// 1×1 透明 PNG。`img()` 要真能解出一张图——拿一个不存在的路径当源，加载失败时
+    /// 元素的绘制范围就不一定还是我们给的尺寸，那样这条断言就白测了。
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60,
+        0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01, 0xe9, 0xfa, 0xdc, 0xd8, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// 往临时目录里落一张真 PNG，返回它的路径（每次调用一个新名字，免得并行串）。
+    fn temp_png(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mo-grid-test-{tag}-{}.png", std::process::id()));
+        std::fs::write(&p, PNG_1X1).expect("写测试用 PNG");
+        p
+    }
+
+    fn entry(thumbnail: ThumbnailState) -> Entry {
+        let mut e = Entry::new(
+            FileId::new(1, 1),
+            "a.txt".to_string(),
+            EntryKind::File,
+            PathBuf::from("/tmp/a.txt"),
+        );
+        e.thumbnail = thumbnail;
+        e.metadata = MetadataState::Loading;
+        e
+    }
+
+    /// 摆一格出来（只画上半部分那块方框）。
+    struct Probe(Entry, ViewMode, Option<PathBuf>);
+
+    impl Render for Probe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .p(px(12.0))
+                .child(visual(&self.0, self.1, false, self.2.clone()))
+        }
+    }
+
+    /// 渲染一格，分别读出方框 / 位图 / 描边图三者的几何（逻辑像素）。
+    ///
+    /// 三者分开读而不是「谁在就取谁」：这条用例要同时钉住「**该**出现位图」和
+    /// 「**不该**出现位图」两个方向。
+    type Bounds = gpui_kit::Bounds<gpui_kit::Pixels>;
+
+    /// 方框里该出现的是什么。
+    #[derive(Clone, Copy)]
+    enum Inner {
+        /// 铺满方框的位图（缩略图 / 系统图标）。
+        Bitmap,
+        /// 缩一圈的内置描边 SVG。
+        Glyph,
+        /// 都不是（正在出缩略图的那一格画的是「⏳」占位）。
+        Placeholder,
+    }
+
+    fn probe_bounds(
+        entry: Entry,
+        mode: ViewMode,
+        system_icon: Option<PathBuf>,
+    ) -> (Bounds, Option<Bounds>, Option<Bounds>) {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let window = cx.open_window(size(px(200.), px(200.)), |_, _cx| {
+            Probe(entry, mode, system_icon)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), &cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        (
+            cx.debug_bounds("mo-grid-visual").expect("方框没渲染"),
+            cx.debug_bounds("mo-grid-raster"),
+            cx.debug_bounds("mo-grid-glyph"),
+        )
+    }
+
+    /// 边长的逻辑像素值。
+    fn side(b: &Bounds) -> f32 {
+        f32::from(b.size.width)
+    }
+
+    /// 方框里装什么：**缩略图 / 系统图标都是位图且铺满方框，内置 SVG 缩一圈**，
+    /// 而四种情况下**方框本身一样大**。
+    ///
+    /// 两件事各有一条理由：
+    ///
+    /// * 方框定死（`visual_box` 见方）——缩略图和系统图标都是异步到的（晚一两帧才
+    ///   浮现），方框要是跟着内容变大小，文件名就会在那两帧之间上下跳一下；网格一屏
+    ///   几十格一起跳，比列表里那种左右抖更扎眼。正在出缩略图那一格画的「⏳」也算在
+    ///   这条里（占位再小也得占满方框）；
+    /// * 位图铺满、描边缩一圈（`ICON_IN_BOX`）——与列表行 `file_item`（位图 16 /
+    ///   描边 12）同一条约定，不然同一份条目在列表和网格里看着一大一小。
+    ///
+    /// 顺带钉住**系统图标那条分支真的走位图**：同一份 `Entry`（没有缩略图）给了
+    /// 系统图标就该出现位图、没给就该出现描边图——只改「画多大」不改「画哪条路」
+    /// 是骗不过 `mo-grid-raster` / `mo-grid-glyph` 这两个判据的。
+    #[test]
+    fn the_visual_box_holds_a_full_bleed_bitmap_or_a_smaller_glyph() {
+        let thumb_png = temp_png("thumb");
+        let icon_png = temp_png("icon");
+        for mode in [ViewMode::Grid, ViewMode::Gallery] {
+            let expect = crate::listing::visual_box(mode);
+            let cases: [(&str, Entry, Option<PathBuf>, Inner); 4] = [
+                (
+                    "缩略图",
+                    entry(ThumbnailState::Loaded(thumb_png.clone())),
+                    None,
+                    Inner::Bitmap,
+                ),
+                (
+                    "系统图标",
+                    entry(ThumbnailState::Idle),
+                    Some(icon_png.clone()),
+                    Inner::Bitmap,
+                ),
+                ("内置 SVG", entry(ThumbnailState::Idle), None, Inner::Glyph),
+                (
+                    "加载占位",
+                    entry(ThumbnailState::Loading),
+                    None,
+                    Inner::Placeholder,
+                ),
+            ];
+            for (what, e, sys, inner_kind) in cases {
+                let (frame, raster, glyph) = probe_bounds(e, mode, sys);
+                assert_eq!(
+                    (side(&frame), f32::from(frame.size.height)),
+                    (expect, expect),
+                    "{mode:?} 里「{what}」那块方框不是 {expect}×{expect}"
+                );
+                match inner_kind {
+                    Inner::Bitmap => {
+                        let raster = raster
+                            .unwrap_or_else(|| panic!("{mode:?} 里「{what}」该画位图，却没画"));
+                        assert!(
+                            glyph.is_none(),
+                            "{mode:?} 里「{what}」画了位图还叠了一张描边图"
+                        );
+                        assert_eq!(
+                            side(&raster),
+                            expect,
+                            "{mode:?} 里「{what}」这个位图没铺满方框（{expect}pt）"
+                        );
+                    }
+                    Inner::Glyph => {
+                        assert!(
+                            raster.is_none(),
+                            "{mode:?} 里「{what}」没有系统图标，不该画位图（会挂一张加载不出来的空图）"
+                        );
+                        let glyph =
+                            glyph.unwrap_or_else(|| panic!("{mode:?} 里「{what}」该退回内置 SVG"));
+                        let want = expect * ICON_IN_BOX;
+                        // 容差 0.51：gpui 会把尺寸对齐到设备像素格，21.6pt 量出来是 21.5。
+                        assert!(
+                            (side(&glyph) - want).abs() < 0.51,
+                            "{mode:?} 里「{what}」该按方框的 {ICON_IN_BOX} 缩着画（{want}pt），实际 {}pt",
+                            side(&glyph)
+                        );
+                    }
+                    Inner::Placeholder => {
+                        assert!(
+                            raster.is_none() && glyph.is_none(),
+                            "{mode:?} 里「{what}」画的是占位，不该有位图也不该有描边图"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -65,12 +65,6 @@ const K_CG_BYTE_ORDER_32_BIG: u32 = 4 << 12;
 /// `kCGInterpolationHigh`：512px 缩到 40px 是 12 倍下采样，默认质量会明显发糊。
 const K_CG_INTERPOLATION_HIGH: i32 = 3;
 
-/// 系统图标要重绘到的像素边长。
-///
-/// 列表行的图标槽位是 16pt（`mo_ui::file_item::ICON_PX`），按 @2x 屏幕取 40px——
-/// 再大就是白白多花重绘与内存。**与显示尺寸解耦**：UI 改尺寸时别顺手改这里。
-const ICON_PX: f64 = 40.0;
-
 /// AppKit 的 `NSSize`（两个 `double`，与 `CGSize` 同构）。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -454,7 +448,12 @@ fn is_network_fs(fs: &str) -> bool {
     )
 }
 
-/// 取一个文件在系统里的图标，**重绘**到 [`ICON_PX`] 见方后交出 RGBA 像素。
+/// 取一个文件在系统里的图标，**重绘**到 `px` 见方后交出 RGBA 像素。
+///
+/// `px` 是**物理像素**边长，由调用方按显示槽位与屏幕倍率决定（见
+/// `mo_app::icon::icon_px_for_slot`）。这里不设默认值是有意的：系统图标是光栅图，
+/// 取 40px 再放进 96pt 的方框里就是近 5 倍上采样，糊得很明显；而统一按 128px 取，
+/// 每一张的主线程重绘 + 拷像素都要涨 10 倍（面积比），列表视图白付这笔钱。
 ///
 /// 整段包在 `on_main_thread` 里——`NSWorkspace` 按 Apple 的约定要在主线程调，所以
 /// 这里的耗时**就是主线程的耗时**，一分都不该多花：
@@ -464,7 +463,7 @@ fn is_network_fs(fs: &str) -> bool {
 ///   原始像素），所以要**真画一张小的**——访达同款的小图标就是这么来的。
 /// * 编码 PNG 那一步（占整段 70%）**不在这里做**：只把像素拷出去，交给调用方在
 ///   后台编码（见 [`crate::IconRaster`]）。
-pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
+pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     let owned = path.to_path_buf();
     on_main_thread(move || unsafe {
         let s = owned.to_string_lossy();
@@ -475,12 +474,14 @@ pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
         if image.is_null() {
             return None;
         }
-        let px = ICON_PX as usize;
+        // 至少 1px：0 会让 `CGBitmapContextCreate` 拿到 0 长度缓冲。
+        let side = px.max(1) as f64;
+        let px = side as usize;
         let src = NSRect {
             origin: NSPoint { x: 0.0, y: 0.0 },
             size: NSSize {
-                width: ICON_PX,
-                height: ICON_PX,
+                width: side,
+                height: side,
             },
         };
         // 从 NSImage 拿一张 CGImage——AppKit 到此为止，后面全是纯 CoreGraphics。
@@ -518,7 +519,7 @@ pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
         if ctx.is_null() {
             return None;
         }
-        // 从 512px 缩到 40px 是 12 倍下采样，插值质量不设高档会明显发糊。
+        // 从 512px 缩到 40–128px 是 4–12 倍下采样，插值质量不设高档会明显发糊。
         CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_HIGH);
         CGContextDrawImage(ctx, src, cg);
         CGContextRelease(ctx);

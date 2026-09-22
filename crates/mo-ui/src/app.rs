@@ -5286,7 +5286,10 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                 )
                 .into_any_element(),
                 ViewMode::Columns => {
-                    columns::render(entity, pane_idx, tab_idx, &panel.columns).into_any_element()
+                    // 列视图的条目不走主目录模型，取不到「窗口」里那份 app，
+                    // 所以把 panel 的 app 传进去（系统图标要走它那条链路）。
+                    columns::render(entity, pane_idx, tab_idx, &panel.columns, &panel.app)
+                        .into_any_element()
                 }
                 ViewMode::Grid | ViewMode::Gallery => {
                     let cols = listing::columns_for(panel.view_mode, available);

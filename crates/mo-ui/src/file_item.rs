@@ -1,21 +1,67 @@
 use gpui_kit::*;
+use mo_app::AppState;
 use mo_core::{Entry, EntryKind, MetadataState, ThumbnailState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::list_columns::{ColId, ColumnLayout};
 
-/// 列表行的图标槽位边长（同时也是系统图标 / 缩略图这类光栅图标的绘制尺寸）。
+/// 列表行 / 列视图行的图标槽位边长（同时也是系统图标 / 缩略图这类光栅图标的绘制尺寸）。
 ///
 /// 定得比行高（`listing::row_height` = 24px）小一圈，上下才留得出呼吸；
 /// 槽位定宽是因为 SVG 图标与位图缩略图的自然宽度不同，不定宽的话
 /// 缩略图一加载文件名就会左右抖动。
-const ICON_PX: f32 = 16.0;
+pub(crate) const ICON_PX: f32 = 16.0;
 
 /// 内置 Lucide 单色 SVG 的绘制尺寸。比槽位再小一圈：描边图形的**视觉**边界
 /// 比它的绘制框小（`icon()` 的 viewBox 自带留白），跟铺满槽位的位图图标
 /// 摆在一起才显得一样大。
 const GLYPH_PX: f32 = 12.0;
+
+/// 这一行该不该问**系统图标**——排除了「这行画的是缩略图」的情况。
+///
+/// 有缩略图（已就绪 / 正在出）的行**不问**：那行画的就是缩略图，白问系统一次
+/// （每张 1.5–12ms 的活，攒起来正是进目录时那一下卡顿）。
+pub(crate) fn wants_system_icon(thumbnail: &ThumbnailState) -> bool {
+    !matches!(
+        thumbnail,
+        ThumbnailState::Loaded(_) | ThumbnailState::Loading
+    )
+}
+
+/// 问系统图标（访达同款 PNG 的缓存路径）：**四个视图共用这一条链路**。
+///
+/// 纯查表，命中给 PNG 路径、没命中只记一笔账并返回 `None`——调用方就此退回内置
+/// SVG，真活由后台图标泵补（见 `AppState::spawn_icon_pump`）。所以这里可以每帧每行
+/// 地调，零 IO。
+///
+/// `slot_pt` 是显示槽位的边长（[`crate::listing::icon_slot`]）：系统图标是光栅图，
+/// 得先知道要放进多大的地方，才知道该取 40px 还是 128px 那一档。
+///
+/// 远程页整页都是远程条目、本机没有这些文件，`file_icon` 直接返回 `None`（内置 SVG
+/// 顶上），所以这里不必特判。**列视图的 `LightEntry` 没有缩略图状态，直接调这一层**；
+/// 有 `Entry` 的视图走 [`entry_system_icon`]，别自己拼判据。
+pub(crate) fn system_icon(
+    app: Option<&AppState>,
+    path: &Path,
+    is_dir: bool,
+    slot_pt: f32,
+) -> Option<PathBuf> {
+    app.and_then(|a| a.file_icon(path, is_dir, slot_pt))
+}
+
+/// 列表 / 网格 / 画廊的行（[`Entry`]）取系统图标：先过「有缩略图就不问」那道，
+/// 其余交给 [`system_icon`]。
+pub(crate) fn entry_system_icon(
+    app: Option<&AppState>,
+    entry: &Entry,
+    slot_pt: f32,
+) -> Option<PathBuf> {
+    if !wants_system_icon(&entry.thumbnail) {
+        return None;
+    }
+    system_icon(app, &entry.path, entry.kind.is_dir(), slot_pt)
+}
 
 /// 单个文件 / 文件夹行的纯展示（不含交互；交互在 `file_list` 中处理）。
 ///
@@ -92,6 +138,9 @@ pub fn view(
             // 没有缩略图时：能用**系统**图标（访达同款真实图标）就用它，
             // 否则退回内置 Lucide 单色 SVG。系统图标是光栅 PNG，没法随选中态改色，
             // 但胜在「.app 是真 App 图标、文档是所属 App 图标」，与系统一致。
+            //
+            // 位图（缩略图 / 系统图标）铺满槽位、描边 SVG 缩一圈（`GLYPH_PX`）：
+            // 两者视觉大小才对得上。
             let icon = match &system_icon {
                 Some(p) => img(p.as_path())
                     .w(px(ICON_PX))

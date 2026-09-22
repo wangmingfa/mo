@@ -679,3 +679,28 @@ SpringAnimation::new(SLIDE_SPRING)          // SpringConfig::new(700.0, 40.0, 1.
 那两个 quad 无法区分谁是谁（`background` 是 `pub(crate)`，不能按色值挑）。靠注释 +
 人工看一眼图标有没有被灰块盖住。
 
+## 32. 四个视图的图标槽位（2026-09-22）
+
+系统图标四个视图统一、位图按槽位分两档的**来龙去脉**见 `macos-platform.md` §11.1；
+这里只记布局侧的契约，改动网格 / 列视图布局时按这张表来。
+
+| 模式 | 位图槽位（`listing::icon_slot`） | 方框（`listing::visual_box`） | 内置描边 SVG 的绘制尺寸 |
+|---|---|---|---|
+| 列表 | 16pt（`file_item::ICON_PX`） | 无 | `file_item::GLYPH_PX` = 12（槽位的 0.75） |
+| 列视图 | 16pt | 无 | 16（跟着槽位，这一处与列表不同） |
+| 网格 | 36pt | 36×36pt | 方框的 0.6（`grid::ICON_IN_BOX`） |
+| 画廊 | 96pt | 96×96pt | 方框的 0.6 |
+
+两条约定：
+
+* **位图铺满、描边缩一圈**：系统图标是光栅图（铺满才有「真实图标」的分量感），
+  内置 Lucide 是描边图（`icon()` 的 viewBox 自带留白），缩一圈两者视觉大小才对得上。
+  列表（16 / 12）是最早的例子，网格 / 画廊照抄。
+* **方框定死**：网格 / 画廊那块方框固定 `visual_box` 见方，里面装缩略图、系统图标、
+  描边图还是「⏳」都一样大 —— 缩略图与系统图标都是**异步到的**（图标泵晚一两帧），
+  方框跟着内容变就会让文件名在那一帧上下跳。守卫：`grid::tests::the_visual_box_holds_a_full_bleed_bitmap_or_a_smaller_glyph`。
+
+⚠️ 槽位表**只有一份**（`listing`），别在视图里写死数字：它同时决定「内置 SVG 画多大」
+和「问系统要哪一档位图」（`mo_app::icon::icon_px_for_slot`）。守卫
+`listing::tests::every_view_mode_maps_to_the_expected_icon_bucket` 穷举 `ViewMode::ALL`
+把两件事绑在一起。

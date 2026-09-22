@@ -124,11 +124,14 @@ pub fn supports_file_icons() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// 取 `path` 在**系统**里的图标，返回一块**重绘到固定尺寸**的 RGBA 像素。
+/// 取 `path` 在**系统**里的图标，返回一块**重绘到 `px` 见方**的 RGBA 像素。
 ///
 /// 与内置的 Lucide 单色 SVG 图标不同，系统图标是**彩色光栅图**（`.app` 显示真实
 /// App 图标、文档显示所属 App 的图标）。上层把它编码成 PNG 文件、用 `img()` 加载，
 /// 别试图拿它当 SVG 描边（它没有「文字色」概念）。
+///
+/// `px` 由调用方给（**物理像素**）：光栅图标取出来多大就是多大，放到更大的槽位里
+/// 只会被拉伸。所以「给这个槽位取多大」是上层的事，见 `mo_app::icon::ICON_PX_*`。
 ///
 /// ## 为什么交出去的是**像素**而不是 PNG
 ///
@@ -141,14 +144,14 @@ pub fn supports_file_icons() -> bool {
 /// （见 `mo_thumbnails::encode_rgba_png` / `unpremultiply_rgba`）。
 ///
 /// 拿不到（路径不存在 / 平台不支持 / 系统没给）返回 `None`，上层退回内置 SVG。
-pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
+pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     #[cfg(target_os = "macos")]
     {
-        macos::file_icon_raster(path)
+        macos::file_icon_raster(path, px)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = path;
+        let _ = (path, px);
         None
     }
 }

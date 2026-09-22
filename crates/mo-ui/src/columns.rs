@@ -9,9 +9,10 @@
 
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
+use mo_app::AppState;
 use mo_core::EntryKind;
 
-use crate::panel::ColumnData;
+use crate::panel::{ColumnData, ViewMode};
 use crate::{theme, RootView};
 
 /// 单列最多渲染的条目数（超出给出「省略」提示）。
@@ -29,6 +30,7 @@ pub fn render(
     pane: usize,
     tab: usize,
     columns_data: &[ColumnData],
+    app: &AppState,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
@@ -47,7 +49,7 @@ pub fn render(
         );
     }
     for (i, data) in columns_data.iter().enumerate() {
-        row = row.child(column_box(entity, pane, tab, i, data));
+        row = row.child(column_box(entity, pane, tab, i, data, app));
     }
     row
 }
@@ -59,6 +61,7 @@ fn column_box(
     tab: usize,
     index: usize,
     data: &ColumnData,
+    app: &AppState,
 ) -> Stateful<Div> {
     let mut col = div()
         // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
@@ -159,17 +162,33 @@ fn column_box(
                 cx.notify();
             });
         });
-        line = line
-            .child(crate::icons::icon(
-                crate::icons::icon_for_kind_and_name(e.kind, &e.name),
-                16.0,
-                if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                },
-            ))
-            .child(div().flex_1().truncate().child(text!(e.name.clone())));
+        // 图标：与列表 / 网格 / 画廊**同一条链路**（`file_item::system_icon`）。
+        //
+        // 列视图的条目来自 `AppState::list_dir`（不走主目录模型），缩略图状态一律是
+        // 初始态——所以这里只可能是「系统图标 or 内置 SVG」两种，不涉及缩略图。
+        // 槽位取自 `listing::icon_slot` 那张表（列视图与列表行同为 16pt），取位图时
+        // 也就只问小档（40px）。
+        let slot = crate::listing::icon_slot(ViewMode::Columns);
+        line = line.child(
+            match crate::file_item::system_icon(Some(app), &e.path, e.kind.is_dir(), slot) {
+                Some(p) => img(p.as_path())
+                    .w(px(slot))
+                    .h(px(slot))
+                    .flex_shrink_0()
+                    .into_any_element(),
+                None => crate::icons::icon(
+                    crate::icons::icon_for_kind_and_name(e.kind, &e.name),
+                    slot,
+                    if selected {
+                        theme::selected_text()
+                    } else {
+                        theme::text()
+                    },
+                )
+                .into_any_element(),
+            },
+        );
+        line = line.child(div().flex_1().truncate().child(text!(e.name.clone())));
         body = body.child(line);
     }
     if data.entries.len() > MAX_PER_COLUMN {

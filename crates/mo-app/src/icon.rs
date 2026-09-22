@@ -53,33 +53,86 @@
 //!
 //! 代价写在明处：给单个文件设过**自定义图标**的，会显示成它那个类型的大众图标
 //! （自定义图标要从 FinderInfo 扩展属性读，是 IO，不能放在渲染路径上）。
+//!
+//! ## 尺寸：按槽位分两档（[`ICON_PX_SMALL`] / [`ICON_PX_LARGE`]）
+//!
+//! 系统图标是**光栅**图，取出来多大就是多大，显示时再缩放。四个视图的槽位差得很远
+//! （列表 / 列视图 16pt、网格 36pt、画廊 96pt），所以不能一刀切：
+//!
+//! * 一刀按 **40px** 取 → 画廊那个 96pt 的方框里放的就是近 5 倍上采样，糊；
+//! * 一刀按 **128px** 取 → 成本按**面积**涨 10 倍（重绘 + 拷像素 + PNG 编码），
+//!   而列表里那些 16pt 的小图标根本用不上，等于每进一个目录都白付这笔钱。
+//!
+//! 于是按槽位就近选档（[`icon_px_for_slot`]），**两档各自缓存、互不串用**：档位是
+//! 缓存键的一部分，[`IconKey`] 里那个 `u32` 就是它。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-/// 图标身份：同一个键 → 系统给同一张图。
+/// 小档位图的边长（物理像素）：列表 / 列视图的 16pt 槽位按 @2x 屏取 40px，留了点余量。
+pub const ICON_PX_SMALL: u32 = 40;
+
+/// 大档位图的边长（物理像素）：网格（36pt）/ 画廊（96pt）的方框都用它。
+///
+/// 和缩略图的约定取同一个数（`mo_thumbnails::DEFAULT_SIZE = 128`）：画廊那个 96pt
+/// 的方框按 @2x 其实要 192px，128px 是 1.5 倍上采样——**与缩略图同等**，肉眼在
+/// 「有缩略图的行」和「只有图标的行」之间看不出差别。再往上取就要为整屏图标白花
+/// 成倍的主线程时间了。
+pub const ICON_PX_LARGE: u32 = 128;
+
+/// 小档能撑到的最大槽位（**逻辑 pt**）。
+///
+/// 40px 在 @2x 屏上正好画 20pt；放到 24pt 是 1.2 倍上采样——这个量级看不出来，
+/// 却能把「行内小槽位」（列表行 / 列视图行，16pt）留在小档上。网格 / 画廊那些
+/// 长方框（36 / 96pt）要的是铺满方框的位图，本来就该走大档。
+const SMALL_MAX_SLOT_PT: f32 = 24.0;
+
+/// 槽位尺寸（**逻辑 pt**，即 `img().w(px(x))` 里的 x）→ 该取哪一档位图。
+///
+/// 调用方只需说自己那个槽位多大，档位（以及为什么是这两个数）留在这一处。
+pub fn icon_px_for_slot(slot_pt: f32) -> u32 {
+    if slot_pt <= SMALL_MAX_SLOT_PT {
+        ICON_PX_SMALL
+    } else {
+        ICON_PX_LARGE
+    }
+}
+
+/// 图标身份：同一个键 **+ 同一个档位** → 系统给同一张图。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IconKey {
     /// 按路径问（目录 / 包 / 无扩展名的文件）。
-    Path(PathBuf),
+    Path(PathBuf, u32),
     /// 按类型问（同扩展名共享），存的是小写扩展名（含点，如 `.txt`）。
-    Type(String),
+    Type(String, u32),
+}
+
+impl IconKey {
+    /// 这个键要的位图边长（物理像素）。
+    ///
+    /// 泵按它去问平台——**键里存的就应该是实际取图用的那个数**，不然缓存会串档。
+    pub fn px(&self) -> u32 {
+        match self {
+            IconKey::Path(_, px) | IconKey::Type(_, px) => *px,
+        }
+    }
 }
 
 /// 一个文件该用哪个键去问系统。
 ///
 /// 规律：**图标由类型决定才共享**（`.txt` 的图标就是同一个）；由**这个条目自己**
-/// 决定就必须按路径问。
-pub fn icon_key(path: &Path, is_dir: bool) -> IconKey {
+/// 决定就必须按路径问。`slot_pt` 只影响档位，不影响「按路径还是按类型」。
+pub fn icon_key(path: &Path, is_dir: bool, slot_pt: f32) -> IconKey {
+    let px = icon_px_for_slot(slot_pt);
     if !is_dir {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext = ext.to_lowercase();
             if !ext.is_empty() && !is_package_ext(&ext) {
-                return IconKey::Type(format!(".{ext}"));
+                return IconKey::Type(format!(".{ext}"), px);
             }
         }
     }
-    IconKey::Path(path.to_path_buf())
+    IconKey::Path(path.to_path_buf(), px)
 }
 
 /// 这些后缀在系统里是**包**：每个包显示自己的图标，一律按路径问。
@@ -111,10 +164,12 @@ fn is_package_ext(ext: &str) -> bool {
 /// 真正的系统调用只在 `take` 出去的那批上做，且发生在后台线程。
 #[derive(Default)]
 pub struct IconCache {
-    /// 路径 → 已落盘的 PNG。
-    by_path: HashMap<PathBuf, PathBuf>,
-    /// 类型 → 已落盘的 PNG（同类型共享一张）。
-    by_type: HashMap<String, PathBuf>,
+    /// (路径, 档位) → 已落盘的 PNG。
+    ///
+    /// 主键带上档位：同一个目录在列表里要 40px、在画廊里要 128px，两张不能互相顶掉。
+    by_path: HashMap<(PathBuf, u32), PathBuf>,
+    /// (类型, 档位) → 已落盘的 PNG（同类型同档位共享一张）。
+    by_type: HashMap<(String, u32), PathBuf>,
     /// 已经问过系统的键——**成功与否都记**。问不到的（文件已被删、系统就是不给）
     /// 不重复排队，省得每帧都去撞一次系统。
     asked: HashSet<IconKey>,
@@ -128,22 +183,31 @@ const ICON_CACHE_MAX: usize = 4000;
 
 impl IconCache {
     /// 查表。**渲染路径唯一允许的动作**，纯内存。
-    pub fn lookup(&self, path: &Path, is_dir: bool) -> Option<PathBuf> {
-        if let Some(hit) = self.by_path.get(path) {
+    ///
+    /// 档位是主键的一部分：[小档]命中的图**不会**拿去填[大档]的槽位（拿 40px 放
+    /// 96pt 的方框就是糊的），反过来也一样——两种槽位各存各的。代价是切视图模式时
+    /// 新槽位要重新问一轮，但那是一屏几十张、且每种类型/路径只问一次。
+    ///
+    /// [小档]: ICON_PX_SMALL
+    /// [大档]: ICON_PX_LARGE
+    pub fn lookup(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<PathBuf> {
+        let px = icon_px_for_slot(slot_pt);
+        if let Some(hit) = self.by_path.get(&(path.to_path_buf(), px)) {
             return Some(hit.clone());
         }
-        match icon_key(path, is_dir) {
-            IconKey::Type(t) => self.by_type.get(&t).cloned(),
+        match icon_key(path, is_dir, slot_pt) {
+            IconKey::Type(t, px) => self.by_type.get(&(t, px)).cloned(),
             // 按路径问的键已经在上面那一层查过了。
-            IconKey::Path(_) => None,
+            IconKey::Path(..) => None,
         }
     }
 
     /// 记下「这一行要图标」，等后台去取。返回是否**新**入队（测试用）。
     ///
     /// 同一个键只会入队一次：`asked` 里有的（在途 / 问过 / 问不到）一律跳过。
-    pub fn request(&mut self, path: &Path, is_dir: bool) -> bool {
-        let key = icon_key(path, is_dir);
+    /// 换了档位就是另一个键，会各自入队一次。
+    pub fn request(&mut self, path: &Path, is_dir: bool, slot_pt: f32) -> bool {
+        let key = icon_key(path, is_dir, slot_pt);
         if !self.asked.insert(key.clone()) {
             return false;
         }
@@ -164,11 +228,12 @@ impl IconCache {
         self.queue.is_empty()
     }
 
-    /// 落库：按路径、按类型（同类型共享）都能命中。
+    /// 落库：按路径、按类型（同类型共享）都能命中。档位取自 `key`。
     pub fn insert(&mut self, path: &Path, key: &IconKey, png: PathBuf) {
-        self.by_path.insert(path.to_path_buf(), png.clone());
-        if let IconKey::Type(t) = key {
-            self.by_type.insert(t.clone(), png);
+        self.by_path
+            .insert((path.to_path_buf(), key.px()), png.clone());
+        if let IconKey::Type(t, px) = key {
+            self.by_type.insert((t.clone(), *px), png);
         }
         if self.by_path.len() > ICON_CACHE_MAX {
             self.clear();
@@ -215,16 +280,21 @@ pub fn encode_icon_png(raster: &mut mo_platform::IconRaster) -> Option<Vec<u8>> 
 mod tests {
     use super::*;
 
+    /// 小槽位 / 大槽位各取一档的代表值（列表行 16pt、列视图 16pt、网格 36pt、画廊 96pt
+    /// ——视图侧那张表在 `mo_ui::listing::icon_slot`，这里只验本模块的档位判据）。
+    const SLOT_SMALL: f32 = 16.0;
+    const SLOT_LARGE: f32 = 96.0;
+
     /// 同扩展名的普通文件共享一个键：三百个 `.txt` 只该问系统一次。
     #[test]
     fn plain_files_share_one_key_per_extension() {
-        let a = icon_key(Path::new("/tmp/a.txt"), false);
-        let b = icon_key(Path::new("/tmp/别的目录/b.TXT"), false);
-        assert_eq!(a, IconKey::Type(".txt".to_string()));
+        let a = icon_key(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
+        let b = icon_key(Path::new("/tmp/别的目录/b.TXT"), false, SLOT_SMALL);
+        assert_eq!(a, IconKey::Type(".txt".to_string(), ICON_PX_SMALL));
         assert_eq!(a, b, "大小写不同的同后缀也该共享");
         assert_ne!(
             a,
-            icon_key(Path::new("/tmp/c.pdf"), false),
+            icon_key(Path::new("/tmp/c.pdf"), false, SLOT_SMALL),
             "不同后缀必须分开"
         );
     }
@@ -241,16 +311,81 @@ mod tests {
         ] {
             let path = Path::new(p);
             assert_eq!(
-                icon_key(path, true),
-                IconKey::Path(path.to_path_buf()),
+                icon_key(path, true, SLOT_SMALL),
+                IconKey::Path(path.to_path_buf(), ICON_PX_SMALL),
                 "{p} 该按路径问"
             );
         }
         // 无扩展名的文件：系统按内容 / UTI 给图（可执行文件 ≠ 无后缀的文本文件），
         // 没有可靠的共享键，也按路径问。
         assert_eq!(
-            icon_key(Path::new("/tmp/LICENSE"), false),
-            IconKey::Path(PathBuf::from("/tmp/LICENSE"))
+            icon_key(Path::new("/tmp/LICENSE"), false, SLOT_SMALL),
+            IconKey::Path(PathBuf::from("/tmp/LICENSE"), ICON_PX_SMALL)
+        );
+    }
+
+    /// 槽位 → 档位：小槽位要 40px、大槽位要 128px，**没有中间态**。
+    ///
+    /// 这条钉的是「一刀切」的两个极端都会出事：全按 40px 取，画廊那个 96pt 的方框里
+    /// 就是近 5 倍上采样（糊）；全按 128px 取，列表里 16pt 的小图标白花 10 倍主线程
+    /// 时间（面积比）。四个视图的槽位都落在这条曲线上。
+    #[test]
+    fn small_slots_take_small_rasters_and_big_slots_take_large() {
+        for slot in [16.0, 20.0, SLOT_SMALL, SMALL_MAX_SLOT_PT] {
+            assert_eq!(
+                icon_px_for_slot(slot),
+                ICON_PX_SMALL,
+                "{slot}pt 的槽位该用小档（40px）"
+            );
+        }
+        // 阈值 24pt：行内小槽位（16pt）在小档，网格 36pt 方框 / 画廊 96pt 方框在大档。
+        for slot in [SMALL_MAX_SLOT_PT + 0.1, 36.0, SLOT_LARGE] {
+            assert_eq!(
+                icon_px_for_slot(slot),
+                ICON_PX_LARGE,
+                "{slot}pt 的槽位该用大档（128px）"
+            );
+        }
+        // 大档必须比小档大——写反了整套分档就没意义。这是常量之间的关系，
+        // 放编译期断言里（`assert!` 直接写会被 clippy 判「断言恒定量」）。
+        const { assert!(ICON_PX_LARGE > ICON_PX_SMALL) };
+    }
+
+    /// 档位是**缓存键的一部分**：小档的图不能拿去填大槽位（40px 放 96pt 就是糊的），
+    /// 大档的图也不能顶掉小槽位（那让小图标白白背着 10 倍内存）。
+    ///
+    /// 两种键都要验：按类型的（`.txt`）和按路径的（目录）。
+    #[test]
+    fn the_two_buckets_never_cross_serve() {
+        let mut c = IconCache::default();
+        // 按类型：小档落了库，大档查不到。
+        let small = icon_key(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
+        c.insert(
+            Path::new("/tmp/a.txt"),
+            &small,
+            PathBuf::from("/icons/txt-40.png"),
+        );
+        assert_eq!(
+            c.lookup(Path::new("/tmp/b.txt"), false, SLOT_SMALL),
+            Some(PathBuf::from("/icons/txt-40.png")),
+            "同类型同档位该命中"
+        );
+        assert_eq!(
+            c.lookup(Path::new("/tmp/b.txt"), false, SLOT_LARGE),
+            None,
+            "同类型但换了档位，必须重新问系统，不能拿小图充数"
+        );
+        // 按路径：同理。
+        let dir_small = icon_key(Path::new("/Users/me/Downloads"), true, SLOT_SMALL);
+        c.insert(
+            Path::new("/Users/me/Downloads"),
+            &dir_small,
+            PathBuf::from("/icons/dl-40.png"),
+        );
+        assert_eq!(
+            c.lookup(Path::new("/Users/me/Downloads"), false, SLOT_LARGE),
+            None,
+            "同一个目录换了档位也要重新问"
         );
     }
 
@@ -258,20 +393,24 @@ mod tests {
     #[test]
     fn the_same_key_is_only_queued_once() {
         let mut c = IconCache::default();
-        assert!(c.request(Path::new("/tmp/a.txt"), false));
+        assert!(c.request(Path::new("/tmp/a.txt"), false, SLOT_SMALL));
         assert!(
-            !c.request(Path::new("/tmp/b.txt"), false),
+            !c.request(Path::new("/tmp/b.txt"), false, SLOT_SMALL),
             "同类型的第二行不该再排队"
         );
         assert!(
-            !c.request(Path::new("/tmp/a.txt"), false),
+            !c.request(Path::new("/tmp/a.txt"), false, SLOT_SMALL),
             "同一个文件也不该"
         );
         assert_eq!(c.queued(), 1);
 
         // 取走之后也不会因为「队列空了」再排一次。
         assert!(c.pop_next().is_some());
-        assert!(!c.request(Path::new("/tmp/a.txt"), false));
+        assert!(!c.request(Path::new("/tmp/a.txt"), false, SLOT_SMALL));
+
+        // 换了档位是另一个键，该排就排（否则切到画廊时那批图标永远补不上）。
+        assert!(c.request(Path::new("/tmp/a.txt"), false, SLOT_LARGE));
+        assert_eq!(c.queued(), 1);
     }
 
     /// 一条类型记录要同时让「同类型的新路径」和「原路径」都命中——否则往目录里
@@ -279,7 +418,7 @@ mod tests {
     #[test]
     fn a_type_hit_serves_every_path_of_that_type() {
         let mut c = IconCache::default();
-        let key = icon_key(Path::new("/tmp/a.txt"), false);
+        let key = icon_key(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
         c.insert(
             Path::new("/tmp/a.txt"),
             &key,
@@ -287,15 +426,15 @@ mod tests {
         );
 
         assert_eq!(
-            c.lookup(Path::new("/tmp/a.txt"), false),
+            c.lookup(Path::new("/tmp/a.txt"), false, SLOT_SMALL),
             Some(PathBuf::from("/icons/txt.png"))
         );
         assert_eq!(
-            c.lookup(Path::new("/tmp/后来才出现的.txt"), false),
+            c.lookup(Path::new("/tmp/后来才出现的.txt"), false, SLOT_SMALL),
             Some(PathBuf::from("/icons/txt.png")),
             "同类型的新文件应当直接命中，不必再问系统"
         );
-        assert_eq!(c.lookup(Path::new("/tmp/c.pdf"), false), None);
+        assert_eq!(c.lookup(Path::new("/tmp/c.pdf"), false, SLOT_SMALL), None);
     }
 
     /// 按路径问的（目录 / 包）**绝不能**互相命中。
@@ -306,10 +445,10 @@ mod tests {
     #[test]
     fn path_keys_never_cross_serve() {
         let mut c = IconCache::default();
-        let key = icon_key(Path::new("/Applications/A.app"), false);
+        let key = icon_key(Path::new("/Applications/A.app"), false, SLOT_SMALL);
         assert_eq!(
             key,
-            IconKey::Path(PathBuf::from("/Applications/A.app")),
+            IconKey::Path(PathBuf::from("/Applications/A.app"), ICON_PX_SMALL),
             "包即使呈现为文件（符号链接）也必须按路径问"
         );
         c.insert(
@@ -319,11 +458,11 @@ mod tests {
         );
 
         assert_eq!(
-            c.lookup(Path::new("/Applications/A.app"), false),
+            c.lookup(Path::new("/Applications/A.app"), false, SLOT_SMALL),
             Some(PathBuf::from("/icons/a.png"))
         );
         assert_eq!(
-            c.lookup(Path::new("/Applications/B.app"), false),
+            c.lookup(Path::new("/Applications/B.app"), false, SLOT_SMALL),
             None,
             "另一个包必须自己去问，不能借用 A 的图标"
         );
@@ -333,9 +472,9 @@ mod tests {
     #[test]
     fn items_are_taken_one_at_a_time_and_the_rest_stay_queued() {
         let mut c = IconCache::default();
-        c.request(Path::new("/tmp/a.txt"), false);
-        c.request(Path::new("/tmp/b.pdf"), false);
-        c.request(Path::new("/tmp/c.png"), false);
+        c.request(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
+        c.request(Path::new("/tmp/b.pdf"), false, SLOT_SMALL);
+        c.request(Path::new("/tmp/c.png"), false, SLOT_SMALL);
 
         assert!(c.pop_next().is_some());
         assert_eq!(c.queued(), 2, "取一条只该少一条，其余留给下一个节拍");
@@ -353,7 +492,7 @@ mod tests {
         let over = ICON_CACHE_MAX + 10;
         for i in 0..over {
             let p = PathBuf::from(format!("/tmp/dir{i}"));
-            let key = icon_key(&p, true);
+            let key = icon_key(&p, true, SLOT_SMALL);
             c.insert(&p, &key, PathBuf::from("/icons/dir.png"));
         }
         assert!(c.cached_paths() <= ICON_CACHE_MAX, "封顶后不该还留这么多");

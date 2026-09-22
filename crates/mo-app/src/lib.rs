@@ -30,6 +30,9 @@ pub mod usercmds;
 pub mod workflows;
 
 pub use controller::DirectoryController;
+// 图标位图的**档位**要给 UI：视图那边只有「我这个槽位多大」，选哪一档是这一侧的事
+// （见 `icon::icon_px_for_slot` 的注释）。UI 侧的测试会拿它和视图的槽位表组合起来断言。
+pub use icon::{icon_px_for_slot, ICON_PX_LARGE, ICON_PX_SMALL};
 pub use metadata::MetadataScheduler;
 // 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
 pub use mo_config::{
@@ -1263,17 +1266,22 @@ impl AppState {
     /// `is_dir` 决定缓存键：目录 / 包 / 无扩展名的文件按路径（图标各不相同），
     /// 其余按扩展名（同类型共享一张，三百个 `.txt` 只问一次）。
     ///
+    /// `slot_pt` 是**显示槽位的边长（逻辑 pt）**：系统图标是光栅图，取出来多大就是
+    /// 多大，所以要先知道这一行要把它放进多大的地方。16pt 的列表行要 40px 的位图就
+    /// 够，96pt 的画廊格子得给 128px 的——否则就是几倍上采样。**档位由
+    /// [`icon::icon_px_for_slot`] 决定**，调用方只报槽位大小，别自己算像素。
+    ///
     /// 当前在看远程时整页都是远程条目，本机没有这些文件，系统给不出图标，返回
-    /// `None`——调用方（列表行）退回内置 SVG 图标。非 macOS 也返回 `None`。
-    pub fn file_icon(&self, path: &Path, is_dir: bool) -> Option<PathBuf> {
+    /// `None`——调用方退回内置 SVG 图标。非 macOS 也返回 `None`。
+    pub fn file_icon(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<PathBuf> {
         if self.browsing_remote() {
             return None;
         }
         let mut cache = self.icon_cache.lock().unwrap();
-        let hit = cache.lookup(path, is_dir);
+        let hit = cache.lookup(path, is_dir, slot_pt);
         if hit.is_none() {
             // 记账而已，不在这里做任何 IO：泵会把它攒进批里。
-            cache.request(path, is_dir);
+            cache.request(path, is_dir, slot_pt);
         }
         hit
     }
@@ -1339,9 +1347,11 @@ impl AppState {
             let Some((path, key)) = self.icon_cache.lock().unwrap().pop_next() else {
                 break;
             };
-            // 第一段（主线程）：问系统 + 重绘 40px + 拷像素。
+            // 第一段（主线程）：问系统 + 重绘到这一档要的尺寸 + 拷像素。
+            // 尺寸取自**键**（键里存的就是要取的档位），而不是某个全局默认值——
+            // 不然列表问来的 40px 会顶掉画廊要的 128px。
             let started = std::time::Instant::now();
-            let raster = mo_platform::file_icon_raster(&path);
+            let raster = mo_platform::file_icon_raster(&path, key.px());
             main_thread_spent += started.elapsed();
             // 第二段（后台）：预乘还原 + PNG 编码——占整段 70%，挪出主线程就是这一刀。
             if let Some(mut raster) = raster {
