@@ -502,3 +502,44 @@ const GLYPH_PX: f32 = 12.0;  // 内置 Lucide 描边 SVG 的绘制尺寸
 
 ⚠️ 这两条用例会派生补窗任务（占位的原因就是快照没回来），所以照 §26 在建 `AppState`
 之前加 `cx.dispatcher.allow_parking()`。
+
+## 29. 列视图换目录会无限追加同一列，把应用拖死（2026-09-22）
+
+**现象**：用户截图——中央列视图右侧不断长出**同一路径**的列（`Downloads` 一列接一列，
+箭头指着还在继续长），几秒后应用卡死。一个 27k 条的目录，每列都是一次全量读盘。
+
+**根因**：列视图的状态机自相矛盾（`47a5fec` 引入列视图起就在，与最近几笔性能改动无关）。
+
+* `ensure_columns`（render 里**每帧**跑）的判据是**第 0 列**：
+  `stale = columns.first().path != tab.path` → 过期就 `load_column(path, None, ..)`。
+  这个判据本身是对的：列视图的第 0 列恒等于当前目录，下钻只往后追加。
+* 但 `load_column(.., None, ..)` 的实现是**只 `push` 到末尾**（`parent = Some(i)` 才
+  `truncate(i + 1)`）。于是只要列栈非空且第 0 列 ≠ 当前目录，就是死循环：
+  发起加载 → 读完 push 到**末尾** → 第 0 列还是旧路径 → 下一帧又判过期 → 再 push …
+* 触发条件很平常：**在列视图里（或下钻过）之后又换了目录**（点侧栏「下载」、面包屑、
+  地址栏、双击进目录都会改 `tab.path`）。截图里第 0 列是 `home`、第 1 列是下钻的
+  `bluecode`，而 `tab.path` 已经是 `Downloads`。
+* 为什么是「卡死」而不是「多点几列」：列视图的列**不虚拟化**——`take(MAX_PER_COLUMN)`
+  只封顶渲染条数，`ColumnData.entries` 是整个目录的 `Vec<LightEntry>`；外加每列都要
+  读盘 + 排序，列一多就把内存和主线程一起占满。`column_busy` 只挡并发、挡不住串行重复。
+
+**修法**：把 `parent = None` 的语义钉成**重建根列（替换）**，而不是追加。
+
+* 发起时就 `p.columns.clear()`（换目录那一刻旧列栈已无意义，别等读完才清）。
+* 回调里按 `parent` 分派：`Some(i)` → **越界直接丢弃不 push**（在途期间列栈被重建过，
+  这列挂不上任何父列，让它自愈重来），否则 `truncate(i + 1)`；`None` → `clear()` 后 push。
+* 这样「第 0 列 == 当前目录」在读完后必然成立，`ensure_columns` 的判据收敛。
+* `Some(i)` 分支保持老行为（读完才截），点击下钻那 100–300ms 里旧列栈不动，不会闪空列。
+
+**守卫**（`mo-ui/src/app.rs`，三条都跑在 headless 上、不依赖异步完成）：
+
+| 用例 | 钉什么 |
+|---|---|
+| `switching_directory_rebuilds_column_stack_instead_of_appending` | 列栈 `[home, sub]` + `tab.path` 改成 `downloads` → `ensure_columns` 后列栈**立刻为空**（发起时清）+ `column_busy`；再调一次（模拟下一帧）仍是空，不追加 |
+| `matching_root_column_is_not_reloaded` | 第 0 列 == 当前目录时不重读盘、列栈不动（防「每帧重建」的反向过度） |
+| `drilling_down_keeps_old_columns_until_loaded` | `load_column(Some(1))` 发起时列栈仍是 2 列（不该提前截断） |
+
+主守卫做了反向验证：把 `load_column` 改回「只追加」→ 第一条变红（另两条保持绿，
+它们守的不是这块）。⚠️ 异步 `push` 测不到（headless 不驱动 `AppState` 自己的 runtime，
+`list_dir` 永远不返回），所以三条断言都落在**同步可观测的状态**上（列栈长度 / `column_busy`）。
+

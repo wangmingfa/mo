@@ -3739,6 +3739,10 @@ impl RootView {
     /// 所有处于列视图的标签页：根列缺失或目录已变化时触发加载。
     ///
     /// 每帧调用，但只在「当前目录 ≠ 根列」且没有在途任务时才真正读盘。
+    /// 判据是**第 0 列**：列视图的第 0 列恒等于当前目录，下钻只往后追加列。
+    /// 因此换目录时必须走「重建」（`load_column(.., None, ..)` 会清空整条列栈），
+    /// 不能只往末尾追加——否则第 0 列永远对不上，每读完一列又判一次过期（见
+    /// [`Self::load_column`] 的注释）。
     fn ensure_columns(&mut self, cx: &mut Context<Self>) {
         let mut todo: Vec<(usize, usize, PathBuf)> = Vec::new();
         for (pi, pane) in self.panes.iter().enumerate() {
@@ -3760,7 +3764,18 @@ impl RootView {
         }
     }
 
-    /// 加载一列并作为当前最深列；`parent` 为 `Some(i)` 时先截掉更深的列。
+    /// 加载一列并作为当前最深列。
+    ///
+    /// - `parent = Some(i)`：展开第 `i` 列里选中的子目录 —— 读完截掉 `i + 1`
+    ///   之后的列再追加（在途期间保持旧列栈显示，避免闪一排空列）；
+    /// - `parent = None`：**重建根列**（当前目录换了）—— 发起时就丢掉整条列栈。
+    ///
+    /// ⚠️ `None` 必须是「替换」而不是「追加」。`ensure_columns` 每帧按
+    /// 「第 0 列 ≠ 当前目录」判断根列过期；若只往末尾追加，第 0 列永远等于旧
+    /// 路径 → 每读完一列又判一次过期 → 无限加列。而列视图的列是**全量读盘**
+    /// （不虚拟化，只 `take(MAX_PER_COLUMN)` 渲染），一个上万条的目录每列就是
+    /// 一次全量读 + 排序，几秒内就把内存和主线程拖死——用户报的「一直无限加载
+    /// 同一个目录导致应用卡死」正是这条路径（从 `47a5fec` 引入列视图起就在）。
     pub(crate) fn load_column(
         &mut self,
         cx: &mut Context<Self>,
@@ -3777,8 +3792,11 @@ impl RootView {
                 return;
             }
             p.column_busy = true;
+            // 换根：旧列栈对新目录已经没有意义，先丢掉，别等到读完。
+            if parent.is_none() {
+                p.columns.clear();
+            }
         }
-        let _ = parent;
         cx.spawn(async move |weak, cx| {
             let entries = app.list_dir(&path).await.unwrap_or_default();
             let _ = weak.update(cx, |v, cx| {
@@ -3786,8 +3804,17 @@ impl RootView {
                     return;
                 };
                 p.column_busy = false;
-                if let Some(i) = parent {
-                    p.columns.truncate(i + 1);
+                match parent {
+                    Some(i) => {
+                        // 在途期间列栈被重建过（中途换了目录 / 切走又切回）：
+                        // 这一列挂不上任何父列，丢掉不 push，让它自愈重来。
+                        if i >= p.columns.len() {
+                            return;
+                        }
+                        p.columns.truncate(i + 1);
+                    }
+                    // 重建根列：清空后只留这一列，`ensure_columns` 的判据才收敛。
+                    None => p.columns.clear(),
                 }
                 p.columns.push(ColumnData {
                     path: path.clone(),
@@ -8978,6 +9005,139 @@ mod tests {
             p.visible_count = p.window.len();
             cx.notify();
         })
+    }
+
+    /// 造一个 columns 列视图的面板（列数据全靠手填，不读盘）。
+    fn seed_column_panel(
+        root: &gpui_kit::Entity<RootView>,
+        cx: &mut gpui_kit::App,
+        path: &str,
+        columns: &[&str],
+    ) {
+        root.update(cx, |v, _cx| {
+            let p = v.panel_mut();
+            p.view_mode = crate::panel::ViewMode::Columns;
+            p.path = Some(PathBuf::from(path));
+            p.columns = columns
+                .iter()
+                .map(|c| crate::panel::ColumnData {
+                    path: PathBuf::from(c),
+                    entries: Vec::new(),
+                    cursor: 0,
+                })
+                .collect();
+            p.column_busy = false;
+        });
+    }
+
+    /// 列视图换目录必须**重建**根列，不能往末尾继续追加。
+    ///
+    /// 回归（从 `47a5fec` 列视图引入起就在，用户报的「一直无限加载同一个目录
+    /// 导致应用卡死」）：`ensure_columns` 每帧按「第 0 列 ≠ 当前目录」判根列过期，
+    /// 而 `load_column(.., None, ..)` 只把新列 push 到末尾 —— 第 0 列永远对不上，
+    /// 于是每读完一列又判一次过期，列数无限增长。列视图的列是全量读盘（只对
+    /// 渲染条数 `take` 封顶，`Vec<LightEntry>` 是整个目录），一个上万条的目录
+    /// 每列一次全量读 + 排序，几秒就把内存和主线程拖死。
+    #[test]
+    fn switching_directory_rebuilds_column_stack_instead_of_appending() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let state = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
+        let root = root.clone();
+
+        // 已经在列视图里下钻过一级：第 0 列 home、第 1 列 sub。
+        cx.update(|_window, app| {
+            seed_column_panel(
+                &root,
+                app,
+                "/mo-columns-test/home",
+                &["/mo-columns-test/home", "/mo-columns-test/home/sub"],
+            );
+        });
+        // 换目录（例如侧栏点「下载」）：当前目录变了，列栈还是旧的。
+        cx.update(|_window, app| {
+            root.update(app, |v, cx| {
+                v.panel_mut().path = Some(PathBuf::from("/mo-columns-test/downloads"));
+                v.ensure_columns(cx);
+                {
+                    let p = v.panel();
+                    assert!(
+                        p.columns.is_empty(),
+                        "换根那一刻就该丢掉旧列栈，实际还剩 {} 列（第 0 列 {:?}）",
+                        p.columns.len(),
+                        p.columns.first().map(|c| c.path.clone()),
+                    );
+                    assert!(p.column_busy, "根列重建应当已经发起读盘");
+                }
+                // 下一帧（`ensure_columns` 在 render 里每帧都跑）不能重复追加。
+                v.ensure_columns(cx);
+                assert!(
+                    v.panel().columns.is_empty(),
+                    "在途期间不该再追加列（老实现就是这么无限涨的）",
+                );
+            });
+        });
+    }
+
+    /// 根列已经对得上当前目录时，不该每帧重新读一次盘。
+    #[test]
+    fn matching_root_column_is_not_reloaded() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let state = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
+        let root = root.clone();
+
+        cx.update(|_window, app| {
+            seed_column_panel(
+                &root,
+                app,
+                "/mo-columns-test/home",
+                &["/mo-columns-test/home"],
+            );
+            root.update(app, |v, cx| {
+                v.ensure_columns(cx);
+                let p = v.panel();
+                assert!(!p.column_busy, "根列没变就不该再读一次盘");
+                assert_eq!(p.columns.len(), 1, "列栈不该被动过");
+            });
+        });
+    }
+
+    /// 点击下钻（`parent = Some(i)`）在发起时**不动**列栈：旧列先留着，读完再一次性
+    /// 替换。否则点击那 100–300ms 里会先闪掉几列，滚动位置也跟着跳。
+    #[test]
+    fn drilling_down_keeps_old_columns_until_loaded() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let state = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(state, cx));
+        let root = root.clone();
+
+        cx.update(|_window, app| {
+            seed_column_panel(
+                &root,
+                app,
+                "/mo-columns-test/home",
+                &["/mo-columns-test/home", "/mo-columns-test/home/sub"],
+            );
+            root.update(app, |v, cx| {
+                v.load_column(
+                    cx,
+                    PathBuf::from("/mo-columns-test/home/sub/bin"),
+                    Some(1),
+                    0,
+                    0,
+                );
+                let p = v.panel();
+                assert!(p.column_busy, "下钻应当发起读盘");
+                assert_eq!(p.columns.len(), 2, "读回来之前不该动列栈");
+            });
+        });
     }
 
     /// 列表视图的行也要留出四周的呼吸空间：首行不顶表头、左右不贴窗口边缘。
