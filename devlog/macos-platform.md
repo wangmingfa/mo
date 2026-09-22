@@ -111,3 +111,27 @@
 * 纪律：**渲染路径上不许出现 AppKit 调用 + 位图编码 + 写盘**。⚠️ 这条调用还必须在主线程
   （`on_main_thread`），所以放后台也只是把它 `dispatch_sync` 回主线程——省不掉，只能让它
   足够小、并且靠缓存命中（`AppState::file_icon` 的路径键缓存）来避开重复生成。
+
+## 15. 卷宗能不能「推出」要问系统，别一律画按钮（2026-09-22）
+
+* 现象：侧栏「位置」区里，**内置硬盘（Macintosh HD）** 行尾也有一个推出按钮。内置盘没有
+  「推出」这个概念——访达不给它画，点了只会得到一句「推出失败」。
+* 根因：`Volume` 只带 `name` / `path`，侧栏无条件给每行画按钮。
+* 判据：macOS 上问 Foundation 的卷宗属性（`getResourceValue:forKey:error:`）——
+  * `NSURLVolumeIsInternalKey == true` → **不可推出**（内置盘，先否掉）；
+  * `NSURLVolumeIsEjectableKey == true` → 可推出（USB / SD / 光盘）；
+  * `NSURLVolumeIsRemovableKey == true` → 可推出（磁盘映像 `.dmg`）；
+  * `NSURLVolumeIsLocalKey == false` → 可推出（网络盘）。
+  ⚠️ `None`（该 key 读不到）**不算证据**：不能因为 `IsLocal` 问不到就当网络盘、把按钮
+  画出来，所以除明确的 `false` 外一律不成立。判据本体抽成纯函数 `decide_ejectable`
+  才好进单测——真机问 AppKit 那步在测试子线程里会被下一段的守卫拦掉。
+* ⚠️ 读属性同样只能在主线程（`on_main_thread`）：`volume_is_ejectable` 开头必须有
+  `is_main_thread()` 守卫（非主线程保守 `false`），否则 headless 测试渲染侧栏时
+  `dispatch_sync` 回主队列会**整套挂死且没有 panic**。与 §14 的 `file_icon` 是同一条坑，
+  只不过这次的调用点在**同步的** `AppState::volumes()`（侧栏每帧问一次，靠 5s TTL 兜底）。
+* 真机探针（一次性 example，跑完即删）确认：`/Volumes` 下 `Macintosh HD`（apfs）→
+  `ejectable=false`；另一块 `172.25.48.48`（**nfs**）被 `is_network_fs` 正确滤到「网络」区，
+  不会在「位置」区重复出现。顺带验证了 `[NSThread isMainThread]` 在我们这种非 Cocoa
+  命令行程序里也返回 `true`。
+* 单测两条：`only_removable_volumes_can_be_ejected`（四类卷宗 + 读不到时的保守）、
+  `volumes_stay_conservative_off_the_main_thread`（守「守卫别忘了加」）。

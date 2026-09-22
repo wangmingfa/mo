@@ -1095,7 +1095,11 @@ impl AppState {
     ///
     /// 只读，不发起任何网络操作。网络盘不在这里（归「网络」区，由
     /// [`AppState::network_shares`] 负责）。按 [`VOLUME_TTL`] 缓存，因为列表要
-    /// `statfs` 逐个查（`mo_platform::volumes` 内已把网络文件系统过滤掉）。
+    /// `statfs` 逐个查（`mo_platform::volumes` 内已把网络文件系统过滤掉）、还要
+    /// 逐块问一次卷宗属性（能否推出）。
+    ///
+    /// 每块盘带 [`mo_platform::Volume::ejectable`]：侧栏据此决定给不给推出按钮。
+    /// ⚠️ 这步走 AppKit，必须在主线程读——所以缓存键里也含它，别在后台线程预填。
     pub fn volumes(&self) -> Vec<mo_platform::Volume> {
         let mut slot = self.volumes_cache.lock().unwrap();
         if slot.0.elapsed() >= VOLUME_TTL {

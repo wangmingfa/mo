@@ -288,6 +288,8 @@ where
 /// * 以点开头的是系统自己用的（`.timemachine` 之类）；
 /// * **网络文件系统要排除**——它们归侧边栏的「网络」区，两边都列同一个盘
 ///   只会让人困惑。判据是 `statfs` 的 `f_fstypename`，不靠路径猜。
+///
+/// 另外逐块问一下 [`volume_is_ejectable`]：内置硬盘推不动，UI 不该给它画推出按钮。
 pub fn volumes() -> Vec<Volume> {
     let Ok(read) = std::fs::read_dir("/Volumes") else {
         return Vec::new();
@@ -302,10 +304,89 @@ pub fn volumes() -> Vec<Volume> {
         if fs_type(&path).is_some_and(|t| is_network_fs(&t)) {
             continue;
         }
-        out.push(Volume { name, path });
+        out.push(Volume {
+            name,
+            ejectable: volume_is_ejectable(&path),
+            path,
+        });
     }
     out.sort_by_key(|v| v.name.to_lowercase());
     out
+}
+
+/// 这块卷宗能不能「推出」。
+///
+/// **内置硬盘（启动盘）不能**——访达也不给它画推出按钮，点下去只会得到
+/// 「推出失败」。判据取 Foundation 的三个 volume resource key：
+///
+/// * 可弹出介质（USB / SD / 光盘）→ `NSURLVolumeIsEjectableKey`；
+/// * 可移动卷（磁盘映像）→ `NSURLVolumeIsRemovableKey`；
+/// * 非本地（网络卷）→ `NSURLVolumeIsLocalKey == false`；
+/// * 内置盘靠 `NSURLVolumeIsInternalKey` 直接否掉。
+///
+/// ⚠️ 不在主线程一律返回 `false`（= 不给按钮），与 `file_icon` 同一条纪律：读
+/// resource value 走 `on_main_thread`，而测试把渲染跑在子线程，`dispatch_sync` 回
+/// 主队列会挂死。渲染在真机的主线程上跑，那里拿得到真值。
+fn volume_is_ejectable(path: &Path) -> bool {
+    if !is_main_thread() {
+        return false;
+    }
+    let owned = path.to_path_buf();
+    on_main_thread(move || unsafe {
+        let Some(url) = nsurl_for(&owned) else {
+            return false;
+        };
+        decide_ejectable(
+            volume_flag(url, "NSURLVolumeIsInternalKey"),
+            volume_flag(url, "NSURLVolumeIsEjectableKey"),
+            volume_flag(url, "NSURLVolumeIsRemovableKey"),
+            volume_flag(url, "NSURLVolumeIsLocalKey"),
+        )
+    })
+}
+
+/// 判据本体（纯函数：四个 resource value → 能不能推出）。
+///
+/// 抽出来是为了可测：真机上每块盘问一次 AppKit 没法进单测（`on_main_thread` 在
+/// 测试子线程里要先被拦掉），而这四条逻辑是「内置盘不给按钮」这件事的全部依据。
+///
+/// `None` = 那个 key 没读到。**读不到不算证据**：不能因为问不到 `IsLocal` 就当成
+/// 网络盘把按钮画出来，所以除了明确的 `false`，一律不成立。
+fn decide_ejectable(
+    internal: Option<bool>,
+    ejectable: Option<bool>,
+    removable: Option<bool>,
+    local: Option<bool>,
+) -> bool {
+    if internal == Some(true) {
+        return false; // 内置盘（启动盘）：没有「推出」这个概念。
+    }
+    ejectable == Some(true)          // U 盘 / SD 卡 / 光盘
+        || removable == Some(true)   // 磁盘映像（.dmg）
+        || local == Some(false) // 网络盘
+}
+
+/// 读一个 BOOL 型的 URL resource value；读不到（key 不认识 / 该卷不提供）返回 `None`。
+///
+/// `None` 与 `Some(false)` 必须分开：判据里要能区分「系统说它不是内置盘」与
+/// 「压根没问到」——后者不能当成「可推出」的证据。
+///
+/// # Safety
+/// `url` 必须是有效的 `NSURL *`。
+unsafe fn volume_flag(url: *mut Object, key_name: &str) -> Option<bool> {
+    let key = nsstring(key_name)?;
+    let mut value: *mut Object = std::ptr::null_mut();
+    let mut err: *mut Object = std::ptr::null_mut();
+    let ok: bool = msg_send![
+        url,
+        getResourceValue: &mut value as *mut *mut Object
+        forKey: key
+        error: &mut err as *mut *mut Object
+    ];
+    if !ok || value.is_null() {
+        return None;
+    }
+    Some(msg_send![value, boolValue])
 }
 
 /// `statfs` 的文件系统类型名（`f_fstypename`：`apfs` / `smbfs` / `nfs`…）。
@@ -426,5 +507,69 @@ mod tests {
     fn the_shared_workspace_exists() {
         let ws = workspace().expect("NSWorkspace 应当拿得到（AppKit 已链接）");
         assert!(!ws.is_null());
+    }
+
+    /// 「能不能推出」的判据：内置盘不给按钮，可弹出 / 可移动 / 网络盘给。
+    ///
+    /// 这是这条链路上**唯一能进单测的一环**（真机问 AppKit 那步在测试子线程里会先被
+    /// `is_main_thread` 拦掉），所以四类卷宗都在这儿钉住——用户报的「内置硬盘也画了
+    /// 推出按钮」就靠它不再回来。
+    #[test]
+    fn only_removable_volumes_can_be_ejected() {
+        // 启动盘：internal = true、local = true，其余 false。
+        assert!(
+            !decide_ejectable(Some(true), Some(false), Some(false), Some(true)),
+            "内置硬盘不该给推出按钮"
+        );
+        // U 盘 / SD 卡 / 光盘：可弹出。
+        assert!(decide_ejectable(
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true)
+        ));
+        // 磁盘映像（.dmg）：可移动但不可弹出。
+        assert!(decide_ejectable(
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true)
+        ));
+        // 网络盘：非本地。
+        assert!(decide_ejectable(
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false)
+        ));
+        // ⚠️ 问不到 key 不算证据：不能因为 `IsLocal` 读不到就当网络盘、把按钮画出来。
+        assert!(
+            !decide_ejectable(None, None, None, None),
+            "全读不到时必须保守（宁可不画按钮）"
+        );
+        assert!(
+            !decide_ejectable(None, Some(false), Some(false), None),
+            "只读到一堆 false 也不构成「能推出」"
+        );
+        // `internal` 优先：内置盘就是不给，哪怕别的 key 说可以。
+        assert!(
+            !decide_ejectable(Some(true), Some(true), Some(true), Some(false)),
+            "internal = true 应当直接否掉"
+        );
+    }
+
+    /// 非主线程里 `volumes()` 不碰 AppKit：`on_main_thread` 会 `dispatch_sync` 回主
+    /// 队列，而 headless 测试的主队列不 drain，真调了就是整套挂死（且**没有 panic**，
+    /// 最难查的那种）。这条守的就是「守卫别忘了加」。
+    #[test]
+    fn volumes_stay_conservative_off_the_main_thread() {
+        assert!(
+            !is_main_thread(),
+            "cargo test 的用例跑在子线程，正好覆盖这条路径"
+        );
+        assert!(
+            volumes().iter().all(|v| !v.ejectable),
+            "子线程里必须保守：一块盘都不该带推出按钮"
+        );
     }
 }

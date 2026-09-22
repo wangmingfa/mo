@@ -367,12 +367,10 @@ pub fn render(
         let label = vol.name.clone();
         let path = vol.path.clone();
         let is_active = current.as_deref() == Some(path.as_path());
+        let ejectable = vol.ejectable;
         let app_click = app.clone();
-        let app_eject = app.clone();
         let entity_click = entity.clone();
-        let entity_eject = entity.clone();
         let target = path.clone();
-        let eject_target = path.clone();
 
         let mut item = div()
             .id(format!("sidebar-vol-{ix}"))
@@ -410,33 +408,42 @@ pub fn render(
             })
             .detach();
         });
-        // 行尾「推出」。同样要 `stop_propagation()`，否则会把上面「打开」也触发。
-        let mut eject = div()
-            .id(format!("sidebar-vol-eject-{ix}"))
-            .ml_auto()
-            .flex_shrink_0()
-            .rounded(px(4.0))
-            .hover(|s| s.bg(crate::theme::hover_bg()));
-        eject.interactivity().on_click(move |_, _window, cx| {
-            cx.stop_propagation();
-            let app_eject = app_eject.clone();
-            let entity_eject = entity_eject.clone();
-            let eject_target = eject_target.clone();
-            cx.spawn(async move |cx| {
-                if let Err(e) = app_eject.eject_volume(eject_target).await {
-                    entity_eject.update(cx, |v, cx| {
-                        v.notice(format!("推出失败：{e}"), None, cx);
-                    });
-                }
-                entity_eject.update(cx, |_, cx| cx.notify());
-            })
-            .detach();
-        });
-        panel = panel.child(item.child(eject.child(crate::icons::icon(
-            crate::icons::POWER,
-            14.0,
-            crate::theme::muted(),
-        ))));
+        // 行尾「推出」——**只有推得动的盘才画这个按钮**。内置硬盘（启动盘）没有
+        // 「推出」这个概念，访达也不给它画；画了只会让人点出一句「推出失败」。
+        // 能不能推出由 `mo_platform::volumes` 按卷宗属性判好（`Volume::ejectable`）。
+        if ejectable {
+            let app_eject = app.clone();
+            let entity_eject = entity.clone();
+            let eject_target = path.clone();
+            // 同样要 `stop_propagation()`，否则会把上面「打开」也触发。
+            let mut eject = div()
+                .id(format!("sidebar-vol-eject-{ix}"))
+                .ml_auto()
+                .flex_shrink_0()
+                .rounded(px(4.0))
+                .hover(|s| s.bg(crate::theme::hover_bg()));
+            eject.interactivity().on_click(move |_, _window, cx| {
+                cx.stop_propagation();
+                let app_eject = app_eject.clone();
+                let entity_eject = entity_eject.clone();
+                let eject_target = eject_target.clone();
+                cx.spawn(async move |cx| {
+                    if let Err(e) = app_eject.eject_volume(eject_target).await {
+                        entity_eject.update(cx, |v, cx| {
+                            v.notice(format!("推出失败：{e}"), None, cx);
+                        });
+                    }
+                    entity_eject.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            });
+            item = item.child(eject.child(crate::icons::icon(
+                crate::icons::POWER,
+                14.0,
+                crate::theme::muted(),
+            )));
+        }
+        panel = panel.child(item);
     }
 
     // 书签区（`~/Library/Application Support/mo/config.json` 里的
