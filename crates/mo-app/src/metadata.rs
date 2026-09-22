@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mo_cache::MetadataCache;
-use mo_core::{Entry, FileId, FileMetadata, MetadataState, Permissions};
+use mo_core::{Directory, Entry, FileId, FileMetadata, MetadataState, Permissions};
 use tokio::sync::Semaphore;
 
 use crate::AppState;
@@ -42,18 +42,38 @@ impl MetadataScheduler {
         }
     }
 
-    /// 用缓存预填一批条目的元数据，返回命中条数。
+    /// 用缓存预填**视图首屏**的元数据，返回命中条数。
+    ///
+    /// 只填前 `upto` 个**视图序**的条目，而不是整份列表：`upto` 之外那两万条用户
+    /// 此刻一行都看不到，而「一次查 2.7 万个 id」实测要 **133ms**（打开大目录时最大
+    /// 的一笔延迟）。它们的值由随后的 [`MetadataScheduler::load`] 逐条 `stat` 时补——
+    /// 那里的顺序本来就是首屏优先，滚到哪行、哪行就有值。
     ///
     /// 一次批量查询而不是 N 次单条查询，避免打开大目录时打爆 SQLite。
-    pub fn prime_from_cache(cache: &MetadataCache, entries: &mut [Entry]) -> usize {
-        let ids: Vec<FileId> = entries.iter().map(|e| e.id).collect();
+    pub fn prime_visible_from_cache(
+        cache: &MetadataCache,
+        dir: &mut Directory,
+        upto: usize,
+    ) -> usize {
+        // 先把前 `upto` 个视图下标抄出来：`dir.view` 与 `dir.entries` 要同时借。
+        let head: Vec<usize> = dir
+            .view
+            .visible_indices()
+            .iter()
+            .take(upto)
+            .copied()
+            .collect();
+        if head.is_empty() {
+            return 0;
+        }
+        let ids: Vec<FileId> = head.iter().map(|&i| dir.entries[i].id).collect();
         let Ok(map) = cache.get_many(&ids) else {
             return 0;
         };
         let mut hits = 0;
-        for e in entries.iter_mut() {
-            if let Some(m) = map.get(&e.id) {
-                e.metadata = MetadataState::Loaded(*m);
+        for i in head {
+            if let Some(m) = map.get(&dir.entries[i].id) {
+                dir.entries[i].metadata = MetadataState::Loaded(*m);
                 hits += 1;
             }
         }

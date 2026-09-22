@@ -4767,6 +4767,8 @@ async fn sync_panel(
     tab_idx: usize,
 ) {
     let path = app.current_path().await;
+    // 正在读取的目标（可能还没读回来）：UI 靠它立刻给反馈。
+    let opening = app.opening_path();
     let count = app.visible_count().await;
     let sort = app.sort().await;
     let can_back = app.can_go_back().await;
@@ -4799,6 +4801,7 @@ async fn sync_panel(
             p.pending = None;
         }
         p.path = path;
+        p.opening = opening;
         p.visible_count = count;
         p.sort = sort;
         p.can_back = can_back;
@@ -4831,7 +4834,6 @@ async fn sync_panel(
     };
 
     let (dir_path, start, entries) = app.visible_window(range).await;
-    let for_thumbs = entries.clone();
     // WeakEntity::update 返回 Result：视图可能已销毁，这里忽略。
     let _ = this.update(cx, |v, cx| {
         let Some(p) = v.panel_at_mut(pane_idx, tab_idx) else {
@@ -4846,8 +4848,9 @@ async fn sync_panel(
         p.window = entries;
         cx.notify();
     });
-    // 缩略图只为当前窗口生成。
-    app.thumbs().request(app.clone(), for_thumbs);
+    // 缩略图不在这里派发：这里的窗口最大到 INITIAL_WINDOW(=200) 条，按它派发就是
+    // 进一个图片目录瞬间排 200 个解码任务（单张 80ms 级）——四核被占住，界面跟着卡。
+    // 派发点在渲染那一帧，只给**看得见**的行排队（见 `file_list` 的 `want_thumbs`）。
 }
 
 impl Render for RootView {
@@ -4903,7 +4906,14 @@ impl Render for RootView {
                     // 会让「图片」「文档」这些本地项跟着一起高亮——用户报的「关闭弹窗
                     // 后左侧选中了 2 个项目」有一半来自这里。
                     let current = (!self.panel().app.browsing_remote())
-                        .then(|| self.panel().path.clone())
+                        .then(|| {
+                            // 正在读取时先高亮**目标**：刚点下去那 100–300ms 里选中态就得动，
+                            // 否则观感就是「点了没反应」。
+                            self.panel()
+                                .opening
+                                .clone()
+                                .or_else(|| self.panel().path.clone())
+                        })
                         .flatten();
                     row = row.child(sidebar::render(&self.panel().app, &current, &entity));
                 }
@@ -5230,6 +5240,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             .flex_1()
             // 测试用（release no-op）：tests/layout.rs 断言中央区位置与尺寸。
             .debug_selector(|| "mo-center".to_string())
+            .child(opening_bar(panel.opening.as_deref()))
             .child(filter_bar(&panel.query, pane_idx))
             .child(match panel.view_mode {
                 ViewMode::List => file_list::render(
@@ -6602,6 +6613,42 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
             cx.notify();
         });
     }
+}
+
+/// 中央区顶部的「正在读取 …」提示条。
+///
+/// 读一个大目录要 100–300ms，这段时间列表还停在**上一处**的内容上——没有这条提示，
+/// 用户看到的就是「点了没反应」（侧栏高亮则由 [`RootView::render`] 里的 `current`
+/// 立刻跟过去）。读完或读失败都由 `AppEvent::OpeningChanged` 收掉。
+fn opening_bar(path: Option<&std::path::Path>) -> Div {
+    let Some(path) = path else {
+        // 空闲时不占高度。
+        return div().h(px(0.0));
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(22.0))
+        .px(px(8.0))
+        .bg(theme::hover_bg())
+        .border_b_1()
+        .border_color(theme::separator())
+        .child(crate::icons::icon(
+            crate::icons::ROTATE_CW,
+            12.0,
+            theme::muted(),
+        ))
+        .child(
+            div()
+                .text_color(theme::muted())
+                .child(text!(id = "opening-hint", format!("正在读取 {name}…"))),
+        )
 }
 
 /// 过滤条：显示当前关键词与提示。
@@ -8966,6 +9013,163 @@ mod tests {
         assert!(
             (top - 12.0).abs() < 0.51,
             "列表顶部留白 {top}，应为 12：首行顶着表头了"
+        );
+    }
+
+    /// 窗口快照还没落地时，列表画的是**斑马纹空行**，不是省略号。
+    ///
+    /// 用户报的现象：切到内容少的目录（或快速滚动）会整屏 `…` 闪一下。占位行改成
+    /// 只有底色之后，真数据到位是文字直接浮现在同一块底色上，连底色都不跳。
+    /// 这里钉三件事：占位行与数据行同高、同左留白（不会抖），相邻行底色交替
+    /// （斑马纹占位生效），且这一帧里确实没有数据行（整片都是占位）。
+    #[test]
+    fn unfilled_rows_are_empty_zebra_placeholders() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        // 占位来自「快照还没回来」，渲染闭包会派生一次补窗任务（`ensure_window`）；
+        // 真 IO 与 gpui 的确定性调度器混搭天生会偶发误报，开一次官方豁免（同
+        // `tests/layout.rs::open_app`）。
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 快照一条都没有 → 可见区整片占位。path 指向不存在的目录：补窗任务取回
+        // 空快照后窗口仍是空的（`visible_window` 对未加载目录直接返回空），
+        // 所以这一帧是确定性的，不掺真实目录内容。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                let p = v.panel_mut();
+                p.view_mode = crate::panel::ViewMode::List;
+                p.path = Some(PathBuf::from("/mo-placeholder-test"));
+                p.window_start = 0;
+                p.window.clear();
+                p.visible_count = 4;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-file-row-0").is_none(),
+            "窗口是空的却渲染出了数据行——这个用例的前提没了"
+        );
+        let list = cx.debug_bounds("mo-file-list").expect("列表视图没有渲染");
+        let ph0 = cx
+            .debug_bounds("mo-file-ph-0")
+            .expect("第 0 条占位行没渲染");
+        let ph1 = cx
+            .debug_bounds("mo-file-ph-1")
+            .expect("第 1 条占位行没渲染");
+        let ph2 = cx
+            .debug_bounds("mo-file-ph-2")
+            .expect("第 2 条占位行没渲染");
+
+        // 几何必须与数据行一致：同 24px 行高、同左留白（list 的 12pt padding）。
+        // 占位期与加载完的几何差一点，看起来就是整块列表抖一下。
+        let row_h = crate::listing::row_height(crate::panel::ViewMode::List);
+        for (i, ph) in [ph0, ph1, ph2].iter().enumerate() {
+            assert!(
+                (f32::from(ph.size.height) - row_h).abs() < 0.51,
+                "第 {i} 条占位行高 {}，应与数据行 {row_h} 一致（占位不能塌）",
+                f32::from(ph.size.height)
+            );
+            assert!(
+                (f32::from(ph.origin.x - list.origin.x) - 12.0).abs() < 0.51,
+                "第 {i} 条占位行左缘距列表 {}，应为 12（与数据行同留白）",
+                f32::from(ph.origin.x - list.origin.x)
+            );
+        }
+
+        // 斑马纹：相邻两行不同色、隔一行同色。
+        // ⚠️ 只比**相对**关系，不拿 `theme::zebra()` 的绝对色值比：调色板是进程级
+        // 全局槽位，并行的主题用例会临时翻深色，比色值就是随机闪断。
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let rect = |b: gpui_kit::Bounds<gpui_kit::Pixels>| {
+            (
+                f32::from(b.origin.x) * scale,
+                f32::from(b.origin.y) * scale,
+                f32::from(b.size.width) * scale,
+                f32::from(b.size.height) * scale,
+            )
+        };
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let bg_at = |r: (f32, f32, f32, f32)| {
+            let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+            quads
+                .iter()
+                .find(|q| {
+                    near(q.bounds.origin.x.as_f32(), r.0)
+                        && near(q.bounds.origin.y.as_f32(), r.1)
+                        && near(q.bounds.size.width.as_f32(), r.2)
+                        && near(q.bounds.size.height.as_f32(), r.3)
+                })
+                .map(|q| q.background)
+                .unwrap_or_else(|| panic!("占位行没有画出同位同尺寸的底色 quad：{r:?}"))
+        };
+        let (b0, b1, b2) = (bg_at(rect(ph0)), bg_at(rect(ph1)), bg_at(rect(ph2)));
+        assert_ne!(
+            b0, b1,
+            "相邻两条占位行同色——斑马纹占位没生效（又退回一片空白了？）"
+        );
+        assert_eq!(
+            b0, b2,
+            "第 0 与第 2 条占位行不同色——交替规律断了（奇偶反了或多算了一行？）"
+        );
+    }
+
+    /// 网格视图缺格时画的是**同尺寸的空骨架格**（不是 `…`）。
+    #[test]
+    fn unfilled_grid_cells_match_cell_geometry() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 只填第一格，其余缺格 → 第一格是数据单元、后面的都是骨架格。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                let p = v.panel_mut();
+                p.view_mode = crate::panel::ViewMode::Grid;
+                p.path = Some(PathBuf::from("/mo-placeholder-grid-test"));
+                p.window_start = 0;
+                p.window = vec![mo_core::Entry::new(
+                    mo_core::FileId::new(0, 0),
+                    "a".to_string(),
+                    mo_core::EntryKind::Directory,
+                    PathBuf::from("/mo-placeholder-grid-test/a"),
+                )];
+                p.visible_count = 4;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let cell = cx
+            .debug_bounds("mo-grid-cell-0")
+            .expect("第一格数据单元没渲染");
+        let ph = cx
+            .debug_bounds("mo-grid-ph-1")
+            .expect("第 1 格骨架没渲染（缺格又退回不画了？）");
+        assert!(
+            cx.debug_bounds("mo-grid-ph-0").is_none(),
+            "第 0 格有数据，不该画骨架格"
+        );
+        assert!(
+            (f32::from(ph.size.height) - f32::from(cell.size.height)).abs() < 0.51,
+            "骨架格高 {} 与真单元 {} 不一致：数据到达前后网格会跳",
+            f32::from(ph.size.height),
+            f32::from(cell.size.height)
+        );
+        assert!(
+            (f32::from(ph.size.width) - f32::from(cell.size.width)).abs() < 0.51,
+            "骨架格宽 {} 与真单元 {} 不一致：数据到达前后网格会跳",
+            f32::from(ph.size.width),
+            f32::from(cell.size.width)
         );
     }
 

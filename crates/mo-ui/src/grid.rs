@@ -46,18 +46,40 @@ pub fn render(
             return Vec::new();
         };
         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
+        // 这一帧真的画出来的、还等着缩略图的单元——行渲染完统一派发（见下方注释）。
+        let mut want_thumbs: Vec<Entry> = Vec::new();
         for r in range.clone() {
             let mut row = div().flex().flex_row().w_full().h(px(height)).gap(px(6.0));
-            let mut any_missing = false;
             for c in 0..cols {
                 let idx = r * cols + c;
                 if idx >= count {
                     break;
                 }
                 let Some(entry) = panel.window.get(idx.wrapping_sub(panel.window_start)) else {
-                    any_missing = true;
+                    // 窗口还没补上这一格（刚切目录 / 快速滚动）：画一个**只有底色**
+                    // 的骨架格，尺寸 / 圆角 / 内边距与 `cell()` 完全一致，别让网格在
+                    // 数据到达前后跳一下。与列表视图的占位行同一条约定：不画 `…`。
+                    // ⚠️ 同样要有唯一 ID（多个格子同时缺数据，a11y NodeId 会撞）。
+                    row = row.child(
+                        div()
+                            .id(format!("grid-ph-{pane}-{tab}-{idx}"))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .p(px(4.0))
+                            .rounded(px(6.0))
+                            .bg(crate::theme::zebra())
+                            .debug_selector(move || format!("mo-grid-ph-{idx}")),
+                    );
                     continue;
                 };
+                if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
+                    want_thumbs.push(entry.clone());
+                }
                 row = row.child(cell(
                     entry,
                     mode,
@@ -68,17 +90,16 @@ pub fn render(
                     idx,
                 ));
             }
-            if any_missing {
-                // ⚠️ 占位文本要有唯一 ID：多个行同时缺数据时，
-                // 同一 `text!` 站点会渲染多次，无 ID 会产生重复 a11y 节点。
-                row = row.child(
-                    div()
-                        .id(format!("grid-ph-{pane}-{tab}-{r}"))
-                        .flex_1()
-                        .child(text!("…".to_string())),
-                );
-            }
             rows.push(row.into_any_element());
+        }
+        // 缩略图：这一帧看得见的、还等着的那几格，统一派发。
+        //
+        // 为什么在渲染路径上派发（而不是「窗口抓回来时」）：窗口带着上下各
+        // BUFFER(=100) **条目**的余量，按整窗口派发等于每进一个目录就白解几百张
+        // 大图（实测单张 80ms 级），目录越大白解得越多——四核被占住，界面跟着卡。
+        // 请求是幂等的（在跑 / 已生成 / 失败都会被调度器跳过），每帧调也无所谓。
+        if !want_thumbs.is_empty() {
+            panel.app.thumbs().request(panel.app.clone(), want_thumbs);
         }
         rows
     })

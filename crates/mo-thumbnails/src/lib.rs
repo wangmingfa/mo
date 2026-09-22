@@ -271,6 +271,45 @@ pub fn generate_to(src: &Path, dst: &Path, size: u32) -> Result<PathBuf, Thumbna
     generate_to_with(src, dst, size, Encoded::Png)
 }
 
+/// 把一张 RGBA8 位图编码成 PNG 字节。
+///
+/// 这是给「系统图标」那条链路的：平台层只能在主线程交出**像素**
+/// （`mo_platform::file_icon_raster`，里面的 AppKit 调用必须主线程），而「像素 →
+/// PNG」这一步很贵——实测占图标整段耗时的 **70%**（0.62ms / 0.9ms）。把它放在
+/// 调用方的后台线程里做，主线程单价就掉下来了。
+///
+/// `rgba` 长度必须正好是 `width * height * 4`；长度不符或编码失败都返回 `None`
+/// （调用方按「这张图标没取到」处理即可，不必区分）。
+pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// 把**预乘 alpha** 的 RGBA 还原成直通 alpha（原地）。
+///
+/// AppKit 把图画进位图时总会预乘（RGB 已经被 alpha 缩过一遍），而 PNG 存的是直通
+/// alpha：不还原的话，抗锯齿边缘与半透明区会整体发暗。
+///
+/// 还原式 `c = c * 255 / a`（四舍五入）；`a == 0` 的全透明像素保持全 0，不参与除法。
+pub fn unpremultiply_rgba(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        if a == 0 || a == 255 {
+            continue;
+        }
+        for c in &mut px[..3] {
+            *c = (((*c as u32) * 255 + a / 2) / a).min(255) as u8;
+        }
+    }
+}
+
 /// 默认缩略图缓存目录：`dirs::cache_dir()/mo/thumbs`。
 fn default_thumb_root() -> PathBuf {
     dirs::cache_dir()

@@ -254,3 +254,47 @@ fn preview_downscale_failures_fall_back_to_original() {
     // 非图片：指标撑不起尺寸探测，返回 None 让调用方用原图，而不是让预览失败。
     assert_eq!(preview_scaled_in(&root, &txt, PREVIEW_MAX_EDGE), None);
 }
+
+/// 平台层交出来的图标像素要能原样编成 PNG（尺寸、通道序、alpha 都不许走样）。
+#[test]
+fn rgba_pixels_round_trip_through_png() {
+    // 2×2：左上不透明红、右上全透明、左下半透明绿、右下不透明蓝。
+    let rgba: Vec<u8> = vec![
+        255, 0, 0, 255, //
+        0, 0, 0, 0, //
+        0, 128, 0, 128, //
+        0, 0, 255, 255,
+    ];
+    let png = mo_thumbnails::encode_rgba_png(2, 2, &rgba).expect("应能编码");
+    assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G'], "产物必须是 PNG");
+
+    let back = image::load_from_memory(&png).expect("解码失败").to_rgba8();
+    assert_eq!((back.width(), back.height()), (2, 2));
+    assert_eq!(back.as_raw(), &rgba, "像素（含 alpha）必须原样往返");
+}
+
+/// 长度与尺寸对不上时返回 `None`，别 panic——调用方按「这张图标没取到」处理。
+#[test]
+fn rgba_encoding_rejects_mismatched_lengths() {
+    assert!(mo_thumbnails::encode_rgba_png(2, 2, &[0u8; 15]).is_none());
+    assert!(mo_thumbnails::encode_rgba_png(0, 0, &[]).is_none());
+}
+
+/// AppKit 的位图是**预乘**的，编码前还原成直通 alpha——否则半透明边缘发暗。
+#[test]
+fn premultiplied_pixels_are_restored() {
+    // alpha=128 的纯红，预乘后红通道是 128；还原后应回到 255。
+    let mut px = vec![128u8, 64, 0, 128];
+    mo_thumbnails::unpremultiply_rgba(&mut px);
+    assert_eq!(px, vec![255u8, 128, 0, 128]);
+
+    // 全透明像素保持全 0（除法要绕开，别变成 NaN/除零）。
+    let mut clear = vec![0u8, 0, 0, 0];
+    mo_thumbnails::unpremultiply_rgba(&mut clear);
+    assert_eq!(clear, vec![0u8, 0, 0, 0]);
+
+    // 不透明的像素本来就等同直通 alpha，不该被改动。
+    let mut opaque = vec![10u8, 20, 30, 255];
+    mo_thumbnails::unpremultiply_rgba(&mut opaque);
+    assert_eq!(opaque, vec![10u8, 20, 30, 255]);
+}

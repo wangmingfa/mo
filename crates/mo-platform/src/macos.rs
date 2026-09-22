@@ -33,21 +33,42 @@ extern "C" {}
 use objc::runtime::{Class, Object};
 use objc::{msg_send, sel, sel_impl};
 
-use crate::{PlatformError, Volume};
+use crate::{IconRaster, PlatformError, Volume};
 
-/// `NSWorkspace` 的图标类型枚举值（`NSWorkspaceIconCreationOptions` 之前就是
-/// `NSCompositeImageRep` / 直接 `iconForFile:`）。这里只用 `iconForFile:`。
-///
-/// `NSBitmapImageRep representationUsingType:properties:` 的第二个参数是
-/// `NSDictionary *`，传 `nil` 即可（不指定额外属性）。
-///
-/// `NSPNGFileType` 在 AppKit 头里是 `4`（`NSBitmapImageFileType` 是 `NSUInteger`）。
-const NSPNG_FILE_TYPE: usize = 4;
+// CoreGraphics：把 `iconForFile:` 给出的 `NSImage` 一次缩到我们要的像素尺寸。
+//
+// 为什么用它而不是 AppKit 的位图：`NSImage` 重绘 + `imageRepWithData:` 那条路在
+// Retina 上按 2x 出图、而且解出来是 **16 位/通道**的位图（实测 bps=16、bpr=640，
+// 按 8 位读就是错位数据）。CG 是纯 C、位深与字节序都由我们指定，还能顺手设插值质量。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+    fn CGColorSpaceRelease(space: *mut std::ffi::c_void);
+    fn CGBitmapContextCreate(
+        data: *mut u8,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: *mut std::ffi::c_void,
+        bitmap_info: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGContextSetInterpolationQuality(ctx: *mut std::ffi::c_void, quality: i32);
+    fn CGContextDrawImage(ctx: *mut std::ffi::c_void, rect: NSRect, image: *mut std::ffi::c_void);
+    fn CGContextRelease(ctx: *mut std::ffi::c_void);
+}
 
-/// 系统图标要出的像素尺寸。
+/// `kCGImageAlphaPremultipliedLast`：通道序 R,G,B,A，alpha 在最后、**预乘**。
+const K_CG_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+/// `kCGBitmapByteOrder32Big`：按内存里的 R,G,B,A 顺序（不是 BGRA）。
+const K_CG_BYTE_ORDER_32_BIG: u32 = 4 << 12;
+/// `kCGInterpolationHigh`：512px 缩到 40px 是 12 倍下采样，默认质量会明显发糊。
+const K_CG_INTERPOLATION_HIGH: i32 = 3;
+
+/// 系统图标要重绘到的像素边长。
 ///
-/// 列表行是 20pt 见方（`file_item` 里 `img(...).w(px(20.0)).h(px(20.0))`），
-/// 按 @2x 屏幕取 40px——再大就是白白多花编码时间与内存。
+/// 列表行的图标槽位是 16pt（`mo_ui::file_item::ICON_PX`），按 @2x 屏幕取 40px——
+/// 再大就是白白多花重绘与内存。**与显示尺寸解耦**：UI 改尺寸时别顺手改这里。
 const ICON_PX: f64 = 40.0;
 
 /// AppKit 的 `NSSize`（两个 `double`，与 `CGSize` 同构）。
@@ -249,6 +270,29 @@ pub fn is_main_thread() -> bool {
         .unwrap_or(false)
 }
 
+/// 主线程的 run loop 是否已经跑起来（见 `crate::mark_main_loop_ready`）。
+///
+/// 单向闩：只由真实应用启动时置位一次。用 `Relaxed` 就够——读到旧值最多让一个
+/// 后台任务晚一轮才动手，没有任何数据要跟着这个标志同步。
+static MAIN_LOOP_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn mark_main_loop_ready() {
+    MAIN_LOOP_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn appkit_usable() -> bool {
+    appkit_usable_with(
+        is_main_thread(),
+        MAIN_LOOP_READY.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// [`appkit_usable`] 的纯逻辑部分——单测能测的那半（真去置位闩会把测试进程带进
+/// 「主队列有人 drain」的假象里，反而危险，所以不测副作用、只测判定）。
+fn appkit_usable_with(is_main: bool, main_loop_ready: bool) -> bool {
+    is_main || main_loop_ready
+}
+
 /// 在主线程上跑 `f`，把结果带回来。
 ///
 /// 已经在主线程就直接跑；否则 `dispatch_sync` 到主队列。⚠️ 后台任务里调用它时，
@@ -324,7 +368,7 @@ pub fn volumes() -> Vec<Volume> {
 /// * 非本地（网络卷）→ `NSURLVolumeIsLocalKey == false`；
 /// * 内置盘靠 `NSURLVolumeIsInternalKey` 直接否掉。
 ///
-/// ⚠️ 不在主线程一律返回 `false`（= 不给按钮），与 `file_icon` 同一条纪律：读
+/// ⚠️ 不在主线程一律返回 `false`（= 不给按钮），与 `file_icon_raster` 同一条纪律：读
 /// resource value 走 `on_main_thread`，而测试把渲染跑在子线程，`dispatch_sync` 回
 /// 主队列会挂死。渲染在真机的主线程上跑，那里拿得到真值。
 fn volume_is_ejectable(path: &Path) -> bool {
@@ -410,69 +454,80 @@ fn is_network_fs(fs: &str) -> bool {
     )
 }
 
-/// 取一个文件在系统里的图标（PNG 字节）。
+/// 取一个文件在系统里的图标，**重绘**到 [`ICON_PX`] 见方后交出 RGBA 像素。
 ///
-/// `NSWorkspace.iconForFile:` 给的是 `NSImage`；转 PNG 走
-/// `TIFFRepresentation` → `NSBitmapImageRep` → `representationUsingType:properties:`。
-/// 整段包在 `on_main_thread` 里——`NSWorkspace` 的调用按 Apple 的约定要在主线程。
-pub fn file_icon(path: &Path) -> Option<Vec<u8>> {
+/// 整段包在 `on_main_thread` 里——`NSWorkspace` 按 Apple 的约定要在主线程调，所以
+/// 这里的耗时**就是主线程的耗时**，一分都不该多花：
+///
+/// * `iconForFile:` 给的是**原始尺寸**的 `NSImage`（512×512 起），当年直接编码它要
+///   250–500ms/张，一屏几十张就是几秒的沙滩球。`setSize:` 只改逻辑尺寸（出图照样按
+///   原始像素），所以要**真画一张小的**——访达同款的小图标就是这么来的。
+/// * 编码 PNG 那一步（占整段 70%）**不在这里做**：只把像素拷出去，交给调用方在
+///   后台编码（见 [`crate::IconRaster`]）。
+pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
     let owned = path.to_path_buf();
     on_main_thread(move || unsafe {
         let s = owned.to_string_lossy();
-        let nsstring = nsstring(&s)?;
+        let ns_path = nsstring(&s)?;
         // 闭包返回 `Option`，所以 Result 这边的 `?` 要走 `.ok()?`（失败即 `None`）。
         let ws = workspace().ok()?;
-        let image: *mut Object = msg_send![ws, iconForFile: nsstring];
+        let image: *mut Object = msg_send![ws, iconForFile: ns_path];
         if image.is_null() {
             return None;
         }
-        // ⚠️ `iconForFile:` 给的是**原始尺寸**的 NSImage（512×512 起，转出来的 PNG 常有
-        // 几百 KB）。实测每张要 250–500ms——而列表一屏要几十张，直接编码就是几秒的
-        // 沙滩球（用户报的「启动后完全卡住、鼠标一直转圈」）。
-        //
-        // `setSize:` 只改逻辑尺寸，`TIFFRepresentation` 照样按原始像素出图（试过：PNG
-        // 仍是 787KB、耗时几乎没降），所以要**真画一张小的**：新建 40px 画布 → 把原图
-        // `drawInRect:` 进去 → 再走 TIFF → PNG。PNG 从几百 KB 掉到几 KB。
-        let size = NSSize {
-            width: ICON_PX,
-            height: ICON_PX,
-        };
-        let small: *mut Object = msg_send![class("NSImage").ok()?, alloc];
-        let small: *mut Object = msg_send![small, initWithSize: size];
-        if small.is_null() {
-            return None;
-        }
-        // `lockFocus` 把这张新图设成当前绘图上下文（AppKit 要求主线程，我们就在主线程）。
-        let rect = NSRect {
+        let px = ICON_PX as usize;
+        let src = NSRect {
             origin: NSPoint { x: 0.0, y: 0.0 },
-            size,
+            size: NSSize {
+                width: ICON_PX,
+                height: ICON_PX,
+            },
         };
-        let _: () = msg_send![small, lockFocus];
-        let _: () = msg_send![image, drawInRect: rect];
-        let _: () = msg_send![small, unlockFocus];
-        // NSImage → TIFF 数据（通用中间格式，任何 NSImage 都有）。
-        let tiff: *mut Object = msg_send![small, TIFFRepresentation];
-        // `alloc` / `initWithSize:` 的持有权在我们手里（没开 ARC），画完就还。
-        let _: () = msg_send![small, release];
-        if tiff.is_null() {
+        // 从 NSImage 拿一张 CGImage——AppKit 到此为止，后面全是纯 CoreGraphics。
+        //
+        // 为什么不再走「新建 40pt 的 NSImage → lockFocus → drawInRect → TIFF →
+        // NSBitmapImageRep」：那条路在 Retina 上会按 2x 出图（40pt = 80px），而且
+        // `imageRepWithData:` 解出来的是 **16 位/通道**的位图（实测 bps=16、bpr=640），
+        // 按 8 位读就是错位数据。CG 这边可以直接缩放到我们的像素尺寸、位深由我们指定。
+        let cg: *mut std::ffi::c_void = msg_send![
+            image,
+            CGImageForProposedRect: &src as *const NSRect as *mut NSRect
+            context: std::ptr::null_mut::<Object>()
+            hints: std::ptr::null_mut::<Object>()
+        ];
+        if cg.is_null() {
             return None;
         }
-        // TIFF → NSBitmapImageRep（才能转成别的格式）。
-        let rep: *mut Object = msg_send![class("NSBitmapImageRep").ok()?, imageRepWithData: tiff];
-        if rep.is_null() {
+
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
             return None;
         }
-        // NSBitmapImageRep → PNG 字节（NSData）。
-        let png: *mut Object = msg_send![rep, representationUsingType: NSPNG_FILE_TYPE properties: std::ptr::null_mut::<Object>()];
-        if png.is_null() {
+        // 8 位/通道、RGBA、**alpha 预乘**（AppKit / CG 的位图约定，上层编码前还原）。
+        let mut rgba = vec![0u8; px * px * 4];
+        let ctx = CGBitmapContextCreate(
+            rgba.as_mut_ptr(),
+            px,
+            px,
+            8,
+            px * 4,
+            space,
+            K_CG_ALPHA_PREMULTIPLIED_LAST | K_CG_BYTE_ORDER_32_BIG,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
             return None;
         }
-        let bytes: *const std::os::raw::c_uchar = msg_send![png, bytes];
-        let len: usize = msg_send![png, length];
-        if bytes.is_null() || len == 0 {
-            return None;
-        }
-        Some(std::slice::from_raw_parts(bytes, len).to_vec())
+        // 从 512px 缩到 40px 是 12 倍下采样，插值质量不设高档会明显发糊。
+        CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_HIGH);
+        CGContextDrawImage(ctx, src, cg);
+        CGContextRelease(ctx);
+
+        Some(IconRaster {
+            width: px as u32,
+            height: px as u32,
+            rgba,
+        })
     })
 }
 
@@ -571,5 +626,25 @@ mod tests {
             volumes().iter().all(|v| !v.ejectable),
             "子线程里必须保守：一块盘都不该带推出按钮"
         );
+    }
+
+    /// 「能不能动 AppKit」是**两个**条件的或：调用方在主线程（直接跑），或主 run loop
+    /// 已在跑（可以 `dispatch_sync` 回去）。
+    ///
+    /// 只判前者会让所有后台任务（图标泵就在后台）永远跳过平台调用；只判后者则会在
+    /// 测试进程里放行——而测试的主队列无人 drain，`dispatch_sync` 直接挂死。
+    #[test]
+    fn appkit_needs_either_the_main_thread_or_a_running_loop() {
+        assert!(appkit_usable_with(true, false), "主线程上直接跑，不需要闩");
+        assert!(
+            appkit_usable_with(false, true),
+            "闩置位后后台可以派回主队列"
+        );
+        assert!(
+            !appkit_usable_with(false, false),
+            "测试进程就是这样：必须保守跳过"
+        );
+        // 交叉验证：`cargo test` 里闩从未置位，所以后台任务一律保守。
+        assert!(!appkit_usable(), "测试进程没标记过主循环，必须保守");
     }
 }

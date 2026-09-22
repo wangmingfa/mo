@@ -1,6 +1,6 @@
 use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
-use mo_core::{SortDir, SortKey};
+use mo_core::{Entry, SortDir, SortKey, ThumbnailState};
 
 use crate::list_columns::{ColId, ColumnLayout};
 use crate::listing::BUFFER;
@@ -287,6 +287,8 @@ pub fn render(
 
         // 3) 渲染：只从窗口快照里取行。
         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
+        // 这一帧「看得见的、还等着缩略图」的行——行渲染完统一派发（见下方注释）。
+        let mut want_thumbs: Vec<Entry> = Vec::new();
         let view = entity.read(cx);
         let Some(panel) = view.panel_at(pane, tab) else {
             return rows;
@@ -307,11 +309,21 @@ pub fn render(
         for i in range.clone() {
             let offset = i.wrapping_sub(panel.window_start);
             let Some(entry) = panel.window.get(offset) else {
-                // ⚠️ 占位行也要有元素 ID：`uniform_list` 的列表项没有逐项 ID，
-                // 而可见区通常同时有多条占位行；`text!` 按调用点生成 ID，
-                // 不给行 ID 的话它们会共享同一条元素 ID 路径 → 相同的
-                // a11y NodeId → 辅助功能开启时 panic（启动时快照未回填
-                // 满屏占位行，正是崩溃现场）。
+                // 窗口还没补上这一行（刚切目录、快速滚动、快照落地前）：画一条
+                // **只有底色、没有任何内容**的空行，也就是「斑马纹占位」。
+                //
+                // ⚠️ 这里曾经画的是 `…`：切到内容少的目录时会整屏省略号闪一下，
+                // 比空白更刺眼；快速滚动时更是滚一路闪一路。空行则安静得多——
+                // 真数据到位时是文字直接浮现在同一块底色上，连底色都不跳。
+                //
+                // 底色规则必须与下面的数据行**逐字一致**（同样受 `zebra` 开关
+                // 控制、同样 `px(4.0)`）：一旦不一致，占位期与加载完的底色会差
+                // 半格，看起来像整块列表在抖。
+                //
+                // ⚠️ 行 ID 不能省：`uniform_list` 的列表项没有逐项 ID，而可见区
+                // 通常同时有多条占位行；不给行 ID 的话它们会共享同一条元素 ID
+                // 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic（启动快照未
+                // 回填满屏占位行，正是崩溃现场）。
                 rows.push(
                     div()
                         .id(format!("file-ph-{pane}-{tab}-{i}"))
@@ -320,7 +332,15 @@ pub fn render(
                         .items_center()
                         .w_full()
                         .h(px(24.0))
-                        .child(text!("…".to_string()))
+                        .px(px(4.0))
+                        .bg(if zebra && i % 2 == 1 {
+                            crate::theme::zebra()
+                        } else {
+                            crate::theme::surface()
+                        })
+                        // 测试用（release no-op）：按绝对行号定位占位行，
+                        // 断言「有底色、无内容、行高与数据行一致」。
+                        .debug_selector(move || format!("mo-file-ph-{i}"))
                         .into_any_element(),
                 );
                 continue;
@@ -468,9 +488,28 @@ pub fn render(
 
             let app = view.panel_at(pane, tab).map(|p| p.app.clone());
             let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
+            // 缩略图：**只为这一行真的要画缩略图、且还没人要过**的时候排一次队。
+            //
+            // 放在渲染路径上（而不是「窗口抓回来时」）是有意的：缩略图的语义就是
+            // 「把看得见的这几行画出来」，而窗口带着上下各 BUFFER(=100) 条的余量——
+            // 按整个窗口派发等于每进一个目录就白解一两百张大图（实测单张 80ms 级），
+            // 目录越大白解得越多，正是「内容多的目录会卡」。请求本身是幂等的
+            // （在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也没关系，
+            // 好处是滚动时新露出来的行立刻能排上队。
+            if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
+                want_thumbs.push(entry.clone());
+            }
             // 系统图标（访达同款 PNG）：远程条目本机没有文件，平台给不出，
             // `file_icon` 直接返回 None，这里退回内置 SVG。
-            let system_icon = app.as_ref().and_then(|a| a.file_icon(&entry.path));
+            //
+            // 两件事都在这一句里：
+            // * 有缩略图的行**不要**系统图标——那行画的是缩略图，白问系统一次
+            //   （每张 1.5–12ms 的活，攒起来正是进目录时那一下卡顿）；
+            // * `file_icon` 是纯查表，没命中就只记账、返回 None，真活交给后台图标泵。
+            let system_icon = match entry.thumbnail {
+                ThumbnailState::Loaded(_) | ThumbnailState::Loading => None,
+                _ => app.as_ref().and_then(|a| a.file_icon(&entry.path, is_dir)),
+            };
             rows.push(
                 row.child(crate::file_item::view(
                     entry,
@@ -481,6 +520,16 @@ pub fn render(
                 ))
                 .into_any_element(),
             );
+        }
+        // 缩略图：这一帧看得见的、还等着的那几行，统一派发。
+        //
+        // 幂等（在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也无所谓；
+        // 关键是对象正好是**看得见的那些行**，而不是整窗口那两百条——见上面
+        // `want_thumbs` 处的注释。
+        if !want_thumbs.is_empty() {
+            if let Some(a) = view.panel_at(pane, tab).map(|p| p.app.clone()) {
+                a.thumbs().request(a.clone(), want_thumbs);
+            }
         }
         rows
     })

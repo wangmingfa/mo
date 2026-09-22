@@ -76,7 +76,6 @@ pub(crate) fn ensure_window(
         return;
     };
     let this = entity.clone();
-    let app_task = app.clone();
     tracing::trace!(
         target: "mo_ui::window",
         pane, tab, need = ?r, visible = ?visible, "fetch spawn"
@@ -85,7 +84,6 @@ pub(crate) fn ensure_window(
     cx.spawn(async move |cx| {
         let (dir_path, start, entries) = app.visible_window(r.clone()).await;
         let elapsed = spawned.elapsed().as_millis();
-        let for_thumbs = entries.clone();
         this.update(cx, |v, cx| {
             let Some(p) = v.panel_at_mut(pane, tab) else {
                 return;
@@ -115,8 +113,10 @@ pub(crate) fn ensure_window(
             );
             cx.notify();
         });
-        // 只为进入窗口的条目生成缩略图，绝不「打开目录就全量生成」。
-        app_task.thumbs().request(app_task.clone(), for_thumbs);
+        // 缩略图**不在这里**派发：窗口带着上下各 BUFFER(=100) 条的余量，按整窗口
+        // 派发等于每进一个目录就白解一两百张大图（单张 80ms 级，目录越大越糟）。
+        // 真正的派发点是渲染那一帧——只给看得见的行排队（见 `file_list` 里的
+        // `want_thumbs`）。
     })
     .detach();
 }

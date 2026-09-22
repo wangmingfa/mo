@@ -124,18 +124,27 @@ pub fn supports_file_icons() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// 取 `path` 在**系统**里的图标，返回 PNG 字节（`NSWorkspace.iconForFile:` 出来的
-/// 光栅图）。
+/// 取 `path` 在**系统**里的图标，返回一块**重绘到固定尺寸**的 RGBA 像素。
 ///
 /// 与内置的 Lucide 单色 SVG 图标不同，系统图标是**彩色光栅图**（`.app` 显示真实
-/// App 图标、文档显示所属 App 的图标）。上层把它写成 PNG 文件、用 `img()` 加载，
+/// App 图标、文档显示所属 App 的图标）。上层把它编码成 PNG 文件、用 `img()` 加载，
 /// 别试图拿它当 SVG 描边（它没有「文字色」概念）。
 ///
+/// ## 为什么交出去的是**像素**而不是 PNG
+///
+/// 这一段只能主线程做（`iconForFile:` 是 AppKit，`on_main_thread` 会
+/// `dispatch_sync` 回主队列——**活就是主线程干的**），而「像素 → PNG」的编码占了
+/// 整段耗时的 **70%**（实测 0.62ms / 0.9ms）。编码没有理由留在主线程：把它交给
+/// 调用方，在上层自己选定的后台线程里做，主线程单价就掉到 ~0.26ms。
+///
+/// 所以这里的契约是：**只做必须主线程的活**，交出像素，编码归调用方
+/// （见 `mo_thumbnails::encode_rgba_png` / `unpremultiply_rgba`）。
+///
 /// 拿不到（路径不存在 / 平台不支持 / 系统没给）返回 `None`，上层退回内置 SVG。
-pub fn file_icon(path: &Path) -> Option<Vec<u8>> {
+pub fn file_icon_raster(path: &Path) -> Option<IconRaster> {
     #[cfg(target_os = "macos")]
     {
-        macos::file_icon(path)
+        macos::file_icon_raster(path)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -144,13 +153,29 @@ pub fn file_icon(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+/// 一张图标位图的**原始像素**：RGBA8、**预乘 alpha**。
+///
+/// 它是「系统图标」这条链路上主线程与后台之间的交接物：主线程负责取回它，
+/// 后台负责把它编码成 PNG。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IconRaster {
+    pub width: u32,
+    pub height: u32,
+    /// `width * height * 4` 字节，通道序 `R, G, B, A`。
+    ///
+    /// ⚠️ **预乘**：AppKit 把图画进位图时总会把 RGB 按 alpha 缩一遍（半透明像素的
+    /// 颜色被压暗）。直接当直通 alpha 的 RGBA 编码，抗锯齿边缘会发暗。
+    /// 编码前先还原（`mo_thumbnails::unpremultiply_rgba`）。
+    pub rgba: Vec<u8>,
+}
+
 /// 当前是不是 OS 主线程。
 ///
-/// `file_icon` 这类 AppKit 调用必须走主线程，否则 `on_main_thread` 会 `dispatch_sync`
-/// 回主队列——而 `cargo test` 里主队列不 drain 会死锁。渲染在真机的主线程上跑，
-/// 这条返回 `true`、系统图标正常出；测试把渲染跑在子线程，返回 `false`，上层据此
-/// 跳过平台调用、回退内置 SVG。非 macOS 没有主队列概念，恒为 `true`（那边
-/// `file_icon` 直接返 `None`，不会死锁）。
+/// `file_icon_raster` 这类 AppKit 调用必须走主线程，否则 `on_main_thread` 会
+/// `dispatch_sync` 回主队列——而 `cargo test` 里主队列不 drain 会死锁。渲染在真机的
+/// 主线程上跑，这条返回 `true`、系统图标正常出；测试把渲染跑在子线程，返回 `false`，
+/// 上层据此跳过平台调用、回退内置 SVG。非 macOS 没有主队列概念，恒为 `true`（那边
+/// `file_icon_raster` 直接返 `None`，不会死锁）。
 pub fn is_main_thread() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -159,6 +184,35 @@ pub fn is_main_thread() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         true
+    }
+}
+
+/// 标记「主线程的 run loop 已经跑起来」——真实应用启动时调一次。
+///
+/// 这条是给**后台任务**用的：它们不在主线程上，但可以把自己的 AppKit 调用
+/// `dispatch_sync` 回主队列，前提是主线程真的在跑 run loop 并会去 drain 那个队列。
+/// 应用在 `mo_ui::run()` 里（拿到 `NSApplication` 之后）标记；`cargo test` 永远不标，
+/// 于是后台任务一律走 `appkit_usable() == false` 的保守分支，不会把测试挂死。
+///
+/// 幂等，且标记之后不会撤销。
+pub fn mark_main_loop_ready() {
+    #[cfg(target_os = "macos")]
+    macos::mark_main_loop_ready();
+}
+
+/// 现在能不能安全地调 AppKit。
+///
+/// 「调用方就在主线程」或「主 run loop 已在跑（可以 `dispatch_sync` 回主队列）」
+/// 任一成立即为真。**后台任务在动 AppKit 之前必须问这一条**——只问
+/// [`is_main_thread`] 是不够的：后台线程永远答 `false`，会把该做的事也一并跳过。
+pub fn appkit_usable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::appkit_usable()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

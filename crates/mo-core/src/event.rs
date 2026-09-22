@@ -57,6 +57,17 @@ pub enum AppEvent {
     NavigationChanged {
         path: PathBuf,
     },
+
+    /// 开始 / 结束读取一个目录。
+    ///
+    /// 与 [`AppEvent::DirectoryChanged`] 的区别：那个是「目录内容**已经**换了」，这个
+    /// 是「**正在**换」。UI 拿它做**立即反馈**——读一个大目录（`read_dir` + 建视图 +
+    /// 缓存预填）要 100–300ms，这段时间界面还停在上一处的内容上，用户看到的就是
+    /// 「点了没反应」。有了它，侧栏高亮可以立刻跟过去、中央可以显示「正在读取 …」。
+    OpeningChanged {
+        /// 正在打开的目录；`None` 表示读完了（成功或失败都算完）。
+        path: Option<PathBuf>,
+    },
 }
 
 /// 进程内事件总线（基于 `tokio::sync::broadcast`）。

@@ -106,6 +106,12 @@ pub(crate) struct Panel {
     pub app: AppState,
     /// 当前目录（窗口快照归属校验用：跨目录的取回结果不能互相覆盖）。
     pub path: Option<PathBuf>,
+    /// 正在读取的目录（`AppState::opening_path` 的最近一次同步）。
+    ///
+    /// 与 `path` 的区别：`path` 是「已经显示出来的目录」，这个是「正在换过去的目标」。
+    /// 读大目录要 100–300ms，这段窗口里界面还停在上一处——侧栏高亮与「正在读取 …」
+    /// 提示都按它走，用户点了才有反应。
+    pub opening: Option<PathBuf>,
     /// 可见条目总数（虚拟化列表的 `item_count`）。
     pub visible_count: usize,
     /// 窗口快照的起始下标。
@@ -161,6 +167,7 @@ impl Panel {
         Self {
             app,
             path: None,
+            opening: None,
             visible_count: 0,
             window_start: 0,
             window: Vec::new(),

@@ -68,8 +68,14 @@ pub fn run() {
     app.spawn_watcher_pump();
     // 启动刷新泵：把密集的元数据 / 缩略图回填合并成节拍性的 UI 刷新。
     app.spawn_refresh_pump();
+    // 启动图标泵：列表行要的系统图标只在渲染路径上「记账」，真去问系统（AppKit +
+    // 重绘 + 编码 + 写盘，一张 1.5–12ms）在这里的后台批里做。
+    app.spawn_icon_pump();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        // 主 run loop 已经跑起来了：允许后台任务把 AppKit 调用 `dispatch_sync`
+        // 回主队列（图标泵就靠它）。测试进程永远走到不这里，所以那边一律保守跳过。
+        mo_platform::mark_main_loop_ready();
         // 框架组件（地址栏的 Input）的配色对齐到当前主题（`RootView::new` 里
         // 先按配置套用主题，这里再同步一次给全局 Theme）。
         theme::apply_component(cx);

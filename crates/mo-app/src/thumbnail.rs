@@ -18,6 +18,8 @@ pub struct ThumbnailScheduler {
     cache: Arc<ThumbnailCache>,
     semaphore: Arc<Semaphore>,
     size: u32,
+    /// 已经排上队（还没落地）的条目 id。见 [`ThumbnailScheduler::request`] 里的说明。
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<mo_core::FileId>>>,
 }
 
 impl ThumbnailScheduler {
@@ -26,6 +28,7 @@ impl ThumbnailScheduler {
             cache: Arc::new(ThumbnailCache::new()),
             semaphore: Arc::new(Semaphore::new(4)),
             size: DEFAULT_SIZE,
+            inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -35,6 +38,7 @@ impl ThumbnailScheduler {
             cache: Arc::new(cache),
             semaphore: Arc::new(Semaphore::new(4)),
             size: DEFAULT_SIZE,
+            inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -45,8 +49,14 @@ impl ThumbnailScheduler {
 
     /// 为一批条目请求缩略图（fire-and-forget）。
     ///
-    /// 已经加载 / 正在加载 / 生成失败的条目会被跳过，
-    /// 因此可以放心地在每次滚动时重复调用。
+    /// 可以放心地在**每一帧**重复调用（UI 就是这么用的：只给看得见的行排队）：
+    ///
+    /// * 已加载 / 生成失败的条目直接跳过；
+    /// * 已经在队的条目靠 [`ThumbnailScheduler::inflight`] 去重。
+    ///
+    /// ⚠️ 后者不是可有可无的：`ThumbnailState::Loading` 从来没有被置位过（条目从
+    /// `Idle` 直接到 `Loaded`/`Failed`），而 UI 手里那份窗口快照要等下一轮同步才
+    /// 更新——只判 `Idle` 的话，同一张图会被每帧排一个新任务。
     pub fn request(&self, app: AppState, entries: Vec<Entry>) {
         for entry in entries {
             if !entry.supports_thumbnail() {
@@ -62,6 +72,17 @@ impl ThumbnailScheduler {
             let semaphore = self.semaphore.clone();
             let size = self.size;
             let app_task = app.clone();
+            let inflight = self.inflight.clone();
+            {
+                let mut inflight = self.inflight.lock().unwrap();
+                if !inflight.insert(id) {
+                    continue;
+                }
+                // 逛久了这个账本会涨：封顶整清，代价只是少数几张图被重复排一次队。
+                if inflight.len() > INFLIGHT_MAX {
+                    inflight.clear();
+                }
+            }
 
             app.spawn(async move {
                 let _permit = match semaphore.acquire().await {
@@ -77,11 +98,16 @@ impl ThumbnailScheduler {
                     }
                     Err(_) => ThumbnailState::Failed,
                 };
+                // 销账：条目状态随即会变成 Loaded / Failed，之后不必再排。
+                inflight.lock().unwrap().remove(&id);
                 app_task.set_thumbnail(id, state).await;
             });
         }
     }
 }
+
+/// `inflight` 账本的封顶（超出整清）。
+const INFLIGHT_MAX: usize = 4000;
 
 impl Default for ThumbnailScheduler {
     fn default() -> Self {

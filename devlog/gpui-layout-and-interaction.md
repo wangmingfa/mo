@@ -458,6 +458,47 @@ const GLYPH_PX: f32 = 12.0;  // 内置 Lucide 描边 SVG 的绘制尺寸
   目视校准的结果，别为了「统一」把它们改成同一个数。
 * 槽位必须**定宽**（`flex_shrink_0` + `overflow_hidden`）：SVG 与位图的自然宽度
   不同，不定宽的话缩略图一加载文件名就会左右抖动。
-* 与平台层的关系：`mo_platform::file_icon` 里那张系统图标是按 40px 重绘再编码 PNG
-  （见 [macos-platform](macos-platform.md) §14），下采样到 16px 显示仍有 2x 以上
+* 与平台层的关系：`mo_platform::file_icon_raster` 里那张系统图标是按 40px 重绘再编码 PNG
+  （§14，编码已挪到后台，见 [async-runtime](async-runtime.md) §6），下采样到 16px 显示仍有 2x 以上
   余量，**不要在 UI 改尺寸时顺手去动它**——它的大小只为够用，与显示尺寸解耦。
+
+## 28. 占位行不再画省略号：改成「斑马纹空行 / 同尺寸骨架格」（2026-09-22）
+
+**现象**：切到内容少的目录、以及快速滚动时，整屏 `…` 闪一下（用户截图：Downloads 12 项，
+左列一竖排省略号）。这不是「进目录慢」——那条已经修到 152ms（见 [async-runtime](async-runtime.md) §6）；
+闪的是**窗口快照落地前的那一两帧**：`sync_panel` 在目录变化时 `p.window.clear()`，
+渲染闭包按下标取不到条目，占位分支就画了 `…`。
+
+**修法**：两处占位改成同一条约定——**只画底色，不画任何内容**。
+
+* `file_list.rs` 占位行：`.px(4.0)` + 与数据行**逐字一致**的底色规则
+  （`zebra && i % 2 == 1 ? zebra() : surface()`），删掉 `text!("…")`。
+* `grid.rs` 缺格：原来是 `continue` 跳过 + 行尾补一个带 `…` 的 `flex_1`；
+  现在每格自己画一个与 `cell()` **同几何**的骨架格
+  （`flex_1` / `min_w_0` / `h_full` / `p(4)` / `rounded(6)` / `bg(zebra())`）。
+
+**为什么底色必须与数据行逐字一致**：真数据到位是文字直接浮现在同一块（同一底色）上，
+连底色都不跳；规则不一致就会看到整块列表抖半格。`zebra` 关掉时占位自然退化成纯
+`surface()` 空行——这是对的：占位要跟「加载完的样子」一致，而不是无条件画条纹。
+
+⚠️ 行 / 格 ID 不能省：`uniform_list` 的列表项没有逐项 ID，`text!` 按调用点生成 ID，
+多条占位行会共享同一条元素 ID 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic
+（启动时满屏占位正是崩溃现场）。去掉文字后 `.id()` 仍要留着。
+
+**守卫**（`mo-ui/src/app.rs`）：
+
+| 用例 | 钉什么 |
+|---|---|
+| `unfilled_rows_are_empty_zebra_placeholders` | 空窗口那一帧：`mo-file-ph-{0,1,2}` 存在、**无** `mo-file-row-0`、行高 = `listing::row_height(List)`、左留白 12、相邻占位行底色不同 / 隔行相同 |
+| `unfilled_grid_cells_match_cell_geometry` | 只填第一格：`mo-grid-ph-1` 与 `mo-grid-cell-0` 同宽同高，且 `mo-grid-ph-0` 不存在 |
+
+两条都做了反向验证：把占位底色 / 骨架格撤掉，各自变红（前者 panic「占位行没有画出
+同位同尺寸的底色 quad」，后者找不到 `mo-grid-ph-1`）。
+
+⚠️ **测不到「不画省略号」**：gpui 的测试通道只给 `painted_quads()`，文本走 glyph sprite、
+不在 `Quad` 里，headless 也拿不到栅格化截图。这条只能靠代码结构（占位分支里没有 `text!`）
+加注释守。断言颜色仍按 §24 的规矩只比**相对**关系（调色板是进程级全局槽位，并行的主题
+用例会临时翻深色）。
+
+⚠️ 这两条用例会派生补窗任务（占位的原因就是快照没回来），所以照 §26 在建 `AppState`
+之前加 `cx.dispatcher.allow_parking()`。

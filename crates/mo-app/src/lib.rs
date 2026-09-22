@@ -18,6 +18,8 @@ mod controller;
 mod credentials;
 /// 扩展系统：声明式清单 + 外部程序。
 pub mod extensions;
+/// 系统图标：渲染路径只查表，真去问系统放在后台（见模块文档）。
+mod icon;
 mod metadata;
 /// 系统 shell 集成（默认打开 / 打开方式）。
 pub mod shell;
@@ -113,13 +115,13 @@ pub struct AppState {
     /// `statfs` 逐个查或调 AppKit，缓存 [`VOLUME_TTL`] 省得每帧抖一下。挂载 / 卸载
     /// 后立刻作废。
     volumes_cache: Arc<std::sync::Mutex<(std::time::Instant, Vec<mo_platform::Volume>)>>,
-    /// 系统文件图标缓存：路径 → 写好的 PNG 缓存文件路径。
+    /// 系统文件图标缓存 + 待取队列（见 [`icon`] 模块文档）。
     ///
-    /// 列表每行都要图标，而「问系统拿图标」（`NSWorkspace.iconForFile:` → 转 PNG）
-    /// 是**重**操作——万条目目录每帧都问会卡死 UI。所以首见才真去问、之后命中。
-    /// 缓存目录在 `temp_dir()/mo-icons`，PNG 文件让 GPUI 的 `img()` 直接加载
-    /// （光栅图没法像内置 SVG 那样用文字色描边）。容量封顶，超出整清空重来。
-    file_icon_cache: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
+    /// ⚠️ **渲染路径只准查表 / 记账**（[`AppState::file_icon`]）：真正的「问系统要
+    /// 图标」是 `NSWorkspace.iconForFile:` + 重绘 + PNG 编码 + 写盘，单张 1.5–12ms，
+    /// 一屏三十来行压在同一帧里就是几百毫秒的停顿。真活由后台的图标泵
+    /// （[`AppState::spawn_icon_pump`]）干。
+    icon_cache: Arc<std::sync::Mutex<icon::IconCache>>,
     /// 中断后台索引爬取的开关。
     index_stop: Arc<AtomicBool>,
     /// 操作历史（轻量环形日志，供「操作历史」面板展示）。
@@ -132,6 +134,43 @@ pub struct AppState {
     redo_stack: Arc<PlMutex<Vec<Reversible>>>,
     /// 应用内剪贴板（⌘C / ⌘X / ⌘V 的文件复制与剪切）。
     clipboard: Arc<Mutex<Option<Clipboard>>>,
+    /// 「正在打开的目录」（`None` = 空闲）。
+    ///
+    /// 读一个大目录要 100–300ms（`read_dir` + 建视图 + 缓存预填，全在 blocking 池），
+    /// 而这段时间 `directory` 还是**上一处**的内容——界面看起来就是「点了没反应」。
+    /// UI 拿它做立即反馈：侧栏高亮先跟过去、中央显示「正在读取 …」。
+    ///
+    /// 与 `directory` 分开存是刻意的：读失败时把它清掉就行，界面自然回到原来的位置，
+    /// 而不是「先切过去、再弹一条错误」。
+    opening: Arc<std::sync::Mutex<Option<PathBuf>>>,
+}
+
+/// 把「正在打开某个目录」置位，离开作用域自动收尾。
+///
+/// 用 RAII 而不是「开头置位、结尾清位」：`load_path` 里有好几处 `?` 与 `return Err`，
+/// 漏掉任何一条就是一条永远不消失的「正在读取 …」。
+struct OpeningGuard<'a> {
+    app: &'a AppState,
+}
+
+impl<'a> OpeningGuard<'a> {
+    fn begin(app: &'a AppState, path: &Path) -> Self {
+        let path = path.to_path_buf();
+        *app.opening.lock().unwrap() = Some(path.clone());
+        app.bus
+            .publish(AppEvent::OpeningChanged { path: Some(path) });
+        Self { app }
+    }
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        *self.app.opening.lock().unwrap() = None;
+        // 广播一次让 UI 收掉提示——读成功还是失败都要收。
+        self.app
+            .bus
+            .publish(AppEvent::OpeningChanged { path: None });
+    }
 }
 
 /// Mo 的后台 runtime：进程级共享，永不释放。
@@ -470,6 +509,46 @@ const NET_SHARE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 卷宗列表的缓存有效期（见 `AppState::volumes_cache`）。
 const VOLUME_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 「首屏」的行数：缓存预填与后台校验的优先区间都按它划。
+///
+/// 取 200（`INITIAL_WINDOW` 的量级）——一屏通常二三十行，这个数足够覆盖「进目录后
+/// 立刻往下滚几屏」。**别把它放大成「整个目录」**：缓存预填一次要查 SQLite，
+/// 27k 条就是 133ms 的白等（见 `MetadataScheduler::prime_visible_from_cache`）。
+const FIRST_SCREEN_ROWS: usize = 200;
+
+/// 图标泵的节拍：渲染路径每帧记下的「这一行要图标」，最多攒这么久一批。
+///
+/// 比刷新泵（120ms）快，是因为用户刚进目录、正盯着那几行看：图标早一帧到位，
+/// 就少一帧「怎么是黑白图标」的疑惑。再快也没意义——UI 重绘本来就是 120ms 一拍的。
+const ICON_PUMP_MS: u64 = 50;
+
+/// 图标泵一批最多问几张。
+///
+/// 一屏也就三十来行，40 足够覆盖；限批是为了别让「快速滚一遍大目录」把几百张
+/// 图标堆进队列后一次性全解——那是一段没有必要的满载。真正的闸门是
+/// [`ICON_BUDGET_MS`] 的时间配额，这条只是条数兜底。
+const ICON_BATCH: usize = 40;
+
+/// 图标泵**每拍**最多让主线程花多少毫秒。
+///
+/// [`mo_platform::file_icon_raster`] 内部是 `on_main_thread`（`dispatch_sync` 回主队列），
+/// 所以「问系统 + 重绘 + 拷像素」那一段**是主线程在执行**：一拍抓 40 张 = 主线程连着
+/// 忙 40×单价，界面就卡一下（用户报的「切到下载目录还是会卡一下」）。
+/// PNG 编码（原本占 70%）已经挪到后台，主线程单价掉到 ~0.2ms；3ms 在一帧（16.6ms）里
+/// 绰绰有余。
+const ICON_BUDGET_MS: u64 = 3;
+
+/// 图标 PNG 的文件名 = 缓存**键**的哈希。
+///
+/// 按类型共享的图标只写一份文件（同类型的其它文件在缓存里指向它），按路径问的则
+/// 各写各的。不能用路径算哈希了——那会让同类型的每一行都落一份同样的 PNG。
+fn icon_file_hash(key: &icon::IconKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// 本进程的会话注册表。
 ///
 /// 与共享 tokio runtime 同理：会话的生命周期就是进程的生命周期——「只有退出应用才
@@ -563,7 +642,7 @@ impl AppState {
                 std::time::Instant::now() - VOLUME_TTL,
                 Vec::new(),
             ))),
-            file_icon_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            icon_cache: Arc::new(std::sync::Mutex::new(icon::IconCache::default())),
             index_stop: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             history: Arc::new(PlMutex::new(Vec::new())),
@@ -571,6 +650,7 @@ impl AppState {
             undo_stack: Arc::new(PlMutex::new(Vec::new())),
             redo_stack: Arc::new(PlMutex::new(Vec::new())),
             clipboard: Arc::new(Mutex::new(None)),
+            opening: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -615,6 +695,14 @@ impl AppState {
     /// （用户要的语义），只有 [`AppState::disconnect_connection`] 与进程退出才关。
     pub fn stop_pumps(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// 正在读取的目录（`None` = 空闲）。
+    ///
+    /// UI 每帧问它，所以只是个 `Mutex<Option<PathBuf>>` 的读 —— 读目录那 100–300ms
+    /// 里界面靠它做立即反馈（见字段说明）。
+    pub fn opening_path(&self) -> Option<PathBuf> {
+        self.opening.lock().unwrap().clone()
     }
 
     /// 底层文件系统抽象（当前生效的，可能是远程连接）。
@@ -672,6 +760,10 @@ impl AppState {
     /// * 打开瞬间先用缓存把元数据填满（stale-while-revalidate），再后台逐条校验；
     /// * 后台校验按「首屏优先」排队，用户看到的行最先补全。
     async fn load_path(&self, path: &Path) -> Result<(), MoError> {
+        // 先把「正在打开 X」亮出去：后面的探活 / `read_dir` / 建视图 / 缓存预填全在这
+        // 之后，大目录要 100–300ms。UI 靠它立刻给反馈（侧栏高亮跟过去 + 中央提示），
+        // 而不是等目录真读完界面才动。guard 保证任何出口都会把它收掉。
+        let _opening = OpeningGuard::begin(self, path);
         // 远程会话闲置久了会被服务器单方面掐断（FTP 的 `idle_session_timeout` 很常见），
         // 这时直接读目录只会拿到一句 `Broken pipe (os error 32)`。所以先确认连接还在，
         // 断了就用会话里记着的凭据原地重连（见 `revive_if_stale`）——这条路径是所有
@@ -706,16 +798,30 @@ impl AppState {
                             .map(|r| Entry::new(r.id, r.name, r.kind, r.path))
                             .collect(),
                     );
+                    // `set_entries` 已经把视图建好了，缓存预填才有「首屏」可按。
                     if let Some(c) = cache_task.as_ref() {
-                        let hits = MetadataScheduler::prime_from_cache(c, &mut dir.entries);
+                        let upto = dir.visible_count().min(FIRST_SCREEN_ROWS);
+                        let hits = MetadataScheduler::prime_visible_from_cache(c, &mut dir, upto);
                         if hits > 0 {
-                            tracing::debug!("元数据缓存命中 {hits}/{} 条", dir.entries.len());
+                            tracing::debug!("元数据缓存命中 {hits}/{upto} 条（只填首屏）");
                         }
                     }
                     dir.loading = false;
-                    dir.rebuild_view();
-                    // 后台校验需要一份条目副本（在 blocking 线程里克隆，不占异步 worker）。
-                    let for_verify = dir.entries.clone();
+                    // 预填只改元数据、不动名称：只有**按大小 / 时间**排时顺序才会变，
+                    // 得重排一次；默认的按名称 / 类型排与元数据无关，这一趟（大目录
+                    // 实测 43ms）省掉。
+                    if matches!(dir.view.sort(), SortKey::Size | SortKey::Modified) {
+                        dir.rebuild_view();
+                    }
+                    // 后台校验要一份**视图序**的副本：`load` 的「首屏优先」是按下标判
+                    // 的，扔一份 `read_dir` 原始序进去，`0..first_screen` 就只是「目录里
+                    // 的前 200 个」，一排序就和屏幕对不上了。
+                    let for_verify: Vec<Entry> = dir
+                        .view
+                        .visible_indices()
+                        .iter()
+                        .map(|&i| dir.entries[i].clone())
+                        .collect();
                     Ok((dir, for_verify))
                 })
                 .await
@@ -736,7 +842,7 @@ impl AppState {
             }
         };
 
-        let first_screen = dir.visible_count().min(200);
+        let first_screen = dir.visible_count().min(FIRST_SCREEN_ROWS);
 
         {
             let mut inner = self.inner.write().await;
@@ -1140,51 +1246,124 @@ impl AppState {
     /// 取一个文件在**系统**里的图标（macOS 走 `NSWorkspace.iconForFile:`）。
     ///
     /// 返回的是缓存后的 PNG 文件路径——GPUI 的 `img()` 吃路径。系统图标是光栅图，
-    /// 没法像内置 SVG 那样用文字色描边，所以这里直接出 PNG。缓存按路径键（系统图标
-    /// 由文件类型决定，与内容无关），首见才真去问系统、之后命中。
+    /// 没法像内置 SVG 那样用文字色描边，所以这里直接出 PNG。
+    ///
+    /// ⚠️ 这是**纯查表**，渲染路径每帧都来问：
+    ///
+    /// * 命中（同一个文件 / 同扩展名问过）→ 返回 PNG 路径；
+    /// * 没命中 → **只记一笔**「这一行要图标」并返回 `None`，调用方就此退回内置 SVG；
+    ///   真去问系统由后台的图标泵做（见 [`AppState::spawn_icon_pump`]），取到后置
+    ///   `dirty`，UI 在下一个节拍重绘时图标就位。
+    ///
+    /// 为什么不让它在渲染里同步问：一次 `iconForFile:` 连带重绘 + PNG 编码 + 写盘
+    /// 要好几毫秒（`.app` 十几毫秒），进一个新目录时一屏几十行全是冷路径 → 一帧卡
+    /// 几十到几百毫秒。这是「渲染路径上不许出现 AppKit + 编码 + 写盘」的正面例子，
+    /// 别再改回去。
+    ///
+    /// `is_dir` 决定缓存键：目录 / 包 / 无扩展名的文件按路径（图标各不相同），
+    /// 其余按扩展名（同类型共享一张，三百个 `.txt` 只问一次）。
     ///
     /// 当前在看远程时整页都是远程条目，本机没有这些文件，系统给不出图标，返回
     /// `None`——调用方（列表行）退回内置 SVG 图标。非 macOS 也返回 `None`。
-    ///
-    /// ⚠️ 这是**同步**方法：列表渲染每帧都来要图标，不能 `await`。远程判据用
-    /// [`AppState::browsing_remote`]（按当前页，足够——图标总是当前页的条目）。
-    pub fn file_icon(&self, path: &Path) -> Option<PathBuf> {
+    pub fn file_icon(&self, path: &Path, is_dir: bool) -> Option<PathBuf> {
         if self.browsing_remote() {
             return None;
         }
-        let mut cache = self.file_icon_cache.lock().unwrap();
-        if let Some(hit) = cache.get(path) {
-            return Some(hit.clone());
+        let mut cache = self.icon_cache.lock().unwrap();
+        let hit = cache.lookup(path, is_dir);
+        if hit.is_none() {
+            // 记账而已，不在这里做任何 IO：泵会把它攒进批里。
+            cache.request(path, is_dir);
         }
-        // 系统图标要问 AppKit，必须走 OS 主线程（`on_main_thread` 在非主线程会
-        // `dispatch_sync` 回主队列）。GPUI 的渲染就跑在 OS 主线程上，真机没问题；
-        // 但 `cargo test` 的 `TestAppContext` 把渲染跑在子线程、主队列不 drain，
-        // 直接 `dispatch_sync` 会死锁（和 `reveal`/`eject` 同款陷阱）。这种「不在
-        // 主线程」的情况（测试 / 后台任务）跳过平台调用、回退内置 SVG——系统图标
-        // 只是视觉加成，不致命。
-        if !mo_platform::is_main_thread() {
-            return None;
-        }
-        let bytes = mo_platform::file_icon(path)?;
-        // 写进缓存目录，返回路径让 `img()` 加载。
+        hit
+    }
+
+    /// 启动图标泵：把渲染路径记下的「这一行还没图标」在后台补齐。
+    ///
+    /// 与 [`AppState::spawn_refresh_pump`] 同款节拍循环：攒一批 → 问系统 → 落盘落缓存
+    /// → 置 `dirty`（由刷新泵合并成一次重绘）。
+    ///
+    /// ⚠️ **一拍只花 `ICON_BUDGET_MS`**：取图标那一段（`iconForFile:` → 重绘 → 拷像素）
+    /// 跑在 `on_main_thread` 里，也就是 `dispatch_sync` 回主队列——活是**主线程**干的。
+    /// PNG 编码（原本占整段 70%）已经在 [`AppState::extract_icons`] 里挪去后台，但剩
+    /// 下这段仍是主线程时间：一拍抓 40 张就等于让它连着忙 40×单价。所以按配额一条条取，
+    /// 剩下的留在队列里等下一拍。
+    ///
+    /// 两处刻意的保守处理：
+    /// * `stopped`（关标签页 / 切会话）就收工，别为已经不在看的目录白解码；
+    /// * [`mo_platform::appkit_usable`] 为假时整轮跳过——测试进程的主队列没人
+    ///   drain，`dispatch_sync` 回去就是挂死（且没有 panic，最难查的那种）。
+    pub fn spawn_icon_pump(&self) {
+        let app = self.clone();
+        self.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(ICON_PUMP_MS)).await;
+                if app.stopped() {
+                    return;
+                }
+                if !mo_platform::appkit_usable() {
+                    continue;
+                }
+                if app.icon_cache.lock().unwrap().is_empty() {
+                    continue;
+                }
+                let task = app.clone();
+                let _ = app.spawn_blocking(move || task.extract_icons()).await;
+            }
+        });
+    }
+
+    /// 图标泵的干活侧：按 `ICON_BUDGET_MS` 的时间配额问系统、写盘、落缓存。
+    ///
+    /// 在 blocking 池里跑，但**取图标那一段在主线程**（`file_icon_raster` 内部
+    /// `dispatch_sync`），配额算的就是它——编码在后台花多久都不影响界面。
+    ///
+    /// ⚠️ 全程**不持 `icon_cache` 的锁**：渲染路径每帧都要拿那把锁查表，这里要是
+    /// 跨着 `iconForFile:`（10ms 级）持锁，等于把停顿原封不动搬回渲染线程。
+    fn extract_icons(&self) {
         let dir = std::env::temp_dir().join("mo-icons");
-        let _ = std::fs::create_dir_all(&dir);
-        let name = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            path.hash(&mut h);
-            format!("{:x}.png", h.finish())
-        };
-        let out = dir.join(name);
-        if std::fs::write(&out, &bytes).is_err() {
-            return None;
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
         }
-        // 容量封顶：超出整清空，下次重新逐条问（避免无限涨内存）。
-        if cache.len() > 4000 {
-            cache.clear();
+        let budget = Duration::from_millis(ICON_BUDGET_MS);
+        let mut got_any = false;
+        // 配额**只累加主线程花掉的那段**：一条条取、取出来就做，花满就停手，剩下的
+        // 留在队列里等下一拍（`pop_next` 出来的不还回去，所以停手前不能多取）。
+        let mut main_thread_spent = Duration::ZERO;
+        // 条数上限兜底：防队列里全是便宜图标时一拍抓太多。
+        for _ in 0..ICON_BATCH {
+            // 切走了就不做了：这些图标已经没人看。
+            if self.stopped() {
+                break;
+            }
+            let Some((path, key)) = self.icon_cache.lock().unwrap().pop_next() else {
+                break;
+            };
+            // 第一段（主线程）：问系统 + 重绘 40px + 拷像素。
+            let started = std::time::Instant::now();
+            let raster = mo_platform::file_icon_raster(&path);
+            main_thread_spent += started.elapsed();
+            // 第二段（后台）：预乘还原 + PNG 编码——占整段 70%，挪出主线程就是这一刀。
+            if let Some(mut raster) = raster {
+                if let Some(bytes) = icon::encode_icon_png(&mut raster) {
+                    // 文件名按**键**算：同类型共享同一份 PNG，不必一个文件写一份。
+                    let out = dir.join(format!("{:x}.png", icon_file_hash(&key)));
+                    if std::fs::write(&out, &bytes).is_ok() {
+                        self.icon_cache.lock().unwrap().insert(&path, &key, out);
+                        got_any = true;
+                    }
+                }
+            }
+            // 问不到的（文件没了 / 系统就是不给）不再重试：`asked` 里已经记着，
+            // 那一行就一直用内置 SVG。
+            if main_thread_spent >= budget {
+                break;
+            }
         }
-        cache.insert(path.to_path_buf(), out.clone());
-        Some(out)
+        if got_any {
+            // 合并进刷新泵的节拍：图标「晚一两帧浮现」，而不是当场冻住界面。
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 「记住的服务器」列表（最近使用的在前）。
