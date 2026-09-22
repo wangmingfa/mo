@@ -78,6 +78,36 @@ fn cache_key_is_file_id_not_path() {
     assert_eq!(first, second);
 }
 
+/// 缓存文件名必须能直接当文件名用。
+///
+/// 这条是 Windows 上那个 bug 的回归：键原来取 `FileId` 的 `Display`（`volume:id`），
+/// 冒号在 Windows 是非法文件名字符，`CreateFile` 回 `ERROR_INVALID_PARAMETER`
+/// （os error 87），整棵缩略图缓存与预览降采样副本都写不下去。
+#[test]
+fn cached_path_file_name_is_legal_on_every_platform() {
+    const ILLEGAL: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    let cache = ThumbnailCache::with_root(tmp("legal-name").join("thumbs"));
+    let ids = [
+        FileId::new(1, 7),
+        FileId::new(u64::MAX, u128::MAX),
+        FileId::synthetic(Path::new("/tmp/照片.png")),
+    ];
+    for id in ids {
+        let p = cache.cached_path(&id, DEFAULT_SIZE);
+        let name = p
+            .file_name()
+            .unwrap_or_else(|| panic!("{id} 的缓存路径没有文件名：{p:?}"))
+            .to_string_lossy()
+            .to_string();
+        for c in ILLEGAL {
+            assert!(
+                !name.contains(c),
+                "缓存文件名 {name:?} 含非法字符 {c:?}（id={id}）——Windows 上会 os error 87"
+            );
+        }
+    }
+}
+
 #[test]
 fn non_image_files_are_rejected() {
     let dir = tmp("not-image");

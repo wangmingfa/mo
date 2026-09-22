@@ -26,6 +26,17 @@ fn open_app(
     // 钉住配置目录到临时路径：否则视图模式 / 侧边栏开关这些布局偏好会读到人家的
     // 真实 config.json，同一份代码在不同机器上渲染结构不同。
     mo_ui::isolate_config_for_tests();
+    // ⚠️ `AppState::new()` 会经 `spawn_blocking` 异步读真实的 Home 目录，读完由 tokio
+    // 的 worker 线程唤醒 GPUI 任务。gpui 的 TestScheduler 默认把「外部线程唤醒本地
+    // 任务」判成 `not deterministic`，并在测试收尾（`end_test`）时 panic——高负载 /
+    // 并发下一撞一个准（实测 4 并发 × 3 波里 5/12 次命中，见 `assert_correct_thread`）。
+    // 这不是被测代码的问题，是「真 IO + 确定性调度器」混搭的固有冲突，所以开一次
+    // 官方的豁免开关 `allow_parking`：
+    //   * 它把 `parking_allowed_once` 置位（此后不复位），让那道线程检查直接 return；
+    //   * 不改变 `run_until_parked`（就是 `while tick() {}`）的执行时序，也不碰任何
+    //     布局断言——这些测试要守的仍然照守。
+    // 少了这一句，`cargo test` 会随机红在「哪条 layout 测试」上，而与被测布局无关。
+    cx.dispatcher.allow_parking();
     let app = AppState::new();
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);

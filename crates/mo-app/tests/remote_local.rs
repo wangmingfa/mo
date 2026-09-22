@@ -27,6 +27,10 @@
 //! 7. **「是不是目录」只问列表模型**。远程条目的路径（`/1`）在本机不存在，
 //!    `Path::is_dir()` 会把远程目录判成文件，双击就被交给系统 `open`——日志里
 //!    `The file /1 does not exist.`，界面一动不动。判据取当前列表那一行的 `kind`。
+//! 8. **文件操作按「这条路径属于哪个后端」分流**。删除 / 重命名 / 新建若一律走本机
+//!    管线，远程条目那条路径在本机不存在，结果就是「成功」地什么都不做；反过来把
+//!    本地路径当远程发给服务器更糟。判据是「它是不是当前列表里那一行」，**不是**
+//!    「我现在在看远程吗」——去重 / 同步会拿着本地路径调同一批 API。
 //!
 //! 为什么守卫落在 `mo-app` 而不是 UI 层：headless 的 GPUI 测试调度器会把「后台
 //! tokio 线程唤醒测试任务」判成不确定性直接 panic（点击回调最终 `await` 到
@@ -49,6 +53,12 @@ use mo_remote::RemoteUrl;
 /// 会立刻拒绝（而不是把测试卡在一条 SYN 上等超时），用例就会干脆地红掉。
 const TEST_URL: &str = "ftp://127.0.0.1:1";
 
+/// 假后端「被问过哪些路径」的记录。
+type AskedLog = Arc<Mutex<Vec<PathBuf>>>;
+
+/// 假后端「收到哪些改动调用」的记录，形如 `remove_file:/x`。
+type OpLog = Arc<Mutex<Vec<String>>>;
+
 /// 假远程后端的健康状况。
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Health {
@@ -70,7 +80,7 @@ fn disconnected_error() -> MoError {
 /// 只认识 `/` 与 `/pub` 的假远程后端：其它路径一律「远端没有这样的目录」，
 /// 并记下被问过的路径——用来证明「切回来时读的是哪台机器的哪个目录」。
 struct FakeRemoteFs {
-    asked: Arc<Mutex<Vec<PathBuf>>>,
+    asked: AskedLog,
     /// 探活 / 读目录时的行为，见 [`Health`]。
     health: Health,
     /// 列目录里那一条文件的名字。重连返回的新后端会换个名字，好断言「后面那次读
@@ -79,6 +89,12 @@ struct FakeRemoteFs {
     /// 额外多列一条**目录**（名字自定）。默认 `None`——只有「目录判据来自列表」
     /// 那条守卫需要它：要一个「列表里说是目录、本机磁盘上却不存在」的条目。
     extra_dir: Option<String>,
+    /// 收到的**改动类**调用（删除 / 重命名 / 建目录），形如 `remove_file:/x`。
+    ///
+    /// 有两个用处：① 断言「这个操作真的走了远程后端，而不是本机管线」；
+    /// ② 让列表反映改动（`read_dir_blocking` 据此过滤 / 改名），于是「远程没有
+    /// watcher，删完必须重读」也是可断言的。
+    log: OpLog,
 }
 
 impl Default for FakeRemoteFs {
@@ -88,6 +104,7 @@ impl Default for FakeRemoteFs {
             health: Health::Ok,
             marker: "remote.txt".to_string(),
             extra_dir: None,
+            log: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -134,7 +151,7 @@ impl FileSystem for FakeRemoteFs {
                         PathBuf::from(format!("/{dir}")),
                     ));
                 }
-                Ok(entries)
+                Ok(Self::apply_log(entries, &self.log.lock().unwrap()))
             }
             other => Err(MoError::Other(format!(
                 "远端没有这样的目录：{}",
@@ -143,28 +160,97 @@ impl FileSystem for FakeRemoteFs {
         }
     }
 
-    async fn metadata(&self, _path: &Path) -> Result<FileMetadata, MoError> {
-        Err(Self::unsupported())
+    /// 只认**自己建出来**的路径（`create_dir` / `write_file` 记下的那些）。
+    ///
+    /// 用来验证「当前列表翻不到那一页时，判重会去问后端」这条兜底路径。
+    async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError> {
+        let wanted = path.to_string_lossy().to_string();
+        let known = self.log.lock().unwrap().iter().any(|op| {
+            matches!(op.strip_prefix("create_dir:"), Some(p) if p == wanted.as_str())
+                || matches!(op.strip_prefix("write_file:"), Some(p) if p == wanted.as_str())
+        });
+        if known {
+            Ok(FileMetadata {
+                size: 0,
+                modified: None,
+                created: None,
+                permissions: mo_core::Permissions::default(),
+            })
+        } else {
+            Err(Self::unsupported())
+        }
     }
 
-    async fn create_dir(&self, _path: &Path) -> Result<(), MoError> {
-        Err(Self::unsupported())
+    async fn create_dir(&self, path: &Path) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("create_dir:{}", path.display()));
+        Ok(())
     }
 
-    async fn write_file(&self, _path: &Path, _contents: &[u8]) -> Result<(), MoError> {
-        Err(Self::unsupported())
+    async fn write_file(&self, path: &Path, _contents: &[u8]) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("write_file:{}", path.display()));
+        Ok(())
     }
 
-    async fn remove_file(&self, _path: &Path) -> Result<(), MoError> {
-        Err(Self::unsupported())
+    async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("remove_file:{}", path.display()));
+        Ok(())
     }
 
-    async fn remove_dir(&self, _path: &Path) -> Result<(), MoError> {
-        Err(Self::unsupported())
+    async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("remove_dir:{}", path.display()));
+        Ok(())
     }
 
-    async fn rename(&self, _from: &Path, _to: &Path) -> Result<(), MoError> {
-        Err(Self::unsupported())
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("rename:{}->{}", from.display(), to.display()));
+        Ok(())
+    }
+}
+
+impl FakeRemoteFs {
+    /// 让列表反映已经发生的改动：删掉的不再列出，改名的按新名列出。
+    fn apply_log(entries: Vec<ReadDirEntry>, log: &[String]) -> Vec<ReadDirEntry> {
+        let mut out = Vec::new();
+        for e in entries {
+            // 改名：以**最后一次** rename 为准。
+            let renamed = log.iter().rev().find_map(|op| {
+                let rest = op.strip_prefix("rename:")?;
+                let (from, to) = rest.split_once("->")?;
+                (from == e.path.to_string_lossy()).then(|| to.to_string())
+            });
+            let path = match renamed {
+                Some(to) => PathBuf::from(to),
+                None => e.path.clone(),
+            };
+            let gone = log.iter().any(|op| {
+                matches!(op.strip_prefix("remove_file:"), Some(p) if p == path.to_string_lossy())
+                    || matches!(op.strip_prefix("remove_dir:"), Some(p) if p == path.to_string_lossy())
+            });
+            if gone {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push(ReadDirEntry::new(e.id, name, e.kind, path));
+        }
+        out
     }
 }
 
@@ -186,12 +272,14 @@ fn tab(sessions: &Arc<SessionRegistry>) -> AppState {
     AppState::with_sessions(trash, sessions.clone())
 }
 
-/// 登入一条假连接，返回 `(编号, 被问过的路径)`。
-fn connect_fake_at(app: &AppState, url: &str) -> (u64, Arc<Mutex<Vec<PathBuf>>>) {
+/// 登入一条假连接，返回 `(编号, 被问过的路径, 改动记录)`。
+fn connect_fake_at(app: &AppState, url: &str) -> (u64, AskedLog, OpLog) {
     let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new(Mutex::new(Vec::new()));
     app.install_backend_for_test(
         Arc::new(FakeRemoteFs {
             asked: asked.clone(),
+            log: log.clone(),
             ..Default::default()
         }),
         url,
@@ -202,7 +290,7 @@ fn connect_fake_at(app: &AppState, url: &str) -> (u64, Arc<Mutex<Vec<PathBuf>>>)
         .last()
         .expect("应当刚登入一条连接")
         .id;
-    (id, asked)
+    (id, asked, log)
 }
 
 fn connect_fake(app: &AppState) -> Arc<Mutex<Vec<PathBuf>>> {
@@ -417,8 +505,8 @@ fn closing_a_tab_keeps_the_connection_alive() {
 fn disconnecting_one_connection_leaves_the_others() {
     let dir = local_tree("multi");
     let app = tab(&Arc::new(SessionRegistry::new()));
-    let (first, _) = connect_fake_at(&app, "ftp://127.0.0.1:1");
-    let (second, _) = connect_fake_at(&app, "ftp://127.0.0.1:2");
+    let (first, _, _) = connect_fake_at(&app, "ftp://127.0.0.1:1");
+    let (second, _, _) = connect_fake_at(&app, "ftp://127.0.0.1:2");
 
     runtime().block_on(async {
         // 切到第一条，并让它在 /pub 留下位置。
@@ -610,7 +698,7 @@ fn a_failed_switch_rolls_the_browsing_state_back() {
 #[test]
 fn the_same_account_never_takes_a_second_row() {
     let app = tab(&Arc::new(SessionRegistry::new()));
-    let (id, asked) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (id, asked, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
 
     runtime().block_on(async {
         app.connect_remote("ftp://alice@127.0.0.1:1")
@@ -638,7 +726,7 @@ fn a_new_password_reconnects_the_same_row() {
     let sessions = Arc::new(SessionRegistry::with_connector(connector));
     let app = tab(&sessions);
     // 先用「旧密码那套」登入（假后端，避免真建 socket）。
-    let (id, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (id, _, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
 
     runtime().block_on(async {
         app.connect_remote_with_credentials("ftp://127.0.0.1:1", "alice", "pw2")
@@ -683,8 +771,8 @@ fn a_new_password_reconnects_the_same_row() {
 #[test]
 fn installing_the_same_account_twice_keeps_one_row() {
     let app = tab(&Arc::new(SessionRegistry::new()));
-    let (_, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
-    let (second, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (_, _, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (second, _, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
 
     let live = app.live_connections();
     assert_eq!(live.len(), 1, "同 key 的旧条目应当被摘掉，不留两行");
@@ -695,8 +783,8 @@ fn installing_the_same_account_twice_keeps_one_row() {
 #[test]
 fn a_second_account_on_the_same_host_keeps_its_own_row() {
     let app = tab(&Arc::new(SessionRegistry::new()));
-    let (alice, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
-    let (bob, _) = connect_fake_at(&app, "ftp://bob@127.0.0.1:1");
+    let (alice, _, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
+    let (bob, _, _) = connect_fake_at(&app, "ftp://bob@127.0.0.1:1");
 
     assert_ne!(alice, bob, "两个账号是两条连接，不该互相顶掉");
     assert_eq!(
@@ -750,4 +838,313 @@ fn whether_an_entry_is_a_directory_comes_from_the_listing() {
             "不在当前列表里的路径返回 None，交给调用方兜底"
         );
     });
+}
+
+/// 删掉一个**远程**条目：走远程后端的删除，**不进本机回收站**。
+///
+/// 原来一律走 `TrashOperation`（本机回收站）：远程路径在本机不存在，那条操作要么
+/// 报错，要么「成功」而服务端文件还在——用户看到的就是「删了，刷新还在」。
+#[test]
+fn deleting_a_remote_entry_goes_through_the_backend() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        let victim = PathBuf::from("/remote.txt");
+
+        app.delete_paths(vec![victim.clone()])
+            .await
+            .expect("远程删除应当走后端成功");
+
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"remove_file:/remote.txt".to_string()),
+            "删除必须发给远程后端（走本机管线的话这里一条记录都没有）"
+        );
+        assert!(
+            app.trash_list().is_empty(),
+            "远程条目不该进本机回收站——回收站是本机概念，远端也没有「还原」这回事"
+        );
+        // 远程没有 watcher：删完必须重读，否则列表里还留着已删除的条目。
+        assert!(
+            !app.current_entries().await.iter().any(|e| e.path == victim),
+            "删完之后列表里不该还有它（说明没重读）"
+        );
+    });
+}
+
+/// 在看远程时删一个**本地**文件：照旧进本机回收站，**不该**发给服务器。
+///
+/// 这条是给「按路径分流」钉边界的：判据若是「我现在在看远程吗」而不是「这条路径
+/// 属于哪个后端」，去重 / 同步拿着本地路径调过来时就会被发到服务器上。
+#[test]
+fn deleting_a_local_file_while_browsing_remote_still_uses_the_trash() {
+    let dir = local_tree("remote-local-delete");
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        assert!(app.browsing_remote(), "前提：当前在看远程");
+
+        let victim = dir.join("local.txt");
+        app.delete_paths(vec![victim.clone()])
+            .await
+            .expect("本地删除");
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "本地文件不该被发给远程后端——它不是远程列表里的条目"
+        );
+        for _ in 0..200 {
+            if !app.trash_list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            app.trash_list().iter().any(|t| t.original == victim),
+            "本地删除应当照旧进本机回收站（可撤销）"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 重命名一个**远程**条目：走远程后端的 `rename`。
+///
+/// 本机 `RenameOperation` 拿到 `/remote.txt` 这种路径只会「成功」地什么都不做——
+/// 那个路径在本机不存在，而操作队列又不报错。
+#[test]
+fn renaming_a_remote_entry_uses_the_backend() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, asked, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        let reads_before = asked.lock().unwrap().len();
+
+        app.rename_many(vec![(
+            PathBuf::from("/remote.txt"),
+            PathBuf::from("/renamed.txt"),
+        )])
+        .await
+        .expect("远程重命名应当走后端成功");
+
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"rename:/remote.txt->/renamed.txt".to_string()),
+            "重命名必须发给远程后端"
+        );
+        assert!(
+            asked.lock().unwrap().len() > reads_before,
+            "远程没有 watcher：改完名必须重读一次，否则列表里还是旧名字"
+        );
+        assert!(
+            app.current_entries()
+                .await
+                .iter()
+                .any(|e| e.path == Path::new("/renamed.txt")),
+            "重读之后列表里应当是新名字"
+        );
+    });
+}
+
+/// 在远程目录里新建文件夹：`create_dir` 发给远程后端，且名字**不与列表里的重名**。
+///
+/// 去重判据原来是 `Path::exists()`（本机磁盘），远程路径恒为「不存在」，于是
+/// 在已经有同名条目的远程目录里新建会撞服务端的错。
+#[test]
+fn a_new_folder_in_a_remote_dir_asks_the_backend() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+
+        let created = app
+            .create_folder(Path::new("/"), "remote.txt")
+            .await
+            .expect("远程建目录应当走后端成功");
+        // `unique_path` 把序号插在扩展名**前**：`/remote.txt` → `/remote 2.txt`。
+        assert_eq!(
+            created,
+            PathBuf::from("/remote 2.txt"),
+            "名字与列表里那条冲突，应当去重（本机 exists() 判不出来的重名）"
+        );
+        assert_eq!(
+            log.lock().unwrap().last().cloned(),
+            Some("create_dir:/remote 2.txt".to_string()),
+            "建目录必须发给远程后端"
+        );
+    });
+}
+
+/// 「判重去问后端」那条兜底：目标目录**不是当前这一页**时（列表查不到），
+/// 名字冲突仍然要被查出来。
+///
+/// 列表判重是零 IO 的快路径，但它只认当前目录；跨目录新建（面包屑跳到别处再建、
+/// 或者像这里一样在子目录里建）只能问后端。原来这里是 `Path::exists()`——远程
+/// 路径恒「不存在」，于是永远不去重。
+#[test]
+fn a_new_folder_outside_the_current_page_still_dedupes() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, _) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        // `/sub` 不是当前列表里的路径：判重必须落到「问后端」。
+        let first = app
+            .create_folder(Path::new("/sub"), "新建文件夹")
+            .await
+            .expect("远程建目录");
+        assert_eq!(first, PathBuf::from("/sub/新建文件夹"));
+
+        let second = app
+            .create_folder(Path::new("/sub"), "新建文件夹")
+            .await
+            .expect("远程建目录");
+        assert_eq!(
+            second,
+            PathBuf::from("/sub/新建文件夹 2"),
+            "第二次应当去重——问后端才知道这个名字已经占了"
+        );
+    });
+}
+
+/// SMB / NFS 走**系统挂载**，不是远程会话。
+///
+/// 侧边栏因此分两区：Mo 自己建的会话在「远程」（点一下走连接 / 重连），操作系统
+/// 挂好的网络盘在「网络」（就是个本地目录）。这条钉住分流本身——`smb://` 若被当成
+/// 「不支持的协议」直接报错，或者被当成远程会话去建连接，都是错的方向。
+#[test]
+fn smb_and_nfs_are_mounted_by_the_system_not_connected() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+
+    // 1. 协议要被放行（不再报「暂不支持」）。
+    let parsed = mo_remote::RemoteUrl::parse("smb://nas.local/public").expect("解析应当成功");
+    assert!(
+        mo_remote::mount::is_mountable(&parsed.scheme),
+        "smb 应当走系统挂载那条路"
+    );
+    assert!(
+        mo_remote::mount::is_mountable("nfs"),
+        "nfs 应当走系统挂载那条路"
+    );
+    assert!(
+        !mo_remote::mount::is_mountable("ftp"),
+        "ftp 是 Mo 自己连的，不该被拿去挂载"
+    );
+
+    // 2. 真去挂载会失败（本机 127.0.0.1 上没有 SMB），但**失败必须发生在挂载那一步**，
+    //    而不是「协议不支持」——两者给用户看的提示完全不同。
+    //    地址用 127.0.0.1：连不上会**立刻**被拒，不用等 DNS / 路由超时。
+    runtime().block_on(async {
+        let err = app
+            .connect_remote("smb://127.0.0.1/public")
+            .await
+            .expect_err("本机挂不上 127.0.0.1，应当失败");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("挂载"),
+            "失败应当来自挂载这一步（说明确实走了挂载那条路）：{msg}"
+        );
+        assert!(
+            !msg.contains("暂不支持"),
+            "不该再把 smb 当成不支持的协议：{msg}"
+        );
+        assert!(
+            app.live_connections().is_empty(),
+            "挂载失败不该留下任何远程会话——这条路根本不建会话"
+        );
+    });
+}
+
+/// 平台原生的那两条（在访达中显示 / 移到系统废纸篓）**只认本地路径**。
+///
+/// 远程条目（`/pub/x`）在本机磁盘上不存在，把这种路径交给系统文件管理器只会
+/// 静默失败（访达不跳转、`trashItemAtURL` 报「文件不存在」），用户看到的就是
+/// 「点了没反应」。所以这里直接挡掉，UI 那边也不给菜单项——守卫见
+/// `mo-ui::context_menu::remote_page_hides_host_only_actions`。
+#[test]
+fn host_only_actions_refuse_remote_paths() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let _ = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        assert!(app.browsing_remote(), "前提：当前在看远程");
+
+        let remote = vec![PathBuf::from("/remote.txt")];
+        let reveal = app
+            .reveal_in_file_manager(remote.clone())
+            .await
+            .expect_err("远程条目没法在系统文件管理器里显示");
+        assert!(
+            reveal.to_string().contains("远程"),
+            "错误要说明原因（而不是丢一句系统报错）：{reveal}"
+        );
+        let recycle = app
+            .recycle_to_system(remote)
+            .await
+            .expect_err("远程条目没法进本机废纸篓");
+        assert!(
+            recycle.to_string().contains("远程"),
+            "错误要说明原因：{recycle}"
+        );
+    });
+}
+
+/// 反过来：**本地**路径在看远程时必须判成「本地」（不被上面那条门禁误伤）。
+///
+/// 去重 / 同步拿的就是本地路径，而它们经常在「当前页是远程」的时候调过来——
+/// 与 `deleting_a_local_file_while_browsing_remote_still_uses_the_trash` 同一条边界。
+///
+/// ⚠️ 断言落在**判据本身**（`goes_through_remote`）而不是真的去调 AppKit：
+/// `mo_platform::reveal` 要从后台线程 `dispatch_sync` 回主线程，而测试的主线程
+/// 正被 `block_on` 占着、不再 drain 主队列——真调会直接挂死（真机行为见
+/// `devlog/macos-platform.md`，那里主线程在跑事件循环，不会）。
+#[test]
+fn local_paths_stay_local_while_browsing_remote() {
+    let dir = local_tree("remote-local-host-only");
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let _ = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+
+        assert!(
+            app.goes_through_remote(Path::new("/remote.txt")).await,
+            "列表里那条是远程条目"
+        );
+        let local = dir.join("local.txt");
+        assert!(
+            !app.goes_through_remote(&local).await,
+            "本机磁盘上的路径不该被当成远程条目——哪怕当前页在看远程"
+        );
+        assert!(
+            !app.goes_through_remote(Path::new("/not-in-the-listing.txt"))
+                .await,
+            "列表里查不到的远程风格路径按本地处理（判据只认当前列表）"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

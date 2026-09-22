@@ -16,6 +16,7 @@ mo-operations.workspace = true
 mo-search.workspace = true
 mo-preview.workspace = true
 mo-diff.workspace = true
+mo-platform.workspace = true
 gpui-kit.workspace = true
 chrono.workspace = true
 tokio.workspace = true

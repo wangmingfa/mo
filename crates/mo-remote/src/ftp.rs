@@ -11,14 +11,25 @@
 //! TCP 连接在建 socket 时就注册到了当时的 reactor，之后所有读写都得由同一个
 //! runtime 驱动。mo-app 的共享 runtime 与 blocking 池是两个不同的池，若在这里
 //! 建连接、在那里 poll，症状是「偶尔卡住 / 偶尷超时」这种最难查的问题。
-//! 因此每个连接独占一份 current-thread runtime，所有动作统一走
-//! [`tokio::runtime::Runtime::block_on`]——包括 `async` 的 trait 方法
-//! （它们内部同步完成远程往返）。
+//! 因此每个连接独占一份 **1 worker 的多线 runtime**（与 SFTP 后端同一套约定），
+//! 分两种用法：
+//!
+//! - 阻塞入口（`read_dir_blocking` / 探活 / 连接）：`rt.block_on`，调用方本就在
+//!   blocking 池里，不该碰异步 worker；
+//! - `async` trait 方法：经 [`FtpFileSystem::run`]（即 `rt.handle().spawn`）把任务
+//!   派回**这条连接自己的** worker，外层只 `await` 结果。
+//!
+//! ⚠️ 这里原来是 current-thread runtime + 直接在 `async fn` 里 `await`：那种写法把
+//! 这条连接的 socket 交给了**调用方**的 runtime 去 poll，正是上面说的跨 runtime
+//! 驱动（SFTP 早就用 `spawn` 躲开了，FTP 漏了这层）。多线 runtime 才能让
+//! `handle().spawn` 的任务真的被 worker 驱动起来——current-thread 的 runtime 闲置时
+//! 没人 poll 它，spawn 出去的任务会永远挂着。
 //!
 //! 代价是一个连接占一个线程，这与它在 `spawn_blocking` 池里被使用的方式一致。
 
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
@@ -34,21 +45,39 @@ use crate::{RemoteError, RemoteUrl};
 pub struct FtpFileSystem {
     url: RemoteUrl,
     /// 仅供本连接使用的 runtime（见模块文档）。
-    rt: tokio::runtime::Runtime,
+    ///
+    /// 用 `Arc` 是为了让 `async` 方法能把任务派回这里：[`Self::run`] 要求 future 是
+    /// `'static`，得把句柄搬进去。
+    rt: Arc<tokio::runtime::Runtime>,
     /// FTP 控制连接：所有命令都要 `&mut`，而 trait 只给 `&self`。
-    conn: Mutex<AsyncFtpStream>,
+    ///
+    /// `Arc` 同理——`run` 里的 future 要自己拿一份锁的句柄。
+    conn: Arc<Mutex<AsyncFtpStream>>,
 }
 
 impl FtpFileSystem {
+    /// 这条连接独占的那份 runtime（见模块文档：多线、1 worker）。
+    ///
+    /// 抽成函数是为了让「它必须能自己驱动 spawn 出去的任务」这件事可被测试
+    /// ——`async` 方法靠 `rt.handle().spawn` 把远程往返派回这里，而调用方
+    /// （mo-app 的共享 runtime）不会去 block_on 它；runtime 若是 current-thread，
+    /// 那些任务就永远没人 poll。见 `tests::the_connection_runtime_drives_its_own_tasks`。
+    fn connection_runtime(url: &RemoteUrl) -> Result<tokio::runtime::Runtime, RemoteError> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            // 一个连接一个线程：线程名带上端点，profile 时一眼看出是哪条连接。
+            .thread_name(format!("mo-ftp-{}", url.host))
+            .enable_all()
+            .build()
+            .map_err(|e| RemoteError::transport("创建 runtime", e))
+    }
+
     /// 建连接并登录。
     ///
     /// 用户名 / 密码缺省时按匿名登录（`anonymous`）——多数公共 FTP 都接受，
     /// 也让「地址里没写凭据」不至于直接失败。
     pub fn connect(url: &RemoteUrl) -> Result<Self, RemoteError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| RemoteError::transport("创建 runtime", e))?;
+        let rt = Self::connection_runtime(url)?;
 
         let addr = format!("{}:{}", url.host, url.port_or_default().unwrap_or(21));
         let user = url.user.clone().unwrap_or_else(|| "anonymous".to_string());
@@ -67,8 +96,8 @@ impl FtpFileSystem {
 
         Ok(Self {
             url: url.clone(),
-            rt,
-            conn: Mutex::new(conn),
+            rt: Arc::new(rt),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
@@ -105,24 +134,42 @@ impl FtpFileSystem {
         }
     }
 
+    /// 在连接自有的 runtime 上驱动一个 future（供 `async` 方法使用，
+    /// 避免跨 runtime 驱动这条连接的 socket——见模块文档）。
+    ///
+    /// 与 SFTP 后端的 `run` 是同一条约定：外层只 `await` 结果，真正的远程往返
+    /// 由这条连接自己的 worker 完成。
+    async fn run<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.handle().spawn(f).await.expect("ftp 后台任务失败")
+    }
+
     /// 列目录：优先 MLSD（机器可读、自带类型与大小），服务器不支持时回退 LIST。
     async fn list_dir(&self, dir: &str) -> Result<Vec<File>, MoError> {
-        let mut conn = self.conn.lock().await;
-        match conn.mlsd(Some(dir)).await {
-            Ok(lines) => Ok(lines.iter().filter_map(|l| parse_mlsd(l)).collect()),
-            // 服务器不实现 MLSD 是常态（RFC 3659 是可选扩展），回退到 LIST。
-            Err(_) => {
-                let lines = conn
-                    .list(Some(dir))
-                    .await
-                    .map_err(|e| MoError::from(transport_error("列目录", e)))?;
-                Ok(lines.iter().filter_map(|l| parse_list(l)).collect())
+        let dir = dir.to_string();
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            match conn.mlsd(Some(&dir)).await {
+                Ok(lines) => Ok(lines.iter().filter_map(|l| parse_mlsd(l)).collect()),
+                // 服务器不实现 MLSD 是常态（RFC 3659 是可选扩展），回退到 LIST。
+                Err(_) => {
+                    let lines = conn
+                        .list(Some(&dir))
+                        .await
+                        .map_err(|e| MoError::from(transport_error("列目录", e)))?;
+                    Ok(lines.iter().filter_map(|l| parse_list(l)).collect())
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn entries_in(&self, dir: &str) -> Result<Vec<ReadDirEntry>, MoError> {
-        let parent = Path::new(dir);
+        let parent = PathBuf::from(dir);
         Ok(self
             .list_dir(dir)
             .await?
@@ -220,62 +267,89 @@ impl FileSystem for FtpFileSystem {
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError> {
         let remote = Self::remote(path);
-        let mut conn = self.conn.lock().await;
-        // 目录没有 SIZE 语义（多数服务器直接报错 550），失败即按目录处理。
-        let size = conn.size(&remote).await.ok().unwrap_or(0) as u64;
-        let modified = conn.mdtm(&remote).await.ok().map(system_time_from_naive);
-        Ok(FileMetadata {
-            size,
-            modified,
-            created: None,
-            permissions: Permissions::default(),
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            // 目录没有 SIZE 语义（多数服务器直接报错 550），失败即按目录处理。
+            let size = conn.size(&remote).await.ok().unwrap_or(0) as u64;
+            let modified = conn.mdtm(&remote).await.ok().map(system_time_from_naive);
+            Ok(FileMetadata {
+                size,
+                modified,
+                created: None,
+                permissions: Permissions::default(),
+            })
         })
+        .await
     }
 
     async fn create_dir(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let mut conn = self.conn.lock().await;
-        conn.mkdir(&remote)
-            .await
-            .map_err(|e| MoError::from(transport_error("建目录", e)))
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            conn.mkdir(&remote)
+                .await
+                .map_err(|e| MoError::from(transport_error("建目录", e)))
+        })
+        .await
     }
 
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let mut conn = self.conn.lock().await;
-        // 「目标已存在必须失败」由调用方保证（见 trait 文档）；FTP 的 STOR 会覆盖，
-        // 这里先探一次 SIZE：有大小就认为已存在，绝不静默覆盖远端数据。
-        if conn.size(&remote).await.is_ok() {
-            return Err(MoError::Other(format!("远端已存在 {remote}——拒绝覆盖")));
-        }
+        // future 要 `'static`：内容拷一份进去（远程往返期间 `contents` 的借用不能悬着）。
         let mut cursor = Cursor::new(contents.to_vec());
-        conn.put_file(&remote, &mut cursor)
-            .await
-            .map_err(|e| MoError::from(transport_error("上传", e)))?;
-        Ok(())
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            // 「目标已存在必须失败」由调用方保证（见 trait 文档）；FTP 的 STOR 会覆盖，
+            // 这里先探一次 SIZE：有大小就认为已存在，绝不静默覆盖远端数据。
+            if conn.size(&remote).await.is_ok() {
+                return Err(MoError::Other(format!("远端已存在 {remote}——拒绝覆盖")));
+            }
+            conn.put_file(&remote, &mut cursor)
+                .await
+                .map_err(|e| MoError::from(transport_error("上传", e)))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let mut conn = self.conn.lock().await;
-        conn.rm(&remote)
-            .await
-            .map_err(|e| MoError::from(transport_error("删除文件", e)))
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            conn.rm(&remote)
+                .await
+                .map_err(|e| MoError::from(transport_error("删除文件", e)))
+        })
+        .await
     }
 
     async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let mut conn = self.conn.lock().await;
-        conn.rmdir(&remote)
-            .await
-            .map_err(|e| MoError::from(transport_error("删除目录", e)))
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            conn.rmdir(&remote)
+                .await
+                .map_err(|e| MoError::from(transport_error("删除目录", e)))
+        })
+        .await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
-        let mut conn = self.conn.lock().await;
-        conn.rename(&Self::remote(from), &Self::remote(to))
-            .await
-            .map_err(|e| MoError::from(transport_error("重命名", e)))
+        let from = Self::remote(from);
+        let to = Self::remote(to);
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            conn.rename(&from, &to)
+                .await
+                .map_err(|e| MoError::from(transport_error("重命名", e)))
+        })
+        .await
     }
 }
 
@@ -328,6 +402,38 @@ mod tests {
             matches!(login_error(err), RemoteError::Transport { .. }),
             "421 不该被当成「需要凭据」"
         );
+    }
+
+    /// 这条连接自己的 runtime 必须**自己**驱动 spawn 出去的任务。
+    ///
+    /// `async` trait 方法（`metadata` / `rename` / `remove_*` …）走
+    /// `rt.handle().spawn`，而调用方是 mo-app 的共享 runtime——它**不会**去
+    /// `block_on` 这条连接的 runtime。所以那份 runtime 必须是**多线**的才有 worker
+    /// 去 poll 这些任务；换成 current-thread，任务就永远挂在队列里，表现为
+    /// 「删了 / 改名了但没反应，也不报错」——正是 SFTP 早就躲开、FTP 原来踩着的坑。
+    #[test]
+    fn the_connection_runtime_drives_its_own_tasks() {
+        let url = RemoteUrl::parse("ftp://127.0.0.1:21").expect("测试地址应当能解析");
+        let rt = FtpFileSystem::connection_runtime(&url).expect("runtime 应当能建起来");
+
+        // 只 spawn，**不** block_on（模拟调用方在别的 runtime 上 await 结果）。
+        let task = rt.handle().spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            7u8
+        });
+
+        // 在**另一个** runtime 上等它——这是真实调用姿势（mo-app 的共享 runtime）。
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("调用方 runtime");
+        let got = caller.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("任务应当被这条连接自己的 worker 驱动完成——而不是永远挂着")
+                .expect("任务不该 panic")
+        });
+        assert_eq!(got, 7);
     }
 
     /// 连接被掐断（用户报的那个 `Broken pipe (os error 32)`）必须归到

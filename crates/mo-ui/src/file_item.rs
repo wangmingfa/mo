@@ -1,5 +1,6 @@
 use gpui_kit::*;
 use mo_core::{Entry, EntryKind, MetadataState, ThumbnailState};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::list_columns::{ColId, ColumnLayout};
@@ -16,6 +17,7 @@ pub fn view(
     selected: bool,
     tag: Option<String>,
     layout: &ColumnLayout,
+    system_icon: Option<PathBuf>,
 ) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
@@ -74,9 +76,16 @@ pub fn view(
         ThumbnailState::Loading => {
             name_cell.child(icon_slot(text!("".to_string()).into_any_element()))
         }
-        _ => name_cell.child(icon_slot(
-            crate::icons::icon(icon_data, 16.0, icon_color).into_any_element(),
-        )),
+        _ => {
+            // 没有缩略图时：能用**系统**图标（访达同款真实图标）就用它，
+            // 否则退回内置 Lucide 单色 SVG。系统图标是光栅 PNG，没法随选中态改色，
+            // 但胜在「.app 是真 App 图标、文档是所属 App 图标」，与系统一致。
+            let icon = match &system_icon {
+                Some(p) => img(p.as_path()).w(px(20.0)).h(px(20.0)).into_any_element(),
+                None => crate::icons::icon(icon_data, 16.0, icon_color).into_any_element(),
+            };
+            name_cell.child(icon_slot(icon))
+        }
     };
 
     // 颜色标签（Finder 式）：有标签时文件名前显示一个色点。
@@ -266,7 +275,7 @@ mod tests {
                 .h(px(24.0))
                 .p(px(4.0))
                 .debug_selector(|| "mo-probe-row".to_string())
-                .child(view(&self.0, false, None, &ColumnLayout::default()))
+                .child(view(&self.0, false, None, &ColumnLayout::default(), None))
         }
     }
 
@@ -386,7 +395,7 @@ mod tests {
                 .w_full()
                 .h(px(24.0))
                 .p(px(4.0))
-                .child(view(&self.0, false, None, &self.1))
+                .child(view(&self.0, false, None, &self.1, None))
         }
     }
 }

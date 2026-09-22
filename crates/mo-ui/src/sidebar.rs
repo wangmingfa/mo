@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
 
@@ -35,6 +36,10 @@ pub fn render(
         .border_r_1()
         .border_color(crate::theme::separator())
         .text_color(crate::theme::text())
+        // 内容（快捷访问 / 位置 / 书签 / 远程 / 网络）可能比窗口高：在栏内滚动，
+        // 别撑高整行（那样会拖累中央文件列表，见 tests/layout.rs 的
+        // file_list_height_tracks_the_window）。
+        .overflow_y_scrollbar()
         // 测试用（release no-op）：tests/layout.rs 断言侧边栏在中央区左侧
         .debug_selector(|| "mo-sidebar".to_string());
 
@@ -181,8 +186,11 @@ pub fn render(
         } else {
             item = item.hover(|s| s.bg(crate::theme::hover_bg()));
         }
+        // 按协议画各自的图标（与「已记住的服务器」列表同一套映射）：一眼分清哪台是
+        // 共享文件夹、哪台是 FTP、哪台是网盘。原来一律画硬盘，跟「此电脑」里的盘符
+        // 撞成一个意思——硬盘表示的是「一块本地卷」，不是「一条网络连接」。
         item = item.child(crate::icons::icon(
-            crate::icons::HARD_DRIVE,
+            crate::icons::scheme_icon(&conn.url.scheme),
             16.0,
             crate::theme::text(),
         ));
@@ -235,6 +243,196 @@ pub fn render(
             .detach();
         });
         panel = panel.child(item.child(disconnect.child(crate::icons::icon(
+            crate::icons::POWER,
+            14.0,
+            crate::theme::muted(),
+        ))));
+    }
+
+    // 网络区：系统里**已经挂好**的网络盘（SMB / NFS）。
+    //
+    // 与上面「远程」区的区别：那里是 Mo 自己建的会话（FTP / SFTP / WebDAV，点一下
+    // 走连接 / 重连），这里是**操作系统**挂好的目录——Mo 不持有任何连接，读写就是
+    // 普通本地 IO。所以点它是 `open_local`，行尾的「断开」是 `umount`。
+    let shares = app.network_shares();
+    if !shares.is_empty() {
+        panel = panel.child(
+            div()
+                .px(px(10.0))
+                .pb(px(6.0))
+                .pt(px(10.0))
+                .text_size(px(11.0))
+                .text_color(crate::theme::muted())
+                .child(text!("网络")),
+        );
+    }
+    for (ix, share) in shares.into_iter().enumerate() {
+        let label = share.label.clone();
+        let path = share.path.clone();
+        let is_active = current.as_deref() == Some(path.as_path());
+        let app_click = app.clone();
+        let app_umount = app.clone();
+        let entity_click = entity.clone();
+        let entity_umount = entity.clone();
+        let target = path.clone();
+        let umount_target = path.clone();
+
+        let mut item = div()
+            .id(format!("sidebar-net-{ix}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(crate::theme::text());
+        if is_active {
+            item = item.bg(crate::theme::accent());
+        } else {
+            item = item.hover(|s| s.bg(crate::theme::hover_bg()));
+        }
+        item = item.child(crate::icons::icon(
+            crate::icons::scheme_icon(&share.scheme),
+            16.0,
+            crate::theme::text(),
+        ));
+        item = item.child(div().flex_1().min_w_0().truncate().child(text!(label)));
+        item.interactivity().on_click(move |_, _window, cx| {
+            let app = app_click.clone();
+            let target = target.clone();
+            let entity = entity_click.clone();
+            cx.spawn(async move |cx| {
+                // 挂载点是**本地目录**：连着远程时也要先切回本地（否则拿本地路径
+                // 去远程后端读必然失败，和侧边栏快捷访问同一个坑）。
+                if let Err(e) = app.open_local(&target).await {
+                    entity.update(cx, |v, cx| {
+                        v.notice(format!("打开网络盘失败：{e}"), None, cx);
+                    });
+                }
+                entity.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+        // 行尾「卸载」。⚠️ `stop_propagation()`：点击在冒泡阶段触发，不拦住会顺带
+        // 把上面那一行（打开目录）也做了——刚卸掉的盘又被打开一次。
+        let mut eject = div()
+            .id(format!("sidebar-net-eject-{ix}"))
+            .ml_auto()
+            .flex_shrink_0()
+            .rounded(px(4.0))
+            .hover(|s| s.bg(crate::theme::hover_bg()));
+        eject.interactivity().on_click(move |_, _window, cx| {
+            cx.stop_propagation();
+            let app_umount = app_umount.clone();
+            let entity_umount = entity_umount.clone();
+            let umount_target = umount_target.clone();
+            cx.spawn(async move |cx| {
+                if let Err(e) = app_umount.unmount_share(umount_target).await {
+                    entity_umount.update(cx, |v, cx| {
+                        v.notice(format!("卸载失败：{e}"), None, cx);
+                    });
+                }
+                entity_umount.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+        panel = panel.child(item.child(eject.child(crate::icons::icon(
+            crate::icons::POWER,
+            14.0,
+            crate::theme::muted(),
+        ))));
+    }
+
+    // 位置区：本机**已挂载的卷宗**（外接磁盘 / DMG / Time Machine 盘）。
+    //
+    // 与「网络」区的区别：网络盘是操作系统按 SMB / NFS 挂的、文件系统类型是网络型，
+    // 这里列的是**本地**卷宗（`apfs` / `hfs` 之类，由 `mo_platform::volumes` 用
+    // `statfs` 的 `f_fstypename` 过滤掉网络型）。点它是 `open_local`，行尾「推出」
+    // 走 `eject_volume`（先问平台、再退回 umount）。
+    let volumes = app.volumes();
+    if !volumes.is_empty() {
+        panel = panel.child(
+            div()
+                .px(px(10.0))
+                .pb(px(6.0))
+                .pt(px(10.0))
+                .text_size(px(11.0))
+                .text_color(crate::theme::muted())
+                .child(text!("位置")),
+        );
+    }
+    for (ix, vol) in volumes.into_iter().enumerate() {
+        let label = vol.name.clone();
+        let path = vol.path.clone();
+        let is_active = current.as_deref() == Some(path.as_path());
+        let app_click = app.clone();
+        let app_eject = app.clone();
+        let entity_click = entity.clone();
+        let entity_eject = entity.clone();
+        let target = path.clone();
+        let eject_target = path.clone();
+
+        let mut item = div()
+            .id(format!("sidebar-vol-{ix}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(crate::theme::text());
+        if is_active {
+            item = item.bg(crate::theme::accent());
+        } else {
+            item = item.hover(|s| s.bg(crate::theme::hover_bg()));
+        }
+        item = item.child(crate::icons::icon(
+            crate::icons::HARD_DRIVE,
+            16.0,
+            crate::theme::text(),
+        ));
+        item = item.child(div().flex_1().min_w_0().truncate().child(text!(label)));
+        item.interactivity().on_click(move |_, _window, cx| {
+            let app = app_click.clone();
+            let target = target.clone();
+            let entity = entity_click.clone();
+            cx.spawn(async move |cx| {
+                if let Err(e) = app.open_local(&target).await {
+                    entity.update(cx, |v, cx| {
+                        v.notice(format!("打开卷宗失败：{e}"), None, cx);
+                    });
+                }
+                entity.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+        // 行尾「推出」。同样要 `stop_propagation()`，否则会把上面「打开」也触发。
+        let mut eject = div()
+            .id(format!("sidebar-vol-eject-{ix}"))
+            .ml_auto()
+            .flex_shrink_0()
+            .rounded(px(4.0))
+            .hover(|s| s.bg(crate::theme::hover_bg()));
+        eject.interactivity().on_click(move |_, _window, cx| {
+            cx.stop_propagation();
+            let app_eject = app_eject.clone();
+            let entity_eject = entity_eject.clone();
+            let eject_target = eject_target.clone();
+            cx.spawn(async move |cx| {
+                if let Err(e) = app_eject.eject_volume(eject_target).await {
+                    entity_eject.update(cx, |v, cx| {
+                        v.notice(format!("推出失败：{e}"), None, cx);
+                    });
+                }
+                entity_eject.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        });
+        panel = panel.child(item.child(eject.child(crate::icons::icon(
             crate::icons::POWER,
             14.0,
             crate::theme::muted(),

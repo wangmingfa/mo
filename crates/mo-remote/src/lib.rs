@@ -20,8 +20,9 @@
 //! * Windows：`\\server\share` 驱动器号
 //!
 //! 文件管理器里「挂载后当本地目录浏览」才是正确解法——它顺带免掉了凭据管理、
-//! 断点续传、Kerberos 这一整套。因此 SMB / NFS 的计划是**发现 + 触发系统挂载**，
-//! 而不是在进程里实现协议。见 `devlog/` 里 Roadmap 第四阶段的记录。
+//! 断点续传、Kerberos 这一整套。因此 SMB / NFS 走 [`mount`]：发现已挂载的网络盘、
+//! 触发系统挂载，而不是在进程里实现协议——挂好之后就是个本地目录，读写全走
+//! `LocalFileSystem`（见 `devlog/` 里 Roadmap 第四阶段的记录）。
 //!
 //! ## FTP 为什么是第一个
 //!
@@ -42,6 +43,7 @@
 //! 刚好一致（见 `mo_fs::FileSystem::read_dir_blocking`）。
 
 pub mod ftp;
+pub mod mount;
 pub mod sftp;
 mod url;
 pub mod webdav;

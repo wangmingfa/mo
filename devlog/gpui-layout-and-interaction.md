@@ -392,3 +392,50 @@
   单字符，网格与画廊各跑一遍（两者共用 `grid::cell`，用户就是先看到网格再看到画廊的），
   量出「单元相对 list 左上各留 12pt」「长名字不溢出单元」「短名字收缩到内容宽且相对
   单元居中」。
+* **同一处留白也补给了列表视图**（`file_list.rs` 的 `.px(12)` → `.p(12)`）：行 hover
+  与选中底色原本上下贴边。断言 `app::tests::file_list_rows_are_inset_from_the_edges`
+  与网格那条共用 `seed_window`（放 in-crate 而不是 `tests/layout.rs` 的原因见
+  [engine-testing §6](engine-testing.md)）。
+
+## 26. headless 测试的「真 IO + 确定性调度器」冲突：`not deterministic` 与 SIGABRT 同源（2026-09-22）
+
+* 症状：`cargo test` 偶发红，panic 落在 `gpui-pre-scheduler-*/src/test_scheduler.rs`：
+
+  ```
+  Detected activity on thread Some("tokio-rt-worker") ThreadId(18), but test scheduler
+  is running on Some("file_list_height_tracks_the_window") ThreadId(4). Your test is not
+  deterministic.
+  ```
+
+  同一轮日志里往往还能看到第二句 `assertion left == right failed: local task dropped by a
+  thread that didn't spawn it. Task spawned at crates/mo-ui/src/app.rs:803`，紧跟
+  `panic in a destructor during cleanup` → 整个测试二进制 SIGABRT。
+* **两者是同一条链，不是一个 bug 的两个症状**：`assert_correct_thread` 并不当场抛，
+  它把 `non_determinism_error` 记下来，等 `end_test()` 才 panic；这个 panic 走 unwind，
+  期间 `RootView::new` 里 `.detach()` 的 `tab_loop`（`app.rs:803`）被 tokio 线程 drop
+  → `executor.rs` 的 `Checked::drop` 断言「谁生谁销」不成立 → destructor 里二次 panic
+  → abort。**修掉第一句，第二句和 SIGABRT 一起消失。**
+* 根因：`AppState::new()` / `RootView::new` 会 `spawn_blocking` 去读**真实目录**，读完由
+  tokio 的 worker 线程唤醒 GPUI 任务；而 TestScheduler 规定「唤醒必须来自跑测试的那个
+  线程」。真机没这问题——GPUI 事件循环本身就在 OS 主线程。
+* **修法**（官方豁免开关，一行，放在建 `AppState` / `RootView` **之前**）：
+
+  ```rust
+  cx.dispatcher.allow_parking();
+  ```
+
+  `TestAppContext.dispatcher` 是 `#[doc(hidden)] pub`；`allow_parking()` 把
+  `parking_allowed_once` 置位，此后 `assert_correct_thread` 直接 `return`（该标志
+  **不复位**，所以一次调用覆盖整条用例）。
+* **它不削弱任何布局断言**：`run_until_parked()` 就是 `while tick() {}`，从不经过
+  `park()`，执行时序完全不变；被关掉的只有那道线程检查。
+* 边界（别用错）：`allow_parking` 只消除**误报**，并不能让你「等」到外部 IO 完成——
+  「点了按钮真的走了哪个后端」这类**断言异步副作用**的用例仍不能放 headless UI 层，
+  要继续下沉到 `mo-app` 的语义测试（见 [engine-testing](engine-testing.md)）。
+* 实测（同一台机器，`cargo test -p mo-ui --test layout`，4 并发 × 3 波）：
+  **加之前 5/12 命中 `not deterministic`（其中 1 次直接 FAILED）→ 加之后 12/12 全绿**；
+  单进程 `cargo test --all-features`（含全部 crate）连跑 8 次全绿。
+* ⚠️ 排查纪律：先用 `git stash` 二分确认不是你引入的**真**回归（真回归的断言会打印真实
+  尺寸数字），再决定要不要 `allow_parking`。另外 `mo-ui/src/app.rs` 里还有 ~25 处单测
+  直接 `TestAppContext::single()` + `AppState::new()`，暴露面理论上相同；单独加压
+  60 次只翻过 1 次且 48 次连跑复现不出（疑似 4 进程并发时踩共享夹具），**暂未改**。

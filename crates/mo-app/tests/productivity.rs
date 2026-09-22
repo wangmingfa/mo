@@ -81,7 +81,10 @@ fn delete_selection_removes_the_file() {
             .id;
         app.select(id).await;
 
-        let ids = app.delete_selection().await;
+        let ids = app
+            .delete_selection()
+            .await
+            .expect("本地删除应当走回收站成功");
         assert_eq!(ids.len(), 1, "应提交一条删除操作");
 
         // 删除走回收站：原路径消失但文件被保留在回收站。
@@ -121,7 +124,7 @@ fn history_records_executed_operations() {
             .unwrap()
             .id;
         app.select(id).await;
-        app.delete_selection().await;
+        let _ = app.delete_selection().await;
         let snap = app.history_snapshot();
         assert!(snap.iter().any(|h| h.kind == "删除"));
     });
@@ -143,7 +146,7 @@ fn undo_restores_a_deleted_file_from_trash() {
         let id = entries.iter().find(|e| e.path == target).unwrap().id;
         app.select(id).await;
 
-        app.delete_selection().await;
+        let _ = app.delete_selection().await;
         wait_for(|| !target.exists()).await;
         assert!(!target.exists(), "删除后原路径应消失");
         assert!(app.can_undo(), "删除后应可撤销");
@@ -173,7 +176,7 @@ fn trash_list_purge_and_empty() {
             .unwrap()
             .id;
         app.select(id).await;
-        app.delete_selection().await;
+        let _ = app.delete_selection().await;
         wait_for(|| app.trash_count() == 1).await;
         assert_eq!(app.trash_count(), 1);
         let list = app.trash_list();
@@ -193,7 +196,7 @@ fn trash_list_purge_and_empty() {
             .unwrap()
             .id;
         app.select(id).await;
-        app.delete_selection().await;
+        let _ = app.delete_selection().await;
         wait_for(|| app.trash_count() == 1).await;
         app.empty_trash();
         wait_for(|| app.trash_count() == 0).await;

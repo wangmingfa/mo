@@ -188,6 +188,10 @@ pub(crate) enum CommandId {
     ConnectServer,
     /// 断开当前远程连接，回到本地浏览。
     DisconnectServer,
+    /// 在系统的文件管理器里显示（macOS = 在访达中显示）：平台没实现时不进目录。
+    RevealInFileManager,
+    /// 把选中项交给**系统**废纸篓（不可逆；平台没实现时不进目录）。
+    RecycleToSystem,
     /// 在当前目录查找重复文件。
     FindDuplicates,
     /// 文件夹同步面板。
@@ -468,6 +472,22 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             category: "排序".to_string(),
         },
     ];
+    // 平台原生的那两条（在访达中显示 / 移到系统废纸篓）：**没有实现的平台不列**
+    // ——列出来点了只会报「不支持」，不如不出现。
+    if mo_platform::supports_reveal() {
+        out.push(CmdDef {
+            id: CommandId::RevealInFileManager,
+            title: format!("{}（选中项 / 当前目录）", mo_platform::reveal_label()),
+            category: "操作".to_string(),
+        });
+    }
+    if mo_platform::supports_trash() {
+        out.push(CmdDef {
+            id: CommandId::RecycleToSystem,
+            title: "移到系统废纸篓（选中项）".to_string(),
+            category: "操作".to_string(),
+        });
+    }
     for (i, u) in users.iter().enumerate() {
         out.push(CmdDef {
             id: CommandId::User(i),
@@ -504,6 +524,26 @@ fn filtered_commands_in(
                 || c.category.to_lowercase().contains(&q)
         })
         .map(|c| c.id)
+        .collect()
+}
+
+/// 「选择其他应用…」的选择器：复用命令面板的那层壳（输入即过滤 + ↑↓ + Enter），
+/// 只是列表从「命令」换成了「应用」。
+///
+/// macOS 没有 Windows `openas` 那样的系统对话框，所以 Mo 自己列一份。
+pub(crate) struct AppPicker {
+    /// 要拿应用打开的**那个文件**。
+    pub path: PathBuf,
+    /// 系统推荐的在前（LaunchServices 给的候选），其余已装应用在后，已去重。
+    pub apps: Vec<mo_app::shell::OpenWithApp>,
+}
+
+/// 选择器的过滤：应用名命中即可（大小写不敏感）。
+fn filtered_apps(q: &str, apps: &[mo_app::shell::OpenWithApp]) -> Vec<mo_app::shell::OpenWithApp> {
+    let q = q.trim().to_lowercase();
+    apps.iter()
+        .filter(|a| q.is_empty() || a.name.to_lowercase().contains(&q))
+        .cloned()
         .collect()
 }
 
@@ -614,6 +654,8 @@ pub struct RootView {
     pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
     /// 「打开方式」二级菜单的候选应用（菜单打开时对文件目标异步查询注册表）。
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
+    /// 「选择其他应用…」的选择器（复用命令面板的那层壳，见 [`AppPicker`]）。
+    pub(crate) app_picker: Option<AppPicker>,
     /// 「打开方式」二级菜单是否展开（hover 驱动）。
     pub(crate) ctx_submenu_open: bool,
     /// 「连接到服务器」对话框的地址输入框（对话框开着期间存在，见 `sync_connect_input`）。
@@ -746,6 +788,7 @@ impl RootView {
             header_cells_owner: (0, 0),
             context_menu: None,
             open_with_apps: Vec::new(),
+            app_picker: None,
             ctx_submenu_open: false,
             connect_input: None,
             connect_sub: None,
@@ -1973,6 +2016,55 @@ impl RootView {
                     v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
                 });
             }
+        })
+        .detach();
+    }
+
+    /// 命令面板当前列表的长度——借给「选择其他应用…」时是应用列表。
+    fn palette_len(&self) -> usize {
+        match &self.app_picker {
+            Some(p) => filtered_apps(&self.cmd_query, &p.apps).len(),
+            None => {
+                filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows).len()
+            }
+        }
+    }
+
+    /// 打开「选择其他应用…」的选择器（macOS）。
+    ///
+    /// 复用命令面板那层壳：输入即过滤、↑↓ 移动、Enter 用选中的应用打开。
+    /// 列表是异步加载的（LaunchServices + 扫 `/Applications`，都是 IO），
+    /// 所以先把空壳摆上、加载完再填——与「打开方式」二级菜单同一个套路。
+    fn open_app_picker(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.modal = Modal::CommandPalette;
+        self.cmd_query.clear();
+        self.palette_index = 0;
+        self.app_picker = Some(AppPicker {
+            path: path.clone(),
+            apps: Vec::new(),
+        });
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            // 系统推荐的排前面，其余已装应用补在后面（同一个 App 不列两遍）。
+            let mut apps = app.open_with_candidates(&path).await;
+            let mut seen: std::collections::HashSet<String> =
+                apps.iter().map(|a| a.progid.clone()).collect();
+            for a in app.installed_apps().await {
+                if seen.insert(a.progid.clone()) {
+                    apps.push(a);
+                }
+            }
+            this.update(cx, |v, cx| {
+                // 一个都列不出来时别留个「无匹配」的空壳骗人——如实说。
+                if apps.is_empty() {
+                    v.app_picker = None;
+                    v.modal = Modal::Info("没有找到可以打开它的应用".to_string());
+                } else if let Some(p) = v.app_picker.as_mut() {
+                    p.apps = apps;
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -3245,8 +3337,15 @@ impl RootView {
             }
             "file.trash" => {
                 let app = self.app();
-                cx.spawn(async move |_weak, _cx| {
-                    app.delete_selection().await;
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    // 远程删除可能真失败（连接断了 / 没权限）：必须回显，
+                    // 否则用户只看到「条目还在」，以为没删掉是因为没点上。
+                    if let Err(e) = app.delete_selection().await {
+                        this.update(cx, |v, cx| {
+                            v.notice(format!("删除失败：{e}"), None, cx);
+                        });
+                    }
                 })
                 .detach();
             }
@@ -4234,6 +4333,12 @@ impl RootView {
             Some((p, d)) => (Some(p), d),
             None => (None, true),
         };
+        // 本机专属动作（在访达中显示 / 移到系统废纸篓）要不要出现，就看这一刻
+        // 是不是在看远程——菜单里的可见性必须在**打开时**定下来（之后列表可能变）。
+        let remote = self
+            .panel_at(pane, tab)
+            .map(|p| p.app.browsing_remote())
+            .unwrap_or(false);
         self.context_menu = Some(crate::context_menu::ContextMenu {
             x,
             y,
@@ -4241,6 +4346,7 @@ impl RootView {
             is_dir,
             selected: paths.len(),
             paths,
+            remote,
         });
         self.ctx_submenu_open = false;
 
@@ -4370,8 +4476,13 @@ impl RootView {
                 .detach();
             }
             A::OpenWithOther => {
-                // 系统的「打开方式」选择对话框（openas 动词）。
+                // 选一个不在候选里的应用：macOS 没有系统对话框，走 Mo 自己的选择器；
+                // Windows 有 `openas` 动词，用系统的。
                 let Some(p) = target else { return };
+                if mo_app::AppState::has_app_picker() {
+                    self.open_app_picker(p, cx);
+                    return;
+                }
                 let app = self.app();
                 let this = cx.entity().clone();
                 cx.spawn(async move |_weak, cx| {
@@ -4454,8 +4565,41 @@ impl RootView {
             }
             A::Trash => {
                 let app = self.app();
-                cx.spawn(async move |_weak, _cx| {
-                    app.delete_selection().await;
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    if let Err(e) = app.delete_selection().await {
+                        this.update(cx, |v, cx| {
+                            v.notice(format!("删除失败：{e}"), None, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+            A::SystemTrash => {
+                // 交给系统废纸篓：不可逆、不进回收站面板，所以**不**入撤销栈
+                // （`delete_selection` 那条路才会压 `Reversible::Delete`）。
+                let app = self.app();
+                let this = cx.entity().clone();
+                let paths = menu.paths.clone();
+                cx.spawn(async move |_weak, cx| {
+                    if let Err(e) = app.recycle_to_system(paths).await {
+                        this.update(cx, |v, cx| {
+                            v.notice(format!("移到系统废纸篓失败：{e}"), None, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+            A::RevealInFileManager => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                let paths = menu.paths.clone();
+                cx.spawn(async move |_weak, cx| {
+                    if let Err(e) = app.reveal_in_file_manager(paths).await {
+                        this.update(cx, |v, cx| {
+                            v.notice(format!("显示失败：{e}"), None, cx);
+                        });
+                    }
                 })
                 .detach();
             }
@@ -4725,7 +4869,7 @@ impl Render for RootView {
             | Modal::Theme
             | Modal::Layout
             | Modal::CommandPalette => {
-                let mut row = div().flex().flex_row().flex_1().min_w_0();
+                let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
                 if self.ui.sidebar {
                     // 浏览远程时**不给「当前位置」**：远程绝对路径和本地路径在字符串上
@@ -5295,7 +5439,7 @@ fn handle_modal_key(
                 cx.notify();
             }),
             "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows).len();
+                let n = v.palette_len();
                 if n > 0 {
                     v.palette_index = (v.palette_index + 1).min(n - 1);
                 }
@@ -5724,12 +5868,45 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
         v.search_results.clear();
         v.diff_cache = None;
         v.palette_index = 0;
+        // 选择器的壳借的是命令面板：一起收掉，否则下次打开面板还是「打开方式」。
+        v.app_picker = None;
         cx.notify();
     });
 }
 
 /// 命令面板回车：执行选中的命令。
 fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
+    // 借这层壳的是「选择其他应用…」时，Enter = 用选中的应用打开那个文件。
+    let picked = entity.update(cx, |v, _cx| {
+        let picker = v.app_picker.as_ref()?;
+        let chosen = filtered_apps(&v.cmd_query, &picker.apps)
+            .get(v.palette_index)
+            .cloned()?;
+        Some((chosen.progid, picker.path.clone()))
+    });
+    if let Some((progid, path)) = picked {
+        let app = entity.update(cx, |v, _cx| v.app());
+        let this = entity.clone();
+        cx.spawn(async move |cx| {
+            if let Err(e) = app.open_with_app(&path, &progid).await {
+                this.update(cx, |v, cx| {
+                    v.modal = Modal::Info(format!("打开失败：{e}"));
+                    cx.notify();
+                });
+            } else {
+                this.update(cx, |v, cx| {
+                    v.modal = Modal::None;
+                    v.app_picker = None;
+                    v.cmd_query.clear();
+                    v.palette_index = 0;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        return;
+    }
+
     let (id, app) = entity.update(cx, |v, _cx| {
         let id = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows)
             .get(v.palette_index)
@@ -5854,6 +6031,56 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 if let Some(p) = v.panel().path.clone() {
                     app.remove_bookmark(&p);
                 }
+                v.cmd_query.clear();
+                v.palette_index = 0;
+                cx.notify();
+            });
+        }
+        Some(CommandId::RevealInFileManager) => {
+            // 没选中就定位**当前目录**——命令面板不像右键那样一定有对象。
+            entity.update(cx, |v, cx| {
+                let app = v.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    let mut paths = app.selection_paths().await;
+                    if paths.is_empty() {
+                        paths = app.current_path().await.into_iter().collect();
+                    }
+                    if let Err(e) = app.reveal_in_file_manager(paths).await {
+                        this.update(cx, |v, cx| {
+                            v.notice(
+                                format!("{}失败：{e}", mo_platform::reveal_label()),
+                                None,
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
+                v.cmd_query.clear();
+                v.palette_index = 0;
+                cx.notify();
+            });
+        }
+        Some(CommandId::RecycleToSystem) => {
+            entity.update(cx, |v, cx| {
+                let app = v.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    let paths = app.selection_paths().await;
+                    if paths.is_empty() {
+                        this.update(cx, |v, cx| {
+                            v.notice("没有选中任何条目".to_string(), None, cx);
+                        });
+                        return;
+                    }
+                    if let Err(e) = app.recycle_to_system(paths).await {
+                        this.update(cx, |v, cx| {
+                            v.notice(format!("移到系统废纸篓失败：{e}"), None, cx);
+                        });
+                    }
+                })
+                .detach();
                 v.cmd_query.clear();
                 v.palette_index = 0;
                 cx.notify();
@@ -6112,7 +6339,7 @@ async fn run_command(id: CommandId, app: &AppState) {
         CommandId::SelectAll => app.select_all_visible().await,
         CommandId::ClearSelection => app.clear_selection().await,
         CommandId::DeleteSelection => {
-            app.delete_selection().await;
+            let _ = app.delete_selection().await;
         }
         CommandId::SortName => sort_via_command(app, SortKey::Name).await,
         CommandId::SortSize => sort_via_command(app, SortKey::Size).await,
@@ -6165,6 +6392,8 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::ToggleZebra
         | CommandId::ConnectServer
         | CommandId::DisconnectServer
+        | CommandId::RevealInFileManager
+        | CommandId::RecycleToSystem
         | CommandId::User(_) => {}
     }
 }
@@ -6348,7 +6577,12 @@ fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
 // ---------- 模态卡片渲染 ----------
 
 impl RootView {
-    fn render_command_palette(&self, entity: &Entity<RootView>) -> impl IntoElement {
+    /// 命令面板。macOS 的「选择其他应用…」借这层壳（列表换成应用），
+    /// 所以返回类型统一成 `AnyElement`。
+    fn render_command_palette(&self, entity: &Entity<RootView>) -> AnyElement {
+        if let Some(picker) = &self.app_picker {
+            return self.render_app_picker(entity, picker);
+        }
         let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
         let idx = self.palette_index;
         let mut body = div()
@@ -6394,6 +6628,61 @@ impl RootView {
             body,
             "↑↓ 选择 · Enter 执行 · Esc 关闭（⌘⇧P 打开）",
         )
+        .into_any_element()
+    }
+
+    /// 「选择其他应用…」的选择器：与命令面板同一层壳，只是列表是应用。
+    ///
+    /// 系统推荐的（LaunchServices 候选）排在已装应用前面，所以多数时候
+    /// 想要的那个就在头几行——输入名字可以进一步过滤。
+    fn render_app_picker(&self, entity: &Entity<RootView>, picker: &AppPicker) -> AnyElement {
+        let list = filtered_apps(&self.cmd_query, &picker.apps);
+        let idx = self.palette_index;
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .overflow_y_scrollbar()
+            .h(px(360.0));
+        for (i, a) in list.iter().enumerate() {
+            let selected = i == idx;
+            let row = div()
+                .id(format!("app-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(6.0))
+                .bg(if selected {
+                    theme::selected_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_color(if selected {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                })
+                .child(text!(a.name.clone()));
+            body = body.child(row);
+        }
+        if list.is_empty() {
+            // 列表还没加载完（异步扫目录）与「真的没有」要分开说，否则看着像坏了。
+            let msg = if picker.apps.is_empty() {
+                "正在查找应用…"
+            } else {
+                "无匹配应用"
+            };
+            body = body.child(text!(msg.to_string()));
+        }
+        dialog_overlay(
+            entity,
+            "打开方式",
+            &format!("🔍 {}", self.cmd_query),
+            body,
+            "↑↓ 选择 · Enter 打开 · Esc 取消",
+        )
+        .into_any_element()
     }
 
     fn render_global_search(&self, _entity: &Entity<RootView>) -> Div {
@@ -7046,10 +7335,15 @@ fn commit_properties(entity: &Entity<RootView>, cx: &mut App) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    cx.spawn(async move |_cx| {
+    let this = entity.clone();
+    cx.spawn(async move |cx| {
         if !p.name.is_empty() && p.name != old_name {
             let to = p.path.with_file_name(&p.name);
-            app.rename_many(vec![(p.path.clone(), to)]).await;
+            if let Err(e) = app.rename_many(vec![(p.path.clone(), to)]).await {
+                this.update(cx, |v, cx| {
+                    v.notice(format!("重命名失败：{e}"), None, cx);
+                });
+            }
         }
         // 权限按修改后的位应用（路径可能已变，但权限属于同一个 inode）。
         let target = p.path.with_file_name(&p.name);
@@ -7065,7 +7359,10 @@ fn commit_properties(entity: &Entity<RootView>, cx: &mut App) {
 fn commit_rename(entity: &Entity<RootView>, cx: &mut App) {
     let (spec, paths) = entity.update(cx, |v, _cx| (v.rename_spec.clone(), v.rename_paths.clone()));
     let app = entity.update(cx, |v, _cx| v.app());
-    cx.spawn(async move |_cx| {
+    let this = entity.clone();
+    // 闭包参数必须叫 `cx`：里面 `this.update(cx, ..)` 用的是**闭包自己的** cx，
+    // 写成 `_cx` 会捕获到外层那个 `&mut App`，进而要求它活到 'static（E0521）。
+    cx.spawn(async move |cx| {
         let names: Vec<String> = paths
             .iter()
             .map(|p| {
@@ -7090,7 +7387,11 @@ fn commit_rename(entity: &Entity<RootView>, cx: &mut App) {
                 }
             })
             .collect();
-        app.rename_many(pairs).await;
+        if let Err(e) = app.rename_many(pairs).await {
+            this.update(cx, |v, cx| {
+                v.notice(format!("重命名失败：{e}"), None, cx);
+            });
+        }
     })
     .detach();
     close_modal(entity, cx);
@@ -7136,8 +7437,31 @@ mod tests {
     use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
-    use super::{ConnectAuthState, Modal, RootView};
+    use super::{filtered_apps, ConnectAuthState, Modal, RootView};
     use crate::panel::Panel;
+
+    /// 「选择其他应用…」的过滤：应用名大小写不敏感命中，空查询全给。
+    ///
+    /// 命令面板的过滤函数管不到这条——列表换成了应用，过滤逻辑是另一份
+    /// （`filtered_apps`），得自己有人守。
+    #[test]
+    fn app_picker_filters_by_name_case_insensitively() {
+        let apps = vec![
+            mo_app::shell::OpenWithApp {
+                name: "TextEdit".to_string(),
+                progid: "/System/Applications/TextEdit.app".to_string(),
+            },
+            mo_app::shell::OpenWithApp {
+                name: "预览".to_string(),
+                progid: "/System/Applications/Preview.app".to_string(),
+            },
+        ];
+        assert_eq!(filtered_apps("", &apps).len(), 2, "空查询应当全给");
+        let hit = filtered_apps("text", &apps);
+        assert_eq!(hit.len(), 1, "大小写不敏感地命中 TextEdit");
+        assert_eq!(hit[0].name, "TextEdit");
+        assert!(filtered_apps("vscode", &apps).is_empty());
+    }
 
     /// 进入地址栏编辑态：路径要**预填**，且内容要**整条被选中**。
     ///
@@ -8458,31 +8782,8 @@ mod tests {
             let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
             let root = root.clone();
 
-            // 直接塞两个假条目再切视图：可见范围已被 `Panel::covered` 命中，
-            // `ensure_window` 不会派生取窗任务把这份快照冲掉。
             // 一条名字很长（验证截断不溢出），一条只有一个字符（验证真的收缩到内容宽）。
-            cx.update(|_window, cx| {
-                root.update(cx, |v, cx| {
-                    let p = v.panel_mut();
-                    p.view_mode = mode;
-                    p.path = Some(PathBuf::from("/mo-grid-test"));
-                    p.window_start = 0;
-                    p.window = ["一个很长名字的文件夹，用来同时验证截断与居中", "b"]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            mo_core::Entry::new(
-                                mo_core::FileId::new(0, i as u128),
-                                name.to_string(),
-                                mo_core::EntryKind::Directory,
-                                PathBuf::from(format!("/mo-grid-test/{i}")),
-                            )
-                        })
-                        .collect();
-                    p.visible_count = p.window.len();
-                    cx.notify();
-                })
-            });
+            cx.update(|_window, app| seed_window(&root, app, mode));
             cx.update(|window, cx| window.render_frame(cx));
 
             let grid = cx
@@ -8539,5 +8840,73 @@ mod tests {
                 f32::from(cell1.size.width)
             );
         }
+    }
+
+    /// 在面板里放几个假条目（网格 / 画廊 / 列表三条布局断言共用）。
+    ///
+    /// 不读真实 Home：headless 里那趟异步加载落不落地是不确定的（gpui 的非确定性
+    /// 检测还会因此偶发 panic），而且换台机器目录内容就变了。直接写窗口快照——
+    /// 范围已被 `Panel::covered` 命中，`ensure_window` 不会派生取窗任务把它冲掉。
+    fn seed_window(
+        root: &gpui_kit::Entity<RootView>,
+        cx: &mut gpui_kit::App,
+        mode: crate::panel::ViewMode,
+    ) {
+        root.update(cx, |v, cx| {
+            let p = v.panel_mut();
+            p.view_mode = mode;
+            p.path = Some(PathBuf::from("/mo-layout-test"));
+            p.window_start = 0;
+            p.window = ["一个很长名字的文件夹，用来同时验证截断与居中", "b"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    mo_core::Entry::new(
+                        mo_core::FileId::new(0, i as u128),
+                        name.to_string(),
+                        mo_core::EntryKind::Directory,
+                        PathBuf::from(format!("/mo-layout-test/{i}")),
+                    )
+                })
+                .collect();
+            p.visible_count = p.window.len();
+            cx.notify();
+        })
+    }
+
+    /// 列表视图的行也要留出四周的呼吸空间：首行不顶表头、左右不贴窗口边缘。
+    ///
+    /// 与 `grid_and_gallery_inset_content_and_center_names` 同源——`uniform_list`
+    /// 的 padding 四个方向都吃（top 加到条目起点、上下算进滚动内容高度、左右扣
+    /// 可用宽度），所以留白挂在 list 上就够，不必每行自己加。
+    #[test]
+    fn file_list_rows_are_inset_from_the_edges() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, app| seed_window(&root, app, crate::panel::ViewMode::List));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let list = cx
+            .debug_bounds("mo-file-list")
+            .expect("列表视图没有渲染（view_mode 没切过去？）");
+        let row = cx
+            .debug_bounds("mo-file-row-0")
+            .expect("第一行没有渲染（条目没进窗口快照？）");
+
+        let left = f32::from(row.origin.x - list.origin.x);
+        let top = f32::from(row.origin.y - list.origin.y);
+        assert!(
+            (left - 12.0).abs() < 0.51,
+            "列表左侧留白 {left}，应为 12：行的 hover 底色顶到窗口边缘了"
+        );
+        assert!(
+            (top - 12.0).abs() < 0.51,
+            "列表顶部留白 {top}，应为 12：首行顶着表头了"
+        );
     }
 }

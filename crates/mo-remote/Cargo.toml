@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 mo-core.workspace = true
+# 挂载点放在应用数据目录下（SMB / NFS 走系统挂载，见 `mount` 模块）。
+dirs.workspace = true
 mo-fs.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

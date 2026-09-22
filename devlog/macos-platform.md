@@ -39,3 +39,55 @@
 ## 6. unsafe 的收敛
 
 * **约定**：`icon.rs` 是全仓唯一 FFI 层，模块级 `#![allow(unsafe_code)]` + 每处 `unsafe` 带 SAFETY 注释；workspace `rust.unsafe_code = "warn"` 保证新 unsafe 出现在别处会告警。
+
+## 7. `Class::get("NSThread")` 返回 None —— 框架没链接
+
+* **现象**：`mo-platform` 的裸二进制（example）一跑就 panic 在 `.unwrap()`，Mac 上明明有 `NSThread`。
+* **根因**：`objc` 只链接了 `libobjc`；Foundation / AppKit 的类是**按需加载**的，没有链接指令就没人把它们加载进进程，`Class::get` 自然查不到。App 里（Mo 本体）碰巧因为 gpui 依赖 cocoa 已经拉进来了，所以同一份代码只在**裸二进制**里炸。
+* **修法**：显式声明
+  ```rust
+  #[link(name = "Foundation", kind = "framework")]
+  extern "C" {}
+  #[link(name = "AppKit", kind = "framework")]
+  extern "C" {}
+  ```
+* **顺带**：`Class::get(...).unwrap()` 这种写法本身就不该留在业务路径上——类拿不到时应当 `Err(PlatformError::Failed)`（`class()` 辅助），否则一次「系统缺了某个类」就把整个进程带走。
+
+## 8. 回收站：`NSWorkspace.recycleURLs:` 换来一片沉默，换成 `NSFileManager`
+
+* **现象**：`recycleURLs:completionHandler:` 返回 NO（文件没动），拿不到任何原因。
+* **根因**：它是**异步** API（结果走 completionHandler、还要主线程 run loop 配合），在后台任务 / 裸二进制里传 nil handler 就只剩一个 NO。
+* **修法**：改用同步的 `NSFileManager.trashItemAtURL:resultingItemURL:error:`——不挑线程、直接给 `NSError`，能把系统的原话（「宗卷不支持废纸篓」这类只有系统知道的原因）带回给用户。
+* **注意**：错误信息要走 `NSError.localizedDescription`（`UTF8String` 取），别自己猜原因。
+
+## 9. AppKit 调用必须回主线程，于是有了死锁的前提
+
+* **约束**：`NSWorkspace`（在访达中显示 / 推出卷宗）是 AppKit 的，要求主线程。Mo 的后台任务都在 tokio worker 上，所以 `on_main_thread` 会判 `NSThread.isMainThread`，不是主线程就 `dispatch_sync` 到主队列。
+* **坑**：`dispatch_sync(主队列)` 要**主线程正在 drain 主队列**才回得来。Mo 本体没问题（主线程在跑 GPUI 事件循环），但 **`cargo test` 里主线程被 `block_on` 占着**，测试一调就挂死（表现为 SIGTERM / 超时，没有任何 panic）。
+* **对策**：自动化测试**不调** AppKit——守卫落在判据本身（`AppState::goes_through_remote` 已是为这个暴露成 pub 的），真机行为用一次性 example 探针验证（跑完即删）。
+
+## 10. 卷宗 / 位置区（2026-09-22）
+
+* 侧边栏加「位置」区：外接磁盘 / DMG / Time Machine 盘。`mo_platform::volumes()` 列 `/Volumes` 下条目，用 `statfs` 的 `f_fstypename` 把网络型（smbfs/nfs/afp/webdav/cifs/ftp…）过滤掉——那些归「网络」区，别两边列同一个盘。
+* `AppState::volumes()` 带 `VOLUME_TTL=5s` 缓存（侧边栏每帧问，裸 `statfs` 逐个查会抖）；`eject_volume()` 先问平台 `eject` 再退回 `mo_remote::mount::unmount`（Mo 自挂目录 AppKit 不认）。行尾「推出」按钮照样 `stop_propagation()`。
+
+## 11. 系统文件图标（2026-09-22）
+
+* `mo_platform::file_icon(path) -> Option<Vec<u8>>`：拿到访达同款真实图标（`.app` 是真 App 图标、文档是所属 App 图标），比内置 Lucide 单色 SVG 准。转 PNG 链路：`NSWorkspace.iconForFile:` → `TIFFRepresentation` → `NSBitmapImageRep` → `representationUsingType:properties:`（`NSPNGFileType = 4`，`properties` 传 `nil`）。
+* 缓存：`AppState::file_icon` 把 PNG 写进 `temp_dir()/mo-icons/<hash>.png`，按路径键、封顶 4000 清空，列表行用 `img(path)` 加载（光栅图没法用文字色描边）。远程页（`browsing_remote()`）直接返 None 退回内置 SVG。
+* ⚠️ **`?` 运算符陷阱（这一轮真踩了）**：`on_main_thread(move || …)` 的闭包若返回 `Option<_>`，里面**不能**写 `workspace()?` / `class(..)?`（那是 `Result`，`?` 要求返回类型是 `Result`）——要 `workspace().ok()?` / `class(..).ok()?`。返回 `Result` 的闭包（`reveal`/`eject`）才直接 `?`。这处编译期才发现，但本轮回合一开始写错、靠通读抓回。
+* 只接了主列表（`file_item::view` 加 `system_icon: Option<PathBuf>` 参数 + `file_list` 调用）；grid / columns 仍是内置 SVG，要一致再补。
+
+## 12. 隐藏文件判据（2026-09-22）
+
+* `mo-fs/src/local.rs` 的 `metadata().permissions.hidden` 之前**写死 `false`**——`.DS_Store`/`.git` 一律显示「不隐藏」，是真 bug。改 `is_hidden(path, m)`：unix 上「文件名以 `.` 开头」**或** `st_flags & 0x8000`（`UF_HIDDEN`，macOS `chflags hidden`）；非 unix 仍 `false`。
+* ⚠️ **`st_flags` 是 macOS-only**：它来自 `std::os::macos::fs::MetadataExt`，**不是** `std::os::unix::fs::MetadataExt`（Linux 的 `stat` 没有 `st_flags` 字段，unix 版 trait 不提供该方法）。所以 `is_hidden` 里 `st_flags()` 必须 `#[cfg(target_os = "macos")]` 限定、import 也只在该分支引入，否则 Linux 编译不过 + macOS 报 unused import。dotfile 判据走 `std::os::unix::ffi::OsStrExt`（unix 全平台），与 `st_flags` 分开。
+* **单测不要 `.expect()` 异步 `metadata()`**：`LocalFileSystem::metadata` 返回 `Pin<Box<dyn Future>>`，同步 `#[test]` 里直接 `.expect()` 是编译错。直接测 `is_hidden(path, &std::fs::metadata(p).unwrap())` 这个纯函数即可（子模块能访问 private fn）。
+* 安全：这个 `hidden` **不参与列表过滤**（列表只看 `ReadDirEntry`，`show_hidden` 配置项也没接过滤），所以改它只修正属性面板、不会突然把用户的 dotfile 藏起来。过滤是另一件事。
+
+## 13. file_icon 在渲染里被调 → 测试死锁（2026-09-22 抓到并修）
+
+* **现象**：给 `file_list` 渲染加 `app.file_icon(path)` 后，整条 `mo-ui` 测试套件**挂死**（之前 23 分钟跑不完，单跑 `file_list_rows_are_inset_from_the_edges` 60s 不过）。根因：`file_icon` 底层 `mo_platform::file_icon` 走 `on_main_thread` → 非主线程时 `dispatch_sync` 回主队列；而 `TestAppContext::single()` 把测试体跑在**子线程**（非 OS 主线程），主队列不 drain → `dispatch_sync` 死锁（和 §9 的 `reveal`/`eject` 同款陷阱，**但 file_icon 在 render 里被调、测试必然触达**，所以比 reveal/eject 更容易踩）。
+* **修法**：`mo-platform` 暴露 `is_main_thread()`（macOS 走 `NSThread.isMainThread`，非 macOS 恒 `true`——非 macOS 那边 `file_icon` 直接返 `None`、无 `dispatch_sync` 死锁）。`AppState::file_icon` 在缓存未命中分支、**调平台之前**加守卫：`if !mo_platform::is_main_thread() { return None; }`——非主线程（测试 / 后台任务）跳过平台调用、回退内置 SVG（系统图标只是视觉加成，不致命）。
+* **为什么安全**：GPUI 事件循环（含渲染）跑在 OS 主线程，真机 `is_main_thread()` 为 `true` → 照常出系统图标；测试把渲染跑在子线程 → `false` → 跳过、不死锁。已验证 `file_list_rows_are_inset_from_the_edges` 从 60s 死锁变 0.06s 通过。
+* **反向验证**：把 `file_list` 里的 `file_icon` 调用临时改成 `None` 重跑，确认布局/图标相关测试行为不变 → 守卫不影响真机路径。

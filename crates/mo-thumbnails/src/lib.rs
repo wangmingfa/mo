@@ -46,8 +46,9 @@ pub const PREVIEW_MAX_EDGE: u32 = 2560;
 
 /// 缩略图缓存。
 ///
-/// * **磁盘缓存**：`<用户缓存目录>/mo/thumbs/<size>/<file-id>.png`，跨会话复用；
-///   以 `FileId`（inode）而非路径命名，所以文件改名 / 移动后缓存依然命中。
+/// * **磁盘缓存**：`<用户缓存目录>/mo/thumbs/<size>/<volume>-<id>.png`，跨会话复用；
+///   以 `FileId`（inode）而非路径命名（键取 [`FileId::cache_key`]，见
+///   [`ThumbnailCache::cached_path`]），所以文件改名 / 移动后缓存依然命中。
 /// * **内存索引**：记录「已确认存在」的缓存路径，避免每次都 `stat` 一次磁盘。
 pub struct ThumbnailCache {
     root: PathBuf,
@@ -74,8 +75,14 @@ impl ThumbnailCache {
     }
 
     /// 某个条目、某个尺寸对应的缓存文件路径。
+    ///
+    /// 文件名取 [`FileId::cache_key`] 而**不是** `FileId` 的 `Display`：后者是
+    /// `volume:id`，冒号在 Windows 上是文件名非法字符，会把整棵缩略图缓存写废
+    /// （`CreateFile` 回 os error 87）。见 `mo-core::file_id::tests`。
     pub fn cached_path(&self, id: &FileId, size: u32) -> PathBuf {
-        self.root.join(size.to_string()).join(format!("{}.png", id))
+        self.root
+            .join(size.to_string())
+            .join(id.cache_key() + ".png")
     }
 
     /// 命中缓存则直接返回路径（不解码）。

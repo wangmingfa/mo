@@ -101,6 +101,25 @@ pub struct AppState {
     stopped: Arc<AtomicBool>,
     /// 全局搜索索引（内存 SQLite）。跨目录搜索的数据源。
     index: Arc<PlMutex<FileIndex>>,
+    /// 「系统里挂了哪些网络盘」的缓存：`(上次查的时刻, 结果)`。
+    ///
+    /// 侧边栏**每帧**都会问一次，而发现是真要去读 `/proc/mounts` 或跑一次 `mount`
+    /// 子进程——每帧一次的子进程会把 UI 拖死。挂载 / 卸载这种事几秒的延迟无所谓，
+    /// 所以按 [`NET_SHARE_TTL`] 缓存（挂载 / 卸载后立刻作废）。
+    net_shares: Arc<std::sync::Mutex<(std::time::Instant, Vec<mo_remote::mount::NetworkShare>)>>,
+    /// 「本机挂了哪些卷宗」的缓存（`mountedVolumeURLs` / 读 `/Volumes`）。
+    ///
+    /// 与 [`AppState::net_shares`] 同一条纪律：侧边栏每帧都问，而卷宗列表要
+    /// `statfs` 逐个查或调 AppKit，缓存 [`VOLUME_TTL`] 省得每帧抖一下。挂载 / 卸载
+    /// 后立刻作废。
+    volumes_cache: Arc<std::sync::Mutex<(std::time::Instant, Vec<mo_platform::Volume>)>>,
+    /// 系统文件图标缓存：路径 → 写好的 PNG 缓存文件路径。
+    ///
+    /// 列表每行都要图标，而「问系统拿图标」（`NSWorkspace.iconForFile:` → 转 PNG）
+    /// 是**重**操作——万条目目录每帧都问会卡死 UI。所以首见才真去问、之后命中。
+    /// 缓存目录在 `temp_dir()/mo-icons`，PNG 文件让 GPUI 的 `img()` 直接加载
+    /// （光栅图没法像内置 SVG 那样用文字色描边）。容量封顶，超出整清空重来。
+    file_icon_cache: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
     /// 中断后台索引爬取的开关。
     index_stop: Arc<AtomicBool>,
     /// 操作历史（轻量环形日志，供「操作历史」面板展示）。
@@ -445,6 +464,12 @@ impl SessionRegistry {
 /// 「闲置」正是服务器掐断连接的时机。判据是 [`RemoteSession::last_used`]。
 const IDLE_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 网络盘发现的缓存有效期（见 `AppState::net_shares`）。
+const NET_SHARE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 卷宗列表的缓存有效期（见 `AppState::volumes_cache`）。
+const VOLUME_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 本进程的会话注册表。
 ///
 /// 与共享 tokio runtime 同理：会话的生命周期就是进程的生命周期——「只有退出应用才
@@ -529,6 +554,16 @@ impl AppState {
             index: Arc::new(PlMutex::new(
                 FileIndex::open_in_memory().expect("open index"),
             )),
+            net_shares: Arc::new(std::sync::Mutex::new((
+                // 起点放到「很久以前」，好让第一次问就真的去查一次。
+                std::time::Instant::now() - NET_SHARE_TTL,
+                Vec::new(),
+            ))),
+            volumes_cache: Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now() - VOLUME_TTL,
+                Vec::new(),
+            ))),
+            file_icon_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             index_stop: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             history: Arc::new(PlMutex::new(Vec::new())),
@@ -785,6 +820,23 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Mo 自己的「打开方式」选择器的数据源：系统里装了哪些应用。
+    ///
+    /// 扫目录是毫秒级但仍是 IO，放 blocking 线程。非 macOS 恒为空。
+    pub async fn installed_apps(&self) -> Vec<shell::OpenWithApp> {
+        self.spawn_blocking(shell::installed_apps)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 本平台有没有 Mo 自己的「打开方式」选择器。
+    ///
+    /// 有的话 UI 走选择器（macOS：系统没有 `openas` 那样的对话框）；
+    /// 没有就退回系统的（Windows 的 `openas` 动词）。
+    pub fn has_app_picker() -> bool {
+        cfg!(target_os = "macos")
+    }
+
     /// 用「打开方式」里选中的应用打开文件。
     pub async fn open_with_app(&self, path: &Path, progid: &str) -> Result<(), String> {
         let p = path.to_path_buf();
@@ -881,9 +933,11 @@ impl AppState {
     /// 解析地址 + 检查协议：两条连接入口共用的前置。
     fn parse_remote(input: &str) -> Result<RemoteUrl, ConnectFailure> {
         let url = RemoteUrl::parse(input).map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        if !mo_remote::supports(&url.scheme) {
+        // SMB / NFS 不走「建远程连接」那条路：它们是**系统挂载**之后当本地目录浏览
+        // 的（见 `mo_remote::mount`），所以要在这里放行，由 `finish_connect` 分流。
+        if !mo_remote::supports(&url.scheme) && !mo_remote::mount::is_mountable(&url.scheme) {
             return Err(ConnectFailure::Message(format!(
-                "暂不支持的协议：{}（目前支持 ftp / sftp / webdav / davs）",
+                "暂不支持的协议：{}（目前支持 ftp / sftp / webdav / davs / smb / nfs）",
                 url.scheme
             )));
         }
@@ -899,6 +953,13 @@ impl AppState {
     /// * 密码变了——真连一次，然后把那条会话的连接与凭据**原地**换掉。编号不变，
     ///   所以侧边栏还是那一行，不会多出一条来。
     async fn finish_connect(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
+        // SMB / NFS：不建远程会话，触发**系统挂载**，然后当本地目录打开。
+        // 挂好之后读写全走 `LocalFileSystem`，所以侧边栏「远程」区也不会多出一行
+        // ——它出现在「网络」区，跟系统挂的其它盘在一起。
+        if mo_remote::mount::is_mountable(&url.scheme) {
+            return self.mount_and_open(url).await;
+        }
+
         if let Some(existing) = self.sessions.find(&url) {
             let id = existing.id;
             let path = url.path.clone();
@@ -965,6 +1026,161 @@ impl AppState {
                 }
                 other => ConnectFailure::Message(other.to_string()),
             })
+    }
+
+    /// 触发系统挂载，然后**当本地目录**打开（SMB / NFS 走这条路）。
+    ///
+    /// 挂载是阻塞的系统调用（可能要等服务器应答），必须在 blocking 池里跑。
+    /// 挂好之后这条连接就不存在「会话」了——它就是个本地目录，卸载由
+    /// [`AppState::unmount_share`] 负责（系统也可能自己卸掉）。
+    async fn mount_and_open(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
+        let point = self
+            .spawn_blocking(move || mo_remote::mount::mount(&url))
+            .await
+            .map_err(|e| ConnectFailure::Message(format!("挂载任务失败：{e}")))?
+            .map_err(|e| ConnectFailure::Message(format!("挂载失败：{e}")))?;
+        self.invalidate_net_shares();
+        self.open_local(&point)
+            .await
+            .map_err(|e| ConnectFailure::Message(format!("打开挂载点失败：{e}")))?;
+        Ok(())
+    }
+
+    /// 系统里已经挂好的**网络盘**（SMB / NFS），供侧边栏「网络」区显示。
+    ///
+    /// 只读（读 `/proc/mounts` 或跑一次 `mount` / `net use`），不发起任何网络操作。
+    pub fn network_shares(&self) -> Vec<mo_remote::mount::NetworkShare> {
+        let mut slot = self.net_shares.lock().unwrap();
+        if slot.0.elapsed() >= NET_SHARE_TTL {
+            *slot = (
+                std::time::Instant::now(),
+                mo_remote::mount::mounted_shares(),
+            );
+        }
+        slot.1.clone()
+    }
+
+    /// 作废网络盘的缓存（挂载 / 卸载之后立刻生效，不必等 TTL 过期）。
+    fn invalidate_net_shares(&self) {
+        self.net_shares.lock().unwrap().0 = std::time::Instant::now() - NET_SHARE_TTL;
+    }
+
+    /// 卸载一块网络盘（侧边栏那个「推出」）。
+    ///
+    /// 顺序：先问**平台**（macOS 走 AppKit 的 `unmountAndEjectDeviceAtURL:`——
+    /// 它会接管「还有文件在用」这类情况，也比直接 `umount` 干净），平台没实现或
+    /// 没做成再退回命令行 `umount`。后者是必需的兜底：Mo 自己挂的 NFS / SMB 落在
+    /// 应用数据目录下的空目录里，系统并不把它当「设备」，AppKit 那套会拒绝。
+    pub async fn unmount_share(&self, path: PathBuf) -> Result<(), MoError> {
+        let native = {
+            let p = path.clone();
+            self.spawn_blocking(move || mo_platform::eject(&p)).await
+        };
+        let r = match native {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                let p = path.clone();
+                self.spawn_blocking(move || mo_remote::mount::unmount(&p))
+                    .await
+                    .map_err(|e| MoError::Other(format!("卸载任务失败：{e}")))?
+                    .map_err(|e| MoError::Other(e.to_string()))
+            }
+        };
+        // 卸了（哪怕失败）列表都该重新查一次。
+        self.invalidate_net_shares();
+        r
+    }
+
+    /// 本机已挂载的**卷宗**（侧边栏「位置」区）：外接磁盘、DMG、Time Machine 盘……
+    ///
+    /// 只读，不发起任何网络操作。网络盘不在这里（归「网络」区，由
+    /// [`AppState::network_shares`] 负责）。按 [`VOLUME_TTL`] 缓存，因为列表要
+    /// `statfs` 逐个查（`mo_platform::volumes` 内已把网络文件系统过滤掉）。
+    pub fn volumes(&self) -> Vec<mo_platform::Volume> {
+        let mut slot = self.volumes_cache.lock().unwrap();
+        if slot.0.elapsed() >= VOLUME_TTL {
+            *slot = (std::time::Instant::now(), mo_platform::volumes());
+        }
+        slot.1.clone()
+    }
+
+    /// 作废卷宗列表缓存（推出 / 挂载之后立刻生效）。
+    fn invalidate_volumes(&self) {
+        self.volumes_cache.lock().unwrap().0 = std::time::Instant::now() - VOLUME_TTL;
+    }
+
+    /// 推出一块本机卷宗（侧边栏「位置」区那个「推出」）。
+    ///
+    /// 与 [`AppState::unmount_share`] 同一条纪律：先问平台（macOS 走 AppKit 的
+    /// `unmountAndEjectDeviceAtURL:`，它会接管「还有窗口在用」这类情况），平台没实现
+    /// 或没做成再退回命令行 `umount`（兜底）。推出后不论成败都作废缓存让列表刷新。
+    pub async fn eject_volume(&self, path: PathBuf) -> Result<(), MoError> {
+        let native = {
+            let p = path.clone();
+            self.spawn_blocking(move || mo_platform::eject(&p)).await
+        };
+        let r = match native {
+            Ok(Ok(())) => Ok(()),
+            _ => {
+                let p = path.clone();
+                self.spawn_blocking(move || mo_remote::mount::unmount(&p))
+                    .await
+                    .map_err(|e| MoError::Other(format!("卸载任务失败：{e}")))?
+                    .map_err(|e| MoError::Other(e.to_string()))
+            }
+        };
+        self.invalidate_volumes();
+        r
+    }
+
+    /// 取一个文件在**系统**里的图标（macOS 走 `NSWorkspace.iconForFile:`）。
+    ///
+    /// 返回的是缓存后的 PNG 文件路径——GPUI 的 `img()` 吃路径。系统图标是光栅图，
+    /// 没法像内置 SVG 那样用文字色描边，所以这里直接出 PNG。缓存按路径键（系统图标
+    /// 由文件类型决定，与内容无关），首见才真去问系统、之后命中。
+    ///
+    /// 当前在看远程时整页都是远程条目，本机没有这些文件，系统给不出图标，返回
+    /// `None`——调用方（列表行）退回内置 SVG 图标。非 macOS 也返回 `None`。
+    ///
+    /// ⚠️ 这是**同步**方法：列表渲染每帧都来要图标，不能 `await`。远程判据用
+    /// [`AppState::browsing_remote`]（按当前页，足够——图标总是当前页的条目）。
+    pub fn file_icon(&self, path: &Path) -> Option<PathBuf> {
+        if self.browsing_remote() {
+            return None;
+        }
+        let mut cache = self.file_icon_cache.lock().unwrap();
+        if let Some(hit) = cache.get(path) {
+            return Some(hit.clone());
+        }
+        // 系统图标要问 AppKit，必须走 OS 主线程（`on_main_thread` 在非主线程会
+        // `dispatch_sync` 回主队列）。GPUI 的渲染就跑在 OS 主线程上，真机没问题；
+        // 但 `cargo test` 的 `TestAppContext` 把渲染跑在子线程、主队列不 drain，
+        // 直接 `dispatch_sync` 会死锁（和 `reveal`/`eject` 同款陷阱）。这种「不在
+        // 主线程」的情况（测试 / 后台任务）跳过平台调用、回退内置 SVG——系统图标
+        // 只是视觉加成，不致命。
+        if !mo_platform::is_main_thread() {
+            return None;
+        }
+        let bytes = mo_platform::file_icon(path)?;
+        // 写进缓存目录，返回路径让 `img()` 加载。
+        let dir = std::env::temp_dir().join("mo-icons");
+        let _ = std::fs::create_dir_all(&dir);
+        let name = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            format!("{:x}.png", h.finish())
+        };
+        let out = dir.join(name);
+        if std::fs::write(&out, &bytes).is_err() {
+            return None;
+        }
+        // 容量封顶：超出整清空，下次重新逐条问（避免无限涨内存）。
+        if cache.len() > 4000 {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), out.clone());
+        Some(out)
     }
 
     /// 「记住的服务器」列表（最近使用的在前）。
@@ -1420,6 +1636,39 @@ impl AppState {
             .iter()
             .find(|e| e.path == path)
             .map(|e| e.kind.is_dir())
+    }
+
+    /// 这条路径**属于当前远程后端吗**——决定文件操作该走远程后端还是本机管线。
+    ///
+    /// 判据是「它是不是当前列表里的那一行」，**不是**「我现在在看远程吗」：
+    /// 去重 / 文件夹同步这类功能会拿着**本地**路径来调同一批 API（`trash_paths`），
+    /// 一刀切会把本地文件当远程路径发给服务器（反过来更常见：在看远程时删本地
+    /// 文件，被送去本机回收站是对的，不该改成远程删除）。
+    ///
+    /// 列表里查得到 = 它就是当前后端列出来的条目；在看远程时即远程条目。
+    /// 判据与 [`AppState::entry_is_dir`] 同源，都不碰本机磁盘。
+    ///
+    /// 对外暴露的原因：平台原生动作（在访达中显示 / 移到系统废纸篓）也按这条分流，
+    /// 上层（UI 的菜单裁剪）与测试都要问同一个问题，别各写一份判据。
+    pub async fn goes_through_remote(&self, path: &Path) -> bool {
+        self.browsing_remote() && self.entry_is_dir(path).await.is_some()
+    }
+
+    /// `dir` 下这个名字已经被占了吗（新建文件夹 / 新建文件去重用）。
+    ///
+    /// 顺序：先问**当前列表**（零 IO，远程条目也答得出来），列表不在这页时再问后端
+    /// ——远程是 `metadata`（网络往返），本地是 `Path::exists()`。
+    /// ⚠️ 不能只用 `Path::exists()`：远程路径在本机不存在，恒返回 `false`，
+    /// 于是「新建文件夹」在远程目录里永远不去重，重名时直接撞服务端的错。
+    async fn name_taken(&self, path: &Path) -> bool {
+        if self.entry_is_dir(path).await.is_some() {
+            return true;
+        }
+        if self.browsing_remote() {
+            self.active_fs().metadata(path).await.is_ok()
+        } else {
+            path.exists()
+        }
     }
 
     /// 当前目录路径。
@@ -2070,15 +2319,63 @@ impl AppState {
         out
     }
 
-    /// 删除选中（无选中则删除聚焦项）：移入回收站（非永久删除），逐条提交到操作队列。
+    /// 删除选中（无选中则删除聚焦项）：本地条目移入回收站，远程条目删在服务端。
     ///
-    /// 因为走回收站，删除天然可撤销——后续 `undo()` 会按原路径从回收站还原。
-    pub async fn delete_selection(&self) -> Vec<u64> {
+    /// 远程删除**不可撤销**（服务端没有回收站），失败时把错误返回给 UI 弹提示。
+    pub async fn delete_selection(&self) -> Result<Vec<u64>, MoError> {
         let paths = self.selection_paths().await;
-        self.trash_paths(paths).await
+        self.delete_paths(paths).await
+    }
+
+    /// 删除一批路径：**逐条**判断该走哪条路（见 [`AppState::goes_through_remote`]）。
+    ///
+    /// * 本地条目 → 回收站（`trash_paths`，可撤销）；
+    /// * 远程条目 → 远程后端的 `remove_file` / `remove_dir`（不可撤销）。
+    pub async fn delete_paths(&self, paths: Vec<PathBuf>) -> Result<Vec<u64>, MoError> {
+        let mut remote = Vec::new();
+        let mut local = Vec::new();
+        for p in paths {
+            if self.goes_through_remote(&p).await {
+                remote.push(p);
+            } else {
+                local.push(p);
+            }
+        }
+        let ids = self.trash_paths(local).await;
+        if !remote.is_empty() {
+            self.delete_remote(remote).await?;
+        }
+        Ok(ids)
+    }
+
+    /// 删掉几条**远程**条目（服务端没有回收站，不可撤销）。
+    ///
+    /// 逐条删，第一条失败就收手并上报：剩下的多半同因（连接断了 / 没权限），
+    /// 继续删只会刷出一串一样的错。删完（或失败后）都要重读——远程没有
+    /// watcher，不重读的话列表里还留着已经不存在的条目。
+    async fn delete_remote(&self, paths: Vec<PathBuf>) -> Result<(), MoError> {
+        let fs = self.active_fs();
+        for p in paths {
+            let is_dir = self.entry_is_dir(&p).await.unwrap_or(false);
+            let result = if is_dir {
+                fs.remove_dir(&p).await
+            } else {
+                fs.remove_file(&p).await
+            };
+            if let Err(e) = result {
+                let _ = self.refresh().await;
+                return Err(e);
+            }
+            self.record_history("删除（远程）", vec![p], None);
+        }
+        self.refresh().await
     }
 
     /// 把**指定**路径逐个移入回收站（可撤销）。
+    ///
+    /// ⚠️ 这是**本机**回收站的路径：调用方给的路径必须是本地的。要「按路径自己
+    /// 判断走哪条路」请用 [`AppState::delete_paths`]——去重 / 同步的待删副本
+    /// 就是本地路径，它们照旧走这里，不该被当成远程条目发给服务器。
     ///
     /// 与 `delete_selection` 同一条流水线，只是不走选择模型——重复文件清理
     /// 要删的是「某个组里的其余副本」，跟当前选中项无关。
@@ -2133,11 +2430,14 @@ impl AppState {
     /// `name` 为空时用 `fallback`。注意**先判断目标是否存在再决定是否去重**：
     /// [`mo_operations::unique_path`] 总是从 ` 2` 起编号，直接拿它会把一个
     /// 本来不冲突的名字变成「新建文件夹 2」。
-    fn free_path(dir: &Path, name: &str, fallback: &str) -> PathBuf {
+    ///
+    /// 「存在」的判据走 [`AppState::name_taken`]（问列表 / 后端），不是
+    /// `Path::exists()`——后者在远程目录里恒为 `false`。
+    async fn free_path(&self, dir: &Path, name: &str, fallback: &str) -> PathBuf {
         let name = name.trim();
         let name = if name.is_empty() { fallback } else { name };
         let base = dir.join(name);
-        if base.exists() {
+        if self.name_taken(&base).await {
             mo_operations::unique_path(&base)
         } else {
             base
@@ -2148,7 +2448,7 @@ impl AppState {
     ///
     /// `name` 为空时用「新建文件夹」。
     pub async fn create_folder(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
-        let target = Self::free_path(dir, name, "新建文件夹");
+        let target = self.free_path(dir, name, "新建文件夹").await;
         self.active_fs().create_dir(&target).await?;
         Ok(target)
     }
@@ -2158,7 +2458,7 @@ impl AppState {
     /// `name` 为空时用「新建文本.txt」。目标名同样走 [`AppState::free_path`] 去重，
     /// 底层 `write_file` 用的是 `create_new`——即便去重算错也不会覆盖已有文件。
     pub async fn create_file(&self, dir: &Path, name: &str) -> Result<PathBuf, MoError> {
-        let target = Self::free_path(dir, name, "新建文本.txt");
+        let target = self.free_path(dir, name, "新建文本.txt").await;
         self.active_fs().write_file(&target, b"").await?;
         Ok(target)
     }
@@ -2291,6 +2591,75 @@ impl AppState {
         }
     }
 
+    // ---- 平台原生集成（mo-platform）----
+
+    /// 在系统的文件管理器里**显示**一条路径（macOS 叫「在访达中显示」）。
+    ///
+    /// * 只认**本地**路径：远程条目（`/pub/x`）在系统文件管理器里根本不存在，传
+    ///   过去只会静默失败，所以这里直接挡掉。判据是 [`AppState::goes_through_remote`]
+    ///   ——「这条路径属不属于当前后端」，**不是**「我现在在看远程吗」：去重 / 同步
+    ///   拿的是本地路径，而它们经常在远程页上被调用（与 `delete_paths` 同一条纪律）。
+    /// * 多选时只定位第一条——访达一次也只能选中一处，与系统行为一致。
+    pub async fn reveal_in_file_manager(&self, paths: Vec<PathBuf>) -> Result<(), MoError> {
+        let Some(first) = paths.into_iter().next() else {
+            return Ok(());
+        };
+        if self.goes_through_remote(&first).await {
+            return Err(MoError::Other(
+                "远程条目没法在系统文件管理器里显示".to_string(),
+            ));
+        }
+        // AppKit 那条路是同步的、还可能在主线程弹 UI，必须放 blocking 池。
+        self.spawn_blocking(move || mo_platform::reveal(&first))
+            .await
+            .map_err(|e| MoError::Other(format!("显示任务失败：{e}")))?
+            .map_err(|e| MoError::Other(e.to_string()))
+    }
+
+    /// 把本地文件交给**系统**废纸篓（macOS 上就是访达那份）。
+    ///
+    /// 与 [`AppState::trash_paths`]（Mo 自己的回收站）是**两条路**：
+    ///
+    /// | | Mo 回收站 | 系统废纸篓（这里） |
+    /// |---|---|---|
+    /// | 撤销 / 回收站面板 | 支持 | 不支持（交出去就由系统负责） |
+    /// | 同宗卷删除 | 搬文件（大文件慢） | O(1) 重命名 |
+    /// | 外接卷宗 / 网络盘 | 搬回本机（慢，可能失败） | 就地进卷宗自己的废纸篓 |
+    ///
+    /// 所以它是**显式动作**（右键 / 命令面板），不接在 ⌘⌫ 上——默认删除仍走
+    /// Mo 回收站，那才是「可撤销、面板里看得见」的那条路。
+    pub async fn recycle_to_system(&self, paths: Vec<PathBuf>) -> Result<(), MoError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // 同样按「这条路径属于哪个后端」过滤：远程条目走不了这条路（它在本机不存在），
+        // 但**本地**路径（去重 / 同步送来的副本）在看远程时也要照办。
+        let mut local = Vec::with_capacity(paths.len());
+        for p in paths {
+            if !self.goes_through_remote(&p).await {
+                local.push(p);
+            }
+        }
+        if local.is_empty() {
+            return Err(MoError::Other(
+                "远程条目没法进本机废纸篓（请用「删除」）".to_string(),
+            ));
+        }
+        let paths = local;
+        let history = paths.clone();
+        let r = self
+            .spawn_blocking(move || mo_platform::recycle(&paths))
+            .await
+            .map_err(|e| MoError::Other(format!("删除任务失败：{e}")))?
+            .map_err(|e| MoError::Other(e.to_string()));
+        if r.is_ok() {
+            self.record_history("移到系统废纸篓", history, None);
+        }
+        // 刷新失败不该盖掉删除结果（列表没跟上用户手动刷一下就是了）。
+        let _ = self.refresh().await;
+        r
+    }
+
     // ---- 回收站 ----
 
     /// 回收站条目快照（最新在前）。
@@ -2334,6 +2703,24 @@ impl AppState {
 
     /// 执行一条可逆操作的正向（inverse=false）或逆向（inverse=true）版本，提交到操作队列。
     async fn apply_reversible(&self, r: &Reversible, inverse: bool) {
+        // 「移动」这条逆操作在**远程**条目上是反向 `rename`（`MoveOperation` 是本机
+        // 管线，拿来撤销一次远程重命名会静默什么都不做）。
+        if let Reversible::Move { from, to } = r {
+            let (a, b) = if inverse {
+                (to.clone(), from.clone())
+            } else {
+                (from.clone(), to.clone())
+            };
+            if self.goes_through_remote(&a).await {
+                // 撤销 / 重做这条路不返回结果（与本机管线一致），失败只能记日志；
+                // 但**必须重读**：远端改名成没成，只有列表说了算。
+                if let Err(e) = self.active_fs().rename(&a, &b).await {
+                    tracing::warn!("远程撤销重命名失败 {} → {}：{e}", a.display(), b.display());
+                }
+                let _ = self.refresh().await;
+                return;
+            }
+        }
         let id = self.ops.lock().await.next_id();
         let op: SharedOperation = match r {
             Reversible::Move { from, to } => {
@@ -2973,11 +3360,27 @@ impl AppState {
 
     /// 批量重命名：`pairs` 为 (原路径, 新路径)，逐个提交重命名操作。
     ///
-    /// 逆操作是「把新名改回旧名」，因此每一种情况都能被 ⌘Z 撤销。
-    pub async fn rename_many(&self, pairs: Vec<(PathBuf, PathBuf)>) -> Vec<u64> {
+    /// 远程条目走远程后端的 `rename`（判据见 [`AppState::goes_through_remote`]），
+    /// 本地条目走操作队列——重命名一条远程路径若交给本机管线，只会「成功」地
+    /// 什么都不做（那个路径在本机不存在）。
+    ///
+    /// 逆操作是「把新名改回旧名」，因此每一种情况都能被 ⌘Z 撤销
+    /// （撤销同样按路径分流，见 [`AppState::apply_reversible`]）。
+    pub async fn rename_many(&self, pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<u64>, MoError> {
         let mut ids = Vec::new();
+        let mut touched_remote = false;
         for (from, to) in pairs {
             if from == to {
+                continue;
+            }
+            if self.goes_through_remote(&from).await {
+                self.active_fs().rename(&from, &to).await?;
+                self.record_history("重命名", vec![from.clone()], Some(to.clone()));
+                self.push_reversible(Reversible::Move {
+                    from: to.clone(),
+                    to: from.clone(),
+                });
+                touched_remote = true;
                 continue;
             }
             let id = self.ops.lock().await.next_id();
@@ -2989,7 +3392,11 @@ impl AppState {
                 to: from.clone(),
             });
         }
-        ids
+        // 远程没有 watcher：改完名得重读一次，否则列表里还是旧名字。
+        if touched_remote {
+            self.refresh().await?;
+        }
+        Ok(ids)
     }
 
     /// 压缩：把 `sources` 打包到 `dest`（格式按后缀推断）。

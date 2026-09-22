@@ -15,6 +15,7 @@ mo-search.workspace = true
 mo-preview.workspace = true
 mo-diff.workspace = true
 mo-remote.workspace = true
+mo-platform.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

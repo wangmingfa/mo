@@ -350,7 +350,9 @@ pub fn render(
                     crate::theme::zebra()
                 } else {
                     crate::theme::surface()
-                });
+                })
+                // 测试用（release no-op）：按绝对行号定位，断言首行相对列表顶部的留白。
+                .debug_selector(move || format!("mo-file-row-{i}"));
 
             if !selected {
                 // fluent `hover` 在 `InteractiveElement` 上，`Div` 实现了它。
@@ -464,13 +466,18 @@ pub fn render(
                     cx.stop_propagation();
                 });
 
-            let tag_color = view
-                .panel_at(pane, tab)
-                .map(|p| p.app.clone())
-                .and_then(|app| app.tag_of(&entry.path));
+            let app = view.panel_at(pane, tab).map(|p| p.app.clone());
+            let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
+            // 系统图标（访达同款 PNG）：远程条目本机没有文件，平台给不出，
+            // `file_icon` 直接返回 None，这里退回内置 SVG。
+            let system_icon = app.as_ref().and_then(|a| a.file_icon(&entry.path));
             rows.push(
                 row.child(crate::file_item::view(
-                    entry, selected, tag_color, &row_cols,
+                    entry,
+                    selected,
+                    tag_color,
+                    &row_cols,
+                    system_icon,
                 ))
                 .into_any_element(),
             );
@@ -481,8 +488,12 @@ pub fn render(
     // 看到的是「没有子节点」的元素，身高算出来是 0。不显式给它确定高度
     // （flex_1 / size_full / h(...)），整个文件列表就会被压成 0 高。
     .flex_1()
-    // 列表左右留白：行 hover 背景不顶到窗口边缘（Finder 式呼吸感）。
-    .px(px(12.0))
+    // 四周留白：行的 hover / 选中底色不顶到窗口边缘（Finder 式呼吸感）。
+    // 上下这 12pt 与网格同源（见 `grid::PAD`、devlog §25）：`uniform_list` 的 padding
+    // 四个方向都吃——top 加到条目起点、上下都算进滚动内容高度，所以滚到底最后一行
+    // 下面也留得出来，不是只把首行往下推。原来这里只有 `px`，首行顶着表头、
+    // 末行贴着状态栏。
+    .p(px(12.0))
     // 滚轮 / 触控板滚动经此 handle 走，滚动条拖动也写回同一 handle。
     .track_scroll(scroll)
     // 测试用：让 tests/layout.rs 能读到这个元素的实际尺寸（release 下 no-op）。

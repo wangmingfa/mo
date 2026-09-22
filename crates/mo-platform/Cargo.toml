@@ -1,0 +1,19 @@
+[package]
+name = "mo-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+# macOS：走 AppKit 的 NSWorkspace（回收站 / 在访达中显示 / 推出卷宗）。
+# 只在 macOS 上引：其它平台这个 crate 只给 `Unsupported`。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+dispatch = "0.2"
+# 卷宗列表要读 `f_fstypename`（区分本地盘与网络盘）。
+libc.workspace = true
+
+[lints]
+workspace = true

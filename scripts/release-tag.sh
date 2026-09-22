@@ -142,7 +142,7 @@ if [ -n "$BUMP" ]; then
       if [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         VERSION="$BUMP"
       else
-        die "无法识别的版本参数：$BUMP（可用 patch / minor / major / x.y.z）"
+        die "无法识别的版本参数：${BUMP}（可用 patch / minor / major / x.y.z）"
       fi
       ;;
   esac
@@ -219,7 +219,7 @@ if [ "$NO_PUSH" -eq 1 ]; then
   printf '  \033[33m--no-push：只本地打 tag，不推送\033[0m\n'
 fi
 printf '\n'
-menu "确认发布 $TAG？（推送后自动触发 GitHub Release 流水线）" "确认发布" "取消"
+menu "确认发布 ${TAG}？（推送后自动触发 GitHub Release 流水线）" "确认发布" "取消"
 [ "$MENU_INDEX" -eq 0 ] || die "已取消"
 
 if [ "$VERSION_COMMIT" -eq 1 ]; then

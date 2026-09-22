@@ -668,15 +668,16 @@ cargo bench                # 性能基准（criterion）
 * [x] 自定义命令（`{dir}` / `{file}` / `{files}` 占位符 + 清单目录 + 输出回显）
 * [x] 插件 / 扩展系统（`extensions/<id>/manifest.json` 声明命令，启停管理 + 条件生效）
 * [x] 自动化工作流（多步命令顺序执行，任一步失败即中止）
-* [ ] ✨ 网络驱动器（SMB / NFS）
-* [ ] ✨ 远程协议（FTP / SFTP / WebDAV / 云存储）
+* [x] ✨ 网络驱动器（SMB / NFS：发现已挂载的网络盘 + 触发系统挂载，挂好当本地目录浏览）
+* [x] ✨ 远程协议（FTP / SFTP / WebDAV；云存储不在进程内实现，走系统挂载 / WebDAV 网关）
 * [x] ✨ 文件夹同步（双向合并 / 镜像 + 冲突策略，先出计划再执行，多余文件进回收站）
 * [x] ✨ 重复文件查找（大小 → 部分哈希 → 整体哈希三级漏斗，副本移入回收站可撤销）
 
 ### 第五阶段：完善
 
 * [ ] Windows
-* [ ] macOS
+* [ ] macOS（已落地：`mo-platform`——系统废纸篓 / 在访达中显示 / 推出卷宗，见
+      [devlog/macOS 平台层](devlog/macos-platform.md) §7–9）
 * [ ] Linux
 * [ ] 性能优化
 * [ ] 无障碍支持

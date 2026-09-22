@@ -78,10 +78,11 @@ pub const QA_HOME: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 /// 硬盘 / 盘符图标（「此电脑」里 C: 这类虚拟目录条目用）。
 pub const HARD_DRIVE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>"##;
 
-/// 远程连接（地球）：标签页上的「这个标签在看远端而不是本机」徽标。
+/// 远程连接（地球）：标签页上的「这个标签在看远端而不是本机」徽标，也是
+/// [`scheme_icon`] 认不出协议时的兜底。
 ///
-/// 与侧边栏的 [`HARD_DRIVE`] 区分开：那边的硬盘图标表示「这是一条连接」，
-/// 这边要表达的是「当前位置在网络上」。
+/// 这里要表达的是「当前位置在网络上」；「这是哪一种连接」由协议图标
+/// （[`SMB`] / [`FTP`] / [`WEBDAV`]）负责，别混用。
 pub const GLOBE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>"##;
 
 /// 加号：侧边栏「远程」标题右侧的「连接到服务器…」入口。
@@ -107,21 +108,26 @@ pub const FTP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 /// WebDAV：一朵云（DAV over HTTP(S)，实际用的基本都是坚果云 / Nextcloud 这类网盘）。
 pub const WEBDAV: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>"##;
 
-/// 按远程地址挑协议图标（`endpoint` 形如 `scheme://host[:port]`）。
+/// 按协议名挑图标（`scheme` 不带 `://` 与主机部分）。
 ///
 /// scheme 正常由 `RemoteUrl::parse` 归一成了小写，但配置是明文 JSON、可能被手改过，
-/// 这里再挡一手大小写；`://` 缺失或协议不认识时回落到 [`GLOBE`]，不画空位。
-pub fn protocol_icon(endpoint: &str) -> &'static [u8] {
-    let scheme = endpoint
-        .split_once("://")
-        .map_or("", |(s, _)| s)
-        .to_ascii_lowercase();
+/// 这里再挡一手大小写。认不出的协议（以及空串）回落到 [`GLOBE`]，不画空位。
+pub fn scheme_icon(scheme: &str) -> &'static [u8] {
+    let scheme = scheme.to_ascii_lowercase();
     match scheme.as_str() {
         "smb" | "cifs" | "samba" => SMB,
         "ftp" | "ftps" | "sftp" | "ssh" => FTP,
         "webdav" | "dav" | "davs" => WEBDAV,
         _ => GLOBE,
     }
+}
+
+/// 按远程地址挑协议图标（`endpoint` 形如 `scheme://host[:port]`）。
+///
+/// 已经握着 `RemoteUrl` 的地方直接用 [`scheme_icon`]（scheme 早就解析好了，别再
+/// 切一次字符串）；这条给只有地址串的入口用——配置里的已记住服务器就是。
+pub fn protocol_icon(endpoint: &str) -> &'static [u8] {
+    scheme_icon(endpoint.split_once("://").map_or("", |(s, _)| s))
 }
 
 pub const QA_DESKTOP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>"##;
@@ -224,5 +230,24 @@ mod tests {
         assert_eq!(protocol_icon("nfs://x"), GLOBE);
         assert_eq!(protocol_icon("没有协议前缀"), GLOBE);
         assert_eq!(protocol_icon(""), GLOBE);
+    }
+
+    /// 已经握着 `RemoteUrl` 的入口（侧边栏）直接按 scheme 取图标，
+    /// 规则必须与「只有地址串」的那条入口一致——别各定一套映射。
+    #[test]
+    fn scheme_icon_agrees_with_the_endpoint_form() {
+        assert_eq!(scheme_icon("smb"), SMB);
+        assert_eq!(scheme_icon("SFTP"), FTP);
+        assert_eq!(scheme_icon("davs"), WEBDAV);
+        assert_eq!(scheme_icon("nfs"), GLOBE);
+        assert_eq!(scheme_icon(""), GLOBE);
+        for ep in ["smb://x", "sftp://x", "webdav://x", "nfs://x", ""] {
+            let scheme = ep.split_once("://").map_or("", |(s, _)| s);
+            assert_eq!(
+                protocol_icon(ep),
+                scheme_icon(scheme),
+                "{ep}：两条入口的映射不一致"
+            );
+        }
     }
 }

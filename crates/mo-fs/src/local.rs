@@ -52,7 +52,7 @@ impl FileSystem for LocalFileSystem {
             created: m.created().ok(),
             permissions: Permissions {
                 readonly: m.permissions().readonly(),
-                hidden: false,
+                hidden: is_hidden(path, &m),
                 mode: unix_mode(&m),
             },
         })
@@ -96,6 +96,48 @@ fn unix_mode(m: &std::fs::Metadata) -> u32 {
     {
         let _ = m;
         0
+    }
+}
+
+/// 一个条目是否「隐藏」。
+///
+/// 之前这里**写死 `false`**，导致 `.DS_Store`、`.git`、`.ssh` 之类在属性面板里
+/// 一律显示「不隐藏」，是 macOS / Unix 上的真 bug。判据：
+///
+/// * **文件名以 `.` 开头**（dotfile）：所有 unix 系都这么认，跨平台成立；
+/// * **macOS 的 `UF_HIDDEN` 属性位**（`chflags hidden` 设的，访达里手动「隐藏」的
+///   文件走这条路）：`st_flags & 0x8000`。`0x8000` 是 BSD 的 `UF_HIDDEN`，
+///   Linux 的 `st_flags` 恒为 0，所以这条在 Linux 上自动失效、不误伤。
+///
+/// ⚠️ 这个 `hidden` 现在**不参与列表过滤**（侧边栏 / 列表只看 `ReadDirEntry`，
+/// 不读 `FileMetadata.hidden`；`show_hidden` 配置项也还没接进过滤），所以改它只会
+/// 让属性面板显示正确，不会突然把用户的 dotfile 藏起来——过滤是另一件事。
+fn is_hidden(path: &Path, m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let dotfile = path
+            .file_name()
+            .map(|n| n.as_bytes().first() == Some(&b'.'))
+            .unwrap_or(false);
+        // macOS 的 `UF_HIDDEN`（`chflags hidden` 设的）：`st_flags & 0x8000`。
+        // `st_flags` 只有 macOS 的 `MetadataExt` 提供（Linux 的 `stat` 没有该字段），
+        // 所以这条判据必须限定在 macOS；Linux 上只看 dotfile。
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::macos::fs::MetadataExt;
+            let flagged = m.st_flags() & 0x8000 != 0; // UF_HIDDEN
+            dotfile || flagged
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            dotfile
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, m);
+        false
     }
 }
 
@@ -165,5 +207,59 @@ mod tests {
         LocalFileSystem
             .read_dir_blocking(Path::new("C:\\"))
             .expect("读取 C:\\ 不应失败");
+    }
+}
+
+/// dotfile 必须被报告为隐藏（修「hidden 恒为 false」的真 bug）。
+///
+/// 直接测 `is_hidden` 这个纯函数（它本就是 private fn，子模块可访问），
+/// 绕开 `LocalFileSystem::metadata` 的异步签名——那是个 `Future`，
+/// 在同步 `#[test]` 里不能 `.expect()`。
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn dotfiles_and_flagged_files_are_hidden() {
+        let dir = std::env::temp_dir().join("mo-fs-hidden-test");
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        // `.DS_Store` 这类 dotfile：在 macOS / Linux 上都算隐藏。
+        let dot = dir.join(".ds_store_probe");
+        std::fs::write(&dot, b"x").expect("写 dotfile");
+        // 普通文件：不该是隐藏。
+        let plain = dir.join("visible.txt");
+        std::fs::write(&plain, b"x").expect("写普通文件");
+
+        let dot_meta = std::fs::metadata(&dot).expect("读 dotfile 元数据");
+        assert!(
+            is_hidden(&dot, &dot_meta),
+            ".DS_Store 类 dotfile 必须报告隐藏"
+        );
+
+        let plain_meta = std::fs::metadata(&plain).expect("读普通文件元数据");
+        assert!(!is_hidden(&plain, &plain_meta), "普通文件不应被标记隐藏");
+
+        // macOS 的 `UF_HIDDEN`（`chflags hidden`）：即便名字不以 . 开头也该藏。
+        #[cfg(target_os = "macos")]
+        {
+            let flagged = dir.join("flagged.txt");
+            std::fs::write(&flagged, b"x").expect("写待标记文件");
+            std::process::Command::new("chflags")
+                .args(["hidden", &flagged.to_string_lossy()])
+                .status()
+                .expect("chflags 应成功");
+            let flagged_meta = std::fs::metadata(&flagged).expect("读标记文件元数据");
+            assert!(
+                is_hidden(&flagged, &flagged_meta),
+                "被 chflags hidden 的文件必须报告隐藏"
+            );
+            std::process::Command::new("chflags")
+                .args(["nohidden", &flagged.to_string_lossy()])
+                .status()
+                .ok();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

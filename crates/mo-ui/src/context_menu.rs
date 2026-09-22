@@ -58,6 +58,12 @@ pub(crate) struct ContextMenu {
     /// 创建副本 / 拷贝路径）如果去读 app 的选择，就要赌那个任务已经跑完——
     /// 直接带这份快照就没有竞态。
     pub paths: Vec<PathBuf>,
+    /// 当前页是不是在**远程**（FTP / SFTP / WebDAV）。
+    ///
+    /// 只有它决定「在访达中显示」「移到系统废纸篓」这类**本机**动作出不出菜单：
+    /// 远程条目在本机磁盘上不存在，给了也是点了没反应（与「目录判据只问列表模型」
+    /// 同一条纪律——别拿路径长相去猜它在哪个后端）。
+    pub remote: bool,
 }
 
 /// 菜单里的一个动作。
@@ -84,8 +90,12 @@ pub(crate) enum MenuAction {
     Paste,
     /// 把选中项的路径（每行一个）写进剪贴板。
     CopyPath,
-    /// 移到废纸篓。
+    /// 移到废纸篓（Mo 自己的回收站：可撤销、回收站面板里看得见）。
     Trash,
+    /// 移到**系统**废纸篓（交给平台，不可逆、不进回收站面板）。
+    SystemTrash,
+    /// 在系统的文件管理器里定位（macOS = 在访达中显示）。
+    RevealInFileManager,
     /// 在当前目录新建文件夹。
     NewFolder,
     /// 在当前目录新建空文本文件。
@@ -232,6 +242,16 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
             true,
         ));
     }
+    // 在系统文件管理器里定位：只有**本机**路径有意义（远程条目本机磁盘上不存在，
+    // 给了就是点了没反应），且平台要有实现。标签随平台（macOS 叫访达）。
+    if !menu.remote && mo_platform::supports_reveal() {
+        out.push(MenuItem::new(
+            MenuAction::RevealInFileManager,
+            mo_platform::reveal_label(),
+            "",
+            true,
+        ));
+    }
 
     // 编辑（重命名走批量重命名对话框，多选时正好用得上，所以始终可用）
     out.push(
@@ -290,6 +310,21 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         )
         .separated(),
     );
+    // 交给**系统**废纸篓：与上面同组（不隔线），但只在平台支持时出现。
+    // 差别写在文档里：这条不可逆、不进回收站面板，换来的是同宗卷 O(1) 与外接
+    // 卷宗就地回收——所以它是显式动作，不抢 ⌘⌫。
+    if !menu.remote && mo_platform::supports_trash() {
+        out.push(MenuItem::new(
+            MenuAction::SystemTrash,
+            if multi {
+                format!("移到系统废纸篓（{} 项）", menu.selected)
+            } else {
+                "移到系统废纸篓".to_string()
+            },
+            "",
+            true,
+        ));
+    }
 
     // 归档
     out.push(MenuItem::new(MenuAction::Compress, "压缩…", "", true).separated());
@@ -622,6 +657,15 @@ mod tests {
             is_dir,
             selected,
             paths: Vec::new(),
+            remote: false,
+        }
+    }
+
+    /// 同上，但当前页在**远程**（用来验证本机专属动作被裁掉）。
+    fn remote_menu(target: Option<&str>, is_dir: bool, selected: usize) -> ContextMenu {
+        ContextMenu {
+            remote: true,
+            ..menu(target, is_dir, selected)
         }
     }
 
@@ -665,6 +709,40 @@ mod tests {
             find(&list, MenuAction::Paste).separator_before,
             "「粘贴」上方应当有分隔线，把「新建」这组隔开"
         );
+    }
+
+    /// 远端页（FTP / SFTP / WebDAV）上**不**出现「在访达中显示 / 移到系统废纸篓」：
+    /// 远程条目在本机磁盘上根本不存在，给了就是点了没反应——与「目录判据只问列表
+    /// 模型」同一条纪律。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remote_page_hides_host_only_actions() {
+        let host = actions(&menu(Some("/tmp/a.txt"), false, 1));
+        assert!(
+            host.contains(&MenuAction::RevealInFileManager),
+            "本机页应当能「在访达中显示」"
+        );
+        assert!(host.contains(&MenuAction::SystemTrash));
+
+        let remote = actions(&remote_menu(Some("/pub/a.txt"), false, 1));
+        assert!(
+            !remote.contains(&MenuAction::RevealInFileManager),
+            "远程条目没法在访达里显示"
+        );
+        assert!(!remote.contains(&MenuAction::SystemTrash));
+        // 裁剪只针对这两条：常规动作（复制到剪贴板 / 移到 Mo 回收站）照旧。
+        assert!(remote.contains(&MenuAction::Copy));
+        assert!(remote.contains(&MenuAction::Trash));
+    }
+
+    /// 平台没实现时（这里是不支持的那几个）这两条压根不该进菜单——列出来点了
+    /// 只会报「不支持」。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_platform_hides_host_only_actions() {
+        let a = actions(&menu(Some("/tmp/a.txt"), false, 1));
+        assert!(!a.contains(&MenuAction::RevealInFileManager));
+        assert!(!a.contains(&MenuAction::SystemTrash));
     }
 
     /// 目录：有「在新标签页 / 分栏中打开」，没有「解压」；「打开」而不是「快速查看」。
