@@ -765,3 +765,14 @@ SpringAnimation::new(SLIDE_SPRING)          // SpringConfig::new(700.0, 40.0, 1.
 AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补窗），
 测试轮询 `panel_window_ready_for_tests`。坐标级点击用 `window.drag(p, p, cx)`
 （from==to 即单击；rows 没有 `.test_support()`，`click(id)` 点不了）。
+
+## 19. 方向键切换选中行也要滚进可视区
+
+* 症状：键盘 ↑↓ 移动焦点时只改了选择、**没滚列表**，选中项滚出视口就看不见了。
+* 修复：`move_cursor` 本来就返回移动后的**行下标**（列表含分组头、网格/画廊各自空间），
+  UI 在拿到 row 后补一句 `scroll.scroll_to_item(row, ScrollStrategy::Nearest)`
+  （`Nearest` = 本来就看得见就不滚，避免无谓跳动；`Center` 会每按一次都居中，方向键更晃）。
+* type-ahead 同理用 `Nearest`。两处共用 `run_type_ahead`（`app.rs` 自由函数），字符输入与退格都走它。
+* ⚠️ `scroll_to_item` 的 row 必须和 `uniform_list` 的 item_count 同一空间：列表=行（含组头），
+  网格/画廊=`row_count`（`pos_to_row` 只解决列表行空间，网格按 `cols` 另算——那是另一处的已知限制，
+  这里不展开）。

@@ -149,8 +149,13 @@ pub(crate) struct Panel {
     pub selection: SelectionModel,
     /// 本面板发起的后台操作快照（进度面板数据源）。
     pub ops: Vec<OperationHandle>,
-    /// 输入即过滤的当前关键词。
+    /// 输入即定位（type-ahead）的当前前缀缓冲：焦点在列表时敲字符逐个累积，
+    /// 用来跳到第一个前缀匹配的文件（不收窄列表，跟 Finder / 资源管理器一致）。
+    /// 几秒后自动清空（见 `RootView` 的自动重置定时器）。
     pub query: String,
+    /// 定位缓冲代数：每次输入 / 退格都自增，让更晚的自动重置定时器能使更早的
+    /// 定时器失效，避免后一次输入被前一次定时器误清空。
+    pub type_ahead_gen: u64,
     /// 文件列表滚动状态（跨帧存活才能记住滚动位置）。
     pub scroll: UniformListScrollHandle,
     pub can_back: bool,
@@ -204,6 +209,7 @@ impl Panel {
             selection: SelectionModel::new(),
             ops: Vec::new(),
             query: String::new(),
+            type_ahead_gen: 0,
             scroll: UniformListScrollHandle::new(),
             can_back: false,
             can_forward: false,

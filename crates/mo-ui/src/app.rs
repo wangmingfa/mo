@@ -5203,17 +5203,6 @@ impl RootView {
             cx.notify();
         }
     }
-
-    /// 应用当前过滤词（输入即过滤），作用于当前焦点标签页。
-    fn apply_filter(&mut self, cx: &mut Context<Self>) {
-        let query = self.panel().query.trim().to_string();
-        let app = self.app();
-        cx.spawn(async move |_weak, _cx| {
-            app.set_filter(if query.is_empty() { None } else { Some(query) })
-                .await;
-        })
-        .detach();
-    }
 }
 
 impl Focusable for RootView {
@@ -5635,7 +5624,7 @@ impl Render for RootView {
                 }
             }
 
-            // 非模态：键盘导航 + 输入即过滤 + 快速预览 + 删除选中。
+            // 非模态：键盘导航 + 输入即定位（type-ahead）+ 快速预览 + 删除选中。
             match key {
                 "up" | "down" if plain || shift => {
                     let app = entity_key.update(cx, |v, _cx| v.app());
@@ -5643,59 +5632,72 @@ impl Render for RootView {
                     let step = if key == "up" { -1 } else { 1 };
                     let extend = shift;
                     cx.spawn(async move |cx| {
-                        app.move_cursor(step, extend).await;
+                        // `move_cursor` 已经移动并选中了新行，这里多拿它返回的
+                        // 行下标把目标滚进可视区（方向键之前没滚动，列表滚远了
+                        // 选中项会跑到视口外看不见）。`Nearest` 只在不可见时才滚。
+                        if let Some(row) = app.move_cursor(step, extend).await {
+                            this.update(cx, |v, cx| {
+                                v.panel_mut()
+                                    .scroll
+                                    .scroll_to_item(row, gpui_kit::ScrollStrategy::Nearest);
+                                cx.notify();
+                            });
+                        }
                         // app 侧选择是唯一事实来源：移动后回灌 UI 高亮。
                         pull_selection(&app, &this, cx).await;
                     })
                     .detach();
                 }
                 "backspace" => {
-                    entity_key.update(cx, |v, cx| {
+                    // 定位缓冲非空：退格删掉最后一个字符并重定位（type-ahead 编辑），
+                    // 缓冲空时回落「返回上级目录」（原有便利行为保留）。
+                    let this = entity_key.clone();
+                    let (to_parent, app, q, gen) = entity_key.update(cx, |v, cx| {
                         if v.panel().query.is_empty() {
-                            // 没有过滤词时返回上级目录。
-                            let app = v.app();
-                            cx.spawn(async move |_weak, _cx| {
-                                let _ = app.open_parent().await;
-                            })
-                            .detach();
+                            (true, v.app(), String::new(), 0)
                         } else {
-                            v.panel_mut().query.pop();
-                            v.apply_filter(cx);
+                            let app = v.app();
+                            let p = v.panel_mut();
+                            p.query.pop();
+                            p.type_ahead_gen += 1;
+                            cx.notify();
+                            (false, app, p.query.clone(), p.type_ahead_gen)
                         }
-                        cx.notify();
                     });
+                    if to_parent {
+                        cx.spawn(async move |_cx| {
+                            let _ = app.open_parent().await;
+                        })
+                        .detach();
+                    } else {
+                        run_type_ahead(app, this, q, gen, cx);
+                    }
                 }
                 "escape" => {
                     entity_key.update(cx, |v, cx| {
                         v.panel_mut().query.clear();
-                        v.apply_filter(cx);
+                        // Esc 直接清空定位缓冲即可，不再触发过滤。
                         cx.notify();
                     });
                 }
                 k if plain && k.chars().count() == 1 => {
                     let ch = k.chars().next().unwrap();
-                    let app = entity_key.update(cx, |v, cx| {
-                        v.panel_mut().query.push(ch);
-                        v.apply_filter(cx);
-                        v.app()
-                    });
-                    // 输入即定位（type-ahead）：列表收窄的同时把选择焦点跳到第一个
-                    // 匹配项，并滚到它——与 Finder / 资源管理器「打字跳到文件」一致。
-                    let q = entity_key.read(cx).panel().query.clone();
+                    // 输入即定位（type-ahead）：只逐字累积前缀缓冲、跳到第一个匹配
+                    // 项并滚进可视区，**不收窄列表**——跟 Finder / 资源管理器一致。
+                    // 不再调用 `apply_filter`：敲字符不再过滤隐藏其它文件。
                     let this = entity_key.clone();
-                    cx.spawn(async move |cx| {
-                        if let Some(idx) = app.focus_by_prefix(&q).await {
-                            this.update(cx, |v, cx| {
-                                v.panel_mut()
-                                    .scroll
-                                    .scroll_to_item(idx, gpui_kit::ScrollStrategy::Center);
-                                cx.notify();
-                            });
-                            // app 侧选择是唯一事实来源：跳选后回灌 UI 高亮。
-                            pull_selection(&app, &this, cx).await;
-                        }
-                    })
-                    .detach();
+                    let (app, q, gen) = entity_key.update(cx, |v, cx| {
+                        // 先取走 `app`（克隆后即释放对 `v` 的借用），再拿
+                        // `panel_mut()` 做可变修改，避免借用冲突。
+                        let app = v.app();
+                        let p = v.panel_mut();
+                        p.query.push(ch);
+                        // 刷新代数：让更早的自动重置定时器失效，避免误清空本次输入。
+                        p.type_ahead_gen += 1;
+                        cx.notify();
+                        (app, p.query.clone(), p.type_ahead_gen)
+                    });
+                    run_type_ahead(app, this, q, gen, cx);
                 }
                 _ => {}
             }
@@ -5869,7 +5871,6 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             .flex_1()
             // 测试用（release no-op）：tests/layout.rs 断言中央区位置与尺寸。
             .debug_selector(|| "mo-center".to_string())
-            .child(filter_bar(&panel.query, pane_idx))
             .child(match panel.view_mode {
                 ViewMode::List => file_list::render(
                     entity,
@@ -7322,6 +7323,52 @@ async fn pull_selection(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncA
     });
 }
 
+/// 输入即定位（type-ahead）的「定位 + 自动重置」逻辑，字符输入与退格共用。
+///
+/// 给定当前前缀 `prefix`：
+/// 1. 选中第一个前缀匹配项（`focus_by_prefix` 已做大小写不敏感匹配），并把它
+///    滚进可视区（`Nearest`：本来就看得见就不滚，避免无谓跳动）；
+/// 2. 之后若 `TYPE_AHEAD_RESET_MS` 内没有新输入，清空定位缓冲（选择保留——
+///    定位只是临时跳选，不该因为缓冲过期就把文件取消选中）。
+///
+/// `gen` 是调用方在更新缓冲时自增的「代数」：每次新输入都会让更早的定时器
+/// 失效，从而避免后一次输入被前一次定时器误清空。
+fn run_type_ahead(app: AppState, this: Entity<RootView>, prefix: String, gen: u64, cx: &mut App) {
+    // 定位与自动重置是两个独立任务，各持一份 `this` 克隆，互不影响。
+    let this_reset = this.clone();
+    cx.spawn(async move |cx| {
+        if let Some(idx) = app.focus_by_prefix(&prefix).await {
+            this.update(cx, |v, cx| {
+                v.panel_mut()
+                    .scroll
+                    .scroll_to_item(idx, gpui_kit::ScrollStrategy::Nearest);
+                cx.notify();
+            });
+            // app 侧选择是唯一事实来源：跳选后回灌 UI 高亮。
+            pull_selection(&app, &this, cx).await;
+        }
+    })
+    .detach();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(TYPE_AHEAD_RESET_MS))
+            .await;
+        this_reset.update(cx, |v, cx| {
+            let p = v.panel_mut();
+            // 仅当期间没有新输入（代数未变）才清空，避免误清后一次输入。
+            if p.type_ahead_gen == gen {
+                p.query.clear();
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+}
+
+/// 输入即定位缓冲的自动重置时长（毫秒）：静默超过此时长即清空前缀缓冲。
+/// 「几百毫秒」级别——足够连续敲完一个词，又不会让旧缓冲长时间滞留。
+const TYPE_AHEAD_RESET_MS: u64 = 400;
+
 /// 打开聚焦 / 选中项：目录进入，文件用**系统默认应用**打开。
 ///
 /// ⚠️ 这里绝不能退回「文件走预览」：预览是空格（`list.preview`）的专属语义，
@@ -7345,35 +7392,6 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
             cx.notify();
         });
     }
-}
-
-/// 过滤条：显示当前关键词与提示。
-///
-/// `pane` 用于生成唯一元素 ID：分栏时每个窗格各渲染一份本条，
-/// `text!` 按调用点生成 ID，若无唯一 ID 链会产生重复的 a11y NodeId。
-fn filter_bar(query: &str, pane: usize) -> impl IntoElement {
-    if query.is_empty() {
-        return div().h(px(0.0));
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(24.0))
-        .px(px(8.0))
-        .bg(theme::hover_bg())
-        .border_b_1()
-        .border_color(theme::separator())
-        .text_color(theme::accent())
-        .child(text!(
-            id = format!("filter-q-{pane}"),
-            format!("🔍 {}", query)
-        ))
-        .child(div().text_color(theme::muted()).child(text!(
-            id = format!("filter-esc-{pane}"),
-            "（Esc 清除）".to_string()
-        )))
 }
 
 // ---------- 模态卡片渲染 ----------

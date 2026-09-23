@@ -15,7 +15,8 @@ pub fn render(
     let mut left = if query.is_empty() {
         format!("{count} 项")
     } else {
-        format!("{count} 项 · 匹配「{query}」")
+        // `query` 现在是「输入即定位」的前缀缓冲（不是过滤），措辞随之改。
+        format!("{count} 项 · 定位「{query}」")
     };
     if selection_count > 0 {
         left.push_str(&format!(" · 已选 {selection_count}"));

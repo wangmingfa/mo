@@ -27,12 +27,21 @@ UI 本地 `panel.selection` 只做即时反馈，异步 `pull_selection` 回灌�
   `on_mouse_up` → `finish_box_selection` 回灌 app（`clear_selection` + `select_range` + `pull_selection`）。
 * 列表内容区左上角（`list_origin`）由 `on_prepaint` 回写（见 §4）。
 
-## 3. type-ahead：复用 `panel.query`，打字即跳选
+## 3. type-ahead：输入即**定位**（不再过滤）
 
-* 不另建缓冲：敲字符走既有「输入即过滤」路径（`panel.query.push(ch)` + `apply_filter`），
-  同时 `app.focus_by_prefix(prefix)` 在可见条目里找**文件名**以输入串开头的第一条、单选它、
-  返回可见下标；UI 用 `scroll.scroll_to_item(idx, ScrollStrategy::Center)` 跟随。
-* 比较大小写不敏感；空串 / 无匹配返回 `None` 且不改选择。与 Finder / 资源管理器一致。
+* **定位 ≠ 过滤**：敲字符只逐字累积 `panel.query` 前缀缓冲，调 `app.focus_by_prefix(prefix)`
+  在可见条目里找**文件名**以输入串开头的第一条、单选它、返回可见下标；UI 用
+  `scroll.scroll_to_item(idx, ScrollStrategy::Nearest)` 跟随。**不再调用 `apply_filter`**
+  ——敲字符不再隐藏其它文件，跟 Finder / 资源管理器「打字跳到文件」一致。
+* 比较大小写不敏感；空串 / 无匹配返回 `None` 且不改选择。
+* **自动重置**：每次输入 / 退格都自增 `panel.type_ahead_gen`；定位后起一个 `cx.background_executor().timer(400ms)`
+  定时器，触发时仅当 `type_ahead_gen` 未变（期间无新输入）才清空 `query`。代数是为了让
+  **更早的定时器失效**——否则后一次输入会被前一次定时器误清空。`app.set_filter` 仍保留
+  （`mo-core` / `mo-app` 测试还在用），只是 UI 不再驱动它。
+* 退格：`query` 非空时删最后一个字符并重定位（`run_type_ahead`）；空时回落「返回上级目录」。
+  Esc 直接清空 `query`。
+* 反馈：状态栏在 `query` 非空时显示 `定位「xxxx」`（原 filter_bar 已删——它会在输入瞬间让
+  中央区闪一下 24px，定位是临时的，没必要占位）。
 
 ## 4. ⚠️ 本次踩的 gpui-kit 0.6.6 API 坑（可复用）
 
