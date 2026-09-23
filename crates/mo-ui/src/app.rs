@@ -802,7 +802,9 @@ fn box_row_range(
 ) -> Option<(usize, usize)> {
     const ROW_H: f32 = 24.0;
     const PAD: f32 = 12.0;
-    let at = |y: f32| -> isize { ((y - list_top - PAD + scroll_y) / ROW_H).floor() as isize };
+    // 与 `start_box_selection_if_empty` 同一把折算：`scroll_y` 是 gpui 滚动偏移，
+    // 「向下滚为负」，这里同样要减它（见那边关于符号的注释）。
+    let at = |y: f32| -> isize { ((y - list_top - PAD - scroll_y) / ROW_H).floor() as isize };
     let a = at(y1);
     let b = at(y2);
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -4434,7 +4436,11 @@ impl RootView {
         };
         const ROW_H: f32 = 24.0;
         const PAD: f32 = 12.0;
-        let rel = y - ly - PAD + scroll_y;
+        // ⚠️ 符号：gpui 的滚动偏移约定「向下滚为负」（`scroll_top = -offset.y`），
+        // 视口 y 折算内容 y 要**减去**它（负负得正 = 加回滚过的距离）。曾经写成
+        // `+ scroll_y`，列表一滚就整段折成负下标——每一下点击都被判成「空白区」
+        // 启动框选，抬起时清空选择：表现正是「翻到后面的数据鼠标点不中文件」。
+        let rel = y - ly - PAD - scroll_y;
         // 行带按**顶边**对齐（floor）：行 i 占 [i*24, (i+1)*24)。原先用 round，
         // 行带整体错开半行——最后一行的下半截被折到行数之外（按下去当空白起橡皮筋）、
         // 列表下方 12px 内反被折成最后一行（点空白选中了它），两个都是用户可感的怪。
@@ -8367,8 +8373,9 @@ mod tests {
         assert_eq!(box_row_range(90.0, 300.0, top, 0.0, 3), Some((0, 2)));
         // 完全在行带之下拖出的框（起止都在界外）= 什么也不选。
         assert_eq!(box_row_range(200.0, 300.0, top, 0.0, 3), None);
-        // 滚动参与折算：滚过一行后，同样的窗口 y 命中的行号 +1。
-        assert_eq!(box_row_range(120.0, 120.0, top, 24.0, 3), Some((1, 1)));
+        // 滚动参与折算：gpui 滚动偏移「向下滚为负」，滚过一行（offset.y = -24）
+        // 后，同样的窗口 y 命中的行号 +1。
+        assert_eq!(box_row_range(120.0, 120.0, top, -24.0, 3), Some((1, 1)));
         // 空目录：任何位置都取不到行。
         assert_eq!(box_row_range(120.0, 120.0, top, 0.0, 0), None);
     }

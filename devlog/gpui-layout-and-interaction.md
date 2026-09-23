@@ -776,3 +776,21 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
 * ⚠️ `scroll_to_item` 的 row 必须和 `uniform_list` 的 item_count 同一空间：列表=行（含组头），
   网格/画廊=`row_count`（`pos_to_row` 只解决列表行空间，网格按 `cols` 另算——那是另一处的已知限制，
   这里不展开）。
+
+## 20. 滚动后鼠标点不中文件：框选折算把滚动偏移符号用反了
+
+* 症状：列表一滚动，鼠标点击文件**不选中**（此前选中的还会被清掉）；回到顶部一切正常。
+* 根因：框选判「点在空白区」的折算式把 gpui 滚动偏移的**符号**用反了。
+  gpui 约定「向下滚 offset.y 为负」（`scroll_top = -offset.y`，见 uniform_list），
+  视口 y → 内容 y 应**减去**它；写成 `+ scroll_y` 后，滚动一发生整段坐标折成
+  负下标 → 每一下点击都被判成「空白区」→ `start_box_selection_if_empty` 启动
+  橡皮筋 → 抬起 `finish_box_selection` 与行带无交 → **清空选择**。
+  表现恰是「点击不选中 + 旧选中也被清」。顶部 scroll_y = 0 所以看不出来。
+* 修复：`start_box_selection_if_empty` 与 `box_row_range` 两处 `+ scroll_y` →
+  `- scroll_y`（同一家几何，必须一起改）。
+* 守卫：headless 集成测试 `clicking_a_row_after_scrolling_still_selects_it`
+  （真实事件链路：基线点击 → 滚轮派发 → 对滚进视口的行坐标级点击）。
+  ⚠️ 行元素不进 observation 注册表（uniform_list 子项），`window.click(id)` /
+  `window.scroll(id)` 都点不中列表，一律用 `debug_bounds` + `window.drag(p,p)` /
+  直接派发 `ScrollWheelEvent`。
+* 单测约定同步：`box_row_range` 的滚动用例改传 `-24.0`（向下滚一行）。

@@ -643,3 +643,105 @@ fn zebra_stripes_fill_the_viewport_below_the_last_row(cx: &mut TestAppContext) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 滚动到后面再点行，必须仍能选中（用户报：翻到后面的数据，鼠标点击选不中文件）。
+///
+/// 走真实事件链路：滚轮把列表滚下去 → 等窗口快照跟上 → 对滚进视口的行发
+/// mousedown/mouseup。整条链任何一环断了（虚拟化元素没拿到 click 注册、
+/// 事件命中区错位、框选误吞），这条测试都会红。
+#[gpui_kit::test]
+fn clicking_a_row_after_scrolling_still_selects_it(cx: &mut TestAppContext) {
+    use gpui_kit::ScrollDelta;
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let dir = dir_with_files("scroll-click", 400);
+    // 大目录下窗口快照只持有可见区±BUFFER，`panel_window_ready_for_tests` 的
+    // `window.len()==rows` 永远不成立——这里只等首屏行真的画出来。
+    window
+        .update(cx, |root, _window, cx| {
+            mo_ui::navigate_for_tests(root, dir.clone(), cx);
+        })
+        .expect("导航失败");
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if vcx.debug_bounds("mo-file-row-0").is_some() {
+            break;
+        }
+    }
+    assert!(
+        vcx.debug_bounds("mo-file-row-0").is_some(),
+        "导航后首屏行没画出来"
+    );
+
+    // 基线：顶部第一行点击有效（隔离「滚动搞坏了点击」与「点击本来就坏」）。
+    // 行元素不进 observation 注册表（uniform_list 子项），点击一律走坐标。
+    let row0 = bounds(&mut vcx, "mo-file-row-0");
+    let p_row0 = point(
+        row0.origin.x + row0.size.width / 2.0,
+        row0.origin.y + row0.size.height / 2.0,
+    );
+    vcx.update(|window, cx| window.drag(p_row0, p_row0, cx));
+    vcx.run_until_parked();
+    assert_eq!(selection_count(&window, cx), 1, "顶部行点击应选中");
+
+    // 滚轮把列表往下滚（delta.y 为负 = 内容上移），分几步滚并让窗口快照跟上。
+    // uniform_list 不进 observation 注册表，滚轮事件直接按坐标派发。
+    use gpui_kit::{InputEvent, ScrollWheelEvent};
+    let list = bounds(&mut vcx, "mo-file-list");
+    let p_wheel = point(
+        list.origin.x + list.size.width / 2.0,
+        list.origin.y + list.size.height / 2.0,
+    );
+    for _ in 0..3 {
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: p_wheel,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(-1500.))),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        });
+        vcx.run_until_parked();
+    }
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    // 滚动必须真的发生了：首行已滚出渲染帧。
+    assert!(
+        vcx.debug_bounds("mo-file-row-0").is_none(),
+        "滚轮事件没有生效，首行仍在渲染帧里"
+    );
+
+    // 找一个已滚进视口的靠后行（不假设精确落点，只要「不在首屏」即可）。
+    let later = [50usize, 100, 150, 200, 250, 300].into_iter().find(|i| {
+        vcx.debug_bounds(Box::leak(format!("mo-file-row-{i}").into_boxed_str()))
+            .is_some()
+    });
+    let Some(later) = later else {
+        panic!("滚动后没有任何靠后行被渲染出来");
+    };
+    let selector: &'static str = Box::leak(format!("mo-file-row-{later}").into_boxed_str());
+    let target = bounds(&mut vcx, selector);
+    assert!(
+        f32::from(target.origin.y) >= 0.0 && f32::from(target.origin.y) < 700.0,
+        "滚动后行 {later} 应落在视口内，实际 {target:?}"
+    );
+
+    vcx.update(|window, cx| {
+        let p = point(
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0,
+        );
+        window.drag(p, p, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        selection_count(&window, cx),
+        1,
+        "滚动到后面再点行也应选中它"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
