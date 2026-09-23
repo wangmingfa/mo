@@ -61,6 +61,32 @@ pub fn isolate_config_for_tests() -> std::path::PathBuf {
     dir.clone()
 }
 
+/// 测试专用：向**当前标签页**注入假的操作快照（传输小块 / 浮层的数据源）。
+///
+/// 真操作要走 `OperationManager` 的注册 / 执行链路，headless 测试里拉不动整条
+/// 后台管线；`Panel.ops` 本来就是 UI 侧的快照缓存，直接塞进去即可渲染验证。
+#[doc(hidden)]
+pub fn inject_ops_for_tests(view: &mut RootView, ops: Vec<mo_operations::OperationHandle>) {
+    if let Some(p) = view.panel_at_mut(0, 0) {
+        p.ops = ops;
+    }
+}
+
+/// 测试专用：直接置传输浮层的开合状态（点击小块在 headless 里不好模拟）。
+#[doc(hidden)]
+pub fn set_ops_open_for_tests(view: &mut RootView, open: bool) {
+    view.ops_open = open;
+}
+
+/// 测试专用：注入假的回收站条目（回收站面板的数据源）。
+///
+/// 真条目要走 `Trash` 的索引文件与删除链路，headless 拉不动；字段直接置上
+/// 即可渲染验证（行高 / 侧栏保留 / 选中样式都靠它）。
+#[doc(hidden)]
+pub fn inject_trash_for_tests(view: &mut RootView, entries: Vec<mo_operations::TrashEntry>) {
+    view.trash_entries = entries;
+}
+
 /// 启动 Mo 图形界面。
 pub fn run() {
     init_tracing();

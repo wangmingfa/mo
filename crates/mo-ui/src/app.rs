@@ -671,8 +671,8 @@ pub struct RootView {
     dedup_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 已索引文件数（状态栏展示，取最近一次同步的值）。
     indexed: usize,
-    /// 回收站条目快照（回收站面板数据源）。
-    trash_entries: Vec<TrashEntry>,
+    /// 回收站条目快照（回收站面板数据源）。`pub(crate)` 仅为测试注入。
+    pub(crate) trash_entries: Vec<TrashEntry>,
     /// 比较 / diff 结果缓存（比较模态数据源）。
     diff_cache: Option<mo_diff::Comparison>,
     /// 模态内表单的当前字段下标。
@@ -705,6 +705,8 @@ pub struct RootView {
     pub(crate) header_cells_owner: (usize, usize),
     /// 右键上下文菜单（一次只开一个；`None` = 关闭）。
     pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
+    /// 左下角传输浮层是否展开（小块点击切换；点外面 / Esc 收起）。
+    pub(crate) ops_open: bool,
     /// 「打开方式」二级菜单的候选应用（菜单打开时对文件目标异步查询注册表）。
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
     /// 「选择其他应用…」的选择器（复用命令面板的那层壳，见 [`AppPicker`]）。
@@ -859,6 +861,7 @@ impl RootView {
             header_cells: Vec::new(),
             header_cells_owner: (0, 0),
             context_menu: None,
+            ops_open: false,
             open_with_apps: Vec::new(),
             app_picker: None,
             ctx_submenu_open: false,
@@ -937,6 +940,44 @@ impl RootView {
             }
         }
         out
+    }
+
+    /// 左下角传输浮层开合（小块点击切换）。
+    pub(crate) fn toggle_ops_popover(&mut self, cx: &mut Context<Self>) {
+        self.ops_open = !self.ops_open;
+        cx.notify();
+    }
+
+    /// 收起传输浮层（点浮层外 / Esc）。本来就收着时不动，也不触发重绘。
+    pub(crate) fn close_ops_popover(&mut self, cx: &mut Context<Self>) {
+        if self.ops_open {
+            self.ops_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 打开回收站面板（侧栏入口 / 命令面板共用同一条路）。
+    pub(crate) fn open_trash_panel(&mut self, cx: &mut Context<Self>) {
+        self.trash_entries = self.app().trash_list();
+        self.modal = Modal::Trash;
+        self.palette_index = 0;
+        cx.notify();
+    }
+
+    /// 导航类入口（侧栏 / 工具栏 / 地址栏）发起跳转时，把次级视图退回浏览态。
+    ///
+    /// 用户点「桌面」是要**去桌面**，不是「下层面板换一页、人还留在回收站里」
+    /// （用户报：从回收站点侧栏，地址栏变了但列表没变）。命令面板路径在
+    /// `dispatch_action` 里已自带关闭；侧栏直接调 `AppState`、工具栏走
+    /// `spawn_nav`，这两条路此前都绕过了它。B 类对话框有遮罩挡着点不到侧栏，
+    /// 无条件置 `None` 是安全的。
+    pub(crate) fn leave_secondary_view(&mut self, cx: &mut Context<Self>) {
+        if self.modal != Modal::None {
+            self.modal = Modal::None;
+            self.palette_index = 0;
+            self.cmd_query.clear();
+            cx.notify();
+        }
     }
 
     /// 全部窗格 / 标签页的 `AppState`。
@@ -2041,6 +2082,9 @@ impl RootView {
             cx.notify();
             return;
         }
+
+        // 地址栏导航同样要离开次级视图（回收站 / 全局搜索）：填了新地址 = 要去那边。
+        self.leave_secondary_view(cx);
 
         // 形如 `scheme://...` 的地址 → 当成远程连接（协议是否支持由连接逻辑判定）。
         if text.contains("://") {
@@ -5324,7 +5368,7 @@ impl Render for RootView {
                                 .or_else(|| self.panel().path.clone())
                         })
                         .flatten();
-                    row = row.child(sidebar::render(&self.panel().app, &current, &entity));
+                    row = row.child(sidebar::render(&self.panel().app, &current, false, &entity));
                 }
                 self.ensure_columns(cx);
                 for i in 0..visible_panes {
@@ -5333,8 +5377,40 @@ impl Render for RootView {
                 row
             }
             // 次级视图（A 类）：占满中央区，由 `central_view` 提供标题栏。
-            Modal::GlobalSearch => self.render_global_search(&entity),
-            Modal::Trash => self.render_trash(),
+            // 其中「浏览型」的两个（全局搜索 / 回收站）**保留侧栏**——它们本质上
+            // 还是在挑文件，左侧导航得一直在（用户报：进回收站左侧整个没了）。
+            // 其余（快捷键 / 扩展 / 比较…）是工具页，全宽无妨。
+            Modal::GlobalSearch | Modal::Trash => {
+                let in_trash = matches!(self.modal, Modal::Trash);
+                let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
+                if self.ui.sidebar {
+                    // 回收站里没有「当前位置」可言：别把进面板前的目录高亮留着，
+                    // 改高亮侧栏的「回收站」入口本身（见 sidebar::render 的 trash_active）。
+                    let current = if in_trash {
+                        None
+                    } else {
+                        (!self.panel().app.browsing_remote())
+                            .then(|| {
+                                self.panel()
+                                    .opening
+                                    .clone()
+                                    .or_else(|| self.panel().path.clone())
+                            })
+                            .flatten()
+                    };
+                    row = row.child(sidebar::render(
+                        &self.panel().app,
+                        &current,
+                        in_trash,
+                        &entity,
+                    ));
+                }
+                if in_trash {
+                    row.child(self.render_trash(&entity))
+                } else {
+                    row.child(self.render_global_search(&entity))
+                }
+            }
             Modal::Diff => self.render_diff(),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
@@ -5373,8 +5449,7 @@ impl Render for RootView {
                 panel.address.as_ref(),
                 panel.view_mode,
             ))
-            .child(body)
-            .child(progress_panel::render(&ops, &app));
+            .child(body);
 
         // 状态栏可关（配置 `ui.status_bar`）。
         if self.ui.status_bar {
@@ -5389,6 +5464,15 @@ impl Render for RootView {
             ));
         }
 
+        // 传输指示：左下角小块 + 浮层（绝对定位，不占布局；没有任务时不画）。
+        // 原先是整条横幅铺在窗口底部，任务会把状态栏顶上去一截，已废弃。
+        root = root.child(progress_panel::render_overlay(
+            &ops,
+            &app,
+            self.ops_open,
+            &entity,
+        ));
+
         // 键盘路由：全局快捷键 + 模态内导航 + 输入即过滤。
         root.interactivity().on_key_down(move |ev, _window, cx| {
             let key = ev.keystroke.key.as_str();
@@ -5396,17 +5480,25 @@ impl Render for RootView {
             let shift = m.shift;
             let plain = !m.control && !m.alt && !m.platform;
 
-            // 右键菜单开着时 Esc 先关菜单（其余按键继续走正常路由，
+            // 右键菜单 / 传输浮层开着时 Esc 先关掉它们（其余按键继续走正常路由，
             // 菜单不该像模态那样吃掉方向键 / 输入即过滤）。
             if key == "escape" {
-                let had_menu = entity_key.update(cx, |v, cx| {
-                    let had = v.context_menu.is_some();
-                    if had {
+                let consumed = entity_key.update(cx, |v, cx| {
+                    let mut consumed = false;
+                    if v.context_menu.is_some() {
                         v.close_context_menu(cx);
+                        consumed = true;
                     }
-                    had
+                    if v.ops_open {
+                        v.ops_open = false;
+                        consumed = true;
+                    }
+                    if consumed {
+                        cx.notify();
+                    }
+                    consumed
                 });
-                if had_menu {
+                if consumed {
                     return;
                 }
             }
@@ -6483,12 +6575,7 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
             .detach();
         }
         Some(CommandId::OpenTrash) => {
-            entity.update(cx, |v, cx| {
-                v.trash_entries = v.app().trash_list();
-                v.modal = Modal::Trash;
-                v.palette_index = 0;
-                cx.notify();
-            });
+            entity.update(cx, |v, cx| v.open_trash_panel(cx));
         }
         Some(CommandId::NewTab) => {
             entity.update(cx, |v, cx| {
@@ -7410,47 +7497,124 @@ impl RootView {
         )
     }
 
-    fn render_trash(&self) -> Div {
+    fn render_trash(&self, entity: &Entity<RootView>) -> Div {
         let idx = self.palette_index;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // 吃满中央区剩余高度（原先写死 360px 是为了配合 640px 卡片）。
+        // 吃满中央区剩余高度。行的视觉语言**与文件列表同一套**（用户报：回收站
+        // 的行又高字又大，像另一套 UI）——24px 行高、13px 字号、斑马纹、Lucide
+        // 图标、蓝底选中，见 file_list 的行渲染。
         let mut body = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .gap(px(2.0))
+            .px(px(12.0))
+            .py(px(6.0))
             .overflow_y_scrollbar();
         for (i, e) in self.trash_entries.iter().enumerate() {
             let selected = i == idx;
-            let kind = if e.is_dir { "📁" } else { "📄" };
-            let row = div()
+            let name = e
+                .original
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| e.original.to_string_lossy().to_string());
+            let parent = e
+                .original
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // 回收站里的原路径多半已不存在，系统图标查不到 → 用内置 Lucide
+            // 字形：目录 FOLDER，文件按扩展名挑（与 file_item 的兜底同源）。
+            let glyph = if e.is_dir {
+                crate::icons::FOLDER
+            } else {
+                crate::icons::file_ext_icon(&name)
+            };
+            let fg = if selected {
+                theme::selected_text()
+            } else {
+                theme::text()
+            };
+
+            // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
+            let mut row = div()
                 .id(format!("trash-row-{i}"))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .p(px(6.0))
+                .w_full()
+                .h(px(24.0))
+                .px(px(4.0))
+                .text_size(px(13.0))
+                // 与文件列表一致：选中蓝底；未选中奇偶斑马纹 + 悬停。
                 .bg(if selected {
                     theme::selected_bg()
+                } else if i % 2 == 1 {
+                    theme::zebra()
                 } else {
                     theme::surface()
                 })
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                })
-                .child(text!(kind.to_string()))
-                .child(text!(e.original.to_string_lossy().to_string()))
-                .child(text!(human_ago(e.at, now)));
+                .debug_selector(move || format!("mo-trash-row-{i}"));
+            if !selected {
+                row = row.hover(|s| s.bg(theme::hover_bg()));
+            }
+            row = row
+                .child(crate::icons::icon(glyph, 16.0, fg))
+                .child(
+                    // 文件名：给个不宽死的上限，路径列吃剩余空间。
+                    div()
+                        .flex_shrink_0()
+                        .max_w(px(280.0))
+                        .min_w_0()
+                        .truncate()
+                        .text_color(fg)
+                        .child(text!(name)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(parent)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(human_ago(e.at, now))),
+                );
+
+            // 点击选中这一行（键盘 ↑↓ 的 palette_index 与鼠标共用同一游标）。
+            let entity_click = entity.clone();
+            row.interactivity().on_click(move |_, _window, cx| {
+                entity_click.update(cx, |v, cx| {
+                    v.palette_index = i;
+                    cx.notify();
+                });
+            });
             body = body.child(row);
         }
         if self.trash_entries.is_empty() {
-            body = body.child(text!("回收站是空的".to_string()));
+            body = body.child(
+                div()
+                    .p(px(24.0))
+                    .text_size(px(13.0))
+                    .text_color(theme::muted())
+                    .child(text!("回收站是空的".to_string())),
+            );
         }
         central_view(
             &format!("回收站（{} 项）", self.trash_entries.len()),
@@ -7691,6 +7855,8 @@ pub(crate) fn central_view(title: &str, input: &str, body: impl IntoElement, hin
         .min_h_0()
         .bg(theme::surface())
         .text_color(theme::text())
+        // 测试用（release no-op）：断言「回收站 / 全局搜索」这类次级视图确实占住了中央区。
+        .debug_selector(|| "mo-central-view".to_string())
         .child(
             div()
                 .flex()

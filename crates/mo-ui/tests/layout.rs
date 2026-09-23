@@ -323,3 +323,199 @@ fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppCon
         status
     );
 }
+
+// ── 传输指示（左下角小块 + 浮层）与回收站入口 ────────────────────────────
+
+use mo_operations::{OperationHandle, OperationStatus};
+
+/// 造一条假操作快照（真操作要走 OperationManager 的后台执行链路，headless 拉不动）。
+fn fake_op(id: u64, status: OperationStatus, done: u64, total: u64) -> OperationHandle {
+    OperationHandle {
+        id,
+        describe: format!("删除（回收站）/Users/demo/file-{id}"),
+        status,
+        progress: (done, total),
+    }
+}
+
+fn inject_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ops: Vec<OperationHandle>) {
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_ops_for_tests(root, ops);
+        })
+        .expect("注入操作快照失败");
+}
+
+/// 传输任务必须收成**左下角统一任务面板**（折叠态），不能再是整条横幅把状态栏
+/// 顶上去，也不能是悬空浮层加底下一份重复小块。
+///
+/// 折叠态：面板宽不超过 310px、贴在状态栏上方，且状态栏高度不受任务影响。
+#[gpui_kit::test]
+fn transfers_render_as_a_corner_badge_above_the_status_bar(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let baseline = bounds(&mut vcx, "mo-statusbar");
+
+    inject_ops(
+        &window,
+        cx,
+        vec![
+            fake_op(1, OperationStatus::Running, 3, 10),
+            fake_op(2, OperationStatus::Completed, 5, 5),
+        ],
+    );
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let badge = bounds(&mut vcx, "mo-ops-badge");
+    assert!(
+        f32::from(badge.size.width) <= 310.0,
+        "折叠面板宽 {}：又铺回横幅了",
+        badge.size.width
+    );
+    let status = bounds(&mut vcx, "mo-statusbar");
+    assert_eq!(
+        status, baseline,
+        "有任务之后状态栏位置/大小变了：面板不该占布局"
+    );
+    assert!(
+        f32::from(badge.origin.y) + f32::from(badge.size.height) <= f32::from(status.origin.y),
+        "面板应悬在状态栏上方：badge={badge:?} status={status:?}"
+    );
+    // 默认折叠。
+    assert!(vcx.debug_bounds("mo-ops-popover").is_none());
+}
+
+/// 点折叠态的小块原地展开成任务列表，再点一次收起——同一张卡片，不是
+/// 悬空浮层 + 底下还留一份重复小块。
+#[gpui_kit::test]
+fn badge_click_toggles_the_transfer_popover(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    inject_ops(
+        &window,
+        cx,
+        vec![fake_op(1, OperationStatus::Running, 0, 4)],
+    );
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-ops-badge").is_some(),
+        "有任务时应画出小块"
+    );
+
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    let pop = bounds(&mut vcx, "mo-ops-popover");
+    assert!(
+        f32::from(pop.size.width) <= 400.0,
+        "展开面板宽 {}：不该铺满窗口",
+        pop.size.width
+    );
+    // 列表在标题行（mo-ops-badge）**正下方**、同一张卡片内：左缘对齐，中间无缝。
+    let badge = bounds(&mut vcx, "mo-ops-badge");
+    assert!(
+        f32::from(pop.origin.y) >= f32::from(badge.origin.y) + f32::from(badge.size.height),
+        "任务列表应紧跟标题行下方：pop={pop:?} badge={badge:?}"
+    );
+    assert_eq!(
+        pop.origin.x, badge.origin.x,
+        "展开面板与折叠小块左缘不对齐：不像同一张卡片"
+    );
+
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-ops-popover").is_none(),
+        "再点一次标题行应收起任务列表"
+    );
+}
+
+/// 侧栏必须有「回收站」入口；点开进回收站面板，且**侧栏不消失**（次级视图
+/// 是「浏览型」的，左侧导航要一直在），行样式与文件列表同一套（24px 行高）。
+#[gpui_kit::test]
+fn sidebar_trash_entry_opens_the_trash_panel(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    // 注入两条假回收站记录（真记录要走 Trash 索引链路，headless 拉不动），
+    // 行样式 / 侧栏保留的断言靠它们渲染出来。
+    let mk = |name: &str, is_dir: bool| mo_operations::TrashEntry {
+        id: format!("t-{name}"),
+        original: std::path::PathBuf::from("/Users/demo").join(name),
+        trashed: std::path::PathBuf::from("/tmp/mo-trash").join(name),
+        is_dir,
+        at: 1_700_000_000,
+    };
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_trash_for_tests(
+                root,
+                vec![mk("新建文本.txt", false), mk("trae-cn", true)],
+            );
+        })
+        .expect("注入回收站条目失败");
+
+    let sidebar = bounds(&mut vcx, "mo-sidebar");
+    let trash = bounds(&mut vcx, "mo-sidebar-trash");
+    assert!(
+        trash.origin.x >= sidebar.origin.x
+            && trash.origin.x + trash.size.width <= sidebar.origin.x + sidebar.size.width,
+        "回收站入口不在侧栏内：sidebar={sidebar:?} trash={trash:?}"
+    );
+    // 浏览态下中央区不是次级视图；点回收站后必须是。
+    assert!(vcx.debug_bounds("mo-central-view").is_none());
+
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-central-view").is_some(),
+        "点了回收站入口，回收站面板没有出现"
+    );
+    // 回归（用户报）：进回收站后侧栏不能整个消失。
+    let sidebar_after = bounds(&mut vcx, "mo-sidebar");
+    assert_eq!(
+        sidebar, sidebar_after,
+        "进回收站后侧栏位置/大小变了：侧栏不该被次级视图顶掉"
+    );
+    // 回归（用户报）：回收站行要复用文件列表的行语言，行高就是 24px。
+    let row = bounds(&mut vcx, "mo-trash-row-0");
+    assert_eq!(
+        f32::from(row.size.height),
+        24.0,
+        "回收站行高 {}：又自成一派了（文件列表行高 24px）",
+        f32::from(row.size.height)
+    );
+}
+
+/// 从回收站点侧栏位置 = **离开回收站去那个目录**（用户报：地址栏变了但人
+/// 还留在回收站里，列表也没变）。侧栏导航必须顺手退出次级视图。
+#[gpui_kit::test]
+fn clicking_a_sidebar_location_leaves_the_trash_panel(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_trash_for_tests(
+                root,
+                vec![mo_operations::TrashEntry {
+                    id: "t-1".into(),
+                    original: std::path::PathBuf::from("/Users/demo/a.txt"),
+                    trashed: std::path::PathBuf::from("/tmp/mo-trash/a.txt"),
+                    is_dir: false,
+                    at: 1_700_000_000,
+                }],
+            );
+        })
+        .expect("注入回收站条目失败");
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(vcx.debug_bounds("mo-central-view").is_some(), "先进回收站");
+
+    vcx.update(|window, cx| window.click(("sidebar-loc", 0usize), cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-central-view").is_none(),
+        "点了侧栏位置，还停在回收站：导航没有退出次级视图"
+    );
+    assert!(
+        vcx.debug_bounds("mo-file-list").is_some(),
+        "离开回收站后文件列表没有回来"
+    );
+}

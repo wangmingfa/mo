@@ -133,7 +133,6 @@ impl KeyCombo {
                 "shift" => out.shift = true,
                 "esc" => out.key = "escape".into(),
                 "return" => out.key = "enter".into(),
-                "del" | "delete" => out.key = "backspace".into(),
                 "pgup" | "prior" => out.key = "pageup".into(),
                 "pgdn" | "next" => out.key = "pagedown".into(),
                 "space" | "spacebar" | "␣" => out.key = " ".into(),
@@ -227,7 +226,16 @@ impl KeyCombo {
             _ => match self.key.as_str() {
                 " " => "Space".to_string(),
                 "escape" => "Esc".to_string(),
-                "backspace" => "Delete".to_string(),
+                // ⌫ 就是 ⌫（macOS 菜单惯例）；其它平台写全名。这里**不能**再显示
+                // 成「Delete」——那是另一个物理键（前向删除），曾经把两者混成一个
+                // 名字，配置里写 delete 实际绑到 ⌫，裸按 ⌫ 就触发了删除。
+                "backspace" => {
+                    if cfg!(target_os = "macos") {
+                        "⌫".to_string()
+                    } else {
+                        "Backspace".to_string()
+                    }
+                }
                 // 其余多字符键名首字母大写展示：enter→Enter、up→Up、f2→F2。
                 other => match other.chars().next() {
                     Some(c) => {
@@ -458,7 +466,9 @@ pub const BINDINGS: [Binding; 33] = [
     Binding {
         id: "file.trash",
         label: "移到废纸篓",
-        default: "delete",
+        // macOS 惯例：⌘⌫ 移到废纸篓（Finder 同款）。**裸 ⌫ 绝不删除**——它留给
+        // 「返回上级 / 删过滤词」。其它平台的默认值在 [`default_spec`] 按平台覆盖。
+        default: "cmd+backspace",
     },
     Binding {
         id: "list.rename",
@@ -527,6 +537,10 @@ pub fn default_spec(b: &Binding) -> &'static str {
             "list.rename" => return "enter",
             _ => {}
         }
+    } else if b.id == "file.trash" {
+        // Windows / Linux 惯例：Delete 键移到回收站（资源管理器同款）。
+        // macOS 走上面的 `cmd+backspace`（⌘⌫）。
+        return "delete";
     }
     b.default
 }
@@ -741,6 +755,42 @@ mod tests {
         let redo = ks("cmd+shift+z");
         assert!(!undo.matches(&redo));
         assert!(redo.matches(&ks("cmd+shift+Z")));
+    }
+
+    /// 回归：删除键位必须按平台落在「正确的物理键」上，且**裸 ⌫ 永不删除**。
+    ///
+    /// 历史坑：`file.trash` 默认写 `delete`，而解析又把 `delete` 折成 `backspace`，
+    /// 结果 macOS 上裸按 ⌫ 就触发「移到废纸篓」——过滤词没删成、文件先没了。
+    /// 现在：macOS = ⌘⌫，Windows / Linux = Delete（前向删除键），⌫ 独立存在。
+    #[test]
+    fn trash_uses_platform_delete_key_and_backspace_stays_free() {
+        // `delete` 是前向删除键，不再折成 backspace——两个物理键必须分得开。
+        assert_eq!(KeyCombo::parse("delete").unwrap().key, "delete");
+        assert_eq!(KeyCombo::parse("backspace").unwrap().key, "backspace");
+
+        let map = Keymap::build(&HashMap::new());
+        let bare_backspace = KeyCombo {
+            cmd: false,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            key: "backspace".into(),
+        };
+        assert!(
+            map.lookup(&bare_backspace).is_none(),
+            "裸 ⌫ 不能绑定任何动作（删除只允许带修饰键 / 用 Delete 键）"
+        );
+
+        let trash = BINDINGS.iter().find(|b| b.id == "file.trash").unwrap();
+        if has_command_key() {
+            let combo = map.combo_of("file.trash").unwrap().clone();
+            assert_eq!(combo.key, "backspace", "macOS：⌘⌫ 移到废纸篓");
+            assert!(combo.cmd, "macOS 上删除必须带 ⌘");
+            assert_eq!(default_spec(trash), "cmd+backspace");
+        } else {
+            assert_eq!(map.combo_of("file.trash").unwrap().key, "delete");
+            assert_eq!(default_spec(trash), "delete");
+        }
     }
 
     /// 默认键表能整体构建，且没有内部冲突。

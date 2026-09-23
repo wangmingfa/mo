@@ -64,7 +64,8 @@ pub fn render(
         .debug_selector(|| "mo-toolbar".to_string())
         .child(icon_button("nav-back", icons::ARROW_LEFT, can_back, {
             let app = app.clone();
-            move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Back)
+            let entity = entity.clone();
+            move |cx: &mut App| spawn_nav(cx, app.clone(), &entity, Nav::Back)
         }))
         .child(icon_button(
             "nav-forward",
@@ -72,16 +73,19 @@ pub fn render(
             can_forward,
             {
                 let app = app.clone();
-                move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Forward)
+                let entity = entity.clone();
+                move |cx: &mut App| spawn_nav(cx, app.clone(), &entity, Nav::Forward)
             },
         ))
         .child(icon_button("nav-parent", icons::ARROW_UP, true, {
             let app = app.clone();
-            move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Parent)
+            let entity = entity.clone();
+            move |cx: &mut App| spawn_nav(cx, app.clone(), &entity, Nav::Parent)
         }))
         .child(icon_button("nav-refresh", icons::ROTATE_CW, true, {
             let app = app.clone();
-            move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
+            let entity = entity.clone();
+            move |cx: &mut App| spawn_nav(cx, app.clone(), &entity, Nav::Refresh)
         }))
         .child(address_bar(app, entity, path, address_editing, address))
         // 视图模式：四个模式**平铺**成一排图标按钮（Finder 工具栏那组），当前模式高亮。
@@ -500,7 +504,10 @@ enum Nav {
 }
 
 /// 在应用上下文里派发一个导航命令，结果通过事件总线回灌到 UI。
-fn spawn_nav(cx: &mut App, app: AppState, nav: Nav) {
+fn spawn_nav(cx: &mut App, app: AppState, entity: &Entity<RootView>, nav: Nav) {
+    // 工具栏导航从次级视图（回收站 / 全局搜索…）发起时，先把面板退回浏览态
+    // ——与侧栏同一约定：导航 = 离开次级视图。
+    entity.update(cx, |v, cx| v.leave_secondary_view(cx));
     cx.spawn(async move |_cx| {
         let result = match nav {
             Nav::Back => app.go_back().await,

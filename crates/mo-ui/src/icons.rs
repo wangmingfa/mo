@@ -244,6 +244,12 @@ pub fn quick_access_icon(label: &str) -> &'static [u8] {
     }
 }
 
+/// 回收站（Lucide `trash-2`）：侧栏「回收站」入口用。
+///
+/// 不放进 [`quick_access_icon`]：那套按**路径**高亮、点击走 `open_local`，
+/// 回收站是模态面板，语义不同，单独一行。
+pub const TRASH: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;

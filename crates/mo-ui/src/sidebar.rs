@@ -10,9 +10,13 @@ use crate::RootView;
 ///
 /// 位置由 [`AppState::quick_locations`] 提供（基于 `dirs` 解析，存在才显示），
 /// 点击即跳转；当前所在位置高亮（含子目录内）。
+///
+/// `trash_active`：回收站面板开着时高亮「回收站」入口——此时「当前位置」的
+/// 高亮由调用方置空（见 app.rs 的 A 类视图分支），两者不并存。
 pub fn render(
     app: &AppState,
     current: &Option<std::path::PathBuf>,
+    trash_active: bool,
     entity: &Entity<RootView>,
 ) -> impl IntoElement {
     let locations = app.quick_locations();
@@ -84,6 +88,9 @@ pub fn render(
             let app = app_click.clone();
             let target = path.clone();
             let entity = entity_click.clone();
+            // 导航 = 离开次级视图（回收站 / 全局搜索），不然「去了那个目录、
+            // 人还留在回收站里」（用户报）。
+            entity.update(cx, |v, cx| v.leave_secondary_view(cx));
             cx.spawn(async move |cx| {
                 // ⚠️ 必须走 `open_local`（快捷访问全是**本地**位置）。连着远程时若直接
                 // `open_directory`，会拿本地路径去远程后端读（FTP 上它不存在）→ 导航
@@ -110,9 +117,48 @@ pub fn render(
                 16.0,
                 crate::theme::text(),
             ))
-            .child(text!(label)),
+            .child(text!(label))
+            // headless 测试要点这一行（见 progress_panel 里 test_support 的说明）。
+            .test_support(),
         );
     }
+
+    // 回收站入口：不占 quick_locations（那套按**路径**匹配高亮、点击走 open_local），
+    // 回收站是模态面板（`Modal::Trash`），语义不同，单独一行，点开即看。
+    let entity_trash = entity.clone();
+    let mut trash_item = div()
+        .id("sidebar-trash")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(10.0))
+        .py(px(5.0))
+        .rounded(px(6.0))
+        .text_size(px(13.0))
+        .text_color(crate::theme::text())
+        // 测试用（release no-op）：headless 断言入口存在。
+        .debug_selector(|| "mo-sidebar-trash".to_string());
+    if trash_active {
+        // 与快捷位置的「当前位置」同款高亮（accent 底）。
+        trash_item = trash_item.bg(crate::theme::accent());
+    } else {
+        trash_item = trash_item.hover(|s| s.bg(crate::theme::hover_bg()));
+    }
+    trash_item.interactivity().on_click(move |_, _window, cx| {
+        entity_trash.update(cx, |v, cx| v.open_trash_panel(cx));
+    });
+    panel = panel.child(
+        trash_item
+            .child(crate::icons::icon(
+                crate::icons::TRASH,
+                16.0,
+                crate::theme::text(),
+            ))
+            .child(text!("回收站"))
+            // headless 测试要点这一行（见 progress_panel 里 test_support 的说明）。
+            .test_support(),
+    );
 
     // 远程连接区：「远程」标题右侧一个「＋」（连接到服务器…），下面是**每条活着的
     // 连接**一行——点一行切过去，行尾的电源图标断开它。
@@ -199,6 +245,8 @@ pub fn render(
         item.interactivity().on_click(move |_, _window, cx| {
             let app = app_back.clone();
             let entity = entity_back.clone();
+            // 同快捷访问：切连接也要离开次级视图。
+            entity.update(cx, |v, cx| v.leave_secondary_view(cx));
             cx.spawn(async move |cx| {
                 // `open_connection` 会先保活 / 重连（闲置被服务器掐掉的连接在这里
                 // 静默恢复），所以走不到 `Err` 就已经是「真的不行了」。
@@ -303,6 +351,8 @@ pub fn render(
             let app = app_click.clone();
             let target = target.clone();
             let entity = entity_click.clone();
+            // 同快捷访问：导航要离开次级视图。
+            entity.update(cx, |v, cx| v.leave_secondary_view(cx));
             cx.spawn(async move |cx| {
                 // 挂载点是**本地目录**：连着远程时也要先切回本地（否则拿本地路径
                 // 去远程后端读必然失败，和侧边栏快捷访问同一个坑）。
@@ -398,6 +448,8 @@ pub fn render(
             let app = app_click.clone();
             let target = target.clone();
             let entity = entity_click.clone();
+            // 同快捷访问：导航要离开次级视图。
+            entity.update(cx, |v, cx| v.leave_secondary_view(cx));
             cx.spawn(async move |cx| {
                 if let Err(e) = app.open_local(&target).await {
                     entity.update(cx, |v, cx| {
@@ -490,6 +542,8 @@ pub fn render(
             let app = app_click.clone();
             let target = target.clone();
             let entity = entity_click.clone();
+            // 同快捷访问：导航要离开次级视图。
+            entity.update(cx, |v, cx| v.leave_secondary_view(cx));
             // 书签是配置里持久化的路径，但**远程会话里加的书签存的是远程路径**
             // （命令面板取「当前目录」）。分流：本地确实存在的 → `open_local`
             // （连远程时先切回本地，否则拿本地路径去远程后端读必然失败）；

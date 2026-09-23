@@ -2462,6 +2462,14 @@ impl AppState {
     pub async fn cancel_operation(&self, id: u64) {
         self.ops.lock().await.cancel(id);
     }
+
+    /// 从操作列表里移除一条**已结束**的操作（传输浮层里的 ✕）。
+    ///
+    /// `OperationManager::remove` 只摘句柄，不动正在跑的后台任务；
+    /// 进行中的操作应走 [`Self::cancel_operation`]，取消后 再由用户移除。
+    pub async fn dismiss_operation(&self, id: u64) {
+        self.ops.lock().await.remove(id);
+    }
 }
 
 impl AppState {
