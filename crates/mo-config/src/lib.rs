@@ -153,6 +153,46 @@ pub struct UiPrefs {
     /// 默认视图模式：`list` / `grid` / `gallery` / `columns`。
     #[serde(default = "default_view_mode")]
     pub view_mode: String,
+    /// 网格 / 画廊里图标（连同单元几何）的缩放倍率，`1.0` = 原始大小。
+    ///
+    /// 只作用于**网格 / 画廊**：列表与列视图的行高是固定 24pt
+    /// （`listing::row_height`），放大图标会牵动整行布局，不在这一档里做。
+    /// 写进配置的坏值（NaN / 0 / 10）由 [`clamp_icon_scale`] 收口，不让它把布局算成负数。
+    #[serde(default = "default_icon_scale")]
+    pub icon_scale: f32,
+    /// 列表视图的分组方式：`none` / `kind` / `date`（新标签页的默认值）。
+    ///
+    /// 存稳定键名而不是中文标签（同 `view_mode` 的约定）；键的合法性与
+    /// 归属在 mo-core 的 `Grouping::from_key` 里收口，坏值回落「不分组」。
+    #[serde(default = "default_grouping")]
+    pub group: String,
+}
+
+/// 图标缩放的档位边界与步长（网格 / 画廊）。
+///
+/// 下限不是随便定的：单元里的文件名 / 大小两行文字不参与缩放，方框缩到 27pt
+/// 以下时格子会被文字撑破（`grid::cell` 是 `justify_center`，撑破的表现是
+/// 文字溢出到相邻格）。上限 2× 是「画廊里 96pt 方框放到 192pt 还看得见一张缩略图」
+/// 的尺度，再大就没意义了，只是把可视条数压到个位数。
+pub const ICON_SCALE_MIN: f32 = 0.75;
+/// 见 [`ICON_SCALE_MIN`]。
+pub const ICON_SCALE_MAX: f32 = 2.0;
+/// 一次 ⌘+ / ⌘- 走过的步长。
+pub const ICON_SCALE_STEP: f32 = 0.25;
+
+/// 把任意倍率收进合法档位，并量化到 0.01——步进是浮点加法，
+/// `0.75 + 0.25 + 0.25` 会得到 `1.2499999`，写进配置就成了脏数据。
+pub fn clamp_icon_scale(v: f32) -> f32 {
+    // 只有 NaN 无从解释（回落默认）；±∞ 语义明确（太大 / 太小），交给 clamp 顶到边界。
+    if v.is_nan() {
+        return default_icon_scale();
+    }
+    let clamped = v.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
+    (clamped * 100.0).round() / 100.0
+}
+
+fn default_icon_scale() -> f32 {
+    1.0
 }
 
 fn truthy() -> bool {
@@ -163,6 +203,10 @@ fn default_view_mode() -> String {
     "list".to_string()
 }
 
+fn default_grouping() -> String {
+    "none".to_string()
+}
+
 impl Default for UiPrefs {
     fn default() -> Self {
         Self {
@@ -170,6 +214,8 @@ impl Default for UiPrefs {
             status_bar: true,
             zebra: true,
             view_mode: default_view_mode(),
+            icon_scale: default_icon_scale(),
+            group: default_grouping(),
         }
     }
 }
@@ -249,6 +295,7 @@ mod tests {
         assert_eq!(cfg.theme, "dark");
         assert_eq!(cfg.sidebar_bookmarks, vec!["/tmp/x".to_string()]);
         assert_eq!(cfg.ui.view_mode, "list", "缺字段走默认值");
+        assert_eq!(cfg.ui.icon_scale, 1.0, "缺字段走默认值");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -264,6 +311,41 @@ mod tests {
         assert!(cfg.show_hidden);
         assert_eq!(cfg.theme, "light");
         assert!(cfg.custom_themes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缩放倍率是用户手改得到的字段，坏值必须在**读的时候**收口。
+    ///
+    /// 界面上那两个按钮不会写出坏值，但 config.json 是给人改的：`0` / `999` /
+    /// `"abc"`（反序列化失败走默认）都会进来。不收口的话，`0` 会让方框边长算成 0
+    /// （图标消失），`NaN` 会污染后面所有几何计算，怎么算都是 NaN。
+    #[test]
+    fn icon_scale_is_clamped_and_quantized() {
+        assert_eq!(clamp_icon_scale(1.0), 1.0);
+        assert_eq!(clamp_icon_scale(0.0), ICON_SCALE_MIN);
+        assert_eq!(clamp_icon_scale(-3.0), ICON_SCALE_MIN);
+        assert_eq!(clamp_icon_scale(99.0), ICON_SCALE_MAX);
+        assert_eq!(clamp_icon_scale(f32::NAN), 1.0, "NaN 回落默认");
+        assert_eq!(clamp_icon_scale(f32::INFINITY), ICON_SCALE_MAX);
+        // 浮点步进的脏值量化到 0.01：0.75 + 0.25 + 0.25 = 1.2499999…
+        assert_eq!(clamp_icon_scale(0.75 + 0.25 + 0.25), 1.25);
+    }
+
+    /// 写坏值的配置能读出来（而不是整份配置回落默认），坏值由 `clamp_icon_scale` 兜。
+    #[test]
+    fn bogus_icon_scale_does_not_kill_the_whole_config() {
+        let dir = std::env::temp_dir().join(format!("mo-config-zoom-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","ui":{"icon_scale":0.0,"zebra":false}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.theme, "dark", "坏字段不该拖垮整份配置");
+        assert!(!cfg.ui.zebra, "同级的正常字段照常生效");
+        assert_eq!(clamp_icon_scale(cfg.ui.icon_scale), ICON_SCALE_MIN);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

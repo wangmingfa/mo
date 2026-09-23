@@ -8,15 +8,24 @@ pub struct ReadDirEntry {
     pub name: String,
     pub kind: EntryKind,
     pub path: PathBuf,
+    /// 是否「隐藏」（`.` 开头；macOS 上还包括 `chflags hidden` 的条目）。
+    ///
+    /// 判据跟着条目一起交上来，而不是让上层拿着路径再去 stat 一遍：列目录是
+    /// **热路径**（进目录 / 刷新 / 前进后退 / 列视图切列都会重读），一个两万条
+    /// 的目录多两万次 syscall 就是肉眼可见的停顿。用户在界面上切「显示隐藏文件」
+    /// 时过滤的是这个字段，不需要重新读盘之外的任何 IO。
+    pub hidden: bool,
 }
 
 impl ReadDirEntry {
     pub fn new(id: FileId, name: String, kind: EntryKind, path: PathBuf) -> Self {
+        let hidden = crate::is_hidden_name(&name);
         Self {
             id,
             name,
             kind,
             path,
+            hidden,
         }
     }
 }

@@ -271,6 +271,30 @@ fn address_bar_lives_inside_the_toolbar(cx: &mut TestAppContext) {
     );
 }
 
+/// 刷新按钮排在地址栏**左边**，与 ←→↑ 同属导航那一组。
+///
+/// 钉的是**左右关系**而不是「按钮在不在」：地址栏是弹性的（`flex_1`），刷新挪到它
+/// 右边时按钮自己的宽高一点没变，只有「谁在谁左边」能抓住。刷新是「重读当前目录」，
+/// 与后退 / 前进 / 上一级同类，摆在一起才读得出是一组；地址栏右侧整块留给视图模式
+/// 那一组（互斥、带外框，自成一体）。
+#[gpui_kit::test]
+fn refresh_sits_left_of_the_address_bar(cx: &mut TestAppContext) {
+    let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    let parent = bounds(&mut cx, "mo-icon-nav-parent");
+    let refresh = bounds(&mut cx, "mo-icon-nav-refresh");
+    let address = bounds(&mut cx, "mo-address");
+
+    assert!(
+        refresh.origin.x >= parent.origin.x + parent.size.width,
+        "刷新不在「上一级」右边：parent={parent:?} refresh={refresh:?}"
+    );
+    assert!(
+        refresh.origin.x + refresh.size.width <= address.origin.x,
+        "刷新没在地址栏左边：refresh={refresh:?} address={address:?}"
+    );
+}
+
 /// 工具栏应当只有一行；状态栏应当贴着窗口底部，中央区正好顶到状态栏。
 #[gpui_kit::test]
 fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppContext) {

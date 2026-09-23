@@ -66,6 +66,15 @@ impl PreviewWindow {
         self.preview.image = Some(image);
         cx.notify();
     }
+
+    /// 换掉窗口里的文本（PDF 首页渲染不出来时用：把「正在渲染…」换成一句解释）。
+    ///
+    /// 只动文本、不动图片与标题——与 `set_image` 一样是「补内容」而不是「换对象」，
+    /// 所以不需要也不应该动代际（`preview_seq`）。
+    pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.preview.text = Some(text);
+        cx.notify();
+    }
 }
 
 impl Render for PreviewWindow {
@@ -81,16 +90,24 @@ impl Render for PreviewWindow {
         // 加载 / 失败都给占位：gpui 要过 LOADING_DELAY(200ms) 才肯显占位，
         // 期间是一片空白；解码失败（损坏 / 不支持的格式）也不能让窗口空着。
         let body: AnyElement = match p.kind {
-            PreviewKind::Image => {
+            // PDF 与图片共用这条分支：首页渲染出来之后，它和一张图片没有区别。
+            PreviewKind::Image | PreviewKind::Pdf => {
                 let inner: AnyElement = match p.image.clone() {
                     Some(path) => img(path)
                         .size_full()
                         .with_loading(|| centered_note("载入预览…"))
                         .with_fallback(|| centered_note("无法解码这张图片"))
                         .into_any_element(),
-                    // 降采样副本还在后台生成（见 `RootView::open_quick_look`）：
+                    // 两种情况都「图还没到」，但给用户的说法不同：
+                    // * PDF：首页还在渲染（mo-preview 给的占位文案，渲染失败时后台会
+                    //   把它换成一句解释）；
+                    // * 图片：降采样副本还在后台生成（见 `RootView::open_quick_look`）。
                     // 窗口先开、内容后到，别让窗口空着。
-                    None => centered_note("载入预览…"),
+                    None => centered_note(if p.kind == PreviewKind::Pdf {
+                        &text
+                    } else {
+                        "载入预览…"
+                    }),
                 };
                 // 入场动画：内容从 8 成大小长到满 + 淡入，对应访达快速预览的展开感。
                 // gpui 这版没有 element 级 `scale`（只有 `opacity`），所以「缩放」用
@@ -167,7 +184,8 @@ impl Render for PreviewWindow {
 }
 
 /// 预览里的居中提示（载入中 / 解码失败）。占满容器，免得提示缩在角落。
-fn centered_note(msg: &'static str) -> AnyElement {
+// `&str` 而不是 `&'static str`：PDF 的占位文案是运行时拼的（渲染失败时还会再换一句）。
+fn centered_note(msg: &str) -> AnyElement {
     div()
         .size_full()
         .flex()

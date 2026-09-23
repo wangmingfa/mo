@@ -26,6 +26,11 @@ pub enum PreviewKind {
     Code,
     /// 图片（内容由 UI 直接加载路径，不在此解码）。
     Image,
+    /// PDF：**首页渲染成图**后由 UI 加载（渲染是平台能力，不在这里做）。
+    ///
+    /// 放 `Image` 下一档而不是复用它：`Image` 的语义是「原路径即可 `img()` 加载」，
+    /// 而 PDF 必须先过一遍渲染，UI 要据此走两段式（先占位、图后到）。
+    Pdf,
     /// 目录（内容为条目摘要）。
     Directory,
     /// 二进制（非文本）。
@@ -84,6 +89,19 @@ pub fn preview_path(path: &Path) -> Result<Preview, MoError> {
             title,
             text: None,
             image: Some(path.to_path_buf()),
+            size,
+        });
+    }
+
+    // PDF：这里只认类型，**不渲染**——渲染是平台能力（macOS 走 CoreGraphics），
+    // mo-preview 刻意不碰平台。首页那张图由 UI 走两段式补上（先占位、图后到）；
+    // 渲染不出来时这段占位文案就是最终显示内容，所以要说得清发生了什么。
+    if is_pdf(path) {
+        return Ok(Preview {
+            kind: PreviewKind::Pdf,
+            title,
+            text: Some("PDF 文档\n\n（正在渲染首页…）".to_string()),
+            image: None,
             size,
         });
     }
@@ -182,6 +200,10 @@ fn is_image(path: &Path) -> bool {
     )
 }
 
+fn is_pdf(path: &Path) -> bool {
+    matches!(ext(path).as_deref(), Some("pdf"))
+}
+
 fn kind_by_ext(path: &Path) -> PreviewKind {
     match ext(path).as_deref() {
         Some("md" | "markdown") => PreviewKind::Markdown,
@@ -275,5 +297,19 @@ mod tests {
         assert_eq!(pv.kind, PreviewKind::Image);
         assert_eq!(pv.image, Some(d.join("pic.png")));
         assert!(pv.text.is_none());
+    }
+
+    /// PDF 在这里只认类型、不渲染（渲染是平台能力，见 `mo_platform::pdf_page_raster`）：
+    /// `image` 必须为空，让 UI 走两段式（先占位、首页后到）而不是拿原路径去喂 `img()`。
+    #[test]
+    fn pdf_is_recognized_but_not_rendered() {
+        let d = tmp("pdf");
+        // 内容是合法 UTF-8 也不影响：PDF 按扩展名判，且必须在「文本类」之前截住
+        // （否则一个含 `%PDF-` 头的文件会先被判成文本读出来）。
+        std::fs::write(d.join("doc.pdf"), b"%PDF-1.4 fake").unwrap();
+        let pv = preview_path(&d.join("doc.pdf")).unwrap();
+        assert_eq!(pv.kind, PreviewKind::Pdf);
+        assert!(pv.image.is_none(), "PDF 不该带 image 路径——那是渲染后的事");
+        assert!(pv.text.is_some(), "要有占位文案：图没到之前窗口不能空着");
     }
 }

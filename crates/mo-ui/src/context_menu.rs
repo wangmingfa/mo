@@ -110,6 +110,8 @@ pub(crate) enum MenuAction {
     OpenTerminal,
     Refresh,
     SelectAll,
+    /// 反选：把可见条目里没选中的换上来（与「全选」同一条「只动可见集」的边界）。
+    InvertSelection,
 }
 
 /// 一行菜单项。`separator_before` 为真时它上方还有一条分隔线。
@@ -191,6 +193,12 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
                 true,
             )
             .separated(),
+            MenuItem::new(
+                MenuAction::InvertSelection,
+                "反选",
+                crate::keys::hint("select.invert"),
+                true,
+            ),
             MenuItem::new(MenuAction::Refresh, "刷新", "", true),
             MenuItem::new(MenuAction::OpenTerminal, "在终端中打开", "", true).separated(),
             MenuItem::new(MenuAction::Properties, "显示简介", "", true),
@@ -688,6 +696,7 @@ mod tests {
                 MenuAction::NewFile,
                 MenuAction::Paste,
                 MenuAction::SelectAll,
+                MenuAction::InvertSelection,
                 MenuAction::Refresh,
                 MenuAction::OpenTerminal,
                 MenuAction::Properties,
@@ -798,11 +807,11 @@ mod tests {
     #[test]
     fn panel_height_accounts_for_separators() {
         let blank = items(&menu(None, true, 0), &[]);
-        assert_eq!(blank.len(), 7);
+        assert_eq!(blank.len(), 8);
         // 3 条分隔线：paste / select_all / open_terminal 各自上方一条。
         let seps = blank.iter().filter(|i| i.separator_before).count();
         assert_eq!(seps, 3);
-        assert_eq!(panel_height(&blank), PAD * 2.0 + ITEM_H * 7.0 + SEP_H * 3.0);
+        assert_eq!(panel_height(&blank), PAD * 2.0 + ITEM_H * 8.0 + SEP_H * 3.0);
     }
 
     /// 文件菜单：第一项是「打开」（系统默认应用，同双击），带「打开方式」

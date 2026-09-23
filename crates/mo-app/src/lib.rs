@@ -33,10 +33,13 @@ pub use controller::DirectoryController;
 // 图标位图的**档位**要给 UI：视图那边只有「我这个槽位多大」，选哪一档是这一侧的事
 // （见 `icon::icon_px_for_slot` 的注释）。UI 侧的测试会拿它和视图的槽位表组合起来断言。
 pub use icon::{icon_px_for_slot, ICON_PX_LARGE, ICON_PX_SMALL};
+// 分组模型经应用层再导出：UI 只依赖 mo-app。
 pub use metadata::MetadataScheduler;
+pub use mo_core::{GroupKey, Grouping};
 // 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
 pub use mo_config::{
-    ColumnPrefs, Config, SavedServer, ThemeColors, UiPrefs, UserCommand, Workflow,
+    clamp_icon_scale, ColumnPrefs, Config, SavedServer, ThemeColors, UiPrefs, UserCommand,
+    Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
 };
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};
@@ -61,6 +64,27 @@ use mo_operations::{
 use mo_preview::Preview;
 use mo_remote::RemoteUrl;
 use mo_search::{crawl, FileIndex, SearchHit};
+
+/// 窗口快照的一行：分组头（列表分组开启时）或条目。
+///
+/// 头行只带组键，标题由 UI 格式化（mo-app 不放文案）；条目行带**克隆的
+/// `Entry`**——窗口快照本来就是按窗克隆的那几十条，头行的加入不改变
+/// 「UI 不持有整份目录」的约定。
+#[derive(Debug, Clone)]
+pub enum WindowRow {
+    Header(GroupKey),
+    Entry(Entry),
+}
+
+impl WindowRow {
+    /// 条目行的 `Entry` 引用；组头行返回 `None`。
+    pub fn entry(&self) -> Option<&Entry> {
+        match self {
+            WindowRow::Entry(e) => Some(e),
+            WindowRow::Header(_) => None,
+        }
+    }
+}
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::{Mutex, RwLock};
 
@@ -146,6 +170,12 @@ pub struct AppState {
     /// 与 `directory` 分开存是刻意的：读失败时把它清掉就行，界面自然回到原来的位置，
     /// 而不是「先切过去、再弹一条错误」。
     opening: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// 「显示隐藏文件」开关（`config.show_hidden` 的进程内镜像）。
+    ///
+    /// 之所以要一份副本：列目录是**热路径**（进目录 / 刷新 / 前进后退 / 列视图切
+    /// 列都会重读一遍），不能每次都去磁盘 load 一遍 `config.json`。改开关时由
+    /// [`AppState::set_show_hidden`] 落盘，并同步所有标签页（见 mo-ui 的分发）。
+    show_hidden: Arc<AtomicBool>,
 }
 
 /// 把「正在打开某个目录」置位，离开作用域自动收尾。
@@ -519,6 +549,57 @@ const VOLUME_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 27k 条就是 133ms 的白等（见 `MetadataScheduler::prime_visible_from_cache`）。
 const FIRST_SCREEN_ROWS: usize = 200;
 
+/// 自举时爬主目录的**限深**（见 [`AppState::ensure_index_started`]）。
+///
+/// 不限深的话一个开发机主目录几十万条目，爬一次好几分钟；限到 6 层后是几十秒量级，
+/// 而日常要找的文件基本都在前几层（`~/Desktop`、`~/Documents/xxx`、`~/code/proj`）。
+const HOME_INDEX_DEPTH: usize = 6;
+
+/// 「用户进过的目录」爬多深（见 [`AppState::note_visited`]）。
+///
+/// 比主目录那档浅：进一个目录是**高频动作**，每次都深爬会让人觉得机器一直在忙。
+/// 3 层能把「这个项目里有什么」收进索引，代价与目录大小成正比而不是与磁盘成正比。
+const VISITED_INDEX_DEPTH: usize = 3;
+
+/// 单次后台爬取最多处理多少条。
+///
+/// 没有这个上限时，「进了一个大目录」就变成一次规模未知的爬取：主目录三层实测
+/// 十万条量级（`~/Library`、`node_modules` 那类子树全在里面），跑一次好几分钟。
+/// 索引是**可增量补齐**的——少爬的部分下次再补，好过把机器占死。
+const HOME_INDEX_LIMIT: usize = 100_000;
+
+/// `note_visited` 那一档的上限（见 [`VISITED_INDEX_DEPTH`]）。
+///
+/// 比自举那档严得多：进目录是用户正在盯着的操作，后台不该为它跑太久。
+const VISITED_INDEX_LIMIT: usize = 20_000;
+
+/// 已登记的根多久算「过期」（秒）：启动时只重爬过期的那些。
+const ROOT_REFRESH_TTL: i64 = 6 * 60 * 60;
+
+/// 「这个目录刚爬过」的有效期（秒）：期间用户反复进出不重复爬。
+const VISITED_INDEX_TTL: i64 = 10 * 60;
+
+/// PDF 首页预览图的长边上限（像素）。
+///
+/// 与缩略图 / 预览降采样同量级：预览窗里显示的宽度通常几百 px，渲染更大只是白花时间。
+const PDF_PREVIEW_MAX_EDGE: u32 = 1024;
+
+/// PDF 首页缓存的文件名键：路径 + 修改时间。
+///
+/// 带上 mtime 是为了「PDF 被改过」能自动失效——只按路径做键的话，改过的 PDF 会一直
+/// 显示旧的首页。
+fn pdf_cache_key(path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    if let Ok(m) = std::fs::metadata(path) {
+        if let Ok(t) = m.modified() {
+            t.hash(&mut h);
+        }
+    }
+    format!("{:016x}", h.finish())
+}
+
 /// 图标泵的节拍：渲染路径每帧记下的「这一行要图标」，最多攒这么久一批。
 ///
 /// 比刷新泵（120ms）快，是因为用户刚进目录、正盯着那几行看：图标早一帧到位，
@@ -633,9 +714,7 @@ impl AppState {
             cache,
             watcher: Arc::new(Mutex::new(None)),
             dirty: Arc::new(AtomicBool::new(false)),
-            index: Arc::new(PlMutex::new(
-                FileIndex::open_in_memory().expect("open index"),
-            )),
+            index: Arc::new(PlMutex::new(Self::open_index())),
             net_shares: Arc::new(std::sync::Mutex::new((
                 // 起点放到「很久以前」，好让第一次问就真的去查一次。
                 std::time::Instant::now() - NET_SHARE_TTL,
@@ -654,6 +733,11 @@ impl AppState {
             redo_stack: Arc::new(PlMutex::new(Vec::new())),
             clipboard: Arc::new(Mutex::new(None)),
             opening: Arc::new(std::sync::Mutex::new(None)),
+            show_hidden: Arc::new(AtomicBool::new(
+                mo_config::Config::load(&Self::config_path())
+                    .map(|c| c.show_hidden)
+                    .unwrap_or(false),
+            )),
         }
     }
 
@@ -792,12 +876,17 @@ impl AppState {
             let fs_task = fs.clone();
             let p_task = p.clone();
             let cache_task = cache.clone();
+            let show_hidden = self.show_hidden();
             let outcome = self
                 .spawn_blocking(move || -> Result<(Directory, Vec<Entry>), MoError> {
                     let raw = fs_task.read_dir_blocking(&p_task)?;
                     let mut dir = Directory::new(dir_id, p_task);
                     dir.set_entries(
                         raw.into_iter()
+                            // 「显示隐藏文件」关掉时在这里就把隐藏条目滤掉：过滤必须在
+                            // 建视图**之前**，否则 `visible_count` / 分页 / 索引全都会
+                            // 把藏起来的条目算进去（状态栏条数对不上、滚动条长度跳）。
+                            .filter(|r| show_hidden || !r.hidden)
                             .map(|r| Entry::new(r.id, r.name, r.kind, r.path))
                             .collect(),
                     );
@@ -875,6 +964,14 @@ impl AppState {
         // 首屏优先校验：缓存里的值可能已过期，但用户看到的行必须最先准确。
         self.scheduler
             .load(self.clone(), for_verify, Some(0..first_screen));
+
+        // 本地目录顺手补进全局索引（远程不爬：索引里的路径是本机路径，把远程路径
+        // 混进去只会让搜索结果点开就失败）。这就是「watcher 增量」的那一半——
+        // 详见 `note_visited`。
+        if self.active_session().is_none() {
+            self.note_visited(path);
+        }
+
         self.bus.publish(AppEvent::DirectoryChanged {
             path: path.to_path_buf(),
         });
@@ -1712,6 +1809,12 @@ impl AppState {
         match ev {
             WatcherEvent::Created(path) => {
                 let Some(r) = entry_at(&path) else { return };
+                // 隐藏文件被过滤掉了，就别再把它插回列表——否则「显示隐藏文件」
+                // 关着时，刚从终端 `touch .foo` 一下，列表里就冒出一条来。
+                if self.skip_hidden() && r.hidden {
+                    return;
+                }
+                let is_dir = r.kind.is_dir();
                 let entry = Entry::new(r.id, r.name, r.kind, r.path);
                 let inserted = {
                     let mut inner = self.inner.write().await;
@@ -1727,6 +1830,13 @@ impl AppState {
                 if inserted {
                     // 新条目的元数据交给后台调度补上（渐进式加载）。
                     self.scheduler().load(self.clone(), vec![entry], Some(0..1));
+                    // 索引要用条目自己的名字：`entry` 已经把 name 交出去了，
+                    // 这里从路径反推（文件名本来就是路径的最后一段）。
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.sync_index_created(&name, &path, is_dir);
                     self.bus
                         .publish(AppEvent::EntryCreated { path: path.clone() });
                     self.publish_dir_changed().await;
@@ -1742,6 +1852,7 @@ impl AppState {
                     }
                 };
                 if removed {
+                    self.sync_index_removed(&path);
                     self.bus.publish(AppEvent::EntryDeleted { path });
                     self.publish_dir_changed().await;
                 }
@@ -1767,6 +1878,7 @@ impl AppState {
                     }
                 };
                 if renamed {
+                    self.sync_index_renamed(&from, &to);
                     self.bus.publish(AppEvent::EntryRenamed { from, to });
                     self.publish_dir_changed().await;
                 }
@@ -1787,6 +1899,61 @@ impl AppState {
                 }
             }
         }
+    }
+
+    // ---- 索引的增量维护 ----
+    //
+    // 全局搜索不能只靠启动时那一遍爬：那样「刚新建的文件」在下次爬之前永远搜不到，
+    // 「刚删掉的」还会被搜出来、点开却是「文件不存在」。这里把**当前被监听的这一层**
+    // 的变化同步进索引——watcher 本来就在听这一层，事件是白捡的。
+    //
+    // ⚠️ 递归 watcher（监听整棵主目录）不做：`notify` 在 macOS 上每目录一个 fd，
+    // 几十万目录不现实。跨目录的新鲜度靠 `note_visited`（你进过的目录爬一遍）与
+    // 启动自举（过期的根重爬）兜住。
+
+    /// 新建：upsert 一条（路径唯一，重复无副作用）。
+    fn sync_index_created(&self, name: &str, path: &Path, is_dir: bool) {
+        // 索引里只有本机路径：远程会话里发生的变化不该写进去。
+        if self.active_session().is_some() {
+            return;
+        }
+        let index = self.index.clone();
+        let (name, path) = (name.to_string(), path.to_path_buf());
+        // 走 blocking 池而不是就地 lock：爬一个大目录时索引锁会被持有几分钟，
+        // 在 async 上下文里等它会把整条 worker 卡住。
+        // 不需要等它：派发即忘（clippy 的 let_underscore_future 要求显式丢弃）。
+        std::mem::drop(self.spawn_blocking(move || {
+            let mut idx = index.lock();
+            let _ = idx.upsert(&path, &name, 0, None, is_dir);
+        }));
+    }
+
+    /// 删除：连同子树一起删（目录被移走后，它下面那些记录会变成孤儿）。
+    fn sync_index_removed(&self, path: &Path) {
+        if self.active_session().is_some() {
+            return;
+        }
+        let index = self.index.clone();
+        let path = path.to_path_buf();
+        // 不需要等它：派发即忘（clippy 的 let_underscore_future 要求显式丢弃）。
+        std::mem::drop(self.spawn_blocking(move || {
+            let mut idx = index.lock();
+            let _ = idx.remove_under(&path);
+        }));
+    }
+
+    /// 改名：改路径与小写名。
+    fn sync_index_renamed(&self, from: &Path, to: &Path) {
+        if self.active_session().is_some() {
+            return;
+        }
+        let index = self.index.clone();
+        let (from, to) = (from.to_path_buf(), to.to_path_buf());
+        // 不需要等它：派发即忘（clippy 的 let_underscore_future 要求显式丢弃）。
+        std::mem::drop(self.spawn_blocking(move || {
+            let mut idx = index.lock();
+            let _ = idx.rename(&from, &to);
+        }));
     }
 
     /// 以当前目录路径广播一次「目录已变化」，触发 UI 刷新快照。
@@ -1918,12 +2085,16 @@ impl AppState {
     pub async fn list_dir(&self, path: &Path) -> Result<Vec<LightEntry>, MoError> {
         let fs = self.active_fs();
         let p = path.to_path_buf();
+        let show_hidden = self.show_hidden();
         let raw = self
             .spawn_blocking(move || fs.read_dir_blocking(&p))
             .await
             .map_err(|e| MoError::Other(format!("列视图读取目录的任务失败：{e}")))??;
+        // 与主列表同一条判据：列视图只是「换了个画法」，藏起来的东西不该在某一
+        // 个视图里冒出来。
         let mut out: Vec<LightEntry> = raw
             .into_iter()
+            .filter(|r| show_hidden || !r.hidden)
             .map(|r| LightEntry {
                 name: r.name,
                 kind: r.kind,
@@ -1945,6 +2116,28 @@ impl AppState {
             let mut inner = self.inner.write().await;
             if let Some(dir) = inner.directory.as_mut() {
                 dir.set_filter(query);
+                // 输入即过滤也承担「首字母定位」的职责（访达的 type-ahead）：过滤是
+                // 即时生效的，用户打完字直接 Enter 就该打开目标——但旧选中项如果
+                // 不在过滤结果里，Enter 打开的是它而不是匹配项。所以过滤后**当前
+                // 选中不在可见集里**时，把光标挪到第一个可见条目上。
+                let visible: Vec<FileId> = dir
+                    .view
+                    .visible_indices()
+                    .iter()
+                    .filter_map(|&i| dir.entries.get(i))
+                    .map(|e| e.id)
+                    .collect();
+                let stale = inner
+                    .selection
+                    .focused()
+                    .is_none_or(|f| !visible.contains(&f));
+                if stale {
+                    if let Some(first) = visible.first() {
+                        inner.selection.select(*first);
+                    } else {
+                        inner.selection.clear();
+                    }
+                }
             }
         }
         self.publish_dir_changed().await;
@@ -1983,6 +2176,120 @@ impl AppState {
             .as_ref()
             .map(|d| d.view.is_filtered())
             .unwrap_or(false)
+    }
+
+    /// 设置列表分组方式（无 / 按类型 / 按日期）。
+    ///
+    /// 与排序一样是视图层的重建（O(n log n)），不碰条目本身。
+    pub async fn set_grouping(&self, grouping: Grouping) {
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(dir) = inner.directory.as_mut() {
+                dir.view.set_grouping(grouping, &dir.entries);
+            }
+        }
+        self.publish_dir_changed().await;
+    }
+
+    /// 当前分组方式；没有目录时为默认（不分组）。
+    pub async fn grouping(&self) -> Grouping {
+        self.inner
+            .read()
+            .await
+            .directory
+            .as_ref()
+            .map(|d| d.view.grouping())
+            .unwrap_or_default()
+    }
+
+    /// 列表视图的**行数**：无分组 = 条目数；有分组 = 条目数 + 非空组头数。
+    ///
+    /// 网格 / 画廊 / 列视图仍走 [`Self::visible_count`]（它们的行就是条目）；
+    /// 只有列表视图在分组开启时用这个数作 `uniform_list` 的 `item_count`。
+    pub async fn list_row_count(&self) -> usize {
+        self.inner
+            .read()
+            .await
+            .directory
+            .as_ref()
+            .map(|d| d.view.row_count())
+            .unwrap_or(0)
+    }
+
+    /// 取列表视图的一窗行（分组行流或普通条目流，见参数）。
+    ///
+    /// `grouped = true` 时 `range` 是**行空间**下标（含分组头），头行只带组键
+    /// （标题由 UI 格式化）；`false` 时 `range` 是条目空间，行为与
+    /// [`Self::visible_window`] 完全一致（全部是条目行）。UI 的窗口快照按它
+    /// 请求的空间存放，两种空间不能混用——切空间时 UI 侧必须作废旧窗口。
+    pub async fn list_window(
+        &self,
+        range: std::ops::Range<usize>,
+        grouped: bool,
+    ) -> (PathBuf, usize, Vec<WindowRow>) {
+        let inner = self.inner.read().await;
+        let Some(dir) = inner.directory.as_ref() else {
+            return (PathBuf::new(), 0, Vec::new());
+        };
+        let dir_path = dir.path.clone();
+        let total = if grouped {
+            dir.view.row_count()
+        } else {
+            dir.visible_count()
+        };
+        let start = range.start.min(total);
+        let end = range.end.min(total);
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for i in start..end {
+            // 行 → 条目位：分组行流里头行返回 None（跳过，不产条目）；
+            // 无分组行流（rows 空）时 row_entry 恒等返回 Some(i)。
+            let pos = if grouped {
+                dir.view.row_entry(i)
+            } else {
+                Some(i)
+            };
+            let Some(pos) = pos else {
+                // grouped 且这一行是组头。
+                if let Some(k) = dir.view.row_header(i) {
+                    out.push(WindowRow::Header(k));
+                }
+                continue;
+            };
+            if let Some(ei) = dir.view.index_at(pos) {
+                if let Some(e) = dir.entries.get(ei) {
+                    out.push(WindowRow::Entry(e.clone()));
+                }
+            }
+        }
+        (dir_path, start, out)
+    }
+
+    /// 选中行区间 `[from, to]` 内的所有条目（分组头自然跳过）。
+    ///
+    /// 框选抬起时用：鼠标 y 折算出来的是**行**下标，选择模型只认条目——
+    /// 这里把行区间折成条目位区间（行流保持条目序，所以是连续区间）再走
+    /// [`Self::select_range`]，语义与其余选择路径完全一致。
+    pub async fn select_rows_range(&self, from: usize, to: usize) {
+        let (lo, hi) = (from.min(to), from.max(to));
+        let (first, last) = {
+            let inner = self.inner.read().await;
+            let Some(dir) = inner.directory.as_ref() else {
+                return;
+            };
+            let mut first = None;
+            let mut last = None;
+            for i in lo..=hi.min(dir.view.row_count().saturating_sub(1)) {
+                if let Some(pos) = dir.view.row_entry(i) {
+                    first.get_or_insert(pos);
+                    last = Some(pos);
+                }
+            }
+            match (first, last) {
+                (Some(f), Some(l)) => (f, l),
+                _ => return,
+            }
+        };
+        self.select_range(first, last).await;
     }
 
     /// 用加载完成的元数据更新某个条目（O(1) 索引查找）。
@@ -2160,12 +2467,113 @@ impl AppState {
 impl AppState {
     // ---- 全局搜索索引 ----
 
+    /// 全局搜索索引的落盘位置（`~/Library/Caches/mo/search.sqlite` 等）。
+    ///
+    /// **必须落盘**：索引放内存时，重开应用就归零，⌘F 什么都搜不到——除非用户
+    /// 先手动跑一次「索引当前目录」。爬一个主目录几分钟，每次启动重来一遍是不可
+    /// 接受的。索引是可重建的缓存（不是用户数据），所以放缓存目录而不是配置目录。
+    fn index_path() -> PathBuf {
+        if let Ok(dir) = std::env::var("MO_CACHE_DIR") {
+            return PathBuf::from(dir).join("search.sqlite");
+        }
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("mo")
+            .join("search.sqlite")
+    }
+
+    /// 打开索引库；建不了就退回内存库（搜索退化成「本次会话内有效」，但不影响启动）。
+    fn open_index() -> FileIndex {
+        let path = Self::index_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("索引目录不可用（退回内存索引）：{e}");
+                return FileIndex::open_in_memory().expect("open in-memory index");
+            }
+        }
+        match FileIndex::open(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("索引库打开失败（退回内存索引）：{e}");
+                FileIndex::open_in_memory().expect("open in-memory index")
+            }
+        }
+    }
+
+    /// 启动时的索引自举：把索引补到「能搜到东西」的程度。
+    ///
+    /// 三档，按代价从小到大：
+    ///
+    /// 1. **从没建过**（空库）：后台爬主目录，限深 [`HOME_INDEX_DEPTH`]。不限深的话
+    ///    一个开发机主目录几十万条目，能跑好几分钟；限深后是几十秒量级，且日常要找
+    ///    的文件基本都在前几层。
+    /// 2. **建过但过期了**：只重爬超过 [`ROOT_REFRESH_TTL`] 的根（重爬是幂等
+    ///    `upsert`，等于刷新）。
+    /// 3. **其余情况**：什么都不做，索引照用。
+    ///
+    /// 全程后台，不阻塞启动；爬的过程可由 `stop_indexing` 中断。
+    pub fn ensure_index_started(&self) {
+        let home = dirs::home_dir();
+        let stale: Vec<String> = {
+            let idx = self.index.lock();
+            let ttl_cut = now_secs() - ROOT_REFRESH_TTL;
+            if idx.count() == 0 {
+                Vec::new()
+            } else {
+                idx.indexed_roots()
+                    .into_iter()
+                    .filter(|(_, at)| *at < ttl_cut)
+                    .map(|(r, _)| r)
+                    .collect()
+            }
+        };
+        let empty = self.index_count() == 0;
+        if empty {
+            if let Some(h) = home {
+                self.index_root_capped(h, HOME_INDEX_DEPTH, HOME_INDEX_LIMIT);
+            }
+            return;
+        }
+        for r in stale {
+            self.index_root_capped(PathBuf::from(r), HOME_INDEX_DEPTH, HOME_INDEX_LIMIT);
+        }
+    }
+
+    /// 记下「用户来过这个目录」，必要时顺手把它补进索引。
+    ///
+    /// 这是**增量**的另一半：全局递归 watcher 要监听整棵主目录（`notify` 在 macOS
+    /// 上是每目录一个 fd，几十万目录不现实），而用户实际会去的地方远少于此。所以
+    /// 改成「你进过的目录我爬一遍」——一次进目录只爬那一棵子树，代价与那个目录的
+    /// 大小成正比，且 [`VISITED_INDEX_TTL`] 内不重复爬。
+    pub fn note_visited(&self, dir: &Path) {
+        let dir = dir.to_path_buf();
+        let fresh = {
+            let idx = self.index.lock();
+            idx.last_indexed(&dir)
+                .is_some_and(|at| now_secs().saturating_sub(at) < VISITED_INDEX_TTL)
+        };
+        if fresh {
+            return;
+        }
+        // 只爬有限深度、限量：进一个项目根目录时把它的前几层收进索引就够了，
+        // 但万一进的是 `/` 或主目录这种地方，也该在 VISITED_INDEX_LIMIT 处停住。
+        self.index_root_capped(dir, VISITED_INDEX_DEPTH, VISITED_INDEX_LIMIT);
+    }
+
     /// 后台递归爬取 `root` 建立全局搜索索引。
     ///
     /// 爬取在 blocking 池进行（只取 name/kind/path，不逐个 stat），
     /// 期间周期性广播 [`AppEvent::IndexUpdated`]，完成后再次广播最终数量。
     /// `max_depth` 为 0 表示不限深度。
     pub fn index_root(&self, root: PathBuf, max_depth: usize) {
+        // 用户手动触发的那条命令：不限量（他明确要求索引这一棵，跑多久都认）。
+        self.index_root_capped(root, max_depth, 0);
+    }
+
+    /// 与 [`AppState::index_root`] 相同，但带条数上限（`0` = 不限）。
+    ///
+    /// 后台自举走这条：不设上限的话，进一个主目录就是一次规模未知的几分钟爬取。
+    fn index_root_capped(&self, root: PathBuf, max_depth: usize, limit: usize) {
         let app = self.clone();
         let bus = self.bus.clone();
         let root_after = root.clone();
@@ -2174,17 +2582,33 @@ impl AppState {
         let fs = self.active_fs();
         self.spawn(async move {
             stop.store(false, Ordering::Relaxed);
+            // 闭包是 `move` 且要进 blocking 池，判据得在派发前算好。
+            let skip_hidden = !app.show_hidden();
             let bus_p = bus.clone();
             let result = app
                 .spawn_blocking(move || {
                     let mut idx = index.lock();
-                    crawl(&mut idx, fs.as_ref(), &root, max_depth, &stop, |n| {
-                        bus_p.publish(AppEvent::IndexUpdated {
-                            indexed: n,
-                            root: root.clone(),
-                        });
-                    })
-                    .map_err(|e| e.to_string())
+                    let out = crawl(
+                        &mut idx,
+                        fs.as_ref(),
+                        &root,
+                        max_depth,
+                        // 与列表同一条判据：列表里看不到的，搜索也不该搜得到。
+                        skip_hidden,
+                        limit,
+                        &stop,
+                        |n| {
+                            bus_p.publish(AppEvent::IndexUpdated {
+                                indexed: n,
+                                root: root.clone(),
+                            });
+                        },
+                    )
+                    .map_err(|e| e.to_string());
+                    // 爬完（或被中断）都记一下时刻：下次自举就知道这个根不用再爬了。
+                    // 被打断时也记，否则每次启动都会重挑这个根、永远刷不完后面那些。
+                    let _ = idx.mark_root(&root, now_secs());
+                    out
                 })
                 .await;
             match result {
@@ -2218,6 +2642,46 @@ impl AppState {
     /// 预览单个文件 / 目录（同步读取，按需提取文本 / 图片路径 / 目录摘要）。
     pub fn preview(&self, path: &Path) -> Result<Preview, MoError> {
         mo_preview::preview_path(path)
+    }
+
+    /// PDF **首页**的预览图：渲染 + 编码 + 落盘，返回可直接 `img()` 加载的路径。
+    ///
+    /// **阻塞**（渲染一个页面 + PNG 编码），必须在 blocking 池调用（调用方已保证）。
+    /// 返回 `None` 一律表示「这个 PDF 出不了图」——平台不支持 / 打不开 / 加密 /
+    /// 渲染失败，调用方回到占位文案即可，**不要**拿 PDF 原路径去喂 `img()`。
+    ///
+    /// 缓存按「路径 + 修改时间」做键：PDF 被改过就重新渲染，否则命中磁盘直接返回
+    /// （不重复渲染）。与缩略图同一个「缓存目录 + 原子写」的套路：先写临时文件
+    /// 再 `rename`，进程被杀不会留下半张图。
+    pub fn preview_pdf_page(&self, path: &Path) -> Option<PathBuf> {
+        if !mo_platform::supports_pdf() {
+            return None;
+        }
+        let root = Self::pdf_preview_root();
+        let dst = root.join(format!("{}.png", pdf_cache_key(path)));
+        if dst.exists() {
+            return Some(dst);
+        }
+        let mut raster = mo_platform::pdf_page_raster(path, PDF_PREVIEW_MAX_EDGE)?;
+        // 平台层交出来的是**预乘** alpha（CG 的位图约定），PNG 存直通 alpha。
+        mo_thumbnails::unpremultiply_rgba(&mut raster.rgba);
+        let png = mo_thumbnails::encode_rgba_png(raster.width, raster.height, &raster.rgba)?;
+        std::fs::create_dir_all(&root).ok()?;
+        let tmp = dst.with_extension("png.tmp");
+        std::fs::write(&tmp, png).ok()?;
+        std::fs::rename(&tmp, &dst).ok()?;
+        Some(dst)
+    }
+
+    /// PDF 首页预览图的缓存目录（`<用户缓存目录>/mo/pdf-preview`）。
+    ///
+    /// 与缩略图 / 预览降采样分开：这是「渲染出来的」，清掉随时能重来，但尺寸与
+    /// 用途都不一样，混在一个目录里不利于整体清理。
+    fn pdf_preview_root() -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("mo")
+            .join("pdf-preview")
     }
 
     /// 图片预览的**降采样副本**：返回 `Some` 时应加载它而不是原图。
@@ -2408,6 +2872,35 @@ impl AppState {
         self.inner.write().await.selection.select_all(&ids);
     }
 
+    /// 反选：可见条目里**没被选中**的那些替换选择集。
+    ///
+    /// 只在可见集内翻转（与全选同一条边界）：藏起来的（过滤掉的 / 隐藏文件）不参与，
+    /// 否则「反选」会选中用户根本看不见的东西，下一操作就动到意料之外的文件。
+    pub async fn select_invert_visible(&self) {
+        let (visible, selected): (Vec<FileId>, Vec<FileId>) = {
+            let inner = self.inner.read().await;
+            let Some(dir) = inner.directory.as_ref() else {
+                return;
+            };
+            let visible = dir
+                .view
+                .visible_indices()
+                .iter()
+                .filter_map(|&i| dir.entries.get(i))
+                .map(|e| e.id)
+                .collect();
+            (
+                visible,
+                inner.selection.selected_ids().iter().copied().collect(),
+            )
+        };
+        let flipped: Vec<FileId> = visible
+            .into_iter()
+            .filter(|id| !selected.contains(id))
+            .collect();
+        self.inner.write().await.selection.set_from(&flipped);
+    }
+
     /// 选择一段可见条目（Shift 连选），`from`/`to` 为可见下标。
     pub async fn select_range(&self, from: usize, to: usize) {
         let ids: Vec<FileId> = {
@@ -2427,6 +2920,62 @@ impl AppState {
             .await
             .selection
             .select_range(&ids, from, to);
+    }
+
+    /// 以两个文件为端点连选（shift 点击）：端点解析成可见位后走 [`Self::select_range`]。
+    ///
+    /// 端点用 `FileId` 而不是下标：分组开启后列表行号 ≠ 条目位，UI 侧在任何
+    /// 空间里算出的下标都可能指错文件；id 在任何视图 / 分组方式下都指同一个文件。
+    /// 任一端点不在当前可见集里（已滚动出窗口之外删除等）时不动选择。
+    pub async fn select_between(&self, a: FileId, b: FileId) {
+        let (from, to) = {
+            let inner = self.inner.read().await;
+            let Some(dir) = inner.directory.as_ref() else {
+                return;
+            };
+            let pos_of = |id: FileId| {
+                dir.view
+                    .visible_indices()
+                    .iter()
+                    .filter_map(|&vi| dir.entries.get(vi))
+                    .position(|e| e.id == id)
+            };
+            match (pos_of(a), pos_of(b)) {
+                (Some(x), Some(y)) => (x.min(y), x.max(y)),
+                _ => return,
+            }
+        };
+        self.select_range(from, to).await;
+    }
+
+    /// 键盘输入即定位（type-ahead）：在可见条目里找**文件名**以 `prefix` 开头的第一条，
+    /// 选中它（单选替换）并返回它的**列表行下标**，供 UI 滚动跟随。找不到返回 `None`。
+    ///
+    /// 行下标而非条目位：分组开启时列表的 `uniform_list` 以行计数（含分组头），
+    /// `scroll_to_item` 要的是行。无分组时两者相等。
+    /// 比较大小写不敏感（中文文件名直接比字符）；`prefix` 来自逐字符累积的输入串。
+    /// 与 Finder / 资源管理器一致：打字跳到第一个匹配项，不碰其余选择语义。
+    pub async fn focus_by_prefix(&self, prefix: &str) -> Option<usize> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let needle = prefix.to_lowercase();
+        let mut inner = self.inner.write().await;
+        let dir = inner.directory.as_ref()?;
+        let visible = dir.view.visible_indices();
+        let mut hit = None;
+        for (pos, &vi) in visible.iter().enumerate() {
+            if let Some(e) = dir.entries.get(vi) {
+                if e.name.to_lowercase().starts_with(&needle) {
+                    hit = Some((pos, e.id));
+                    break;
+                }
+            }
+        }
+        let (idx, id) = hit?;
+        let row = dir.view.pos_to_row(idx);
+        inner.selection.select(id);
+        Some(row)
     }
 
     /// 当前选择集的快照（UI 以 app 侧为唯一事实来源，用它回灌本地缓存）。
@@ -2485,7 +3034,17 @@ impl AppState {
         } else {
             self.select(ids[next]).await;
         }
-        Some(next)
+        // 返回**列表行下标**（分组开启时 ≠ 条目位）：UI 只拿它做 scroll_to_item，
+        // 而列表的 item_count 在分组时按行计（含分组头）。
+        let row = {
+            let inner = self.inner.read().await;
+            inner
+                .directory
+                .as_ref()
+                .map(|d| d.view.pos_to_row(next))
+                .unwrap_or(next)
+        };
+        Some(row)
     }
 
     /// 侧边栏快捷访问位置（存在才列出）。
@@ -3047,6 +3606,28 @@ impl AppState {
         if let Err(e) = cfg.save(&Self::config_path()) {
             tracing::warn!("配置保存失败：{e}");
         }
+    }
+
+    /// 是否显示隐藏文件（`.` 开头，macOS 上还有 `chflags hidden` 的条目）。
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden.load(Ordering::Relaxed)
+    }
+
+    /// 切换「显示隐藏文件」并落盘。
+    ///
+    /// ⚠️ 只改**这一个** `AppState` 的镜像：每个标签页各有一份 `AppState`，调用方
+    /// 要给所有标签页都设一遍（mo-ui 的 `ToggleHidden` 分发就是这么做的），否则
+    /// 当前标签页变了、切到另一个标签页又变回去。
+    pub fn set_show_hidden(&self, v: bool) {
+        self.show_hidden.store(v, Ordering::Relaxed);
+        let mut cfg = self.config();
+        cfg.show_hidden = v;
+        self.save_config(&cfg);
+    }
+
+    /// 读目录时是否该丢掉隐藏条目（列目录 / 列视图 / 监听增量 / 索引爬取共用）。
+    fn skip_hidden(&self) -> bool {
+        !self.show_hidden()
     }
 
     /// 当前主题名：`light` / `dark` / `system`（跟随系统）/ 自定义主题 key。

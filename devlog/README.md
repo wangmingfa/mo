@@ -14,6 +14,7 @@
 | [engine-testing.md](engine-testing.md) | 引擎逻辑与测试方法：headless 布局测试、通用算法陷阱 |
 | [async-runtime.md](async-runtime.md) | 异步 runtime：后台任务洪泛饿死 UI、刷新竞态、跨目录快照覆盖 |
 | [customization.md](customization.md) | 自定义系统：配置文件 BOM、主题取色的全局槽位、深色档语义色 |
+| [search.md](search.md) | 全局搜索与索引：落盘、启动自举、增量维护、爬取上限 |
 | [preview.md](preview.md) | 缩略图与快速预览：降采样编码选择、先开窗后到图、入场动画 |
 
 ## 约定

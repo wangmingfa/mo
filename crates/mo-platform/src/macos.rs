@@ -56,6 +56,17 @@ extern "C" {
     fn CGContextSetInterpolationQuality(ctx: *mut std::ffi::c_void, quality: i32);
     fn CGContextDrawImage(ctx: *mut std::ffi::c_void, rect: NSRect, image: *mut std::ffi::c_void);
     fn CGContextRelease(ctx: *mut std::ffi::c_void);
+
+    // PDF：系统自带的渲染器（`CGPDFDocument`），不需要任何第三方依赖。
+    fn CGPDFDocumentCreateWithURL(url: *mut Object) -> *mut std::ffi::c_void;
+    fn CGPDFDocumentGetNumberOfPages(doc: *mut std::ffi::c_void) -> usize;
+    fn CGPDFDocumentGetPage(doc: *mut std::ffi::c_void, page: usize) -> *mut std::ffi::c_void;
+    fn CGPDFDocumentRelease(doc: *mut std::ffi::c_void);
+    fn CGPDFPageGetBoxRect(page: *mut std::ffi::c_void, box_kind: i32) -> NSRect;
+    fn CGContextDrawPDFPage(ctx: *mut std::ffi::c_void, page: *mut std::ffi::c_void);
+    fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+    fn CGContextFillRect(ctx: *mut std::ffi::c_void, rect: NSRect);
+    fn CGContextScaleCTM(ctx: *mut std::ffi::c_void, sx: f64, sy: f64);
 }
 
 /// `kCGImageAlphaPremultipliedLast`：通道序 R,G,B,A，alpha 在最后、**预乘**。
@@ -530,6 +541,104 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
             rgba,
         })
     })
+}
+
+/// `kCGPDFMediaBox`：页面「纸张」尺寸（区别于裁切 / 出血框）。
+const K_CGPDF_MEDIA_BOX: i32 = 0;
+
+/// 把 PDF 的**第一页**渲染成一张位图（长边不超过 `max_edge` 像素）。
+///
+/// PDF 是日常高频格式，而 mo-preview 只能给「二进制文件」——空格键预览一个 PDF 看到
+/// 一句乱码说明，等于没有预览。这里用系统自带的 CoreGraphics 渲染，不引第三方依赖。
+///
+/// 与 [`file_icon_raster`] 的关键区别：**不需要主线程**。`CGPDFDocument` 是纯 C 的，
+/// 不碰 `NSWorkspace` / AppKit，所以可以放心放在 blocking 池里跑（首页渲染几毫秒到
+/// 几十毫秒，大页面更久，绝不能压在主线程上）。
+///
+/// 返回 `None` 一律表示「这个 PDF 渲染不出来」（打不开 / 加密 / 零页 / 尺寸异常），
+/// 调用方退回文本提示即可。
+pub fn pdf_page_raster(path: &Path, max_edge: u32) -> Option<IconRaster> {
+    if max_edge == 0 {
+        return None;
+    }
+    // SAFETY: 全部是 CoreGraphics 的 C 入口，指针要么非空判过、要么来自上面的创建函数。
+    unsafe {
+        let url = nsurl_for(path)?;
+        let doc = CGPDFDocumentCreateWithURL(url);
+        if doc.is_null() {
+            return None;
+        }
+        // 页数 0 / 取不到第一页：加密或已损坏的 PDF 会走这里。
+        let pages = CGPDFDocumentGetNumberOfPages(doc);
+        if pages == 0 {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        // 1-based（CoreGraphics 的页码从 1 开始）。
+        let page = CGPDFDocumentGetPage(doc, 1);
+        if page.is_null() {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+
+        let media = CGPDFPageGetBoxRect(page, K_CGPDF_MEDIA_BOX);
+        let (pw, ph) = (media.size.width, media.size.height);
+        if !pw.is_finite() || !ph.is_finite() || pw <= 0.0 || ph <= 0.0 {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        // 等比缩到长边 `max_edge`（页面本身比这小时**不放大**：放大只会糊，
+        // 而预览要的是「看得出是什么」）。
+        let scale = (max_edge as f64 / pw.max(ph)).min(1.0);
+        let w = ((pw * scale).round()).max(1.0) as usize;
+        let h = ((ph * scale).round()).max(1.0) as usize;
+
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        let mut rgba = vec![0u8; w * h * 4];
+        let ctx = CGBitmapContextCreate(
+            rgba.as_mut_ptr(),
+            w,
+            h,
+            8,
+            w * 4,
+            space,
+            K_CG_ALPHA_PREMULTIPLIED_LAST | K_CG_BYTE_ORDER_32_BIG,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        // 先铺白底：PDF 只有文字笔画、页面本身是透明的，不铺底就是一张黑图
+        // （透明像素在 PNG 里看着是黑的）。
+        CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+        CGContextFillRect(
+            ctx,
+            NSRect {
+                origin: NSPoint { x: 0.0, y: 0.0 },
+                size: NSSize {
+                    width: w as f64,
+                    height: h as f64,
+                },
+            },
+        );
+        // 位图上下文是「像素」单位，PDF 页面是「点」单位：先整体缩放再画页面，
+        // 剩下的交给 CoreGraphics。
+        CGContextScaleCTM(ctx, scale, scale);
+        CGContextDrawPDFPage(ctx, page);
+        CGContextRelease(ctx);
+        CGPDFDocumentRelease(doc);
+
+        Some(IconRaster {
+            width: w as u32,
+            height: h as u32,
+            rgba,
+        })
+    }
 }
 
 #[cfg(test)]

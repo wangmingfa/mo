@@ -36,6 +36,10 @@ impl FileIndex {
     /// 打开磁盘上的索引库（不存在则建表）。
     pub fn open(path: &Path) -> Result<Self, SearchError> {
         let conn = Connection::open(path)?;
+        // 两个「应用实例」短暂并存时（多标签页 / 测试里先后建两个 AppState），
+        // 对端可能正握着写事务；没有 busy 超时的话 open / 建表会立刻拿到
+        // SQLITE_BUSY，上层只能退回内存索引——表现为「重开应用后索引归零」。
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let idx = Self { conn };
         idx.init()?;
         Ok(idx)
@@ -51,7 +55,9 @@ impl FileIndex {
 
     fn init(&self) -> Result<(), SearchError> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS files (
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
@@ -61,7 +67,11 @@ impl FileIndex {
                 is_dir INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_name ON files(name_lower);
-            CREATE INDEX IF NOT EXISTS idx_path ON files(path);",
+            CREATE INDEX IF NOT EXISTS idx_path ON files(path);
+            CREATE TABLE IF NOT EXISTS indexed_roots (
+                root TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );",
         )?;
         Ok(())
     }
@@ -95,12 +105,13 @@ impl FileIndex {
         Ok(())
     }
 
-    /// 删除一条记录（按路径）。
-    pub fn remove(&mut self, path: &Path) -> Result<(), SearchError> {
+    /// 删除一条记录（按路径）。返回删掉的行数。
+    pub fn remove(&mut self, path: &Path) -> Result<usize, SearchError> {
         let p = path.to_string_lossy().to_string();
-        self.conn
+        let n = self
+            .conn
             .execute("DELETE FROM files WHERE path = ?1", params![p])?;
-        Ok(())
+        Ok(n)
     }
 
     /// 重命名：更新路径与小写名（保持索引与文件系统一致）。
@@ -116,6 +127,62 @@ impl FileIndex {
             params![to_s, name_lower, from_s],
         )?;
         Ok(())
+    }
+
+    /// 记下「某个根已经爬到什么时刻」。
+    ///
+    /// 增量索引靠它：下一次自举只重爬**过期**的根，而不是每次启动都把整个主目录
+    /// 再走一遍（几十万条目的遍历，跑一次就是几分钟）。
+    pub fn mark_root(&mut self, root: &Path, at: i64) -> Result<(), SearchError> {
+        let r = root.to_string_lossy().to_string();
+        self.conn.execute(
+            "INSERT INTO indexed_roots (root, at) VALUES (?1, ?2)
+             ON CONFLICT(root) DO UPDATE SET at=excluded.at",
+            params![r, at],
+        )?;
+        Ok(())
+    }
+
+    /// 某个根上次爬完的时刻（`None` = 从没爬过）。
+    pub fn last_indexed(&self, root: &Path) -> Option<i64> {
+        let r = root.to_string_lossy().to_string();
+        self.conn
+            .query_row(
+                "SELECT at FROM indexed_roots WHERE root = ?1",
+                params![r],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+    }
+
+    /// 全部已登记的根与上次爬完的时刻（越久没刷的排在前面）。
+    pub fn indexed_roots(&self) -> Vec<(String, i64)> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT root, at FROM indexed_roots ORDER BY at ASC")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// 删掉某个前缀下的全部条目。
+    ///
+    /// 删目录时用的：`crawl` 只按路径 upsert 单条，目录被移走后它下面那些记录会
+    /// 变成孤儿——搜索还能搜到，点开却「文件不存在」。
+    pub fn remove_under(&mut self, prefix: &Path) -> Result<usize, SearchError> {
+        let p = format!("{}/%", prefix.to_string_lossy());
+        let n = self
+            .conn
+            .execute("DELETE FROM files WHERE path LIKE ?1", params![p])?;
+        // 目录自己那条也一起走（watcher 的 Removed 对文件同样适用）。
+        let self_row = self.remove(prefix)?;
+        Ok(n + self_row)
     }
 
     /// 库中的文件总数。
@@ -275,6 +342,51 @@ mod tests {
         let hits = i.search("b.md", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, std::path::Path::new("/x/b.md"));
+    }
+
+    /// 「某个根爬到什么时候」要能记能查：增量索引靠它避免每次启动都重爬整棵树。
+    #[test]
+    fn roots_are_recorded_and_read_back() {
+        let mut i = idx();
+        assert!(i.last_indexed(Path::new("/home")).is_none());
+
+        i.mark_root(Path::new("/home"), 100).unwrap();
+        assert_eq!(i.last_indexed(Path::new("/home")), Some(100));
+
+        // 再记一次覆盖旧值（不是插重复行）。
+        i.mark_root(Path::new("/home"), 200).unwrap();
+        assert_eq!(i.last_indexed(Path::new("/home")), Some(200));
+
+        i.mark_root(Path::new("/data"), 50).unwrap();
+        let roots = i.indexed_roots();
+        assert_eq!(roots.len(), 2);
+        // 「最久没刷的排在最前」：自举时按这个顺序重爬。
+        assert_eq!(roots[0].0, "/data");
+    }
+
+    /// 删目录要连子树一起删：只删目录自己那条的话，它下面的记录会变成孤儿
+    /// （搜索还能搜到，点开却「文件不存在」）。
+    #[test]
+    fn remove_under_takes_the_whole_subtree() {
+        let mut i = idx();
+        i.upsert(Path::new("/x/proj"), "proj", 0, None, true)
+            .unwrap();
+        i.upsert(Path::new("/x/proj/a.md"), "a.md", 1, None, false)
+            .unwrap();
+        i.upsert(Path::new("/x/proj/deep/b.md"), "b.md", 1, None, false)
+            .unwrap();
+        i.upsert(Path::new("/x/other.md"), "other.md", 1, None, false)
+            .unwrap();
+        assert_eq!(i.count(), 4);
+
+        let n = i.remove_under(Path::new("/x/proj")).unwrap();
+        assert_eq!(n, 3, "目录自己 + 两条子记录");
+
+        assert!(i.search("a.md", 10).unwrap().is_empty());
+        assert!(i.search("b.md", 10).unwrap().is_empty());
+        // 别误伤同级其它文件。
+        assert_eq!(i.search("other.md", 10).unwrap().len(), 1);
+        assert_eq!(i.count(), 1);
     }
 
     #[test]

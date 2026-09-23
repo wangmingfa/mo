@@ -42,6 +42,117 @@ impl SortDir {
     }
 }
 
+/// 列表视图的分组方式（任务⑤：按类型 / 按日期）。
+///
+/// 分组**只作用于列表视图**：网格 / 画廊 / 列视图的几何与虚拟化都以
+/// 「条目 = 一行」为前提，插分组头会把行流变成「头 + 条目」两种行，
+/// 那三种视图不消费它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Grouping {
+    #[default]
+    None,
+    /// 按类型：文件夹 / 图片 / 文稿 / 影音 / 压缩包 / 其他。
+    Kind,
+    /// 按修改时间：今天 / 最近 7 天 / 更早。
+    Date,
+}
+
+impl Grouping {
+    /// 配置文件里用的稳定键名（同 `ViewMode::key` 的约定）。
+    pub fn key(self) -> &'static str {
+        match self {
+            Grouping::None => "none",
+            Grouping::Kind => "kind",
+            Grouping::Date => "date",
+        }
+    }
+
+    /// 键名 → 分组方式；不认识返回 `None`（调用方回落默认）。
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "none" => Some(Grouping::None),
+            "kind" => Some(Grouping::Kind),
+            "date" => Some(Grouping::Date),
+            _ => None,
+        }
+    }
+
+    /// 循环切换的下一档（无 → 类型 → 日期 → 无）。
+    pub fn next(self) -> Self {
+        match self {
+            Grouping::None => Grouping::Kind,
+            Grouping::Kind => Grouping::Date,
+            Grouping::Date => Grouping::None,
+        }
+    }
+}
+
+/// 分组键。分组顺序固定（见 [`DirectoryView::rebuild`]），条目 → 键的映射
+/// 在这里收口；键的**中文标题**由 UI 层格式化（mo-core 不放文案）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKey {
+    // —— 按类型（Kind）——
+    Folder,
+    Image,
+    Document,
+    Media,
+    Archive,
+    Other,
+    // —— 按日期（Date）——
+    Today,
+    Week,
+    Earlier,
+}
+
+/// 列表视图的一行：分组头或条目。
+///
+/// `Entry` 存的是 **visible 下标**（展示顺序位），不是 `entries` 下标——
+/// 这样 `row_entry(i)` 的返回值可以直接喂给 `index_at` / 选择 / 预览等
+/// 一切以 visible 位为参数的既有路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Header(GroupKey),
+    Entry(usize),
+}
+
+/// 类型分组的后缀 → 键。顺序即匹配表；`Folder` 在调用处按 `kind` 判，不走这里。
+fn kind_group_of(ext: &str) -> GroupKey {
+    match ext {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "heic" | "svg" => {
+            GroupKey::Image
+        }
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" | "rtf"
+        | "pages" | "numbers" | "key" | "odt" | "ods" => GroupKey::Document,
+        "mp4" | "mov" | "mkv" | "avi" | "webm" | "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" => {
+            GroupKey::Media
+        }
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "iso" => {
+            GroupKey::Archive
+        }
+        _ => GroupKey::Other,
+    }
+}
+
+/// 日期分组的桶：24 小时内 = 今天，7 天内 = 最近 7 天，其余 = 更早。
+/// 元数据未加载（`Loading` / `None`）时落「更早」——回填后下一次 rebuild 自然归位。
+fn date_group_of(e: &Entry, now: std::time::SystemTime) -> GroupKey {
+    let modified = match &e.metadata {
+        crate::entry::MetadataState::Loaded(m) => m.modified,
+        _ => None,
+    };
+    let Some(t) = modified else {
+        return GroupKey::Earlier;
+    };
+    let age = now.duration_since(t).unwrap_or(std::time::Duration::ZERO);
+    if age <= std::time::Duration::from_secs(24 * 3600) {
+        GroupKey::Today
+    } else if age <= std::time::Duration::from_secs(7 * 24 * 3600) {
+        GroupKey::Week
+    } else {
+        GroupKey::Earlier
+    }
+}
+
 /// 目录视图：排序 + 名称过滤后的**可见索引**。
 ///
 /// 大目录优化的关键之一：过滤 / 排序不复制条目，只维护一份 `Vec<usize>`
@@ -57,6 +168,11 @@ pub struct DirectoryView {
     filter: Option<String>,
     /// `entries` 中可见条目的下标，顺序即展示顺序。
     visible: Vec<usize>,
+    /// 列表分组方式。
+    grouping: Grouping,
+    /// 分组后的行流（`Header` + `Entry` 交错）。**只在 `grouping != None` 时非空**；
+    /// 空表示「无分组」，行流就等于 `visible` 本身。组内顺序 = 现有排序序。
+    rows: Vec<Row>,
 }
 
 impl DirectoryView {
@@ -81,6 +197,17 @@ impl DirectoryView {
         self.filter.is_some()
     }
 
+    /// 当前分组方式。
+    pub fn grouping(&self) -> Grouping {
+        self.grouping
+    }
+
+    /// 设置分组方式并重建（同排序 / 过滤一样走一次 O(n log n) 重建）。
+    pub fn set_grouping(&mut self, grouping: Grouping, entries: &[Entry]) {
+        self.grouping = grouping;
+        self.rebuild(entries);
+    }
+
     /// 可见条目的下标（顺序即展示顺序）。
     pub fn visible_indices(&self) -> &[usize] {
         &self.visible
@@ -98,6 +225,45 @@ impl DirectoryView {
     /// 第 `i` 个可见条目在 `entries` 中的下标。
     pub fn index_at(&self, i: usize) -> Option<usize> {
         self.visible.get(i).copied()
+    }
+
+    /// 列表视图的**行数**：无分组 = 条目数；有分组 = 条目数 + 分组头数。
+    pub fn row_count(&self) -> usize {
+        if self.rows.is_empty() {
+            self.visible.len()
+        } else {
+            self.rows.len()
+        }
+    }
+
+    /// 第 `i` 行的条目 visible 位；分组头行返回 `None`。
+    pub fn row_entry(&self, i: usize) -> Option<usize> {
+        match self.rows.get(i) {
+            Some(Row::Entry(pos)) => Some(*pos),
+            Some(Row::Header(_)) => None,
+            // 无分组（rows 空）：行即条目。
+            None => self.visible.get(i).map(|_| i),
+        }
+    }
+
+    /// 第 `i` 行的分组头键；条目行返回 `None`。
+    pub fn row_header(&self, i: usize) -> Option<GroupKey> {
+        match self.rows.get(i) {
+            Some(Row::Header(k)) => Some(*k),
+            _ => None,
+        }
+    }
+
+    /// 条目 visible 位 → 行下标（供键盘移动 / type-ahead 的滚动跟随）。
+    /// 无分组时两者相等；有分组时线性扫（键盘导航本身已是 O(n)，同量级）。
+    pub fn pos_to_row(&self, pos: usize) -> usize {
+        if self.rows.is_empty() {
+            return pos;
+        }
+        self.rows
+            .iter()
+            .position(|r| matches!(r, Row::Entry(p) if *p == pos))
+            .unwrap_or(pos)
     }
 
     /// 设置排序方式（键 + 方向）并重建索引。
@@ -161,6 +327,64 @@ impl DirectoryView {
             };
             primary.then_with(|| natural_cmp(&ea.name, &eb.name))
         });
+        self.rebuild_rows(entries);
+    }
+
+    /// 从已排好的 `visible` 构建（或清掉）分组行流。
+    ///
+    /// 组**顺序固定**（类型：文件夹 → 图片 → 文稿 → 影音 → 压缩包 → 其他；
+    /// 日期：今天 → 最近 7 天 → 更早），组**内**保持现有排序序（稳定分桶）——
+    /// 这样分组与排序是叠加关系而不是替换：切分组不重排组内条目。
+    /// 空组不出头（没有内容的组不占行）。
+    fn rebuild_rows(&mut self, entries: &[Entry]) {
+        self.rows.clear();
+        if self.grouping == Grouping::None {
+            return;
+        }
+        const KIND_ORDER: [GroupKey; 6] = [
+            GroupKey::Folder,
+            GroupKey::Image,
+            GroupKey::Document,
+            GroupKey::Media,
+            GroupKey::Archive,
+            GroupKey::Other,
+        ];
+        const DATE_ORDER: [GroupKey; 3] = [GroupKey::Today, GroupKey::Week, GroupKey::Earlier];
+        let order: &[GroupKey] = match self.grouping {
+            Grouping::Kind => &KIND_ORDER,
+            Grouping::Date => &DATE_ORDER,
+            Grouping::None => unreachable!("上面已 return"),
+        };
+        let now = std::time::SystemTime::now();
+        // 单趟分桶：每个桶收集属于该组的 visible 位（桶内顺序 = 现有排序序）。
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
+        for (pos, &vi) in self.visible.iter().enumerate() {
+            let e = &entries[vi];
+            let key = match self.grouping {
+                Grouping::Kind => {
+                    if e.kind.is_dir() {
+                        GroupKey::Folder
+                    } else {
+                        let ext = e.extension();
+                        kind_group_of(&ext)
+                    }
+                }
+                Grouping::Date => date_group_of(e, now),
+                Grouping::None => unreachable!("上面已 return"),
+            };
+            let slot = order
+                .iter()
+                .position(|&k| k == key)
+                .unwrap_or(order.len() - 1);
+            buckets[slot].push(pos);
+        }
+        for (slot, bucket) in buckets.iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            self.rows.push(Row::Header(order[slot]));
+            self.rows.extend(bucket.iter().map(|&pos| Row::Entry(pos)));
+        }
     }
 }
 
@@ -236,5 +460,132 @@ fn contains_fold(name: &str, needle_lower: &str) -> bool {
             .any(|w| w.eq_ignore_ascii_case(n))
     } else {
         name.to_lowercase().contains(needle_lower)
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryKind, MetadataState};
+    use crate::file_id::FileId;
+    use crate::metadata::{FileMetadata, Permissions};
+    use std::time::{Duration, SystemTime};
+
+    fn e(name: &str, dir: bool) -> Entry {
+        Entry::new(
+            FileId::new(1, name.len() as u128),
+            name.to_string(),
+            if dir {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            },
+            std::path::PathBuf::from(name),
+        )
+    }
+
+    /// 带修改时间（age 秒前）的条目。
+    fn aged(name: &str, age_secs: u64) -> Entry {
+        let mut e = e(name, false);
+        e.metadata = MetadataState::Loaded(FileMetadata {
+            size: 1,
+            modified: Some(SystemTime::now() - Duration::from_secs(age_secs)),
+            created: None,
+            permissions: Permissions::default(),
+        });
+        e
+    }
+
+    /// 类型分组：组顺序固定、空组不出头、组内保持排序序。
+    #[test]
+    fn kind_grouping_inserts_headers_in_fixed_order() {
+        // 排序后：sub（目录）在最前，其余按名升序。
+        let entries = vec![
+            e("sub", true),
+            e("a.png", false),
+            e("b.txt", false),
+            e("c.zip", false),
+            e("d.xyz", false),
+        ];
+        let mut v = DirectoryView::new();
+        v.set_grouping(Grouping::Kind, &entries);
+
+        assert_eq!(v.row_count(), 5 + 5, "5 条目 + 5 个非空组头");
+        // 逐行核对：头行 row_entry = None，条目行给出正确的 visible 位。
+        let expect_rows: Vec<(Option<GroupKey>, Option<usize>)> = vec![
+            (Some(GroupKey::Folder), None),
+            (None, Some(0)),
+            (Some(GroupKey::Image), None),
+            (None, Some(1)),
+            (Some(GroupKey::Document), None),
+            (None, Some(2)),
+            (Some(GroupKey::Archive), None),
+            (None, Some(3)),
+            (Some(GroupKey::Other), None),
+            (None, Some(4)),
+        ];
+        for (i, (hk, en)) in expect_rows.iter().enumerate() {
+            assert_eq!(v.row_header(i), *hk, "第 {i} 行的组头不对");
+            assert_eq!(v.row_entry(i), *en, "第 {i} 行的条目位不对");
+        }
+        // pos → row 映射（条目位 0..=4 → 1,3,5,7,9）。
+        for (pos, row) in [(0usize, 1usize), (1, 3), (2, 5), (3, 7), (4, 9)] {
+            assert_eq!(v.pos_to_row(pos), row, "条目位 {pos} 应在第 {row} 行");
+        }
+    }
+
+    /// 日期分组：24h / 7d / 更早三桶；元数据未加载落「更早」。
+    #[test]
+    fn date_grouping_buckets_by_age() {
+        let entries = vec![
+            aged("fresh.txt", 3600),         // 1h → 今天
+            aged("week.txt", 3 * 24 * 3600), // 3d → 最近 7 天
+            aged("old.txt", 30 * 24 * 3600), // 30d → 更早
+            e("loading.txt", false),         // 无元数据 → 更早
+        ];
+        let mut v = DirectoryView::new();
+        v.set_grouping(Grouping::Date, &entries);
+
+        // 名字排序后：fresh / loading / old / week（visible 位 0..3）。
+        // 分组只改行流不改桶内顺序：Today 只含 fresh(0)，
+        // Week 只含 week.txt(3)，Earlier 含 old(2) 与 loading(1)。
+        let expect_rows: Vec<(Option<GroupKey>, Option<usize>)> = vec![
+            (Some(GroupKey::Today), None),
+            (None, Some(0)),
+            (Some(GroupKey::Week), None),
+            (None, Some(3)),
+            (Some(GroupKey::Earlier), None),
+            (None, Some(1)),
+            (None, Some(2)),
+        ];
+        for (i, (hk, en)) in expect_rows.iter().enumerate() {
+            assert_eq!(v.row_header(i), *hk, "第 {i} 行的组头不对");
+            assert_eq!(v.row_entry(i), *en, "第 {i} 行的条目位不对");
+        }
+    }
+
+    /// 无分组时行 API 与 visible 恒等——既有路径不能因为接了这套接口而变。
+    #[test]
+    fn ungrouped_rows_are_identity() {
+        let entries = vec![e("a", false), e("b", false)];
+        let mut v = DirectoryView::new();
+        v.rebuild(&entries);
+        assert_eq!(v.row_count(), 2);
+        for i in 0..2 {
+            assert_eq!(v.row_entry(i), Some(i));
+            assert_eq!(v.row_header(i), None);
+            assert_eq!(v.pos_to_row(i), i);
+        }
+    }
+
+    /// 过滤 + 分组叠加：分组吃的是过滤后的可见集。
+    #[test]
+    fn grouping_composes_with_filter() {
+        let entries = vec![e("sub", true), e("a.png", false), e("b.txt", false)];
+        let mut v = DirectoryView::new();
+        v.set_filter(Some("t".to_string()), &entries); // 命中 txt（t 在 txt）与 sub？
+        v.set_grouping(Grouping::Kind, &entries);
+        let total_entries: usize = (0..v.row_count()).filter_map(|i| v.row_entry(i)).count();
+        assert_eq!(total_entries, v.len(), "行流里的条目数 = 可见条目数");
     }
 }

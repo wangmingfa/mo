@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use mo_core::{FileMetadata, MoError, Permissions};
 
 use crate::reader::ReadDirEntry;
-use crate::{entry_kind_from_path, file_id_for, to_dir_error, FileSystem};
+use crate::{
+    entry_kind_from_path, file_id_for, is_hidden_name, is_hidden_with_metadata, kind_from_metadata,
+    to_dir_error, FileSystem,
+};
 
 /// 基于 `std::fs` 的本地文件系统实现。
 #[derive(Debug, Default)]
@@ -30,9 +33,22 @@ impl FileSystem for LocalFileSystem {
         while let Some(entry) = rd.next().transpose().map_err(to_dir_error)? {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            let kind = entry_kind_from_path(&p).unwrap_or(mo_core::EntryKind::Other);
+            // 一次 `DirEntry::metadata()` 把「类型」和「macOS 隐藏标记位」一起拿
+            // 出来：它内部就是 lstat，比按路径再查一次 dentry 便宜（拿不到时退回
+            // 按路径判，宁可多一次 syscall 也不要丢条目）。
+            let meta = entry.metadata().ok();
+            let kind = meta
+                .as_ref()
+                .map(|m| kind_from_metadata(m, &p))
+                .or_else(|| entry_kind_from_path(&p).ok())
+                .unwrap_or(mo_core::EntryKind::Other);
             let id = file_id_for(&p);
-            out.push(ReadDirEntry::new(id, name, kind, p));
+            let mut r = ReadDirEntry::new(id, name.clone(), kind, p);
+            r.hidden = match meta.as_ref() {
+                Some(m) => is_hidden_with_metadata(&name, m),
+                None => is_hidden_name(&name),
+            };
+            out.push(r);
         }
         // 目录在前，再按名称排序。
         out.sort_by(|a, b| {
@@ -109,36 +125,16 @@ fn unix_mode(m: &std::fs::Metadata) -> u32 {
 ///   文件走这条路）：`st_flags & 0x8000`。`0x8000` 是 BSD 的 `UF_HIDDEN`，
 ///   Linux 的 `st_flags` 恒为 0，所以这条在 Linux 上自动失效、不误伤。
 ///
-/// ⚠️ 这个 `hidden` 现在**不参与列表过滤**（侧边栏 / 列表只看 `ReadDirEntry`，
-/// 不读 `FileMetadata.hidden`；`show_hidden` 配置项也还没接进过滤），所以改它只会
-/// 让属性面板显示正确，不会突然把用户的 dotfile 藏起来——过滤是另一件事。
+/// 属性面板的「隐藏」一栏：与列表过滤共用 [`is_hidden_with_metadata`] 那套判据。
+///
+/// 两处必须同一套判据，否则会出现「属性面板说不隐藏，列表里却被过滤掉」这种
+/// 自相矛盾的显示。
 fn is_hidden(path: &Path, m: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let dotfile = path
-            .file_name()
-            .map(|n| n.as_bytes().first() == Some(&b'.'))
-            .unwrap_or(false);
-        // macOS 的 `UF_HIDDEN`（`chflags hidden` 设的）：`st_flags & 0x8000`。
-        // `st_flags` 只有 macOS 的 `MetadataExt` 提供（Linux 的 `stat` 没有该字段），
-        // 所以这条判据必须限定在 macOS；Linux 上只看 dotfile。
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::macos::fs::MetadataExt;
-            let flagged = m.st_flags() & 0x8000 != 0; // UF_HIDDEN
-            dotfile || flagged
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            dotfile
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, m);
-        false
-    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    is_hidden_with_metadata(&name, m)
 }
 
 /// 「此电脑」虚拟目录：枚举本机盘符（Windows）。
@@ -259,6 +255,40 @@ mod unix_tests {
                 .status()
                 .ok();
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 列目录必须把「是否隐藏」跟着条目一起交上来。
+    ///
+    /// 上层过滤（「显示隐藏文件」开关）只看这个字段。它若丢失，上层就只能拿着
+    /// 路径再 stat 一遍——列目录是热路径，两万条的目录就是两万次额外 syscall。
+    #[test]
+    fn read_dir_reports_hidden_per_entry() {
+        let dir = std::env::temp_dir().join(format!("mo-fs-hidden-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::write(dir.join(".dot_probe"), b"x").expect("写 dotfile");
+        std::fs::write(dir.join("plain.txt"), b"x").expect("写普通文件");
+        std::fs::create_dir_all(dir.join(".dot_dir")).expect("写 dot 目录");
+
+        let entries = LocalFileSystem.read_dir_blocking(&dir).expect("读目录");
+        let hidden_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("目录里应有 {name}"))
+                .hidden
+        };
+        assert!(hidden_of(".dot_probe"), "dotfile 必须标 hidden");
+        assert!(hidden_of(".dot_dir"), "dot 目录同样要标 hidden");
+        assert!(!hidden_of("plain.txt"), "普通文件不该标 hidden");
+
+        // 类型判据没被这次改动带偏：`DirEntry::metadata()` 那条路要给出同样的结果。
+        let plain = entries.iter().find(|e| e.name == "plain.txt").unwrap();
+        assert!(plain.kind.is_file(), "plain.txt 应是文件");
+        let dot_dir = entries.iter().find(|e| e.name == ".dot_dir").unwrap();
+        assert!(dot_dir.kind.is_dir(), ".dot_dir 应是目录");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

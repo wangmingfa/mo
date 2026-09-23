@@ -72,6 +72,10 @@ pub fn run() {
     // 启动图标泵：列表行要的系统图标只在渲染路径上「记账」，真去问系统（AppKit +
     // 重绘 + 编码 + 写盘，一张 1.5–12ms）在这里的后台批里做。
     app.spawn_icon_pump();
+    // 全局搜索自举：索引现在落在磁盘上（`~/Library/Caches/mo/search.sqlite`），
+    // 但**首次启动**仍要爬一遍主目录才有东西可搜。这里后台起，不挡窗口出现；
+    // 之后每次启动只重爬「超过 6 小时没刷」的根（见 `ensure_index_started`）。
+    app.ensure_index_started();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         // 主 run loop 已经跑起来了：允许后台任务把 AppKit 调用 `dispatch_sync`

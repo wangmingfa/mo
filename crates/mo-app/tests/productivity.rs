@@ -34,6 +34,13 @@ async fn wait_for<F: Fn() -> bool>(f: F) {
 
 #[test]
 fn global_search_finds_files_across_subdirs() {
+    // 索引现在**落在盘上**（`~/Library/Caches/mo/search.sqlite`），不隔离就会往开发者
+    // 机器上的真实索引里写测试目录，而且那些记录会一直留在那儿、把后续搜索的前 50
+    // 条挤掉。测试一律把库钉到临时目录。
+    let dir = std::env::temp_dir().join(format!("mo-index-prod-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建索引目录");
+    std::env::set_var("MO_CACHE_DIR", &dir);
+
     let base = tree("search");
     let app = AppState::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -364,6 +371,144 @@ fn create_file_is_empty_and_never_overwrites() {
         let dir = app.create_folder(&base, "").await.unwrap();
         assert_eq!(dir.file_name().unwrap(), "新建文件夹");
         assert!(dir.is_dir());
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// type-ahead：键盘输入即定位——在可见条目里跳到文件名以输入串开头的第一条。
+#[test]
+fn focus_by_prefix_jumps_to_first_matching_name() {
+    let base = tree("typeahead");
+    let app = AppState::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+        let entries = app.current_entries().await;
+        let alpha_id = entries.iter().find(|e| e.name == "alpha.txt").unwrap().id;
+        let beta_id = entries.iter().find(|e| e.name == "beta.log").unwrap().id;
+
+        // "al" 跳到 alpha.txt：返回其可见位置，且单选它。
+        let idx = app.focus_by_prefix("al").await.expect("应跳到 alpha.txt");
+        assert_eq!(
+            app.selection_ids().await,
+            vec![alpha_id],
+            "跳选应单选 alpha.txt"
+        );
+
+        // "be" 跳到 beta.log：可见序排在 alpha.txt 之后，且选中它。
+        let idx_b = app.focus_by_prefix("be").await.expect("应跳到 beta.log");
+        assert!(idx_b > idx, "beta.log 在可见序中应排在 alpha.txt 之后");
+        assert_eq!(app.selection_ids().await, vec![beta_id]);
+
+        // 大小写不敏感："AL" 同样命中 alpha.txt（同一可见位置）。
+        let idx_a2 = app.focus_by_prefix("AL").await.expect("大写也应命中");
+        assert_eq!(idx_a2, idx, "大写前缀应命中同一个 alpha.txt");
+        assert_eq!(app.selection_ids().await, vec![alpha_id]);
+
+        // 无匹配 → 返回 None，且不改变已有选择。
+        let before = app.selection_ids().await;
+        assert!(
+            app.focus_by_prefix("zzz").await.is_none(),
+            "无匹配应返回 None"
+        );
+        assert_eq!(app.selection_ids().await, before, "无匹配时不应改动选择集");
+
+        // 空串 → 直接 None，不动作。
+        assert!(app.focus_by_prefix("").await.is_none());
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 反选：可见集内翻转让未选中的变成选中、已选中的取消，且不碰隐藏 / 过滤掉的条目。
+#[test]
+fn invert_selection_flips_visible_set_only() {
+    let base = tree("invert");
+    let app = AppState::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+        let ids = app
+            .current_entries()
+            .await
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 3);
+
+        // 先选第一个，再反选 → 应剩下两个未选中的。
+        app.select(ids[0]).await;
+        app.select_invert_visible().await;
+        let sel = app.selection_ids().await;
+        assert_eq!(sel.len(), 2, "反选后应剩 2 个");
+        assert!(!sel.contains(&ids[0]), "原选中项应被取消");
+        assert!(
+            sel.contains(&ids[1]) && sel.contains(&ids[2]),
+            "另两项应被选中"
+        );
+
+        // 全选后反选 → 空集。
+        app.select_all_visible().await;
+        app.select_invert_visible().await;
+        assert!(app.selection_ids().await.is_empty(), "全选后反选应为空");
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 列表分组：行流 = 组头 + 条目交错；行区间选择跳过组头；type-ahead 返回行下标。
+///
+/// 行空间（含组头）与条目空间是两套下标——这里钉住三者的换算关系，
+/// 任何一处漏乘（渲染 count、框选、键盘导航）都会在这条测试上翻车。
+#[test]
+fn grouping_rows_headers_and_row_range_selection() {
+    let base = tree("grouping");
+    let app = AppState::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+        assert_eq!(app.visible_count().await, 3, "sub + alpha.txt + beta.log");
+        // 无分组时行数 = 条目数（行=条目恒等，既有路径不能变）。
+        assert_eq!(app.list_row_count().await, 3);
+
+        app.set_grouping(mo_app::Grouping::Kind).await;
+        // 名字排序且目录在前：sub(0) → 文件夹；alpha.txt(1) → 文稿（txt）；
+        // beta.log(2) → 其他（log 不在任何类目表里）。行流：
+        // [头-文件夹, sub, 头-文稿, alpha, 头-其他, beta]。
+        let rows = app.list_row_count().await;
+        assert_eq!(rows, 6, "3 条目 + 3 个非空组头");
+
+        let (_, start, win) = app.list_window(0..rows, true).await;
+        assert_eq!(start, 0);
+        assert_eq!(win.len(), rows, "窗口行数 = 行流总数");
+        assert!(
+            matches!(win[0], mo_app::WindowRow::Header(_)),
+            "第 0 行应是「文件夹」组头"
+        );
+        assert!(matches!(win[1], mo_app::WindowRow::Entry(_)));
+        assert_eq!(
+            win.iter()
+                .filter(|r| matches!(r, mo_app::WindowRow::Entry(_)))
+                .count(),
+            3,
+            "行流里的条目行恰好 3 条"
+        );
+
+        // 行区间选择（区间故意盖住组头行）：行 2..=6 只含 alpha 与 beta 两条条目。
+        app.clear_selection().await;
+        app.select_rows_range(2, 6).await;
+        assert_eq!(
+            app.selection_ids().await.len(),
+            2,
+            "行区间选择应跳过组头、选中 2 条条目"
+        );
+
+        // type-ahead 返回**行**下标：alpha.txt 在「文稿」组里，行号 = 3。
+        let row = app.focus_by_prefix("al").await.unwrap();
+        assert_eq!(row, 3, "alpha.txt 的行号应把组头行算进去");
+        assert_eq!(app.selection_ids().await.len(), 1, "跳选应为单选");
+
+        // 切回不分组：行数回到条目数。
+        app.set_grouping(mo_app::Grouping::None).await;
+        assert_eq!(app.list_row_count().await, 3);
     });
     let _ = std::fs::remove_dir_all(&base);
 }

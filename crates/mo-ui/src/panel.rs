@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use gpui_kit::component::input::InputState;
 use gpui_kit::{Entity, Subscription, UniformListScrollHandle};
-use mo_app::AppState;
-use mo_core::{Entry, LightEntry, SelectionModel, SortDir, SortKey};
+use mo_app::{AppState, Grouping, WindowRow};
+use mo_core::{LightEntry, SelectionModel, SortDir, SortKey};
 use mo_operations::OperationHandle;
 
 /// 面板的呈现方式。
@@ -126,14 +126,27 @@ pub(crate) struct Panel {
     /// 读大目录要 100–300ms，这段窗口里界面还停在上一处——侧栏高亮与「正在读取 …」
     /// 提示都按它走，用户点了才有反应。
     pub opening: Option<PathBuf>,
-    /// 可见条目总数（虚拟化列表的 `item_count`）。
+    /// 可见条目总数（网格 / 画廊 / 列视图的 `item_count`；它们的行就是条目）。
     pub visible_count: usize,
+    /// **列表视图**的行数（分组开启时 = 条目数 + 非空组头数；否则等于
+    /// `visible_count`）。列表的 `uniform_list` 以它为 `item_count`。
+    pub list_count: usize,
+    /// 当前列表分组方式（`AppState` 的最近一次同步）。
+    pub grouping: Grouping,
     /// 窗口快照的起始下标。
     pub window_start: usize,
     /// 窗口快照：只覆盖可见区 + 少量缓冲。
-    pub window: Vec<Entry>,
-    /// 已发起但还没回填的窗口请求，避免重复派生任务。
-    pub pending: Option<Range<usize>>,
+    ///
+    /// ⚠️ 里面的下标属于**一种空间**：分组开启的列表视图是「行空间」（含组头），
+    /// 其余情况是「条目空间」。当前是哪种由 [`Self::window_is_grouped] 标记，
+    /// 切换空间时窗口必须作废重取（`sync_panel` 负责），两种空间的下标混用
+    /// 会把 A 行的内容画到 B 行上。
+    pub window: Vec<WindowRow>,
+    /// 当前窗口快照是否处于分组行空间。
+    pub window_is_grouped: bool,
+    /// 已发起但还没回填的窗口请求（范围 + 发起时的空间标记），避免重复派生任务；
+    /// 空间变了的话旧在途请求的结果会被弃用重取。
+    pub pending: Option<(Range<usize>, bool)>,
     pub selection: SelectionModel,
     /// 本面板发起的后台操作快照（进度面板数据源）。
     pub ops: Vec<OperationHandle>,
@@ -183,8 +196,11 @@ impl Panel {
             path: None,
             opening: None,
             visible_count: 0,
+            list_count: 0,
+            grouping: Grouping::default(),
             window_start: 0,
             window: Vec::new(),
+            window_is_grouped: false,
             pending: None,
             selection: SelectionModel::new(),
             ops: Vec::new(),
@@ -251,6 +267,14 @@ impl Panel {
         !self.window.is_empty()
             && start >= self.window_start
             && end <= self.window_start + self.window.len()
+    }
+
+    /// 窗口里的**条目**（跳过分组头），保持窗口顺序。
+    ///
+    /// 选择回灌 / 用户命令上下文这类「只关心文件」的路径都走它；
+    /// 直接 `.window.iter()` 会把组头也当成条目（组头没有 id / path）。
+    pub fn window_entries(&self) -> impl Iterator<Item = &mo_core::Entry> {
+        self.window.iter().filter_map(|r| r.entry())
     }
 }
 

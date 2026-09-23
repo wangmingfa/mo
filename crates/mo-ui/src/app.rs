@@ -203,6 +203,18 @@ pub(crate) enum CommandId {
     ToggleSidebar,
     ToggleStatusBar,
     ToggleZebra,
+    /// 显示 / 隐藏隐藏文件（访达的 ⌘⇧. 那一个开关）。
+    ToggleHidden,
+    /// 反选：可见条目里没选中的换上来。
+    InvertSelection,
+    /// 放大图标（网格 / 画廊）。
+    ZoomIn,
+    /// 缩小图标（网格 / 画廊）。
+    ZoomOut,
+    /// 图标大小回到 1.0×。
+    ZoomReset,
+    /// 列表分组循环切换（无 → 类型 → 日期），并落为新标签页默认值。
+    GroupingCycle,
 }
 
 struct CmdDef {
@@ -297,6 +309,31 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             category: "外观".to_string(),
         },
         CmdDef {
+            id: CommandId::ToggleHidden,
+            title: "显示 / 隐藏隐藏文件".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ZoomIn,
+            title: "放大图标（网格 / 画廊）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ZoomOut,
+            title: "缩小图标（网格 / 画廊）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ZoomReset,
+            title: "图标大小还原（1×）".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::GroupingCycle,
+            title: "列表分组：无 → 按类型 → 按日期".to_string(),
+            category: "外观".to_string(),
+        },
+        CmdDef {
             id: CommandId::HashSelection,
             title: "计算选中文件哈希（MD5/SHA-1/SHA-256）".to_string(),
             category: "工具".to_string(),
@@ -344,6 +381,11 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         CmdDef {
             id: CommandId::ClearSelection,
             title: "清除选择".to_string(),
+            category: "选择".to_string(),
+        },
+        CmdDef {
+            id: CommandId::InvertSelection,
+            title: "反选（选中其余全部）".to_string(),
             category: "选择".to_string(),
         },
         CmdDef {
@@ -647,6 +689,12 @@ pub struct RootView {
     pub(crate) usage: Vec<mo_app::DirUsage>,
     /// 进行中的拖拽（鼠标按下时记录、抬起时结算）。
     pub(crate) drag: Option<DragState>,
+    /// 列表视图的鼠标框选（rubber-band）进行态；`None` = 没在框选。
+    pub(crate) box_selection: Option<BoxSelection>,
+    /// 各 (窗格, 标签页) 列表视图的内容区左上角（窗口坐标），prepaint 回写。
+    ///
+    /// 框选取坐标用：把鼠标 y 折算成可见行下标需要「列表顶在哪 + 滚了多少」。
+    pub(crate) list_origin: std::collections::HashMap<(usize, usize), (f32, f32)>,
     /// 列表视图的列布局（顺序 + 宽度），表头与数据行共用。
     pub(crate) cols: crate::list_columns::ColumnLayout,
     /// 进行中的表头操作（调宽 / 调序）。
@@ -721,6 +769,22 @@ pub(crate) struct DragState {
     pub(crate) paths: Vec<PathBuf>,
 }
 
+/// 列表视图的鼠标框选（rubber-band）进行态。
+///
+/// 坐标都是**窗口坐标**（与表头拖拽、右键菜单落点同一套），框选结束后清回 `None`。
+/// 起点记录的是按下那一刻的鼠标位置；拖动中实时更新 `cursor`，按 y 带映射成可见
+/// 行下标范围。只作用于列表视图——网格 / 画廊 / 列视图的命中几何不同，框选先不覆盖。
+pub(crate) struct BoxSelection {
+    pub(crate) pane: usize,
+    pub(crate) tab: usize,
+    /// 是否以「加选」模式进行（按住 ⌘/Ctrl 或 Shift 时不替换既有选择）。
+    pub(crate) extend: bool,
+    /// 按下起点（窗口坐标）。
+    pub(crate) origin: (f32, f32),
+    /// 当前光标（窗口坐标）。
+    pub(crate) cursor: (f32, f32),
+}
+
 /// 「新建」的种类（两种新建流程一致，只有名字与调用的 app 方法不同）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NewEntry {
@@ -788,6 +852,8 @@ impl RootView {
             archive_name: String::new(),
             usage: Vec::new(),
             drag: None,
+            box_selection: None,
+            list_origin: std::collections::HashMap::new(),
             cols: crate::list_columns::ColumnLayout::from_prefs(&app.column_prefs()),
             header_drag: None,
             header_cells: Vec::new(),
@@ -868,6 +934,21 @@ impl RootView {
         for pane in &self.panes {
             for tab in &pane.tabs {
                 out.extend(tab.ops.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// 全部窗格 / 标签页的 `AppState`。
+    ///
+    /// 「显示隐藏文件」这类**全局开关**要逐个标签页同步：每个标签页各持一份
+    /// `AppState`，而开关在 `AppState` 里是进程内镜像（热路径不能每次读盘），
+    /// 只改当前那一份就会出现「切到另一个标签页又变回去」。
+    pub(crate) fn all_apps(&self) -> Vec<AppState> {
+        let mut out = Vec::new();
+        for pane in &self.panes {
+            for tab in &pane.tabs {
+                out.push(tab.app.clone());
             }
         }
         out
@@ -2171,6 +2252,22 @@ impl RootView {
         }
     }
 
+    /// 预览窗口里的文本替换（PDF 首页渲染不出来时给一句解释）。
+    pub(crate) fn set_preview_text(&mut self, seq: u64, text: String, cx: &mut Context<Self>) {
+        if seq != self.preview_seq {
+            return;
+        }
+        let Some(handle) = self.preview_window else {
+            return;
+        };
+        if handle
+            .update(cx, |v, _window, cx| v.set_text(text, cx))
+            .is_err()
+        {
+            self.preview_window = None;
+        }
+    }
+
     /// 预览窗口里按方向键：移动列表焦点并换预览内容。
     ///
     /// 焦点的唯一事实来源仍是 app 侧选择模型，所以这里复用主列表的
@@ -2483,8 +2580,7 @@ impl RootView {
         let ctx = {
             let panel = self.panel();
             let selected = panel
-                .window
-                .iter()
+                .window_entries()
                 .filter(|e| panel.selection.is_selected(&e.id))
                 .map(|e| e.path.clone())
                 .collect();
@@ -3196,6 +3292,31 @@ impl RootView {
         )
     }
 
+    /// 切换「显示隐藏文件」（⌘⇧.，访达同款键位）。
+    ///
+    /// 两件事必须一起做，**顺序也不能反**：
+    ///
+    /// * **所有标签页都要切**：开关在 `AppState` 里是进程内镜像（列目录是热路径，
+    ///   不能每次读盘），而每个标签页各持一份 `AppState`——只改当前那份会出现
+    ///   「切到另一个标签页又变回去」；
+    /// * **切完立刻重读**：过滤发生在建视图**之前**（`load_path`），不重读的话界面
+    ///   上什么都没变，用户会以为按键没生效。
+    fn toggle_hidden(&mut self, _entity: &Entity<RootView>, cx: &mut Context<Self>) {
+        let apps = self.all_apps();
+        // 判据取「当前值取反」：所有标签页同值，用谁读都一样；`apps` 为空时是关。
+        let next = !apps.first().is_some_and(|a| a.show_hidden());
+        for a in &apps {
+            a.set_show_hidden(next);
+        }
+        cx.spawn(async move |_weak, _cx| {
+            for a in apps {
+                let _ = a.refresh().await;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     // ------------------------------------------------------------ 快捷键
 
     /// 执行一个可绑定动作（键表查出来的 id 落到这里）。
@@ -3248,6 +3369,15 @@ impl RootView {
                 })
                 .detach();
             }
+            "select.invert" => {
+                let app = self.app();
+                cx.spawn(async move |_weak, cx| {
+                    app.select_invert_visible().await;
+                    // app 侧选择是唯一事实来源：反选后回灌 UI 高亮。
+                    pull_selection(&app, &entity, cx).await;
+                })
+                .detach();
+            }
             "edit.undo" => self.app().undo(),
             "edit.redo" => self.app().redo(),
             "tab.new" => {
@@ -3282,6 +3412,12 @@ impl RootView {
                 self.switch_pane(1);
                 cx.notify();
             }
+            "view.hidden" => {
+                self.toggle_hidden(&entity, cx);
+            }
+            "view.zoom_in" => self.zoom_by(1, cx),
+            "view.zoom_out" => self.zoom_by(-1, cx),
+            "view.zoom_reset" => self.reset_zoom(cx),
             key @ ("view.list" | "view.grid" | "view.gallery" | "view.columns") => {
                 let mode = match key {
                     "view.grid" => ViewMode::Grid,
@@ -3302,8 +3438,7 @@ impl RootView {
                 let paths = {
                     let panel = self.panel();
                     panel
-                        .window
-                        .iter()
+                        .window_entries()
                         .filter(|e| panel.selection.is_selected(&e.id))
                         .map(|e| e.path.clone())
                         .collect::<Vec<_>>()
@@ -3343,8 +3478,7 @@ impl RootView {
                 let text = {
                     let panel = self.panel();
                     panel
-                        .window
-                        .iter()
+                        .window_entries()
                         .filter(|e| panel.selection.is_selected(&e.id))
                         .map(|e| e.path.to_string_lossy().to_string())
                         .collect::<Vec<_>>()
@@ -3581,6 +3715,20 @@ impl RootView {
                 "新标签页默认视图".to_string(),
                 format!("{mode}（Enter 切换）"),
             ),
+            // 图标缩放的三个入口（网格 / 画廊生效）。值那一列直接显示当前倍率，
+            // 这样「按了没反应」一眼能看出是到了档位边界还是根本没生效。
+            // f32 的 Display 会砍掉多余的 0（1.0 → "1"、1.25 → "1.25"）。
+            (
+                "放大图标（网格 / 画廊）".to_string(),
+                format!("当前 {}×", self.ui.icon_scale),
+            ),
+            ("缩小图标（网格 / 画廊）".to_string(), String::new()),
+            ("图标大小还原 1×".to_string(), String::new()),
+            // 列表分组：值那一列显示当前档位（不分组 / 按类型 / 按日期）。
+            (
+                "列表分组".to_string(),
+                grouping_label(self.panel().grouping).to_string(),
+            ),
             ("恢复默认布局".to_string(), String::new()),
         ]
     }
@@ -3594,8 +3742,7 @@ impl RootView {
         let ctx = {
             let panel = self.panel();
             let selected = panel
-                .window
-                .iter()
+                .window_entries()
                 .filter(|e| panel.selection.is_selected(&e.id))
                 .map(|e| e.path.clone())
                 .collect();
@@ -3644,7 +3791,53 @@ impl RootView {
         self.app().set_ui_prefs(ui);
     }
 
-    /// 触发布局设置器里的一行（开关取反 / 视图循环 / 恢复默认）。
+    /// 按一档调整图标缩放（`dir` = +1 放大 / -1 缩小），只作用于网格 / 画廊。
+    pub(crate) fn zoom_by(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let step = mo_app::ICON_SCALE_STEP * if dir < 0 { -1.0 } else { 1.0 };
+        self.set_icon_scale(self.ui.icon_scale + step, cx);
+    }
+
+    /// 图标大小还原 1×。
+    pub(crate) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_icon_scale(1.0, cx);
+    }
+
+    /// 列表分组循环切换（无 → 按类型 → 按日期 → 无）。
+    ///
+    /// 改的是当前面板 app 的视图分组（异步），同时把它落成**新标签页的默认值**
+    /// （`ui.group`）——与「新标签页默认视图」同一条约定：设置器里改的是默认，
+    /// 不是只影响当前标签页的一次性开关。
+    pub(crate) fn cycle_grouping(&mut self, cx: &mut Context<Self>) {
+        let next = self.panel().grouping.next();
+        self.ui.group = next.key().to_string();
+        self.persist_ui();
+        let app = self.panel().app.clone();
+        cx.spawn(async move |_weak, _cx| {
+            app.set_grouping(next).await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 收口一次图标缩放：夹档位 → 落盘 → 重绘。
+    ///
+    /// 两件事值得在这一个入口里做掉，而不是让调用方各写一遍：
+    ///
+    /// * **夹档位只在这里**：边界与量化归 `mo_app::clamp_icon_scale`（唯一定义处），
+    ///   界面上再夹一次就等于多一份会漂的规则；
+    /// * **值没变就不落盘**：档位到头后继续按 ⌘+，不该每次重写一遍 config.json
+    ///   （用户按着不放会连着写）。没变也就不 `notify`——那一帧本来就没东西变。
+    fn set_icon_scale(&mut self, v: f32, cx: &mut Context<Self>) {
+        let v = mo_app::clamp_icon_scale(v);
+        if self.ui.icon_scale == v {
+            return;
+        }
+        self.ui.icon_scale = v;
+        self.persist_ui();
+        cx.notify();
+    }
+
+    /// 触发布局设置器里的一行（开关取反 / 视图循环 / 图标缩放 / 恢复默认）。
     pub(crate) fn layout_activate(&mut self, index: usize, cx: &mut Context<Self>) {
         match index {
             0 => self.ui.sidebar = !self.ui.sidebar,
@@ -3657,12 +3850,37 @@ impl RootView {
                     .next();
                 self.ui.view_mode = next.key().to_string();
             }
+            // 图标缩放三档：`zoom_*` 自己落盘 + 重绘，所以这里直接 return，
+            // 免得再走一遍下面的 `persist_ui` 写第二次配置。
             4 => {
-                // 恢复默认：配置落盘 + 内存里的列布局也一起复位。
+                self.zoom_by(1, cx);
+                return;
+            }
+            5 => {
+                self.zoom_by(-1, cx);
+                return;
+            }
+            6 => {
+                self.reset_zoom(cx);
+                return;
+            }
+            // 列表分组：循环到下一档（cycle_grouping 自己落盘 + 重绘）。
+            7 => {
+                self.cycle_grouping(cx);
+                return;
+            }
+            8 => {
+                // 恢复默认：配置落盘 + 内存里的列布局也一起复位；
+                // 当前面板的分组也回到「不分组」（默认值的一部分）。
                 self.app().reset_layout();
                 self.ui = mo_app::UiPrefs::default();
                 self.cols = crate::list_columns::ColumnLayout::new();
                 self.persist_ui();
+                let app = self.panel().app.clone();
+                cx.spawn(async move |_weak, _cx| {
+                    app.set_grouping(mo_app::Grouping::None).await;
+                })
+                .detach();
                 self.modal = Modal::None;
                 cx.notify();
                 return;
@@ -3852,7 +4070,7 @@ impl RootView {
                 .selected_ids()
                 .iter()
                 .next()
-                .and_then(|id| self.panel().window.iter().find(|e| e.id == *id))
+                .and_then(|id| self.panel().window_entries().find(|e| e.id == *id))
                 .map(|e| e.path.clone())
                 .unwrap_or(path.clone())
         });
@@ -4016,7 +4234,7 @@ impl RootView {
             .selection
             .selected_ids()
             .iter()
-            .filter_map(|id| self.panel().window.iter().find(|e| e.id == *id))
+            .filter_map(|id| self.panel().window_entries().find(|e| e.id == *id))
             .map(|e| e.path.clone())
             .collect();
         let paths = if paths.is_empty() {
@@ -4058,8 +4276,7 @@ impl RootView {
         };
         let multiple = p.selection.count() > 1 && p.selection.is_selected(&id);
         let paths = if multiple {
-            p.window
-                .iter()
+            p.window_entries()
                 .filter(|e| p.selection.is_selected(&e.id))
                 .map(|e| e.path.clone())
                 .collect()
@@ -4081,6 +4298,147 @@ impl RootView {
         // 分栏时两个窗格都会回写：只认最后画的那个，落点判定前先核对归属。
         self.header_cells = cells;
         self.header_cells_owner = (pane, tab);
+    }
+
+    /// prepaint 回写列表内容区左上角（窗口坐标），供框选把鼠标 y 折算成行下标。
+    pub(crate) fn set_list_origin(&mut self, pane: usize, tab: usize, x: f32, y: f32) {
+        self.list_origin.insert((pane, tab), (x, y));
+    }
+
+    // ------------------------------------------------------------ 框选（列表视图）
+
+    /// 列表视图里按下左键：只有点在**空白区**（顶部留白 / 末行以下）才启动框选，
+    /// 点到某个条目就交给那行的单选 / 拖拽逻辑，不在这里抢。
+    pub(crate) fn start_box_selection_if_empty(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        x: f32,
+        y: f32,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (count, scroll_y) = {
+            let Some(panel) = self.panel_at(pane, tab) else {
+                return;
+            };
+            // 框选只在列表视图，行数用**列表行数**（分组开启时含组头行）。
+            let count = panel.list_count;
+            let scroll_y = f32::from(panel.scroll.0.borrow().base_handle.offset().y);
+            (count, scroll_y)
+        };
+        let Some(&(_lx, ly)) = self.list_origin.get(&(pane, tab)) else {
+            return;
+        };
+        const ROW_H: f32 = 24.0;
+        const PAD: f32 = 12.0;
+        let rel = y - ly - PAD + scroll_y;
+        let idx = (rel / ROW_H).round() as isize;
+        // 落在已存在行带内 = 点到某个条目，走单选 / 拖拽，不在这里框选。
+        if idx >= 0 && idx < count as isize {
+            return;
+        }
+        self.box_selection = Some(BoxSelection {
+            pane,
+            tab,
+            extend,
+            origin: (x, y),
+            cursor: (x, y),
+        });
+        if !extend {
+            if let Some(p) = self.panel_at_mut(pane, tab) {
+                p.selection.clear();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 把当前框选矩形折算成可见行下标区间 `(pane, tab, extend, min, max)`。
+    ///
+    /// 几何：行 `i` 顶边在窗口坐标 = `list_origin.y + PAD + i*ROW_H - scroll_y`，
+    /// 反解 y 得下标。`min/max` 已钳到 `[0, count-1]`。拿不到列表几何时返回 `None`。
+    fn box_selection_range(&self) -> Option<(usize, usize, bool, usize, usize)> {
+        let box_sel = self.box_selection.as_ref()?;
+        let (pane, tab) = (box_sel.pane, box_sel.tab);
+        let (_lx, ly) = *self.list_origin.get(&(pane, tab))?;
+        let panel = self.panel_at(pane, tab)?;
+        let count = panel.list_count;
+        let scroll_y = f32::from(panel.scroll.0.borrow().base_handle.offset().y);
+        const ROW_H: f32 = 24.0;
+        const PAD: f32 = 12.0;
+        let at = |y: f32| -> isize {
+            let rel = y - ly - PAD + scroll_y;
+            (rel / ROW_H).round() as isize
+        };
+        let a = at(box_sel.origin.1).clamp(0, count as isize - 1);
+        let b = at(box_sel.cursor.1).clamp(0, count as isize - 1);
+        let (min, max) = if a <= b { (a, b) } else { (b, a) };
+        Some((pane, tab, box_sel.extend, min as usize, max as usize))
+    }
+
+    /// 框选拖动中：实时更新橡皮筋 + 本地选择（抬起时再回灌 app）。
+    pub(crate) fn update_box_selection(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if let Some(box_sel) = self.box_selection.as_mut() {
+            box_sel.cursor = (x, y);
+        }
+        let Some((pane, tab, extend, min, max)) = self.box_selection_range() else {
+            return;
+        };
+        if let Some(p) = self.panel_at_mut(pane, tab) {
+            let wlen = p.window.len() as isize;
+            if wlen <= 0 {
+                return;
+            }
+            let ws = p.window_start as isize;
+            // 行区间 [min, max] ∩ 窗口里的条目（跳过组头）。行流保持条目序，
+            // 所以这些条目在「窗口条目序」里仍是连续一段 [first, last]，
+            // 本地先按它给即时反馈；抬起时 app 侧按行区间重算（select_rows_range）。
+            let ordered: Vec<mo_core::FileId> = p.window_entries().map(|e| e.id).collect();
+            let mut first = None;
+            let mut last = None;
+            let mut k = 0usize;
+            for (ri, row) in p.window.iter().enumerate() {
+                let global = ws + ri as isize;
+                if row.entry().is_some() {
+                    if global >= min as isize && global <= max as isize {
+                        if first.is_none() {
+                            first = Some(k);
+                        }
+                        last = Some(k);
+                    }
+                    k += 1;
+                }
+            }
+            if let (Some(f), Some(l)) = (first, last) {
+                if !extend {
+                    p.selection.clear();
+                }
+                p.selection.select_range(&ordered, f, l);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 框选抬起：回灌 app 侧选择（清旧 + 选区间），并收掉橡皮筋。
+    pub(crate) fn finish_box_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((_pane, _tab, extend, min, max)) = self.box_selection_range() else {
+            self.box_selection = None;
+            return;
+        };
+        self.box_selection = None;
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            if !extend {
+                app.clear_selection().await;
+            }
+            // 行区间回灌：app 侧把区间内的条目（跳过组头）折成条目位再选。
+            app.select_rows_range(min, max).await;
+            // app 侧选择是唯一事实来源：框选结果回灌 UI 高亮。
+            pull_selection(&app, &this, cx).await;
+        })
+        .detach();
+        cx.notify();
     }
 
     /// 在列头上按下：准备拖列（抬起时若没移动，就当成点击 → 切换排序）。
@@ -4349,7 +4707,7 @@ impl RootView {
         if let Some((path, _)) = target.as_ref() {
             let id = self
                 .panel_at(pane, tab)
-                .and_then(|p| p.window.iter().find(|e| e.path == *path).map(|e| e.id));
+                .and_then(|p| p.window_entries().find(|e| e.path == *path).map(|e| e.id));
             if let Some(id) = id {
                 let already = self
                     .panel_at(pane, tab)
@@ -4375,8 +4733,7 @@ impl RootView {
         let paths: Vec<PathBuf> = self
             .panel_at(pane, tab)
             .map(|p| {
-                p.window
-                    .iter()
+                p.window_entries()
                     .filter(|e| p.selection.is_selected(&e.id))
                     .map(|e| e.path.clone())
                     .collect()
@@ -4704,6 +5061,15 @@ impl RootView {
                 })
                 .detach();
             }
+            A::InvertSelection => {
+                let app = self.app();
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
+                    app.select_invert_visible().await;
+                    pull_selection(&app, &this, cx).await;
+                })
+                .detach();
+            }
         }
         cx.notify();
     }
@@ -4797,6 +5163,8 @@ async fn sync_panel(
     // 正在读取的目标（可能还没读回来）：UI 靠它立刻给反馈。
     let opening = app.opening_path();
     let count = app.visible_count().await;
+    let grouping = app.grouping().await;
+    let list_count = app.list_row_count().await;
     let sort = app.sort().await;
     let can_back = app.can_go_back().await;
     let can_forward = app.can_go_forward().await;
@@ -4814,13 +5182,23 @@ async fn sync_panel(
         v.indexed = indexed;
         v.trash_entries = trash_entries;
         let p = v.panel_at_mut(pane_idx, tab_idx)?;
-        // 切换目录或改过滤词后，旧窗口的下标已失效，直接作废。
-        if ui_path != path || p.visible_count != count {
+        // 列表视图当前应该用哪种窗口空间：分组开启才按「行」（含组头）取。
+        let want_grouped =
+            p.view_mode == crate::panel::ViewMode::List && grouping != mo_app::Grouping::None;
+        // 切换目录 / 改过滤词 / 行数变化 / **窗口空间切换**后，旧窗口的下标已失效，
+        // 直接作废。空间切换不改变条目数（count 不变），必须单独比标记。
+        if ui_path != path
+            || p.visible_count != count
+            || p.list_count != list_count
+            || p.window_is_grouped != want_grouped
+        {
             tracing::debug!(
                 target: "mo_ui::window",
                 pane = pane_idx, tab = tab_idx,
                 ui_path = ?ui_path, app_path = ?path,
                 ui_count = p.visible_count, app_count = count,
+                ui_rows = p.list_count, app_rows = list_count,
+                was_grouped = p.window_is_grouped, want_grouped,
                 "sync invalidated window"
             );
             p.window.clear();
@@ -4830,6 +5208,9 @@ async fn sync_panel(
         p.path = path;
         p.opening = opening;
         p.visible_count = count;
+        p.list_count = list_count;
+        p.grouping = grouping;
+        p.window_is_grouped = want_grouped;
         p.sort = sort;
         p.can_back = can_back;
         p.can_forward = can_forward;
@@ -4853,14 +5234,14 @@ async fn sync_panel(
         } else {
             p.window.len()
         };
-        Some(p.window_start..p.window_start + len)
+        Some((p.window_start..p.window_start + len, want_grouped))
     });
-    let Ok(Some(range)) = outcome else {
+    let Ok(Some((range, want_grouped))) = outcome else {
         // 视图已销毁 / 标签页已关闭 / 补窗任务在途（本轮跳过）。
         return;
     };
 
-    let (dir_path, start, entries) = app.visible_window(range).await;
+    let (dir_path, start, rows) = app.list_window(range, want_grouped).await;
     // WeakEntity::update 返回 Result：视图可能已销毁，这里忽略。
     let _ = this.update(cx, |v, cx| {
         let Some(p) = v.panel_at_mut(pane_idx, tab_idx) else {
@@ -4872,7 +5253,8 @@ async fn sync_panel(
         }
         // 只更新窗口内容，不碰 pending——pending 只归补窗任务管。
         p.window_start = start;
-        p.window = entries;
+        p.window = rows;
+        p.window_is_grouped = want_grouped;
         cx.notify();
     });
     // 缩略图不在这里派发：这里的窗口最大到 INITIAL_WINDOW(=200) 条，按它派发就是
@@ -5127,15 +5509,48 @@ impl Render for RootView {
                 }
                 k if plain && k.chars().count() == 1 => {
                     let ch = k.chars().next().unwrap();
-                    entity_key.update(cx, |v, cx| {
+                    let app = entity_key.update(cx, |v, cx| {
                         v.panel_mut().query.push(ch);
                         v.apply_filter(cx);
-                        cx.notify();
+                        v.app()
                     });
+                    // 输入即定位（type-ahead）：列表收窄的同时把选择焦点跳到第一个
+                    // 匹配项，并滚到它——与 Finder / 资源管理器「打字跳到文件」一致。
+                    let q = entity_key.read(cx).panel().query.clone();
+                    let this = entity_key.clone();
+                    cx.spawn(async move |cx| {
+                        if let Some(idx) = app.focus_by_prefix(&q).await {
+                            this.update(cx, |v, cx| {
+                                v.panel_mut()
+                                    .scroll
+                                    .scroll_to_item(idx, gpui_kit::ScrollStrategy::Center);
+                                cx.notify();
+                            });
+                            // app 侧选择是唯一事实来源：跳选后回灌 UI 高亮。
+                            pull_selection(&app, &this, cx).await;
+                        }
+                    })
+                    .detach();
                 }
                 _ => {}
             }
         });
+
+        // 框选（列表视图橡皮筋）：拖动中实时更新，抬起收尾并回灌 app 侧选择。
+        // 鼠标事件冒泡到根容器，所以即便指针移到行 / 滚动条上也收得到。
+        let box_entity = entity.clone();
+        root.interactivity().on_mouse_move(move |ev, _window, cx| {
+            if box_entity.read(cx).box_selection.is_none() {
+                return;
+            }
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            box_entity.update(cx, |v, cx| v.update_box_selection(x, y, cx));
+        });
+        let box_entity_up = entity.clone();
+        root.interactivity()
+            .on_mouse_up(MouseButton::Left, move |_ev, _window, cx| {
+                box_entity_up.update(cx, |v, cx| v.finish_box_selection(cx));
+            });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
         // ⚠️ 三个例外——焦点属于真实输入组件时不能抢：
@@ -5185,6 +5600,28 @@ impl Render for RootView {
                 &entity,
                 self.ctx_submenu_open,
             ));
+        }
+
+        // 框选橡皮筋：窗口坐标直接当偏移量（与右键菜单同一套坐标系），画在最上层。
+        if let Some(box_sel) = self.box_selection.as_ref() {
+            let (ox, oy) = box_sel.origin;
+            let (cx2, cy2) = box_sel.cursor;
+            let left = ox.min(cx2);
+            let top = oy.min(cy2);
+            let w = (cx2 - ox).abs();
+            let h = (cy2 - oy).abs();
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(theme::selected_bg().opacity(0.22))
+                    .border_1()
+                    .border_color(rgb(0x0a84ff))
+                    .debug_selector(|| "mo-box-selection".to_string()),
+            );
         }
 
         root
@@ -5274,7 +5711,8 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                     entity,
                     pane_idx,
                     tab_idx,
-                    panel.visible_count,
+                    // 列表用**行数**：分组开启时含组头行（与窗口快照同空间）。
+                    panel.list_count,
                     &panel.scroll,
                     file_list::ListChrome {
                         cols: &view.cols,
@@ -5292,7 +5730,10 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         .into_any_element()
                 }
                 ViewMode::Grid | ViewMode::Gallery => {
-                    let cols = listing::columns_for(panel.view_mode, available);
+                    // 图标缩放（配置 `ui.icon_scale`）：只作用于网格 / 画廊。
+                    // 列数也要用同一个 `zoom` 算——方框放大了列数不变，相邻单元会互相压住。
+                    let zoom = listing::Zoom(view.ui.icon_scale);
+                    let cols = zoom.columns_for(panel.view_mode, available);
                     grid::render(
                         entity,
                         pane_idx,
@@ -5301,6 +5742,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         cols,
                         panel.view_mode,
                         &panel.scroll,
+                        zoom,
                     )
                     .into_any_element()
                 }
@@ -5464,8 +5906,7 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
 /// 当前选中项的扩展名集合（小写、含点），供扩展的 `when_ext` 条件判断。
 fn selected_ext_names(panel: &crate::panel::Panel) -> Vec<String> {
     let mut out: Vec<String> = panel
-        .window
-        .iter()
+        .window_entries()
         .filter(|e| panel.selection.is_selected(&e.id))
         .filter_map(|e| {
             e.path
@@ -5479,11 +5920,29 @@ fn selected_ext_names(panel: &crate::panel::Panel) -> Vec<String> {
     out
 }
 
-/// 新建面板：套用配置里的默认视图模式（第四阶段·自定义布局）。
+/// 分组方式的中文短标签（布局设置器的值列用）。
+fn grouping_label(g: mo_app::Grouping) -> &'static str {
+    match g {
+        mo_app::Grouping::None => "不分组",
+        mo_app::Grouping::Kind => "按类型",
+        mo_app::Grouping::Date => "按日期",
+    }
+}
+
+/// 新建面板：套用配置里的默认视图模式与默认分组（第四阶段·自定义布局）。
 ///
-/// 认不出的 `ui.view_mode` 回落 `List`——用户手改配置写错字符串不该让新标签页崩掉。
+/// 认不出的 `ui.view_mode` / `ui.group` 回落默认——用户手改配置写错字符串
+/// 不该让新标签页崩掉。分组是 app 侧的异步状态，这里只投递种子任务；
+/// 首轮 `sync_panel`（120ms 泵）会把它同步进面板快照。
 fn panel_with_prefs(app: AppState, ui: &mo_app::UiPrefs) -> Panel {
     let mode = ViewMode::from_key(&ui.view_mode).unwrap_or_default();
+    let grouping = mo_app::Grouping::from_key(&ui.group).unwrap_or_default();
+    app.spawn({
+        let app = app.clone();
+        async move {
+            app.set_grouping(grouping).await;
+        }
+    });
     Panel::new(app).with_view_mode(mode)
 }
 
@@ -6238,6 +6697,15 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 v.palette_index = 0;
             });
         }
+        Some(CommandId::ToggleHidden) => {
+            entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.cmd_query.clear();
+                v.palette_index = 0;
+                // 与 ⌘⇧. 同一条路径，避免「面板里点了」和「按了键」行为分叉。
+                v.dispatch_action("view.hidden", cx);
+            });
+        }
         Some(
             id @ (CommandId::ToggleSidebar | CommandId::ToggleStatusBar | CommandId::ToggleZebra),
         ) => {
@@ -6249,6 +6717,28 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
             entity.update(cx, |v, cx| {
                 v.modal = Modal::None;
                 v.toggle_ui_flag(which, cx);
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        // 图标缩放三条走 UI 层：它改的是 `RootView.ui`（配置的镜像），与布局设置器
+        // 同一份状态，不必再从 mo-app 绕一圈。
+        Some(id @ (CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset)) => {
+            entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                match id {
+                    CommandId::ZoomIn => v.zoom_by(1, cx),
+                    CommandId::ZoomOut => v.zoom_by(-1, cx),
+                    _ => v.reset_zoom(cx),
+                }
+                v.cmd_query.clear();
+                v.palette_index = 0;
+            });
+        }
+        Some(CommandId::GroupingCycle) => {
+            entity.update(cx, |v, cx| {
+                v.modal = Modal::None;
+                v.cycle_grouping(cx);
                 v.cmd_query.clear();
                 v.palette_index = 0;
             });
@@ -6405,6 +6895,7 @@ async fn run_command(id: CommandId, app: &AppState) {
             let _ = app.open_parent().await;
         }
         CommandId::SelectAll => app.select_all_visible().await,
+        CommandId::InvertSelection => app.select_invert_visible().await,
         CommandId::ClearSelection => app.clear_selection().await,
         CommandId::DeleteSelection => {
             let _ = app.delete_selection().await;
@@ -6458,6 +6949,13 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::ToggleSidebar
         | CommandId::ToggleStatusBar
         | CommandId::ToggleZebra
+        | CommandId::ToggleHidden
+        // 图标缩放：改的是 UI 自己的 `ui.icon_scale`（见 `on_palette_enter`）。
+        | CommandId::ZoomIn
+        | CommandId::ZoomOut
+        | CommandId::ZoomReset
+        // 列表分组：同上，走 UI 层（`on_palette_enter` → `cycle_grouping`）。
+        | CommandId::GroupingCycle
         | CommandId::ConnectServer
         | CommandId::DisconnectServer
         | CommandId::RevealInFileManager
@@ -6513,9 +7011,28 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
 /// ⚠️ 图片预览**必须**在这里把 `image` 摘掉：留着它，窗口就会继续显示**上一张**的图
 /// （本轮修的体验问题），永远走不到占位分支。摘出来的路径拿去后台降采样，回来再由
 /// [`crate::preview::PreviewWindow::set_image`] 补上。非图片预览一次给全，第二拍为空。
-fn split_preview_for_two_pass(mut pv: Preview) -> (Preview, Option<PathBuf>) {
+/// 两段式预览的「第二段要补什么」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewSecond {
+    /// 图片：降采样后加载（`None` 表示直接用原图）。
+    Image(PathBuf),
+    /// PDF：把首页渲染成一张 PNG 再加载——渲染是平台能力，得等后台。
+    Pdf(PathBuf),
+}
+
+impl PreviewSecond {
+    /// 第二段要处理的那个文件（渲染 / 降采样的输入）。
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Image(p) | Self::Pdf(p) => p.as_path(),
+        }
+    }
+}
+
+fn split_preview_for_two_pass(mut pv: Preview) -> (Preview, Option<PreviewSecond>) {
     let src = match pv.kind {
-        PreviewKind::Image => pv.image.take(),
+        PreviewKind::Image => pv.image.take().map(PreviewSecond::Image),
+        PreviewKind::Pdf => pv.image.take().map(PreviewSecond::Pdf),
         _ => None,
     };
     (pv, src)
@@ -6534,17 +7051,41 @@ fn show_preview_twopass(app: &AppState, this: &Entity<RootView>, pv: Preview, cx
     let pool = app.clone();
     let this = this.clone();
     cx.spawn(async move |cx| {
-        let inner = pool.clone();
-        let probe = src.clone();
-        let scaled = pool
-            .spawn_blocking(move || inner.preview_image_scaled(&probe))
-            .await
-            .ok()
-            .flatten();
-        // `None` 是「用原图」（长边本来就没超上限 / 不是图片 / 降采样失败）——
-        // 必须回落到原图路径，否则窗口会永远停在占位上。
-        let show = scaled.unwrap_or(src);
-        this.update(cx, |v, cx| v.set_preview_image(seq, show, cx));
+        let probe = src.path().to_path_buf();
+        match src {
+            PreviewSecond::Image(src) => {
+                let inner = pool.clone();
+                let probe = probe.clone();
+                let scaled = pool
+                    .spawn_blocking(move || inner.preview_image_scaled(&probe))
+                    .await
+                    .ok()
+                    .flatten();
+                // `None` 是「用原图」（长边本来就没超上限 / 不是图片 / 降采样失败）——
+                // 必须回落到原图路径，否则窗口会永远停在占位上。
+                let show = scaled.unwrap_or(src);
+                this.update(cx, |v, cx| v.set_preview_image(seq, show, cx));
+            }
+            PreviewSecond::Pdf(_) => {
+                let inner = pool.clone();
+                let rendered = pool
+                    .spawn_blocking(move || inner.preview_pdf_page(&probe))
+                    .await
+                    .ok()
+                    .flatten();
+                this.update(cx, |v, cx| match rendered {
+                    Some(png) => v.set_preview_image(seq, png, cx),
+                    // 渲染不出来（平台不支持 / 加密 / 打不开）：把「正在渲染…」换成一句
+                    // 说明，别让窗口永远停在占位上。
+                    None => v.set_preview_text(
+                        seq,
+                        "PDF 文档\n\n（首页渲染不出来：平台不支持，或这个文件打不开 / 有加密）"
+                            .to_string(),
+                        cx,
+                    ),
+                });
+            }
+        }
     })
     .detach();
 }
@@ -6852,7 +7393,14 @@ impl RootView {
             body = body.child(row);
         }
         if self.search_results.is_empty() {
-            body = body.child(text!("输入关键词搜索整个文件系统（⌘F）".to_string()));
+            // 「索引还没建起来」与「搜了但没匹配」是两件事，提示必须分开：前者用户
+            // 什么都没做错，只是得等一等，写成「输入关键词…」会让人以为搜索坏了。
+            let hint = if self.indexed == 0 {
+                "索引正在建立（首次启动要爬一遍主目录），稍后再试".to_string()
+            } else {
+                "输入关键词搜索整个文件系统".to_string()
+            };
+            body = body.child(text!(hint));
         }
         central_view(
             &format!("全局搜索（已索引 {} 项）", self.indexed),
@@ -8994,15 +9542,16 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, name)| {
-                    mo_core::Entry::new(
+                    mo_app::WindowRow::Entry(mo_core::Entry::new(
                         mo_core::FileId::new(0, i as u128),
                         name.to_string(),
                         mo_core::EntryKind::Directory,
                         PathBuf::from(format!("/mo-layout-test/{i}")),
-                    )
+                    ))
                 })
                 .collect();
             p.visible_count = p.window.len();
+            p.list_count = p.visible_count;
             cx.notify();
         })
     }
@@ -9517,6 +10066,9 @@ mod tests {
                 p.window_start = 0;
                 p.window.clear();
                 p.visible_count = 4;
+                // 列表渲染的 item_count 用**行数**（分组开启时含组头）；
+                // 这里无分组，行数 = 条目数。
+                p.list_count = 4;
                 cx.notify();
             })
         });
@@ -9608,13 +10160,14 @@ mod tests {
                 p.view_mode = crate::panel::ViewMode::Grid;
                 p.path = Some(PathBuf::from("/mo-placeholder-grid-test"));
                 p.window_start = 0;
-                p.window = vec![mo_core::Entry::new(
+                p.window = vec![mo_app::WindowRow::Entry(mo_core::Entry::new(
                     mo_core::FileId::new(0, 0),
                     "a".to_string(),
                     mo_core::EntryKind::Directory,
                     PathBuf::from("/mo-placeholder-grid-test/a"),
-                )];
+                ))];
                 p.visible_count = 4;
+                p.list_count = 4;
                 cx.notify();
             })
         });
@@ -9662,10 +10215,9 @@ mod tests {
             size: 1024,
         };
         let (head, src) = super::split_preview_for_two_pass(image);
-        assert_eq!(
-            src.as_deref(),
-            Some(photo),
-            "图片的源路径要交给第二拍去降采样"
+        assert!(
+            matches!(&src, Some(super::PreviewSecond::Image(p)) if p == photo),
+            "图片的源路径要交给第二拍去降采样：{src:?}"
         );
         assert!(
             head.image.is_none(),

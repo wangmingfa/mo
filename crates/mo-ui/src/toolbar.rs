@@ -25,7 +25,12 @@ pub fn traffic_light_position() -> (f32, f32) {
     (14.0, (TOOLBAR_HEIGHT - TRAFFIC_LIGHT_FRAME) / 2.0)
 }
 
-/// 工具栏：导航图标 + Win11 风格地址栏（面包屑 / 可编辑）+ 刷新。
+/// 工具栏：**导航图标（后退 / 前进 / 上一级 / 刷新）+** Win11 风格地址栏
+/// （面包屑 / 可编辑）+ 视图模式组。
+///
+/// 刷新排在地址栏**左边**、与 ←→↑ 挨着：它和那三个同属「走导航历史 / 重读当前
+/// 目录」这一类动作，摆在一起才读得出是一组；地址栏右侧则整块留给视图模式那一组
+/// （互斥、有外框，自成一体）。
 ///
 /// 按钮只负责**发命令**（调用 [`AppState`] 的导航方法），不负责刷新列表：
 /// 状态变化由事件总线广播，UI 快照在 `RootView` 里统一同步。
@@ -74,11 +79,11 @@ pub fn render(
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Parent)
         }))
-        .child(address_bar(app, entity, path, address_editing, address))
         .child(icon_button("nav-refresh", icons::ROTATE_CW, true, {
             let app = app.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), Nav::Refresh)
         }))
+        .child(address_bar(app, entity, path, address_editing, address))
         // 视图模式：四个模式**平铺**成一排图标按钮（Finder 工具栏那组），当前模式高亮。
         .child(view_mode_buttons(view_mode, entity))
 }
@@ -527,7 +532,10 @@ fn icon_button(
         .justify_center()
         .size(px(28.0))
         .rounded(px(6.0))
-        .flex_shrink_0();
+        .flex_shrink_0()
+        // 测试用（release no-op）：按 `mo-icon-<id>` 取几何，用来钉住**这一排按钮
+        // 的先后顺序**（刷新在地址栏左边，见 tests/layout.rs）。挪动顺序时别漏了它。
+        .debug_selector(move || format!("mo-icon-{id}"));
 
     if enabled {
         button = button.hover(|s| s.bg(theme::hover_bg()));

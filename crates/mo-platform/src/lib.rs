@@ -156,6 +156,32 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     }
 }
 
+/// 这个平台能渲染 PDF 页面吗（决定预览里有没有 PDF 首页）。
+pub fn supports_pdf() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// 把 PDF 的**第一页**渲染成一张位图（长边不超过 `max_edge` 像素）。
+///
+/// 与 [`file_icon_raster`] 的两点不同：
+///
+/// * **不需要主线程**（CoreGraphics 的 `CGPDFDocument` 不碰 AppKit），可以放心在
+///   blocking 池里跑；
+/// * 仍然只交**像素**（预乘 RGBA），PNG 编码归调用方——与图标那条链路同一个契约。
+///
+/// 拿不到返回 `None`（平台不支持 / 打不开 / 加密 / 零页），调用方退回文本提示。
+pub fn pdf_page_raster(path: &Path, max_edge: u32) -> Option<IconRaster> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::pdf_page_raster(path, max_edge)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, max_edge);
+        None
+    }
+}
+
 /// 一张图标位图的**原始像素**：RGBA8、**预乘 alpha**。
 ///
 /// 它是「系统图标」这条链路上主线程与后台之间的交接物：主线程负责取回它，

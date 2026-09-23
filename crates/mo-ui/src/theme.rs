@@ -20,7 +20,6 @@
 //! 指定基底（`dark: true/false`）+ 逐角色覆盖 `#RRGGBB`，未覆盖的角色继承基底。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use gpui_kit::{Hsla, Rgba};
 use mo_app::ThemeColors;
@@ -169,27 +168,68 @@ pub fn label(name: &str) -> String {
 
 /// 当前调色板槽位。
 ///
+/// **测试下改成每线程一份**（`thread_local`）：GPUI 的 `TestAppContext` 每条用例跑在
+/// 自己的上下文里、`cargo test` 又默认并行，于是 A 用例刚把调色板预览成深色，
+/// B 用例创建 `RootView` 时又把它设回浅色——A 那条「全局调色板应跟随预览项」的断言
+/// 就随机红（CI 上表现为偶发失败，单独重跑必过）。每线程一份就互不干扰。
+///
+/// 生产路径不受影响：界面只在主线程跑，写调色板的只有 `RootView::new` 与
+/// `repaint_theme` 两处（都在 UI 上下文）。
+#[cfg(test)]
+mod slot {
+    use super::Palette;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CURRENT: RefCell<Palette> = const { RefCell::new(Palette::light()) };
+    }
+
+    pub(super) fn get() -> Palette {
+        CURRENT.with(|c| *c.borrow())
+    }
+
+    pub(super) fn set(p: Palette) {
+        CURRENT.with(|c| *c.borrow_mut() = p);
+    }
+}
+
+/// 当前调色板槽位（生产）。
+///
 /// 用 `OnceLock<Mutex<..>>` 而不是 `static Mutex<Palette>`：`Palette::light()`
 /// 虽然本身是 const，但 `Mutex::new` 里塞 const 求值结果在旧稳定版上仍受限，
 /// 这里直接懒初始化最省心。
-fn slot() -> &'static Mutex<Palette> {
-    static CURRENT: OnceLock<Mutex<Palette>> = OnceLock::new();
-    CURRENT.get_or_init(|| Mutex::new(Palette::light()))
+#[cfg(not(test))]
+mod slot {
+    use super::Palette;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cell() -> &'static Mutex<Palette> {
+        static CURRENT: OnceLock<Mutex<Palette>> = OnceLock::new();
+        CURRENT.get_or_init(|| Mutex::new(Palette::light()))
+    }
+
+    pub(super) fn get() -> Palette {
+        cell()
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| Palette::light())
+    }
+
+    pub(super) fn set(p: Palette) {
+        if let Ok(mut g) = cell().lock() {
+            *g = p;
+        }
+    }
 }
 
 /// 当前调色板。
 pub fn current() -> Palette {
-    slot()
-        .lock()
-        .map(|g| *g)
-        .unwrap_or_else(|_| Palette::light())
+    slot::get()
 }
 
 /// 切换当前调色板（调用方随后要 `notify` 让界面重画）。
 pub fn set(p: Palette) {
-    if let Ok(mut g) = slot().lock() {
-        *g = p;
-    }
+    slot::set(p);
 }
 
 /// 解析一个 `#RRGGBB` / `RRGGBB` 颜色串。

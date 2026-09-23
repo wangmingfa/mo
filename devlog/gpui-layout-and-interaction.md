@@ -704,3 +704,17 @@ SpringAnimation::new(SLIDE_SPRING)          // SpringConfig::new(700.0, 40.0, 1.
 和「问系统要哪一档位图」（`mo_app::icon::icon_px_for_slot`）。守卫
 `listing::tests::every_view_mode_maps_to_the_expected_icon_bucket` 穷举 `ViewMode::ALL`
 把两件事绑在一起。
+
+## 33. 工具栏的左右分工（2026-09-22）
+
+刷新从地址栏**右边**挪到了**左边**，与 ← → ↑ 挨着（`toolbar::render` 的 child 顺序）。
+
+- **左（地址栏左边）= 导航动作**：后退 / 前进 / 上一级 / 刷新。刷新是「重读当前目录」，
+  和走导航历史那三个同类，摆在一起才读得出是一组；放地址栏右边时，它孤零零挨着
+  视图模式组，会被误读成「视图那组的一员」。
+- **右（地址栏右边）= 视图模式组**：互斥、共用一条外框（§31），自成一体，
+  不该被导航类按钮插进来。
+- 守卫 `tests/layout.rs::refresh_sits_left_of_the_address_bar`：钉的是**左右关系**
+  而不是「按钮在不在」——地址栏是 `flex_1`，刷新挪错边时按钮自己的宽高一点没变，
+  只有「谁在谁左边」抓得住。为此给 `icon_button` 挂了 `mo-icon-<id>` 探针。
+  反向验证：挪回地址栏右边 → 变红（refresh 844px / address 起 104px）。

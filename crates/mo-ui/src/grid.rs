@@ -9,7 +9,7 @@ use gpui_kit::*;
 use mo_core::{Entry, MetadataState, ThumbnailState};
 use std::path::{Path, PathBuf};
 
-use crate::listing::{self, row_height, BUFFER};
+use crate::listing::{self, Zoom, BUFFER};
 use crate::panel::ViewMode;
 
 /// 网格内容四周的留白（与 `columns_for` 里扣掉的 24pt 对得上）。
@@ -24,10 +24,12 @@ const ICON_IN_BOX: f32 = 0.6;
 enum SelSync {
     Select(mo_core::FileId),
     Toggle(mo_core::FileId),
-    Range(usize, usize),
+    /// shift 连选：两端以 FileId 表达（见 `file_list::SelSync::Range` 的说明）。
+    Range(mo_core::FileId, mo_core::FileId),
 }
 use crate::RootView;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     entity: &Entity<RootView>,
     pane: usize,
@@ -36,10 +38,13 @@ pub fn render(
     cols: usize,
     mode: ViewMode,
     scroll: &UniformListScrollHandle,
+    zoom: Zoom,
 ) -> impl IntoElement {
     let cols = cols.max(1);
     let row_count = if count == 0 { 0 } else { count.div_ceil(cols) };
-    let height = row_height(mode);
+    // ⚠️ 行高与下面每行 `.h(px(height))`、`cell` 里的方框必须来自**同一个** `zoom`：
+    // `uniform_list` 的行高是靠渲染一行量出来的，三处各算各的就会行行重叠。
+    let height = zoom.row_height(mode);
     let entity_c = entity.clone();
 
     let list = uniform_list("mo-grid", row_count, move |range, _window, cx| {
@@ -61,7 +66,9 @@ pub fn render(
                 if idx >= count {
                     break;
                 }
-                let Some(entry) = panel.window.get(idx.wrapping_sub(panel.window_start)) else {
+                let Some(mo_app::WindowRow::Entry(entry)) =
+                    panel.window.get(idx.wrapping_sub(panel.window_start))
+                else {
                     // 窗口还没补上这一格（刚切目录 / 快速滚动）：画一个**只有底色**
                     // 的骨架格，尺寸 / 圆角 / 内边距与 `cell()` 完全一致，别让网格在
                     // 数据到达前后跳一下。与列表视图的占位行同一条约定：不画 `…`。
@@ -92,11 +99,12 @@ pub fn render(
                 let system_icon = crate::file_item::entry_system_icon(
                     Some(&panel.app),
                     entry,
-                    listing::icon_slot(mode),
+                    zoom.icon_slot(mode),
                 );
                 row = row.child(cell(
                     entry,
                     mode,
+                    zoom,
                     panel.selection.is_selected(&entry.id),
                     &entity_c,
                     pane,
@@ -143,6 +151,7 @@ pub fn render(
 fn cell(
     entry: &Entry,
     mode: ViewMode,
+    zoom: Zoom,
     selected: bool,
     entity: &Entity<RootView>,
     pane: usize,
@@ -150,7 +159,9 @@ fn cell(
     global_idx: usize,
     system_icon: Option<PathBuf>,
 ) -> Stateful<Div> {
-    let visual = visual(entry, mode, selected, system_icon);
+    let visual = visual(entry, mode, zoom, selected, system_icon);
+    // 文字随缩放走但阻尼（见 `listing::zoom_text`）：方框可以 2×，名字不能。
+    let label_k = listing::zoom_text(zoom.0);
 
     // 元数据未就绪时不显示大小，避免把「还没加载」误读成「空文件」。
     let sub = match &entry.metadata {
@@ -213,17 +224,16 @@ fn cell(
         let Some((app, sync)) = click_entity.update(cx, |v, _cx| {
             let p = v.panel_at_mut(pane, tab)?;
             if shift {
-                let ordered: Vec<mo_core::FileId> = p.window.iter().map(|e| e.id).collect();
+                let ordered: Vec<mo_core::FileId> = p.window_entries().map(|e| e.id).collect();
                 let clicked = ordered.iter().position(|x| *x == id)?;
                 if let Some(a) = p.selection.anchor() {
                     if let Some(ai) = ordered.iter().position(|x| *x == a) {
                         p.selection.clear();
                         p.selection.select_range(&ordered, ai, clicked);
                         p.selection.set_anchor(a);
-                        return Some((
-                            p.app.clone(),
-                            SelSync::Range(p.window_start + ai, global_idx),
-                        ));
+                        // 端点走 id：网格窗口永远在条目空间，但 id 与列表视图共用
+                        // 同一条回灌路径（`select_between`），不特判。
+                        return Some((p.app.clone(), SelSync::Range(a, id)));
                     }
                 }
                 p.selection.select(id);
@@ -252,10 +262,10 @@ fn cell(
                 })
                 .detach();
             }
-            SelSync::Range(from, to) => {
+            SelSync::Range(anchor, clicked) => {
                 cx.spawn(async move |_cx| {
                     app.clear_selection().await;
-                    app.select_range(from, to).await;
+                    app.select_between(anchor, clicked).await;
                 })
                 .detach();
             }
@@ -272,7 +282,7 @@ fn cell(
             // `max_w_full` + `truncate` 让长名字截成省略号，而不是溢出到隔壁格。
             div()
                 .max_w_full()
-                .text_size(px(12.0))
+                .text_size(px(12.0 * label_k))
                 .text_color(if selected {
                     crate::theme::selected_text()
                 } else {
@@ -286,7 +296,7 @@ fn cell(
         )
         .child(
             div()
-                .text_size(px(11.0))
+                .text_size(px(11.0 * label_k))
                 .text_color(if selected {
                     crate::theme::selected_text()
                 } else {
@@ -314,10 +324,11 @@ fn kind_icon(entry: &Entry) -> &'static [u8] {
 fn visual(
     entry: &Entry,
     mode: ViewMode,
+    zoom: Zoom,
     selected: bool,
     system_icon: Option<PathBuf>,
 ) -> AnyElement {
-    let box_px = listing::visual_box(mode);
+    let box_px = zoom.visual_box(mode);
     // 位图铺满方框，圆角与缩略图一致（系统图标也是位图，不能一个圆角一个直角）。
     let raster = |p: &Path| {
         img(p)
@@ -366,6 +377,7 @@ mod tests {
     // ⚠️ 不能 `use super::*`：会把 `gpui_kit::*` 一并 glob 进来，它的 `test` 与
     // `#[test]` 属性撞名（同 `file_item.rs` 里那条注释）。
     use super::{visual, ICON_IN_BOX};
+    use crate::listing::Zoom;
     use crate::panel::ViewMode;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -405,13 +417,13 @@ mod tests {
     }
 
     /// 摆一格出来（只画上半部分那块方框）。
-    struct Probe(Entry, ViewMode, Option<PathBuf>);
+    struct Probe(Entry, ViewMode, Zoom, Option<PathBuf>);
 
     impl Render for Probe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .p(px(12.0))
-                .child(visual(&self.0, self.1, false, self.2.clone()))
+                .child(visual(&self.0, self.1, self.2, false, self.3.clone()))
         }
     }
 
@@ -432,15 +444,17 @@ mod tests {
         Placeholder,
     }
 
-    fn probe_bounds(
+    fn probe_bounds_at(
         entry: Entry,
         mode: ViewMode,
+        zoom: Zoom,
         system_icon: Option<PathBuf>,
     ) -> (Bounds, Option<Bounds>, Option<Bounds>) {
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
-        let window = cx.open_window(size(px(200.), px(200.)), |_, _cx| {
-            Probe(entry, mode, system_icon)
+        // 窗口要放得下 2× 的画廊方框（96 × 2 + 四周 12 × 2 = 216），不然量到的是被裁剪的尺寸。
+        let window = cx.open_window(size(px(320.), px(320.)), |_, _cx| {
+            Probe(entry, mode, zoom, system_icon)
         });
         let mut cx = VisualTestContext::from_window(window.into(), &cx);
         cx.update(|window, cx| window.render_frame(cx));
@@ -449,6 +463,15 @@ mod tests {
             cx.debug_bounds("mo-grid-raster"),
             cx.debug_bounds("mo-grid-glyph"),
         )
+    }
+
+    /// 摆一格出来，不缩放（原来那条用例的入口）。
+    fn probe_bounds(
+        entry: Entry,
+        mode: ViewMode,
+        system_icon: Option<PathBuf>,
+    ) -> (Bounds, Option<Bounds>, Option<Bounds>) {
+        probe_bounds_at(entry, mode, Zoom(1.0), system_icon)
     }
 
     /// 边长的逻辑像素值。
@@ -541,6 +564,41 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// 缩放**真的落在渲染上**：同一份条目，方框与位图按倍率等比变化。
+    ///
+    /// 这条是这一档功能的硬判据——`Zoom` 算得再对，视图只要没把它接上（或只接了
+    /// 方框没接位图），用户看到的就是「按了 ⌘+ 没反应」或「图标跟方框对不上」。
+    /// 所以这里量的是**画出来的** bounds，不是算出来的数。
+    #[test]
+    fn zooming_scales_the_painted_box_and_bitmap() {
+        let png = temp_png("zoom");
+        for mode in [ViewMode::Grid, ViewMode::Gallery] {
+            let base = crate::listing::visual_box(mode);
+            for k in [0.75, 1.5, 2.0] {
+                let (frame, raster, glyph) = probe_bounds_at(
+                    entry(ThumbnailState::Loaded(png.clone())),
+                    mode,
+                    Zoom(k),
+                    None,
+                );
+                assert!(glyph.is_none(), "{mode:?} 有缩略图不该画描边图");
+                let want = base * k;
+                // 容差 0.51：gpui 把尺寸对齐到设备像素格（36 × 0.75 = 27 量出来是 26.5~27）。
+                assert!(
+                    (side(&frame) - want).abs() < 0.51,
+                    "{mode:?} 在 {k}× 下方框该是 {want}pt，实际 {}pt",
+                    side(&frame)
+                );
+                let raster = raster.expect("有缩略图就该画位图");
+                assert!(
+                    (side(&raster) - want).abs() < 0.51,
+                    "{mode:?} 在 {k}× 下位图该铺满 {want}pt 的方框，实际 {}pt",
+                    side(&raster)
+                );
             }
         }
     }

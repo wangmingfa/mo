@@ -80,6 +80,27 @@
   再 `setFrame:display:animate:`」的平台 hack，跨平台各写一套，且动画期间 gpui 会按新
   尺寸重排内容。**暂不做**（结论记录，不是待办）。
 
+## 4. PDF 预览：系统自带渲染器就够，别引第三方（2026-09-22）
+
+空格键预览一个 PDF 只能看到「二进制文件，N 字节」——`PreviewKind` 压根没有 PDF。
+
+- **渲染用 CoreGraphics 的 `CGPDFDocument`**（`mo_platform::pdf_page_raster`）：
+  系统自带、零新依赖，实测首页（612×792pt）渲染 + 编码 19ms。不用 pdfium / mupdf——
+  那两个都要带二进制，而 macOS 的 CG 渲染质量就是「预览」要的水平。
+- 与 `file_icon_raster` 的关键区别：**不需要主线程**。`CGPDFDocument` 是纯 C、不碰
+  AppKit，可以放心放 blocking 池（首页几毫秒到几十毫秒，大页面更久）。
+- **先铺白底再画页面**：PDF 只有笔画、页面本身透明，不铺底透明像素在 PNG 里看着
+  是黑的。页面比 `max_edge` 小时**不放大**（放大只会糊）。
+- **类型判定在 mo-preview，渲染在 mo-app**：`PreviewKind::Pdf` 的 `image` 恒为
+  `None`——`Image` 的语义是「原路径即可 `img()` 加载」，PDF 必须先过渲染。UI 走既有的
+  两段式（`show_preview_twopass`）：先占位「正在渲染首页…」，后台
+  `AppState::preview_pdf_page`（渲染 + `unpremultiply` + 编码 PNG + 原子写缓存），
+  图到后 `set_preview_image`；渲染失败把占位换成一句解释，别让窗口永远停在
+  「正在渲染…」。
+- 缓存键 = 路径 hash + **mtime**：PDF 被改过自动失效，只按路径做键会一直显示旧首页。
+- 验证：一次性 example 探针（跑完即删）渲染真实 PDF 出图正确；mo-preview 单测钉
+  「pdf 被识别但不带 image」。真机还要看一眼：两段式占位 → 图淡入的衔接。
+
 ## 附：系统文件图标（列表行）
 
 `AppState::file_icon` 那条链路的性能坑（原始尺寸 NSImage 转 PNG，40 张 10.77s）

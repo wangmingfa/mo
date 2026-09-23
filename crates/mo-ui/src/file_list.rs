@@ -1,3 +1,4 @@
+use gpui_kit::base::ElementExt;
 use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
 use mo_core::{Entry, SortDir, SortKey, ThumbnailState};
@@ -221,8 +222,26 @@ enum SelSync {
     Select(mo_core::FileId),
     /// cmd/ctrl 切换这一项。
     Toggle(mo_core::FileId),
-    /// shift 连选：`from`/`to` 为可见列表的全局下标。
-    Range(usize, usize),
+    /// shift 连选：两端以 **FileId** 表达，由 app 侧解析成条目位。
+    ///
+    /// 早年传的是全局下标——分组开启后列表行号 ≠ 条目位（行流里混着组头），
+    /// 下标在不同空间会指到不同条目；id 在任何空间下都指同一个文件。
+    Range(mo_core::FileId, mo_core::FileId),
+}
+
+/// 分组头的中文标题（mo-core 只定键，文案归 UI）。
+fn group_title(key: mo_app::GroupKey) -> &'static str {
+    match key {
+        mo_app::GroupKey::Folder => "文件夹",
+        mo_app::GroupKey::Image => "图片",
+        mo_app::GroupKey::Document => "文稿",
+        mo_app::GroupKey::Media => "影音",
+        mo_app::GroupKey::Archive => "压缩包",
+        mo_app::GroupKey::Other => "其他",
+        mo_app::GroupKey::Today => "今天",
+        mo_app::GroupKey::Week => "最近 7 天",
+        mo_app::GroupKey::Earlier => "更早",
+    }
 }
 
 /// 文件列表：`UniformList` 虚拟化 + 窗口懒加载。
@@ -279,260 +298,300 @@ pub fn render(
     let row_cols = chrome.cols.clone();
     // 斑马纹开关：`chrome` 借着列布局，`move` 闭包只能带走标量。
     let zebra = chrome.zebra;
-    let list = uniform_list("mo-file-list", count, move |range, _window, cx| {
-        let need_start = range.start.saturating_sub(BUFFER);
-        let need_end = (range.end + BUFFER).min(count);
+    let mut list = uniform_list("mo-file-list", count, {
+        // 闭包整体 move 捕获 entity；先 clone 一份给闭包，保留外层 entity 供后续 on_mouse_down / on_prepaint 复用。
+        let entity = entity.clone();
+        move |range, _window, cx| {
+            let need_start = range.start.saturating_sub(BUFFER);
+            let need_end = (range.end + BUFFER).min(count);
 
-        // 1) 保证窗口覆盖可见区，不覆盖则异步补窗（内部会跳过行的测量调用）。
-        crate::listing::ensure_window(&entity, pane, tab, need_start, need_end, &range, cx);
+            // 1) 保证窗口覆盖可见区，不覆盖则异步补窗（内部会跳过行的测量调用）。
+            crate::listing::ensure_window(&entity, pane, tab, need_start, need_end, &range, cx);
 
-        // 3) 渲染：只从窗口快照里取行。
-        let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
-        // 这一帧「看得见的、还等着缩略图」的行——行渲染完统一派发（见下方注释）。
-        let mut want_thumbs: Vec<Entry> = Vec::new();
-        let view = entity.read(cx);
-        let Some(panel) = view.panel_at(pane, tab) else {
-            return rows;
-        };
-        if range.clone().any(|i| {
-            panel
-                .window
-                .get(i.wrapping_sub(panel.window_start))
-                .is_none()
-        }) {
-            tracing::debug!(
-                target: "mo_ui::window",
-                pane, tab, range = ?range, win_start = panel.window_start,
-                win_len = panel.window.len(), pending = ?panel.pending,
-                count, "rendering placeholder rows"
-            );
-        }
-        for i in range.clone() {
-            let offset = i.wrapping_sub(panel.window_start);
-            let Some(entry) = panel.window.get(offset) else {
-                // 窗口还没补上这一行（刚切目录、快速滚动、快照落地前）：画一条
-                // **只有底色、没有任何内容**的空行，也就是「斑马纹占位」。
-                //
-                // ⚠️ 这里曾经画的是 `…`：切到内容少的目录时会整屏省略号闪一下，
-                // 比空白更刺眼；快速滚动时更是滚一路闪一路。空行则安静得多——
-                // 真数据到位时是文字直接浮现在同一块底色上，连底色都不跳。
-                //
-                // 底色规则必须与下面的数据行**逐字一致**（同样受 `zebra` 开关
-                // 控制、同样 `px(4.0)`）：一旦不一致，占位期与加载完的底色会差
-                // 半格，看起来像整块列表在抖。
-                //
-                // ⚠️ 行 ID 不能省：`uniform_list` 的列表项没有逐项 ID，而可见区
-                // 通常同时有多条占位行；不给行 ID 的话它们会共享同一条元素 ID
-                // 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic（启动快照未
-                // 回填满屏占位行，正是崩溃现场）。
-                rows.push(
-                    div()
-                        .id(format!("file-ph-{pane}-{tab}-{i}"))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .w_full()
-                        .h(px(24.0))
-                        .px(px(4.0))
-                        .bg(if zebra && i % 2 == 1 {
-                            crate::theme::zebra()
-                        } else {
-                            crate::theme::surface()
-                        })
-                        // 测试用（release no-op）：按绝对行号定位占位行，
-                        // 断言「有底色、无内容、行高与数据行一致」。
-                        .debug_selector(move || format!("mo-file-ph-{i}"))
-                        .into_any_element(),
-                );
-                continue;
+            // 3) 渲染：只从窗口快照里取行。
+            let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
+            // 这一帧「看得见的、还等着缩略图」的行——行渲染完统一派发（见下方注释）。
+            let mut want_thumbs: Vec<Entry> = Vec::new();
+            let view = entity.read(cx);
+            let Some(panel) = view.panel_at(pane, tab) else {
+                return rows;
             };
-
-            let id = entry.id;
-            let entry_path = entry.path.clone();
-            let selected = panel.selection.is_selected(&id);
-            let is_dir = entry.kind.is_dir();
-            let entity_click = entity.clone();
-
-            // ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
-            // 无 ID 的裸 div 拿不到 state，on_click 回调永远不会注册。
-            // 用全列表绝对索引保证滚动后 ID 稳定。
-            let mut row = div()
-                .id(format!("file-row-{pane}-{tab}-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .h(px(24.0))
-                .px(px(4.0))
-                // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
-                .bg(if selected {
-                    crate::theme::selected_bg()
-                } else if zebra && i % 2 == 1 {
-                    crate::theme::zebra()
-                } else {
-                    crate::theme::surface()
-                })
-                // 测试用（release no-op）：按绝对行号定位，断言首行相对列表顶部的留白。
-                .debug_selector(move || format!("mo-file-row-{i}"));
-
-            if !selected {
-                // fluent `hover` 在 `InteractiveElement` 上，`Div` 实现了它。
-                row = row.hover(|s| s.bg(crate::theme::hover_bg()));
+            if range.clone().any(|i| {
+                panel
+                    .window
+                    .get(i.wrapping_sub(panel.window_start))
+                    .is_none()
+            }) {
+                tracing::debug!(
+                    target: "mo_ui::window",
+                    pane, tab, range = ?range, win_start = panel.window_start,
+                    win_len = panel.window.len(), pending = ?panel.pending,
+                    count, "rendering placeholder rows"
+                );
             }
-
-            // `Div` 只实现 `InteractiveElement`（提供 `interactivity()`），
-            // fluent `on_click` 在 `StatefulInteractiveElement`（Div 未实现），
-            // 因此点击回调走 imperative API。
-            row.interactivity().on_click(move |ev, _window, cx| {
-                // 双击（click_count >= 2）：进入目录 / 预览文件，与 Enter 同语义。
-                if ev.click_count() >= 2 {
-                    // `is_dir` 来自 `entry.kind`（列表模型），不是 `Path::is_dir()`
-                    // ——远程目录在本地磁盘上不存在，见 `RootView::open_entry`。
-                    entity_click.update(cx, |v, cx| v.open_entry(entry_path.clone(), is_dir, cx));
-                    return;
-                }
-                // 修饰键决定选择语义（Finder / 资源管理器一致）：
-                // 无修饰 = 单选替换；cmd/ctrl = 切换多选；shift = 从锚点连选。
-                let mods = ev.modifiers();
-                let multi = mods.platform || mods.control;
-                let shift = mods.shift;
-
-                let Some((app, sync)) = entity_click.update(cx, |v, _cx| {
-                    let p = v.panel_at_mut(pane, tab)?;
-                    if shift {
-                        // 以锚点为起点延伸到点击项；锚点缺失则退化为单选。
-                        let ordered: Vec<mo_core::FileId> = p.window.iter().map(|e| e.id).collect();
-                        let clicked = ordered.iter().position(|x| *x == id)?;
-                        if let Some(a) = p.selection.anchor() {
-                            if let Some(ai) = ordered.iter().position(|x| *x == a) {
-                                p.selection.clear();
-                                p.selection.select_range(&ordered, ai, clicked);
-                                p.selection.set_anchor(a);
-                                return Some((
-                                    p.app.clone(),
-                                    SelSync::Range(p.window_start + ai, p.window_start + clicked),
-                                ));
-                            }
-                        }
-                        p.selection.select(id);
-                        Some((p.app.clone(), SelSync::Select(id)))
-                    } else if multi {
-                        // cmd/ctrl 点击：在现有选择上切换这一项。
-                        p.selection.toggle(id);
-                        Some((p.app.clone(), SelSync::Toggle(id)))
-                    } else {
-                        // 普通点击：单选替换，取消其余选中。
-                        p.selection.select(id);
-                        Some((p.app.clone(), SelSync::Select(id)))
-                    }
-                }) else {
-                    return;
+            for i in range.clone() {
+                let offset = i.wrapping_sub(panel.window_start);
+                let Some(row) = panel.window.get(offset) else {
+                    // 窗口还没补上这一行（刚切目录、快速滚动、快照落地前）：画一条
+                    // **只有底色、没有任何内容**的空行，也就是「斑马纹占位」。
+                    //
+                    // ⚠️ 这里曾经画的是 `…`：切到内容少的目录时会整屏省略号闪一下，
+                    // 比空白更刺眼；快速滚动时更是滚一路闪一路。空行则安静得多——
+                    // 真数据到位时是文字直接浮现在同一块底色上，连底色都不跳。
+                    //
+                    // 底色规则必须与下面的数据行**逐字一致**（同样受 `zebra` 开关
+                    // 控制、同样 `px(4.0)`）：一旦不一致，占位期与加载完的底色会差
+                    // 半格，看起来像整块列表在抖。
+                    //
+                    // ⚠️ 行 ID 不能省：`uniform_list` 的列表项没有逐项 ID，而可见区
+                    // 通常同时有多条占位行；不给行 ID 的话它们会共享同一条元素 ID
+                    // 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic（启动快照未
+                    // 回填满屏占位行，正是崩溃现场）。
+                    rows.push(
+                        div()
+                            .id(format!("file-ph-{pane}-{tab}-{i}"))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .h(px(24.0))
+                            .px(px(4.0))
+                            .bg(if zebra && i % 2 == 1 {
+                                crate::theme::zebra()
+                            } else {
+                                crate::theme::surface()
+                            })
+                            // 测试用（release no-op）：按绝对行号定位占位行，
+                            // 断言「有底色、无内容、行高与数据行一致」。
+                            .debug_selector(move || format!("mo-file-ph-{i}"))
+                            .into_any_element(),
+                    );
+                    continue;
+                };
+                // 分组头行（仅分组开启的列表视图会有）：固定斑马底 + 弱化小字，
+                // 行高与数据行一致（24px）——虚拟化列表的行高必须恒定，也保住
+                // 框选 / 键盘导航的「行号 → 鼠标 y」换算不用分叉。
+                let Some(entry) = row.entry() else {
+                    let mo_app::WindowRow::Header(key) = row else {
+                        unreachable!("窗口行非条目即组头");
+                    };
+                    rows.push(
+                        div()
+                            .id(format!("file-hd-{pane}-{tab}-{i}"))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .h(px(24.0))
+                            .px(px(4.0))
+                            .bg(crate::theme::zebra())
+                            .debug_selector(move || format!("mo-file-hd-{i}"))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(crate::theme::muted())
+                                    .child(text!(group_title(*key))),
+                            )
+                            .into_any_element(),
+                    );
+                    continue;
                 };
 
-                match sync {
-                    SelSync::Select(id) => {
-                        cx.spawn(async move |_cx| {
-                            app.select(id).await;
-                        })
-                        .detach();
-                    }
-                    SelSync::Toggle(id) => {
-                        cx.spawn(async move |_cx| {
-                            app.toggle(id).await;
-                        })
-                        .detach();
-                    }
-                    SelSync::Range(from, to) => {
-                        cx.spawn(async move |_cx| {
-                            // select_range 只 insert 不清空，连选前先清掉旧选区，
-                            // 否则 app 侧选择会累积、导致后续复制 / 移动选错文件。
-                            app.clear_selection().await;
-                            app.select_range(from, to).await;
-                        })
-                        .detach();
-                    }
+                let id = entry.id;
+                let entry_path = entry.path.clone();
+                let selected = panel.selection.is_selected(&id);
+                let is_dir = entry.kind.is_dir();
+                let entity_click = entity.clone();
+
+                // ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
+                // 无 ID 的裸 div 拿不到 state，on_click 回调永远不会注册。
+                // 用全列表绝对索引保证滚动后 ID 稳定。
+                let mut row = div()
+                    .id(format!("file-row-{pane}-{tab}-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .h(px(24.0))
+                    .px(px(4.0))
+                    // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
+                    .bg(if selected {
+                        crate::theme::selected_bg()
+                    } else if zebra && i % 2 == 1 {
+                        crate::theme::zebra()
+                    } else {
+                        crate::theme::surface()
+                    })
+                    // 测试用（release no-op）：按绝对行号定位，断言首行相对列表顶部的留白。
+                    .debug_selector(move || format!("mo-file-row-{i}"));
+
+                if !selected {
+                    // fluent `hover` 在 `InteractiveElement` 上，`Div` 实现了它。
+                    row = row.hover(|s| s.bg(crate::theme::hover_bg()));
                 }
-            });
 
-            // 拖拽：按下记源、抬起结算。跨窗格拖拽落在别处时由窗格级兜底。
-            let entity_down = entity.clone();
-            let down_path = entry.path.clone();
-            row.interactivity()
-                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                    entity_down.update(cx, |v, _cx| {
-                        v.begin_drag(pane, tab, down_path.clone(), id);
-                    });
-                });
-            let entity_up = entity.clone();
-            let up_path = entry.path.clone();
-            row.interactivity()
-                .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
-                    // 按住 ⌥（Windows / Linux 上是 Alt）拖 = 移动，否则复制。
-                    let alt = ev.modifiers.alt;
-                    entity_up.update(cx, |v, cx| {
-                        v.drop_on_entry(pane, tab, up_path.clone(), is_dir, alt, cx);
-                    });
+                // `Div` 只实现 `InteractiveElement`（提供 `interactivity()`），
+                // fluent `on_click` 在 `StatefulInteractiveElement`（Div 未实现），
+                // 因此点击回调走 imperative API。
+                row.interactivity().on_click(move |ev, _window, cx| {
+                    // 双击（click_count >= 2）：进入目录 / 预览文件，与 Enter 同语义。
+                    if ev.click_count() >= 2 {
+                        // `is_dir` 来自 `entry.kind`（列表模型），不是 `Path::is_dir()`
+                        // ——远程目录在本地磁盘上不存在，见 `RootView::open_entry`。
+                        entity_click
+                            .update(cx, |v, cx| v.open_entry(entry_path.clone(), is_dir, cx));
+                        return;
+                    }
+                    // 修饰键决定选择语义（Finder / 资源管理器一致）：
+                    // 无修饰 = 单选替换；cmd/ctrl = 切换多选；shift = 从锚点连选。
+                    let mods = ev.modifiers();
+                    let multi = mods.platform || mods.control;
+                    let shift = mods.shift;
+
+                    let Some((app, sync)) = entity_click.update(cx, |v, _cx| {
+                        let p = v.panel_at_mut(pane, tab)?;
+                        if shift {
+                            // 以锚点为起点延伸到点击项；锚点缺失则退化为单选。
+                            // 窗口里的条目序 = 全局序的连续切片，本地先用它算；
+                            // app 侧回灌走 id 端点（分组行空间下下标会错位）。
+                            let ordered: Vec<mo_core::FileId> =
+                                p.window_entries().map(|e| e.id).collect();
+                            let clicked = ordered.iter().position(|x| *x == id)?;
+                            if let Some(a) = p.selection.anchor() {
+                                if let Some(ai) = ordered.iter().position(|x| *x == a) {
+                                    p.selection.clear();
+                                    p.selection.select_range(&ordered, ai, clicked);
+                                    p.selection.set_anchor(a);
+                                    return Some((p.app.clone(), SelSync::Range(a, id)));
+                                }
+                            }
+                            p.selection.select(id);
+                            Some((p.app.clone(), SelSync::Select(id)))
+                        } else if multi {
+                            // cmd/ctrl 点击：在现有选择上切换这一项。
+                            p.selection.toggle(id);
+                            Some((p.app.clone(), SelSync::Toggle(id)))
+                        } else {
+                            // 普通点击：单选替换，取消其余选中。
+                            p.selection.select(id);
+                            Some((p.app.clone(), SelSync::Select(id)))
+                        }
+                    }) else {
+                        return;
+                    };
+
+                    match sync {
+                        SelSync::Select(id) => {
+                            cx.spawn(async move |_cx| {
+                                app.select(id).await;
+                            })
+                            .detach();
+                        }
+                        SelSync::Toggle(id) => {
+                            cx.spawn(async move |_cx| {
+                                app.toggle(id).await;
+                            })
+                            .detach();
+                        }
+                        SelSync::Range(anchor, clicked) => {
+                            cx.spawn(async move |_cx| {
+                                // select_between 只 insert 不清空，连选前先清掉旧选区，
+                                // 否则 app 侧选择会累积、导致后续复制 / 移动选错文件。
+                                app.clear_selection().await;
+                                app.select_between(anchor, clicked).await;
+                            })
+                            .detach();
+                        }
+                    }
                 });
 
-            // 右键：对着这一行弹上下文菜单。必须 `stop_propagation`，
-            // 否则事件继续冒泡到窗格容器，菜单会被随即替换成「空白处」版本。
-            let entity_ctx = entity.clone();
-            let ctx_path = entry.path.clone();
-            row.interactivity()
-                .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
-                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
-                    entity_ctx.update(cx, |v, cx| {
-                        v.open_context_menu(Some((ctx_path.clone(), is_dir)), x, y, pane, tab, cx);
+                // 拖拽：按下记源、抬起结算。跨窗格拖拽落在别处时由窗格级兜底。
+                let entity_down = entity.clone();
+                let down_path = entry.path.clone();
+                row.interactivity()
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        entity_down.update(cx, |v, _cx| {
+                            v.begin_drag(pane, tab, down_path.clone(), id);
+                        });
                     });
-                    cx.stop_propagation();
-                });
+                let entity_up = entity.clone();
+                let up_path = entry.path.clone();
+                row.interactivity()
+                    .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
+                        // 按住 ⌥（Windows / Linux 上是 Alt）拖 = 移动，否则复制。
+                        let alt = ev.modifiers.alt;
+                        entity_up.update(cx, |v, cx| {
+                            v.drop_on_entry(pane, tab, up_path.clone(), is_dir, alt, cx);
+                        });
+                    });
 
-            let app = view.panel_at(pane, tab).map(|p| p.app.clone());
-            let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
-            // 缩略图：**只为这一行真的要画缩略图、且还没人要过**的时候排一次队。
-            //
-            // 放在渲染路径上（而不是「窗口抓回来时」）是有意的：缩略图的语义就是
-            // 「把看得见的这几行画出来」，而窗口带着上下各 BUFFER(=100) 条的余量——
-            // 按整个窗口派发等于每进一个目录就白解一两百张大图（实测单张 80ms 级），
-            // 目录越大白解得越多，正是「内容多的目录会卡」。请求本身是幂等的
-            // （在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也没关系，
-            // 好处是滚动时新露出来的行立刻能排上队。
-            if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
-                want_thumbs.push(entry.clone());
-            }
-            // 系统图标（访达同款 PNG）：判据与取图都收在 `file_item::system_icon` 里
-            // ——**四个视图共用同一条链路**（列视图 / 网格 / 画廊见各自的 mod 文档），
-            // 那边一句话说清了「有缩略图的行不问」「查表命不中只记账」。
-            //
-            // 槽位按 `listing::icon_slot` 那张表取：系统图标是光栅图，16pt 的行有
-            // 40px 的位图就够了，不必替它去取画廊（96pt 方框）要的那一档。
-            let system_icon = crate::file_item::entry_system_icon(
-                app.as_ref(),
-                entry,
-                crate::listing::icon_slot(ViewMode::List),
-            );
-            rows.push(
-                row.child(crate::file_item::view(
+                // 右键：对着这一行弹上下文菜单。必须 `stop_propagation`，
+                // 否则事件继续冒泡到窗格容器，菜单会被随即替换成「空白处」版本。
+                let entity_ctx = entity.clone();
+                let ctx_path = entry.path.clone();
+                row.interactivity()
+                    .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        entity_ctx.update(cx, |v, cx| {
+                            v.open_context_menu(
+                                Some((ctx_path.clone(), is_dir)),
+                                x,
+                                y,
+                                pane,
+                                tab,
+                                cx,
+                            );
+                        });
+                        cx.stop_propagation();
+                    });
+
+                let app = view.panel_at(pane, tab).map(|p| p.app.clone());
+                let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
+                // 缩略图：**只为这一行真的要画缩略图、且还没人要过**的时候排一次队。
+                //
+                // 放在渲染路径上（而不是「窗口抓回来时」）是有意的：缩略图的语义就是
+                // 「把看得见的这几行画出来」，而窗口带着上下各 BUFFER(=100) 条的余量——
+                // 按整个窗口派发等于每进一个目录就白解一两百张大图（实测单张 80ms 级），
+                // 目录越大白解得越多，正是「内容多的目录会卡」。请求本身是幂等的
+                // （在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也没关系，
+                // 好处是滚动时新露出来的行立刻能排上队。
+                if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
+                    want_thumbs.push(entry.clone());
+                }
+                // 系统图标（访达同款 PNG）：判据与取图都收在 `file_item::system_icon` 里
+                // ——**四个视图共用同一条链路**（列视图 / 网格 / 画廊见各自的 mod 文档），
+                // 那边一句话说清了「有缩略图的行不问」「查表命不中只记账」。
+                //
+                // 槽位按 `listing::icon_slot` 那张表取：系统图标是光栅图，16pt 的行有
+                // 40px 的位图就够了，不必替它去取画廊（96pt 方框）要的那一档。
+                let system_icon = crate::file_item::entry_system_icon(
+                    app.as_ref(),
                     entry,
-                    selected,
-                    tag_color,
-                    &row_cols,
-                    system_icon,
-                ))
-                .into_any_element(),
-            );
-        }
-        // 缩略图：这一帧看得见的、还等着的那几行，统一派发。
-        //
-        // 幂等（在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也无所谓；
-        // 关键是对象正好是**看得见的那些行**，而不是整窗口那两百条——见上面
-        // `want_thumbs` 处的注释。
-        if !want_thumbs.is_empty() {
-            if let Some(a) = view.panel_at(pane, tab).map(|p| p.app.clone()) {
-                a.thumbs().request(a.clone(), want_thumbs);
+                    crate::listing::icon_slot(ViewMode::List),
+                );
+                rows.push(
+                    row.child(crate::file_item::view(
+                        entry,
+                        selected,
+                        tag_color,
+                        &row_cols,
+                        system_icon,
+                    ))
+                    .into_any_element(),
+                );
             }
+            // 缩略图：这一帧看得见的、还等着的那几行，统一派发。
+            //
+            // 幂等（在跑 / 已生成 / 生成失败的都会被调度器跳过），所以每帧调也无所谓；
+            // 关键是对象正好是**看得见的那些行**，而不是整窗口那两百条——见上面
+            // `want_thumbs` 处的注释。
+            if !want_thumbs.is_empty() {
+                if let Some(a) = view.panel_at(pane, tab).map(|p| p.app.clone()) {
+                    a.thumbs().request(a.clone(), want_thumbs);
+                }
+            }
+            rows
         }
-        rows
     })
     // ⚠️ 必需：`uniform_list` 的列表项只在 prepaint 阶段渲染，布局阶段 taffy
     // 看到的是「没有子节点」的元素，身高算出来是 0。不显式给它确定高度
@@ -549,9 +608,24 @@ pub fn render(
     // 测试用：让 tests/layout.rs 能读到这个元素的实际尺寸（release 下 no-op）。
     .debug_selector(|| "mo-file-list".to_string());
 
+    // 框选起点：只在列表**空白区**按下才启动橡皮筋（点到条目走单选 / 拖拽）。
+    // 拖动过程与收尾在 `RootView` 的窗口级 `on_mouse_move` / `on_mouse_up` 里处理。
+    let entity_box = entity.clone();
+    list.interactivity()
+        .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            let extend = ev.modifiers.platform || ev.modifiers.control || ev.modifiers.shift;
+            entity_box.update(cx, |v, cx| {
+                v.start_box_selection_if_empty(pane, tab, x, y, extend, cx)
+            });
+        });
+
     // 滚动条作为兄弟节点覆盖在列表右侧（容器 relative），
     // 与 gpui-component List 的做法一致：overlay 而非挤压内容宽度。
     // 表头固定在滚动区上方，不随内容滚动（Finder 列表视图行为）。
+    // 框选几何：prepaint 把列表内容区左上角（窗口坐标）回写，供把鼠标 y 折算成行下标。
+    // 挂在包裹列表的 div 上（UniformList 自身没有 on_prepaint），其 bounds 即列表区左上角。
+    let entity_origin = entity.clone();
     div()
         .relative()
         .flex()
@@ -566,6 +640,10 @@ pub fn render(
                 .flex_col()
                 .flex_1()
                 .min_w_0()
+                .on_prepaint(move |bounds, _window, cx| {
+                    let (x, y) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+                    entity_origin.update(cx, |v, _cx| v.set_list_origin(pane, tab, x, y));
+                })
                 .child(list)
                 .child(Scrollbar::vertical(scroll)),
         )

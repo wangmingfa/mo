@@ -119,18 +119,57 @@ pub fn entry_at(path: &Path) -> Option<ReadDirEntry> {
 /// 根据路径判断条目类型（正确处理符号链接）。
 pub(crate) fn entry_kind_from_path(path: &Path) -> std::io::Result<mo_core::EntryKind> {
     let sym = std::fs::symlink_metadata(path)?;
-    if sym.is_symlink() {
+    Ok(kind_from_metadata(&sym, path))
+}
+
+/// 从一份 **lstat** 结果判断条目类型（符号链接仍要跟随一次，见 [`entry_kind_from_path`]）。
+///
+/// 与 [`entry_kind_from_path`] 分成两个函数是为了让 `read_dir` 能复用手上那次
+/// `DirEntry::metadata()` 的结果，省掉按路径再查一次 dentry。
+pub(crate) fn kind_from_metadata(m: &std::fs::Metadata, path: &Path) -> mo_core::EntryKind {
+    if m.is_symlink() {
         return match std::fs::metadata(path) {
-            Ok(m) if m.is_dir() => Ok(mo_core::EntryKind::Directory),
-            Ok(_) => Ok(mo_core::EntryKind::File),
-            Err(_) => Ok(mo_core::EntryKind::Symlink),
+            Ok(m) if m.is_dir() => mo_core::EntryKind::Directory,
+            Ok(_) => mo_core::EntryKind::File,
+            Err(_) => mo_core::EntryKind::Symlink,
         };
     }
-    if sym.is_dir() {
-        Ok(mo_core::EntryKind::Directory)
-    } else if sym.is_file() {
-        Ok(mo_core::EntryKind::File)
+    if m.is_dir() {
+        mo_core::EntryKind::Directory
+    } else if m.is_file() {
+        mo_core::EntryKind::File
     } else {
-        Ok(mo_core::EntryKind::Other)
+        mo_core::EntryKind::Other
+    }
+}
+
+/// 条目名是否「隐藏」：只看名字，零 IO。
+///
+/// `.` 开头这一条在 unix 系与 Windows 上都成立（两边都用 `.` 开头的目录放配置），
+/// 也是访达 ⌘⇧. 切的那批。列目录过滤用它打底，macOS 上再叠加标记位判断
+/// （见 [`is_hidden_with_metadata`]）。
+pub fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+/// 在 [`is_hidden_name`] 之上叠加「文件系统标记位」判据（macOS 的 `UF_HIDDEN`）。
+///
+/// `chflags hidden` 设的条目（`~/Library` 就是这么藏起来的）名字不以 `.` 开头，
+/// 只按名字判会漏；而标记位只有 stat 才拿得到，所以做成「上层手上已有 metadata
+/// 时的补充判据」——`read_dir` 里那次 `DirEntry::metadata()` 是免费的。
+pub fn is_hidden_with_metadata(name: &str, m: &std::fs::Metadata) -> bool {
+    if is_hidden_name(name) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        // `UF_HIDDEN`：BSD 的隐藏位，Linux 的 `st_flags` 恒为 0（且该字段不存在）。
+        m.st_flags() & 0x8000 != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, m);
+        false
     }
 }

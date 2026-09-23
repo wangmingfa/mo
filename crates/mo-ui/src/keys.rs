@@ -37,10 +37,29 @@ const fn has_command_key() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// `+` 与 `=`、`_` 与 `-` 在键盘上是**同一个物理键**（Shift 切印刷变体）。
+///
+/// 归一时折回基本键名、**连同 Shift 位一起归掉**：默认键位写 `cmd+=`（无 Shift），
+/// 用户按「⌘+」报的却是 Shift+=（key == `+`）——Shift 位若保留，两个组合永远差一位、
+/// 永远打不中。返回 `(key, shift)`，调用方用它替换原 key 与 shift 位。
+fn fold_typographic_shift(key: &str, _shift: bool) -> (String, bool) {
+    match key {
+        // `+` 与 `=`、`_` 与 `-` 各是**同一个物理键**（Shift 切印刷变体）。
+        // 折回基本键名时把 Shift 位一并丢掉：默认键位写 `cmd+=`（无 Shift），
+        // 而用户按「⌘+」报的是 Shift+=（key == "+"）——Shift 位若保留，
+        // 两个组合永远差一位、永远打不中。这四个字符没有别的绑定用，
+        // Shift 不参与区分没有副作用。
+        "+" | "=" => ("=".to_string(), false),
+        "_" | "-" => ("-".to_string(), false),
+        _ => (key.to_string(), _shift),
+    }
+}
+
 impl KeyCombo {
     /// 从 gpui 按键事件构造。
     pub fn from_keystroke(ks: &Keystroke) -> Self {
         let m = &ks.modifiers;
+        let (key, shift) = fold_typographic_shift(&normalize(&ks.key), m.shift);
         Self {
             cmd: if has_command_key() {
                 m.platform
@@ -51,8 +70,8 @@ impl KeyCombo {
             // "ctrl+c" 与 "cmd+c" 会成两个互斥的键组。
             ctrl: if has_command_key() { m.control } else { false },
             alt: m.alt,
-            shift: m.shift,
-            key: normalize(&ks.key),
+            shift,
+            key,
         }
     }
 
@@ -88,7 +107,13 @@ impl KeyCombo {
             .replace('⌃', "ctrl+")
             .replace('⌥', "alt+")
             .replace('⇧', "shift+");
-        for part in expanded.split(['+', '-']) {
+        // 分隔符二选一：**有 `+` 就只按 `+` 切**，没有才退回 `-`（老写法 `cmd-t`）。
+        //
+        // ⚠️ 不能像原来那样同时按 `+` 和 `-` 切：`cmd+-`（缩小的默认键位）会被切成
+        // `["cmd", ""]`，主键变空串 → 解析失败 → 动作退回默认、用户写的键位静默失联。
+        // `-` 本身就是 `view.zoom_out` 的主键，它有资格出现在键串里。
+        let sep = if expanded.contains('+') { '+' } else { '-' };
+        for part in expanded.split(sep) {
             let p = part.trim().to_lowercase();
             if p.is_empty() {
                 continue;
@@ -115,6 +140,11 @@ impl KeyCombo {
                 _ => out.key = normalize(&p),
             }
         }
+        // `+` 与 `=` 是同一个键位（见 [`fold_typographic_shift`]）：配置里写
+        // `cmd+shift+=` / `cmd++` 都折到 `cmd+=`，别让同一个物理按键有两种写法。
+        let (key, shift) = fold_typographic_shift(&out.key, out.shift);
+        out.key = key;
+        out.shift = shift;
         // 主键必须是认识的键名：否则「不是键」这种手打错的值会被当成一个
         // 永远按不出来的键，动作直接失联——这里返回 None 让调用方退回默认。
         (!out.key.is_empty() && known_key(&out.key)).then_some(out)
@@ -276,7 +306,7 @@ pub struct Binding {
 }
 
 /// 全部可重映射动作。id 是配置里的键，一旦发布就不要改名。
-pub const BINDINGS: [Binding; 28] = [
+pub const BINDINGS: [Binding; 33] = [
     Binding {
         id: "app.quit",
         label: "退出应用",
@@ -296,6 +326,11 @@ pub const BINDINGS: [Binding; 28] = [
         id: "select.all",
         label: "全选",
         default: "cmd+a",
+    },
+    Binding {
+        id: "select.invert",
+        label: "反选",
+        default: "cmd+shift+a",
     },
     Binding {
         id: "edit.undo",
@@ -361,6 +396,29 @@ pub const BINDINGS: [Binding; 28] = [
         id: "view.columns",
         label: "列视图",
         default: "cmd+4",
+    },
+    Binding {
+        id: "view.hidden",
+        label: "显示 / 隐藏隐藏文件",
+        // 访达的 ⌘⇧. 是这一行的事实标准，照抄比自创一个键位好用。
+        default: "cmd+shift+.",
+    },
+    Binding {
+        id: "view.zoom_in",
+        label: "放大图标",
+        // 主键写 `=`（键帽上的字符）：macOS 上「⌘+」就是 ⌘⇧=，两者都命中，
+        // 见 `KeyCombo::from_keystroke` 里对「按 Shift 才打得出来的符号」的处理。
+        default: "cmd+=",
+    },
+    Binding {
+        id: "view.zoom_out",
+        label: "缩小图标",
+        default: "cmd+-",
+    },
+    Binding {
+        id: "view.zoom_reset",
+        label: "图标大小还原",
+        default: "cmd+0",
     },
     Binding {
         id: "file.properties",
@@ -431,8 +489,9 @@ pub const BINDINGS: [Binding; 28] = [
 ///
 /// ⚠️ 新增绑定若作用于浏览区，记得加进来——`browser_scoped_ids_all_exist` 守住
 /// 拼写（写错的 id 会静默失效，等于没拦）。
-pub const BROWSER_SCOPED: [&str; 13] = [
+pub const BROWSER_SCOPED: [&str; 14] = [
     "select.all",
+    "select.invert",
     "edit.undo",
     "edit.redo",
     "file.properties",
@@ -620,6 +679,38 @@ mod tests {
         assert_eq!(KeyCombo::parse("esc").unwrap().key, "escape");
         assert_eq!(KeyCombo::parse("space").unwrap().key, " ");
         assert!(KeyCombo::parse("").is_none(), "空串不是合法键组");
+    }
+
+    /// 回归：缩放三键的印刷变体。`-` 是 `view.zoom_out` 的主键，键串解析
+    /// **不能**把它当分隔符吃掉；`+` 是 Shift 切出来的变体，真实按键（gpui 报
+    /// key == `+`）要与写 `=` 的默认键位（`cmd+=`）命中同一条绑定——
+    /// 这里任何一处没折拢，⌘+ / ⌘- 就是「按了没反应」。
+    #[test]
+    fn zoom_keys_survive_typographic_variants() {
+        let map = Keymap::build(&HashMap::new());
+
+        let minus = ks("cmd+-");
+        assert_eq!(minus.key, "-", "`-` 主键不能被分隔符切掉");
+        assert_eq!(map.lookup(&minus), Some("view.zoom_out"));
+
+        let plus_binding = ks("cmd+=");
+        assert_eq!(plus_binding.key, "=");
+        let typed = KeyCombo::from_keystroke(&Keystroke {
+            key: "+".into(),
+            modifiers: gpui_kit::Modifiers {
+                shift: true,
+                // 与 `from_keystroke` 同一约定：macOS 看 platform，其它平台看 control。
+                platform: has_command_key(),
+                control: !has_command_key(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(typed, plus_binding, "「⌘+」应与 `cmd+=` 折到同一键组");
+        assert_eq!(map.lookup(&typed), Some("view.zoom_in"));
+
+        // 配置里另一种自然写法 `cmd+shift+=` 也折到同一条。
+        assert_eq!(ks("cmd+shift+="), plus_binding);
     }
 
     /// 回归：空格必须能从**真实按键事件**命中默认绑定。

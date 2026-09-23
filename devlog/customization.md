@@ -89,3 +89,46 @@
   「blocking 只做文件复制 + 交回待删清单，删除回到异步侧提交」。
 * **另一条**：同步必须先 `plan`（只读）再 `apply`。这是全项目唯一会成批改动
   几百个文件的功能，一步算错就是灾难，UI 必须让用户先过目计划。
+
+## 10. 「显示隐藏文件」：判据跟着条目走，开关要同步所有标签页（2026-09-22）
+
+`config.show_hidden` 早就有了，但**过滤没接**——dotfile 恒显示，`.git` /
+`node_modules` 铺满列表。接线时三个决定：
+
+- **判据跟着 `ReadDirEntry` 一起交上来**（新增 `hidden` 字段），不是让上层拿路径
+  再 stat 一遍。列目录是**热路径**（进目录 / 刷新 / 前进后退 / 列视图切列都会重
+  读），两万条的目录多两万次 syscall 就是肉眼可见的停顿。`read_dir_blocking` 里
+  那次 `DirEntry::metadata()`（unix 上就是 lstat）顺手把「类型」和 macOS 的
+  `UF_HIDDEN` 标记位一起取了，所以这条判据是**免费**的。
+- 属性面板的「隐藏」一栏与列表过滤**共用同一套判据**（`is_hidden_with_metadata`）：
+  否则会出现「面板说不隐藏、列表里却被过滤掉」这种自相矛盾的显示。
+- **过滤必须在建视图之前**（`load_path` 里 `set_entries` 之前）：`visible_count` /
+  分页 / 索引全按视图算，过滤晚了状态栏条数与滚动条长度就会对不上。
+
+两个容易漏的连带处：
+
+- **监听增量**：`WatcherEvent::Created` 也要过滤，否则「显示隐藏文件」关着时，
+  终端里 `touch .foo` 一下列表就冒出一条（`entry_at` 只按名字判，够用）。
+- **索引爬取**：`mo_search::crawl` 多了 `skip_hidden` 参数。**列表里看不到的，搜索
+  也不该搜得到**，顺带 `.git` / `node_modules` 整棵子树不进索引，体积小一个数量级。
+
+⚠️ **开关要同步所有标签页**：它在 `AppState` 里是进程内镜像（`Arc<AtomicBool>`，
+热路径不能每次读盘），而每个标签页各持一份 `AppState`——只改当前那份就会「切到
+另一个标签页又变回去」。所以 `RootView::toggle_hidden` 拿 `all_apps()` 逐个 set，
+并且**切完立刻 `refresh()`**（不重读界面上什么都没变，用户只会以为按键坏了）。
+
+入口：命令面板「显示 / 隐藏隐藏文件」+ 快捷键 `view.hidden`（默认 `cmd+shift+.`，
+访达同款）。守卫 `mo-app/tests/hidden_files.rs` 两条（主列表 / 列视图），反向验证：
+去掉 `load_path` 的 `.filter(..)` → 变红。
+
+## 11. 主题槽位在测试下必须每线程一份（2026-09-22）
+
+`theme_picker_previews_and_restores` 偶发红：「全局调色板应跟随预览项」，单独重跑必过。
+
+根因：调色板是**进程级静态**（`OnceLock<Mutex<Palette>>`），而 `cargo test` 默认并行、
+每条用例都会创建 `RootView`（`RootView::new` 里 `theme::set`）。于是 A 用例刚把调色板
+预览成深色，B 用例建 `RootView` 又把它设回浅色，A 的断言就随机落空。
+
+修法：`theme` 的槽位在 `#[cfg(test)]` 下改成 `thread_local`，生产路径照旧（界面只在
+主线程跑，写调色板的只有 `RootView::new` 与 `repaint_theme` 两处）。**不要**为了修测试
+去动生产语义——`cfg` 分开就两边都不冒险。
