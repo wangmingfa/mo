@@ -156,6 +156,26 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     }
 }
 
+/// 取**通用文件夹**的系统图标（访达里那种蓝色文件夹），契约与 [`file_icon_raster`]
+/// 完全一致：主线程做、只交像素、编码归调用方。
+///
+/// 与 [`file_icon_raster`] 的关键差别：它问的是**系统图标目录**（AppKit 资产目录里的
+/// `NSFolder`），不碰任何文件路径——所以不吃 macOS 图标服务的抖动（同一个路径连问
+/// 两次可能一次给图下一次 nil 的那口锅），可以稳定地当「目录行的占位图」用。
+///
+/// 拿不到返回 `None`（平台不支持 / 资产缺失），上层退回内置 SVG。
+pub fn folder_icon_raster(px: u32) -> Option<IconRaster> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::folder_icon_raster(px)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = px;
+        None
+    }
+}
+
 /// 这个平台能渲染 PDF 页面吗（决定预览里有没有 PDF 首页）。
 pub fn supports_pdf() -> bool {
     cfg!(target_os = "macos")

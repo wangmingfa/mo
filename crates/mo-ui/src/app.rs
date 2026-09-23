@@ -691,10 +691,11 @@ pub struct RootView {
     pub(crate) drag: Option<DragState>,
     /// 列表视图的鼠标框选（rubber-band）进行态；`None` = 没在框选。
     pub(crate) box_selection: Option<BoxSelection>,
-    /// 各 (窗格, 标签页) 列表视图的内容区左上角（窗口坐标），prepaint 回写。
+    /// 各 (窗格, 标签页) 列表视图的内容区左上角与高度（窗口坐标），prepaint 回写。
     ///
-    /// 框选取坐标用：把鼠标 y 折算成可见行下标需要「列表顶在哪 + 滚了多少」。
-    pub(crate) list_origin: std::collections::HashMap<(usize, usize), (f32, f32)>,
+    /// 框选取坐标用：把鼠标 y 折算成可见行下标需要「列表顶在哪 + 滚了多少」；
+    /// 高度给「斑马纹铺满一屏」算行数（`list_fill_rows`）。
+    pub(crate) list_origin: std::collections::HashMap<(usize, usize), (f32, f32, f32)>,
     /// 列表视图的列布局（顺序 + 宽度），表头与数据行共用。
     pub(crate) cols: crate::list_columns::ColumnLayout,
     /// 进行中的表头操作（调宽 / 调序）。
@@ -785,6 +786,33 @@ pub(crate) struct BoxSelection {
     pub(crate) origin: (f32, f32),
     /// 当前光标（窗口坐标）。
     pub(crate) cursor: (f32, f32),
+}
+
+/// 橡皮筋两端 y → 行区间 `(min, max)`：行带按**顶边**对齐（floor），矩形与
+/// 行带不相交（全在最后一行之下 / 第一行之上）时返回 `None`。
+///
+/// 抽成纯函数是为了能单测：这半行错位曾经让「列表空白处单击一下」选中
+/// 最后一行（round 把行带错开 + clamp 把界外硬折到边界，双坑叠加）。
+fn box_row_range(
+    y1: f32,
+    y2: f32,
+    list_top: f32,
+    scroll_y: f32,
+    count: usize,
+) -> Option<(usize, usize)> {
+    const ROW_H: f32 = 24.0;
+    const PAD: f32 = 12.0;
+    let at = |y: f32| -> isize { ((y - list_top - PAD + scroll_y) / ROW_H).floor() as isize };
+    let a = at(y1);
+    let b = at(y2);
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    if hi < 0 || lo >= count as isize {
+        return None;
+    }
+    Some((
+        lo.max(0) as usize,
+        hi.min(count as isize - 1).max(0) as usize,
+    ))
 }
 
 /// 「新建」的种类（两种新建流程一致，只有名字与调用的 app 方法不同）。
@@ -4344,9 +4372,39 @@ impl RootView {
         self.header_cells_owner = (pane, tab);
     }
 
-    /// prepaint 回写列表内容区左上角（窗口坐标），供框选把鼠标 y 折算成行下标。
-    pub(crate) fn set_list_origin(&mut self, pane: usize, tab: usize, x: f32, y: f32) {
-        self.list_origin.insert((pane, tab), (x, y));
+    /// prepaint 回写列表内容区 bounds（窗口坐标），供框选折算行下标与
+    /// 「斑马纹铺满一屏」算行数。值变化时返回 `true`（调用方借此 notify，
+    /// 让下一帧用上新高度；高度不变时通知会造成每帧重绘）。
+    pub(crate) fn set_list_origin(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        x: f32,
+        y: f32,
+        h: f32,
+    ) -> bool {
+        let changed = self.list_origin.get(&(pane, tab)) != Some(&(x, y, h));
+        if changed {
+            self.list_origin.insert((pane, tab), (x, y, h));
+        }
+        changed
+    }
+
+    /// 列表视图的斑马纹要**铺满一屏**：条目不足一屏时，把 `uniform_list` 的
+    /// 行数补到「内容区装得下的行数」，多出来的行走占位斑马纹（file_list 渲染端
+    /// 的 `mo-file-ph-*` 分支，数据行未就绪时画的同一种空行）。
+    ///
+    /// 行数取 `floor((h - 2*PAD) / ROW_H)` 保证内容高度不超出视口——超出会出现
+    /// 一条能滚进空白区的假滚动量。高度来自上一帧 prepaint；首帧拿不到就先按
+    /// `count` 渲染，下一帧自然补齐。
+    pub(crate) fn list_fill_rows(&self, pane: usize, tab: usize, count: usize) -> usize {
+        const ROW_H: f32 = 24.0;
+        const PAD: f32 = 12.0;
+        let Some(&(_x, _y, h)) = self.list_origin.get(&(pane, tab)) else {
+            return count;
+        };
+        let fit = (((h - 2.0 * PAD) / ROW_H).floor().max(0.0)) as usize;
+        count.max(fit)
     }
 
     // ------------------------------------------------------------ 框选（列表视图）
@@ -4371,13 +4429,16 @@ impl RootView {
             let scroll_y = f32::from(panel.scroll.0.borrow().base_handle.offset().y);
             (count, scroll_y)
         };
-        let Some(&(_lx, ly)) = self.list_origin.get(&(pane, tab)) else {
+        let Some(&(_lx, ly, _lh)) = self.list_origin.get(&(pane, tab)) else {
             return;
         };
         const ROW_H: f32 = 24.0;
         const PAD: f32 = 12.0;
         let rel = y - ly - PAD + scroll_y;
-        let idx = (rel / ROW_H).round() as isize;
+        // 行带按**顶边**对齐（floor）：行 i 占 [i*24, (i+1)*24)。原先用 round，
+        // 行带整体错开半行——最后一行的下半截被折到行数之外（按下去当空白起橡皮筋）、
+        // 列表下方 12px 内反被折成最后一行（点空白选中了它），两个都是用户可感的怪。
+        let idx = (rel / ROW_H).floor() as isize;
         // 落在已存在行带内 = 点到某个条目，走单选 / 拖拽，不在这里框选。
         if idx >= 0 && idx < count as isize {
             return;
@@ -4400,24 +4461,19 @@ impl RootView {
     /// 把当前框选矩形折算成可见行下标区间 `(pane, tab, extend, min, max)`。
     ///
     /// 几何：行 `i` 顶边在窗口坐标 = `list_origin.y + PAD + i*ROW_H - scroll_y`，
-    /// 反解 y 得下标。`min/max` 已钳到 `[0, count-1]`。拿不到列表几何时返回 `None`。
+    /// 反解 y 得下标（行带按顶边对齐，floor，见 `start_box_selection_if_empty`）。
+    /// 矩形与行带**不相交**（整段在最后一行之下 / 第一行之上）时返回 `None`——
+    /// 不能钳到边界，否则在空白处单击一下就变成「选中最后一行」。
+    /// 拿不到列表几何时同样返回 `None`。
     fn box_selection_range(&self) -> Option<(usize, usize, bool, usize, usize)> {
         let box_sel = self.box_selection.as_ref()?;
         let (pane, tab) = (box_sel.pane, box_sel.tab);
-        let (_lx, ly) = *self.list_origin.get(&(pane, tab))?;
+        let (_lx, ly, _lh) = *self.list_origin.get(&(pane, tab))?;
         let panel = self.panel_at(pane, tab)?;
         let count = panel.list_count;
         let scroll_y = f32::from(panel.scroll.0.borrow().base_handle.offset().y);
-        const ROW_H: f32 = 24.0;
-        const PAD: f32 = 12.0;
-        let at = |y: f32| -> isize {
-            let rel = y - ly - PAD + scroll_y;
-            (rel / ROW_H).round() as isize
-        };
-        let a = at(box_sel.origin.1).clamp(0, count as isize - 1);
-        let b = at(box_sel.cursor.1).clamp(0, count as isize - 1);
-        let (min, max) = if a <= b { (a, b) } else { (b, a) };
-        Some((pane, tab, box_sel.extend, min as usize, max as usize))
+        let (min, max) = box_row_range(box_sel.origin.1, box_sel.cursor.1, ly, scroll_y, count)?;
+        Some((pane, tab, box_sel.extend, min, max))
     }
 
     /// 框选拖动中：实时更新橡皮筋 + 本地选择（抬起时再回灌 app）。
@@ -4464,12 +4520,29 @@ impl RootView {
     }
 
     /// 框选抬起：回灌 app 侧选择（清旧 + 选区间），并收掉橡皮筋。
+    ///
+    /// 橡皮筋没碰到任何行 = 在空白处**单击**：只清选择、什么都不选——
+    /// 曾经这里把界外下标钳到最后一行，「点空白」变成了「选最后一条」。
     pub(crate) fn finish_box_selection(&mut self, cx: &mut Context<Self>) {
-        let Some((_pane, _tab, extend, min, max)) = self.box_selection_range() else {
-            self.box_selection = None;
+        if self.box_selection.is_none() {
+            // 根级的左键抬起都在这里过一遍；没在框选就什么都不做。
+            return;
+        }
+        let range = self.box_selection_range();
+        let extend = self.box_selection.as_ref().is_some_and(|b| b.extend);
+        self.box_selection = None;
+        let Some((_pane, _tab, _extend, min, max)) = range else {
+            let app = self.app();
+            let this = cx.entity().clone();
+            cx.spawn(async move |_weak, cx| {
+                app.clear_selection().await;
+                // app 侧选择是唯一事实来源：清完回灌 UI 高亮。
+                pull_selection(&app, &this, cx).await;
+            })
+            .detach();
+            cx.notify();
             return;
         };
-        self.box_selection = None;
         let app = self.app();
         let this = cx.entity().clone();
         cx.spawn(async move |_weak, cx| {
@@ -5796,7 +5869,6 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             .flex_1()
             // 测试用（release no-op）：tests/layout.rs 断言中央区位置与尺寸。
             .debug_selector(|| "mo-center".to_string())
-            .child(opening_bar(panel.opening.as_deref()))
             .child(filter_bar(&panel.query, pane_idx))
             .child(match panel.view_mode {
                 ViewMode::List => file_list::render(
@@ -5812,6 +5884,8 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         dragging: view.dragging_column(),
                         resizing: view.resizing_divider(),
                         zebra: view.ui.zebra,
+                        // 斑马纹铺满一屏：条目不足时补到视口装得下的行数。
+                        fill_to: view.list_fill_rows(pane_idx, tab_idx, panel.list_count),
                     },
                 )
                 .into_any_element(),
@@ -7273,39 +7347,6 @@ async fn open_focused(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp
     }
 }
 
-/// 中央区顶部的「正在读取 …」提示条。
-///
-/// 读一个大目录要 100–300ms，这段时间列表还停在**上一处**的内容上——没有这条提示，
-/// 用户看到的就是「点了没反应」（侧栏高亮则由 [`RootView::render`] 里的 `current`
-/// 立刻跟过去）。读完或读失败都由 `AppEvent::OpeningChanged` 收掉。
-fn opening_bar(path: Option<&std::path::Path>) -> Div {
-    let Some(path) = path else {
-        // 空闲时不占高度。
-        return div().h(px(0.0));
-    };
-    let name = crate::path_label::last_segment(path);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(22.0))
-        .px(px(8.0))
-        .bg(theme::hover_bg())
-        .border_b_1()
-        .border_color(theme::separator())
-        .child(crate::icons::icon(
-            crate::icons::ROTATE_CW,
-            12.0,
-            theme::muted(),
-        ))
-        .child(
-            div()
-                .text_color(theme::muted())
-                .child(text!(id = "opening-hint", format!("正在读取 {name}…"))),
-        )
-}
-
 /// 过滤条：显示当前关键词与提示。
 ///
 /// `pane` 用于生成唯一元素 ID：分栏时每个窗格各渲染一份本条，
@@ -8284,8 +8325,35 @@ mod tests {
     use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
-    use super::{filtered_apps, ConnectAuthState, Modal, RootView};
+    use super::{box_row_range, filtered_apps, ConnectAuthState, Modal, RootView};
     use crate::panel::Panel;
+
+    /// 橡皮筋 y → 行区间的折算：行带按顶边对齐（floor），与渲染出的行一一对应。
+    ///
+    /// 这组测试守的是「空白处单击选中最后一行」的根因：旧实现 round + clamp 双
+    /// 叠加，最后一行的下半截折到行外、列表下方 12px 折成最后一行、界外硬钳边界。
+    #[test]
+    fn box_row_range_aligns_to_row_tops_and_never_clamps_out_of_band() {
+        let top = 100.0;
+        // 3 行：行带 = [112,136) [136,160) [160,184)（含 12px 顶部留白）。
+        // 行内点击命中本行（上半截、下半截都要中——round 版下半截会脱靶）。
+        assert_eq!(box_row_range(120.0, 120.0, top, 0.0, 3), Some((0, 0)));
+        assert_eq!(box_row_range(133.0, 133.0, top, 0.0, 3), Some((0, 0)));
+        assert_eq!(box_row_range(170.0, 170.0, top, 0.0, 3), Some((2, 2)));
+        // 空白：首行上方与末行下方都**不命中任何行**，也不许钳到边界。
+        assert_eq!(box_row_range(105.0, 105.0, top, 0.0, 3), None);
+        assert_eq!(box_row_range(190.0, 190.0, top, 0.0, 3), None);
+        // 拖拽跨界：从末行拖进下方空白 = 与行带求交，止于最后一行（Finder 同款）。
+        assert_eq!(box_row_range(170.0, 300.0, top, 0.0, 3), Some((2, 2)));
+        // 拖拽从空白起、扫过全部行 = 全选。
+        assert_eq!(box_row_range(90.0, 300.0, top, 0.0, 3), Some((0, 2)));
+        // 完全在行带之下拖出的框（起止都在界外）= 什么也不选。
+        assert_eq!(box_row_range(200.0, 300.0, top, 0.0, 3), None);
+        // 滚动参与折算：滚过一行后，同样的窗口 y 命中的行号 +1。
+        assert_eq!(box_row_range(120.0, 120.0, top, 24.0, 3), Some((1, 1)));
+        // 空目录：任何位置都取不到行。
+        assert_eq!(box_row_range(120.0, 120.0, top, 0.0, 0), None);
+    }
 
     /// 「选择其他应用…」的过滤：应用名大小写不敏感命中，空查询全给。
     ///

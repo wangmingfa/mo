@@ -254,8 +254,11 @@ unsafe fn error_text(err: *mut Object) -> Option<String> {
 
 fn nsstring(s: &str) -> Option<*mut Object> {
     let cls = Class::get("NSString")?; // NSString 属于 Foundation，拿不到就是没链接上。
-    let obj: *mut Object =
-        unsafe { msg_send![cls, stringWithUTF8String: s.as_ptr() as *const std::os::raw::c_char] };
+                                       // ⚠️ 必须 CString：`&str` 不保证 NUL 结尾，直接 `as_ptr()` 传给
+                                       // `stringWithUTF8String:` 会读到越界——堆上的 String 后面凑巧是 0 才侥幸能用，
+                                       // 字面量（如 "NSFolder"）后面是别的数据，拼出乱码名，`imageNamed:` 就 nil。
+    let c = std::ffi::CString::new(s).ok()?;
+    let obj: *mut Object = unsafe { msg_send![cls, stringWithUTF8String: c.as_ptr()] };
     if obj.is_null() {
         None
     } else {
@@ -485,61 +488,94 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
         if image.is_null() {
             return None;
         }
-        // 至少 1px：0 会让 `CGBitmapContextCreate` 拿到 0 长度缓冲。
-        let side = px.max(1) as f64;
-        let px = side as usize;
-        let src = NSRect {
-            origin: NSPoint { x: 0.0, y: 0.0 },
-            size: NSSize {
-                width: side,
-                height: side,
-            },
+        draw_ns_image_to_raster(image, px)
+    })
+}
+
+/// 取**通用文件夹**的系统图标（`NSImage imageNamed: NSFolder`），契约同
+/// [`file_icon_raster`]：主线程做、只交像素、编码归调用方。
+///
+/// 走 AppKit **资产目录**而不是 `iconForFile:`：不碰任何文件路径，也就不吃 macOS
+/// 图标服务的抖动（同一路径连问两次可能一次给图、下一次瞬间 nil）。上层拿它当
+/// 「目录行在真图标就位前的占位图」，让目录永远不落到内置描边 SVG 上。
+pub fn folder_icon_raster(px: u32) -> Option<IconRaster> {
+    on_main_thread(move || unsafe {
+        // `NSImageNameFolder` 的字符串值就是 "NSFolder"。分步取，别把 `?` 内联进
+        // `msg_send!` 的参数里（宏展开后 `?` 的归属不如展开前直观，容易踩坑）。
+        let Some(cls) = Class::get("NSImage") else {
+            eprintln!("dbg: no NSImage class");
+            return None;
         };
-        // 从 NSImage 拿一张 CGImage——AppKit 到此为止，后面全是纯 CoreGraphics。
-        //
-        // 为什么不再走「新建 40pt 的 NSImage → lockFocus → drawInRect → TIFF →
-        // NSBitmapImageRep」：那条路在 Retina 上会按 2x 出图（40pt = 80px），而且
-        // `imageRepWithData:` 解出来的是 **16 位/通道**的位图（实测 bps=16、bpr=640），
-        // 按 8 位读就是错位数据。CG 这边可以直接缩放到我们的像素尺寸、位深由我们指定。
-        let cg: *mut std::ffi::c_void = msg_send![
-            image,
-            CGImageForProposedRect: &src as *const NSRect as *mut NSRect
-            context: std::ptr::null_mut::<Object>()
-            hints: std::ptr::null_mut::<Object>()
-        ];
-        if cg.is_null() {
+        let Some(name) = nsstring("NSFolder") else {
+            eprintln!("dbg: no nsstring");
+            return None;
+        };
+        let image: *mut Object = msg_send![cls, imageNamed: name];
+        if image.is_null() {
             return None;
         }
+        draw_ns_image_to_raster(image, px)
+    })
+}
 
-        let space = CGColorSpaceCreateDeviceRGB();
-        if space.is_null() {
-            return None;
-        }
-        // 8 位/通道、RGBA、**alpha 预乘**（AppKit / CG 的位图约定，上层编码前还原）。
-        let mut rgba = vec![0u8; px * px * 4];
-        let ctx = CGBitmapContextCreate(
-            rgba.as_mut_ptr(),
-            px,
-            px,
-            8,
-            px * 4,
-            space,
-            K_CG_ALPHA_PREMULTIPLIED_LAST | K_CG_BYTE_ORDER_32_BIG,
-        );
-        CGColorSpaceRelease(space);
-        if ctx.is_null() {
-            return None;
-        }
-        // 从 512px 缩到 40–128px 是 4–12 倍下采样，插值质量不设高档会明显发糊。
-        CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_HIGH);
-        CGContextDrawImage(ctx, src, cg);
-        CGContextRelease(ctx);
+/// 把一张 `NSImage` 重绘到 `px` 见方后交出 RGBA 像素（AppKit 之下的纯 CoreGraphics 段，
+/// [`file_icon_raster`] / [`folder_icon_raster`] 共用）。
+///
+/// * 至少 1px：0 会让 `CGBitmapContextCreate` 拿到 0 长度缓冲。
+/// * `CGImageForProposedRect:` 给的是**原始尺寸**的位图（512×512 起），要真画一张
+///   小的而不是 `setSize:`（那只改逻辑尺寸）。也不走「lockFocus → TIFF →
+///   NSBitmapImageRep」：那条路在 Retina 上按 2x 出图且解出来是 16 位/通道，按 8 位
+///   读就错位。CG 这边可以直接缩放到位、位深由我们指定。
+///
+/// ⚠️ 必须在主线程调（入参是 AppKit 对象；调用方负责已经 `on_main_thread`）。
+unsafe fn draw_ns_image_to_raster(image: *mut Object, px: u32) -> Option<IconRaster> {
+    let side = px.max(1) as f64;
+    let px = side as usize;
+    let src = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: NSSize {
+            width: side,
+            height: side,
+        },
+    };
+    let cg: *mut std::ffi::c_void = msg_send![
+        image,
+        CGImageForProposedRect: &src as *const NSRect as *mut NSRect
+        context: std::ptr::null_mut::<Object>()
+        hints: std::ptr::null_mut::<Object>()
+    ];
+    if cg.is_null() {
+        return None;
+    }
 
-        Some(IconRaster {
-            width: px as u32,
-            height: px as u32,
-            rgba,
-        })
+    let space = CGColorSpaceCreateDeviceRGB();
+    if space.is_null() {
+        return None;
+    }
+    // 8 位/通道、RGBA、**alpha 预乘**（AppKit / CG 的位图约定，上层编码前还原）。
+    let mut rgba = vec![0u8; px * px * 4];
+    let ctx = CGBitmapContextCreate(
+        rgba.as_mut_ptr(),
+        px,
+        px,
+        8,
+        px * 4,
+        space,
+        K_CG_ALPHA_PREMULTIPLIED_LAST | K_CG_BYTE_ORDER_32_BIG,
+    );
+    CGColorSpaceRelease(space);
+    if ctx.is_null() {
+        return None;
+    }
+    // 从 512px 缩到 40–128px 是 4–12 倍下采样，插值质量不设高档会明显发糊。
+    CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_HIGH);
+    CGContextDrawImage(ctx, src, cg);
+    CGContextRelease(ctx);
+
+    Some(IconRaster {
+        width: px as u32,
+        height: px as u32,
+        rgba,
     })
 }
 

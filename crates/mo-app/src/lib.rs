@@ -936,12 +936,40 @@ impl AppState {
 
         let first_screen = dir.visible_count().min(FIRST_SCREEN_ROWS);
 
+        // 预取整个目录的 40px 档图标（视图序，16pt 列表槽位 → 小档）：滚到哪一行，
+        // 图标都已经躺在缓存里，显示即最终图标——消掉「滚动时图标跳变」。纯内存
+        // 入队、零 IO；泵按时间配额慢慢消化，主线程每拍只占 `ICON_BUDGET_MS`，
+        // 不会卡顿。远程条目本机没有这些文件，问了也白问，跳过。
+        let prefetch_items: Vec<(PathBuf, bool)> = if self.browsing_remote() {
+            Vec::new()
+        } else {
+            dir.view
+                .visible_indices()
+                .iter()
+                .map(|&i| {
+                    let e = &dir.entries[i];
+                    (e.path.clone(), e.kind.is_dir())
+                })
+                .collect()
+        };
+
         {
             let mut inner = self.inner.write().await;
             let mut sel = inner.selection.clone();
             sel.clear();
             inner.directory = Some(dir);
             inner.selection = sel;
+        }
+
+        // 切目录：上一目录还没消化完的预取作废（那些行多半看不到了，留着只会把
+        // 新目录的预取往后推），然后整目录入队。
+        if !prefetch_items.is_empty() {
+            const PREFETCH_SLOT_PT: f32 = 16.0; // 列表 / 列视图行的小图标槽位。
+            let mut cache = self.icon_cache.lock().unwrap();
+            cache.clear_prefetch();
+            for (path, is_dir) in &prefetch_items {
+                cache.request_prefetch(path, *is_dir, PREFETCH_SLOT_PT);
+            }
         }
 
         // 记下这条会话待过的地方：切回本地再回来时回到同一层（见 `use_session`）。
@@ -1379,6 +1407,15 @@ impl AppState {
         if hit.is_none() {
             // 记账而已，不在这里做任何 IO：泵会把它攒进批里。
             cache.request(path, is_dir, slot_pt);
+            // 目录在真图标就位前先给**通用文件夹占位图**（系统资产目录里的蓝文件夹，
+            // 泵启动时就备好）：普通目录的真图标与它一模一样，特殊目录（桌面/下载等）
+            // 稍后被真图标替换。没有这一步，目录行会先露出内置描边 SVG、再「跳」成
+            // 系统图标——图标服务抖动 + 重试冷却的几秒里观感就是「图标坏了」。
+            if is_dir {
+                if let Some(fb) = cache.folder_fallback(icon::icon_px_for_slot(slot_pt)) {
+                    return Some(fb);
+                }
+            }
         }
         hit
     }
@@ -1409,7 +1446,7 @@ impl AppState {
                 if !mo_platform::appkit_usable() {
                     continue;
                 }
-                if app.icon_cache.lock().unwrap().is_empty() {
+                if app.icon_cache.lock().unwrap().is_idle() {
                     continue;
                 }
                 let task = app.clone();
@@ -1430,6 +1467,32 @@ impl AppState {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
+        // 先把**通用文件夹占位图**备齐（哪个档位缺就取哪个）：目录行在真图标就位前
+        // 全靠它顶住，不露内置描边。走系统资产目录（`NSFolder`），不碰文件路径，
+        // 不吃图标服务的抖动；万一这拍没取到，下一拍再试（有尝试上限）。
+        //
+        // ⚠️ 值必须先绑出来再 `if let`：2021 edition 下 `if let Some(px) =
+        // self.icon_cache.lock()…` 的 MutexGuard 临时**活到整个 if-let 结束**，
+        // 体里 1448 行再锁同一把 Mutex = 泵线程持锁自死锁，主线程渲染查表跟着
+        // 全部卡死（启动转彩球就是这么来的）。
+        let pending_fallback = self.icon_cache.lock().unwrap().pending_folder_fallback();
+        if let Some(px) = pending_fallback {
+            let fetched = mo_platform::folder_icon_raster(px)
+                .and_then(|mut raster| icon::encode_icon_png(&mut raster).map(|bytes| (px, bytes)));
+            let mut cache = self.icon_cache.lock().unwrap();
+            match fetched {
+                Some((px, bytes)) => {
+                    let out = dir.join(format!("folder-fallback-{px}.png"));
+                    if std::fs::write(&out, &bytes).is_ok() {
+                        cache.set_folder_fallback(px, out);
+                        self.dirty.store(true, Ordering::Relaxed);
+                    } else {
+                        cache.note_folder_fallback_failure(px);
+                    }
+                }
+                None => cache.note_folder_fallback_failure(px),
+            }
+        }
         let budget = Duration::from_millis(ICON_BUDGET_MS);
         let mut got_any = false;
         // 配额**只累加主线程花掉的那段**：一条条取、取出来就做，花满就停手，剩下的
@@ -1441,7 +1504,12 @@ impl AppState {
             if self.stopped() {
                 break;
             }
-            let Some((path, key)) = self.icon_cache.lock().unwrap().pop_next() else {
+            let Some((path, key)) = self
+                .icon_cache
+                .lock()
+                .unwrap()
+                .pop_next(std::time::Instant::now())
+            else {
                 break;
             };
             // 第一段（主线程）：问系统 + 重绘到这一档要的尺寸 + 拷像素。
@@ -1451,18 +1519,29 @@ impl AppState {
             let raster = mo_platform::file_icon_raster(&path, key.px());
             main_thread_spent += started.elapsed();
             // 第二段（后台）：预乘还原 + PNG 编码——占整段 70%，挪出主线程就是这一刀。
+            let mut ok = false;
             if let Some(mut raster) = raster {
                 if let Some(bytes) = icon::encode_icon_png(&mut raster) {
                     // 文件名按**键**算：同类型共享同一份 PNG，不必一个文件写一份。
                     let out = dir.join(format!("{:x}.png", icon_file_hash(&key)));
-                    if std::fs::write(&out, &bytes).is_ok() {
+                    ok = std::fs::write(&out, &bytes).is_ok();
+                    if ok {
                         self.icon_cache.lock().unwrap().insert(&path, &key, out);
-                        got_any = true;
                     }
                 }
             }
-            // 问不到的（文件没了 / 系统就是不给）不再重试：`asked` 里已经记着，
-            // 那一行就一直用内置 SVG。
+            if ok {
+                got_any = true;
+            } else {
+                // 系统这会儿没给图：macOS 图标服务偶发抖动（同一目录同进程连问两次，
+                // 一次给图、下一次瞬间 nil）。失败冷却 1s 后重新排队，重试几次一般
+                // 就成了；次数用尽（多半文件真没了）才认命，那一行停在内置 SVG。
+                self.icon_cache.lock().unwrap().note_failure(
+                    &path,
+                    &key,
+                    std::time::Instant::now(),
+                );
+            }
             if main_thread_spent >= budget {
                 break;
             }

@@ -87,6 +87,43 @@ pub fn inject_trash_for_tests(view: &mut RootView, entries: Vec<mo_operations::T
     view.trash_entries = entries;
 }
 
+/// 测试专用：驱动当前标签页真实导航到 `dir`。
+///
+/// headless 里自己铺窗口快照撑不住——Home 目录的元数据回填等后台事件随时会
+/// 触发 `sync_panel`，把注入的假行当「旧目录窗口」作废清掉。干脆走真链路：
+/// `DirectoryController::open` 发事件 → 标签页的订阅循环自动 sync + 补窗，
+/// 测试侧轮询行出现即可（`allow_parking` 下外部 IO 完成会唤醒测试执行器）。
+#[doc(hidden)]
+pub fn navigate_for_tests(
+    view: &mut RootView,
+    dir: std::path::PathBuf,
+    cx: &mut gpui_kit::Context<RootView>,
+) {
+    let Some(p) = view.panel_at_mut(0, 0) else {
+        return;
+    };
+    let app = p.app.clone();
+    cx.spawn(async move |_this, _cx| {
+        let _ = mo_app::DirectoryController::new(app).open(&dir).await;
+    })
+    .detach();
+}
+
+/// 测试专用：读当前标签页的本地选中数（空白点击语义断言用）。
+#[doc(hidden)]
+pub fn panel_selection_count_for_tests(view: &RootView) -> usize {
+    view.panel_at(0, 0)
+        .map(|p| p.selection.count())
+        .unwrap_or(0)
+}
+
+/// 测试专用：当前标签页的窗口快照是否已同步到 `rows` 行（导航等待用）。
+#[doc(hidden)]
+pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {
+    view.panel_at(0, 0)
+        .is_some_and(|p| p.list_count == rows && p.window.len() == rows)
+}
+
 /// 启动 Mo 图形界面。
 pub fn run() {
     init_tracing();

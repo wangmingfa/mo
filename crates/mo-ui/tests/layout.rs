@@ -519,3 +519,127 @@ fn clicking_a_sidebar_location_leaves_the_trash_panel(cx: &mut TestAppContext) {
         "离开回收站后文件列表没有回来"
     );
 }
+
+// ── 空白点击语义与斑马纹铺满一屏（用户报：点空白选中了最后一条；下方空白没有斑马纹）──
+
+use gpui_kit::point;
+use std::path::PathBuf;
+
+/// 造一个只装 `n` 个 txt 的临时目录（真导航，别注入假行——后台元数据事件会把
+/// 注入的窗口快照作废清掉，测试随机红）。
+fn dir_with_files(tag: &str, n: usize) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("mo-layout-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    for i in 0..n {
+        std::fs::write(base.join(format!("file-{i}.txt")), b"x").unwrap();
+    }
+    base
+}
+
+/// 读当前标签页的本地选中数。
+fn selection_count(window: &WindowHandle<RootView>, cx: &mut TestAppContext) -> usize {
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::panel_selection_count_for_tests(root)
+        })
+        .expect("读选中数失败")
+}
+
+/// 真实导航到 `dir`，轮询到第 `want_rows` 行真的画出来（含外部 IO 完成唤醒）。
+fn navigate_and_wait(
+    vcx: &mut VisualTestContext,
+    window: &WindowHandle<RootView>,
+    cx: &mut TestAppContext,
+    dir: PathBuf,
+    want_rows: usize,
+) {
+    window
+        .update(cx, |root, _window, cx| {
+            mo_ui::navigate_for_tests(root, dir, cx);
+        })
+        .expect("导航失败");
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        let ready = window
+            .update(cx, |root, _window, _cx| {
+                mo_ui::panel_window_ready_for_tests(root, want_rows)
+            })
+            .unwrap_or(false);
+        if ready {
+            return;
+        }
+    }
+    panic!("导航后 {} 行没画出来", want_rows);
+}
+
+/// 在列表空白处（最后一行之下）单击，应该**清空选择**，而不是选中最后一行。
+///
+/// 用户报的原状：点一下列表下方空白，最后一行被选中了。根因是橡皮筋几何
+/// round + clamp 双叠加——界外的 y 被硬折到最后一行，抬起时回灌成单选。
+#[gpui_kit::test]
+fn clicking_blank_below_the_list_clears_the_selection(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let dir = dir_with_files("blank-click", 3);
+    navigate_and_wait(&mut vcx, &window, cx, dir.clone(), 3);
+
+    let list = bounds(&mut vcx, "mo-file-list");
+    let row0 = bounds(&mut vcx, "mo-file-row-0");
+    // 先点第一行（坐标级点击，走真实鼠标事件），确认行点击仍然有效。
+    let p_row = point(
+        row0.origin.x + row0.size.width / 2.0,
+        row0.origin.y + row0.size.height / 2.0,
+    );
+    vcx.update(|window, cx| window.drag(p_row, p_row, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        selection_count(&window, cx),
+        1,
+        "点第一行应选中它（floor 行映射不能把行内点击弄丢）"
+    );
+
+    // 再点最后一行之下的空白：选择应清空，而不是选中最后一行。
+    let p_blank = point(
+        list.origin.x + px(200.0),
+        list.origin.y + list.size.height - px(10.0),
+    );
+    vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        selection_count(&window, cx),
+        0,
+        "点空白应清空选择，不是选中最后一行"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 条目不足一屏时，斑马纹要一直铺到视口底部（下方空白也是斑马行）。
+///
+/// 靠「把 uniform_list 的行数补到视口装得下的行数」实现，补出来的行没有
+/// 数据、走占位斑马纹分支（`mo-file-ph-*`，与窗口未就绪的占位是同一种行）。
+#[gpui_kit::test]
+fn zebra_stripes_fill_the_viewport_below_the_last_row(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let dir = dir_with_files("zebra-fill", 3);
+    navigate_and_wait(&mut vcx, &window, cx, dir.clone(), 3);
+    // 第一帧 prepaint 记下列表高度并 notify；这一帧补足行才画出来。
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    // 真实行只有 3 条，行 10 一定是补足行；它必须在视口内、行高 24px。
+    let ph = vcx
+        .debug_bounds("mo-file-ph-10")
+        .expect("条目不足一屏时斑马纹应铺满视口：ph-10 没画出来");
+    let list = bounds(&mut vcx, "mo-file-list");
+    assert_eq!(f32::from(ph.size.height), 24.0, "补足行高必须与数据行一致");
+    assert!(
+        f32::from(ph.origin.y) >= f32::from(bounds(&mut vcx, "mo-file-row-2").origin.y),
+        "补足行应在真实行之下"
+    );
+    assert!(
+        f32::from(ph.origin.y) + f32::from(ph.size.height)
+            <= f32::from(list.origin.y) + f32::from(list.size.height) + 0.5,
+        "补足行溢出了列表视口（会出现能滚进空白区的假滚动量）：ph={ph:?} list={list:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

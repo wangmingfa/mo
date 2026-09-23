@@ -718,3 +718,50 @@ SpringAnimation::new(SLIDE_SPRING)          // SpringConfig::new(700.0, 40.0, 1.
   而不是「按钮在不在」——地址栏是 `flex_1`，刷新挪错边时按钮自己的宽高一点没变，
   只有「谁在谁左边」抓得住。为此给 `icon_button` 挂了 `mo-icon-<id>` 探针。
   反向验证：挪回地址栏右边 → 变红（refresh 844px / address 起 104px）。
+
+## 34. 中央区「正在读取 …」提示条整体删除：它就是文件列表抖动的来源（2026-09-23）
+
+用户截图指名去掉列表上方的「正在读取 Downloads…」一条——它开合时占 22px / 0px，
+把下面的列头 + 列表整体顶下又弹回，读一个目录抖一次。
+
+`opening_bar()` 连同调用点整体删除。**注意 `panel.opening` 状态要保留**：侧栏
+「正在读取时先高亮目标」的逻辑（render 里 `panel.opening` 的两处分支）还依赖它，
+删状态会把「点了没反应」问题放大成「点了侧栏高亮也不动」。反馈链路
+`AppEvent::OpeningChanged` 照旧，只是不再有 UI 消费它画条。
+
+过时注释同步清理（panel.rs 的 `opening` 字段 doc、path_label.rs 的模块头——
+后者原本拿「中央区提示条」当三处使用方之一举例）。
+
+## 35. 空白点击不选最后一行 + 斑马纹铺满一屏（2026-09-23）
+
+用户两条：①点列表空白处会选中最后一行；②条目不足一屏时下方空白是白板，
+斑马纹应该铺满视口。
+
+**① 根因是几何双坑叠加**：橡皮筋把鼠标 y 折算成行下标用 `round`——行带整体
+错开半行（行 i 的 round 带是 `(i±0.5)*24`，而渲染的行顶边在 `i*24`），最后一行
+的下半截被折到行数之外、列表下方 12px 反被折成最后一行；再把界外 `clamp` 到
+`count-1`，于是「点空白」=「选最后一行」。修复：
+
+- 行带改**顶边对齐（floor）**：行 i 占 `[i*24, (i+1)*24)`，与渲染逐像素对应
+  （`start_box_selection_if_empty` 与 `box_selection_range` 两处同步改）；
+- 矩形与行带**不相交**（整段在末行之下 / 首行之上）返回 `None`，绝不钳边界；
+  拖拽跨界时才求交（拖到末行之下止于末行，Finder 同款）；
+- `finish_box_selection` 区分「没在框选」（全局左键抬起都路过，no-op）与
+  「框选没碰到行」（空白单击）：后者清空 app 侧选择 + 回灌，不再选行。
+
+几何抽成纯函数 `box_row_range`（app.rs `#[cfg(test)]` 十条断言：行内上下半截、
+上下空白、跨界拖拽、滚动偏移、空目录）。
+
+**② 实现**：`ListChrome` 加 `fill_to`（= max(真实行数, floor((视口高-2*PAD)/24))），
+`uniform_list` 的 item_count 用它；下标 ≥ 真实行数的行走**已有的占位斑马纹分支**
+（`mo-file-ph-*`，与窗口未就绪占位同一种行——底色规则逐字一致，不会跳）。
+行数取 floor 保证内容高度不超视口（不会多出一条能滚进空白的假滚动量）。
+视口高度靠 `on_prepaint` 回写（`list_origin` 扩成 (x, y, h)，值变化才 notify，
+不会重绘循环）；首帧拿不到就按真实行数渲染，下一帧补齐。
+
+**测试坑**：headless 里往 panel 注入假行撑不住——Home 目录的元数据回填事件
+随时触发 sync_panel，把「ui_path ≠ app 路径」的窗口快照当旧目录作废清掉，
+行点击随机失效。改走**真链路**：临时目录 + `navigate_for_tests`（面板自己的
+AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补窗），
+测试轮询 `panel_window_ready_for_tests`。坐标级点击用 `window.drag(p, p, cx)`
+（from==to 即单击；rows 没有 `.test_support()`，`click(id)` 点不了）。

@@ -271,6 +271,10 @@ pub struct ListChrome<'a> {
     pub resizing: Option<ColId>,
     /// 斑马纹开关（配置 `ui.zebra`）。
     pub zebra: bool,
+    /// 斑马纹要铺到的**总行数**（≥ `count`）：条目不足一屏时，调用方把行数补到
+    /// 视口装得下的行数，多出来的行没有数据——渲染闭包里 `window.get` 取不到
+    /// 自然走占位斑马纹分支（`mo-file-ph-*`），与「窗口未就绪」的占位是同一种行。
+    pub fill_to: usize,
 }
 
 /// `pane` / `tab` 指明渲染的是哪个标签页：多标签页与分栏共享同一个实现。
@@ -298,7 +302,10 @@ pub fn render(
     let row_cols = chrome.cols.clone();
     // 斑马纹开关：`chrome` 借着列布局，`move` 闭包只能带走标量。
     let zebra = chrome.zebra;
-    let mut list = uniform_list("mo-file-list", count, {
+    // 实际渲染的行数：真实行数与「铺满一屏」补足行数取大。占位分支用 `count`
+    // 判界（下标 ≥ count 的行一定是补足行），窗口补取仍只按真实行数来。
+    let total = chrome.fill_to.max(count);
+    let mut list = uniform_list("mo-file-list", total, {
         // 闭包整体 move 捕获 entity；先 clone 一份给闭包，保留外层 entity 供后续 on_mouse_down / on_prepaint 复用。
         let entity = entity.clone();
         move |range, _window, cx| {
@@ -316,12 +323,17 @@ pub fn render(
             let Some(panel) = view.panel_at(pane, tab) else {
                 return rows;
             };
-            if range.clone().any(|i| {
-                panel
-                    .window
-                    .get(i.wrapping_sub(panel.window_start))
-                    .is_none()
-            }) {
+            // 只对**真实行**判断窗口覆盖；下标 ≥ count 的补足行没有数据可取，
+            // 参与判断会让这条日志每帧都冒出来。
+            let real_end = range.end.min(count);
+            if range.start < real_end
+                && (range.start..real_end).any(|i| {
+                    panel
+                        .window
+                        .get(i.wrapping_sub(panel.window_start))
+                        .is_none()
+                })
+            {
                 tracing::debug!(
                     target: "mo_ui::window",
                     pane, tab, range = ?range, win_start = panel.window_start,
@@ -642,7 +654,14 @@ pub fn render(
                 .min_w_0()
                 .on_prepaint(move |bounds, _window, cx| {
                     let (x, y) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-                    entity_origin.update(cx, |v, _cx| v.set_list_origin(pane, tab, x, y));
+                    let h = f32::from(bounds.size.height);
+                    entity_origin.update(cx, |v, cx| {
+                        // 高度变化才 notify：首帧拿到真实高度后下一帧才能把
+                        // 斑马纹补满一屏；此后每帧相等，不会造成重绘循环。
+                        if v.set_list_origin(pane, tab, x, y, h) {
+                            cx.notify();
+                        }
+                    });
                 })
                 .child(list)
                 .child(Scrollbar::vertical(scroll)),
