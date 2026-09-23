@@ -89,6 +89,11 @@ pub trait Operation: Send + Sync + 'static {
     fn cancel(&self);
     fn pause(&self);
     fn resume(&self);
+    /// 是否支持暂停。只有真正在循环里检查暂停标记的操作（复制 / 移动这类
+    /// 字节级传输）才该暴露「暂停」按钮——单文件快操作按了也没处停，UI 会骗人。
+    fn pausable(&self) -> bool {
+        false
+    }
     /// 在后台任务中执行；实现应周期性检查取消标记。
     fn run(&self) -> Result<(), MoError>;
 }

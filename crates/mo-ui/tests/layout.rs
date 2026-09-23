@@ -329,12 +329,14 @@ fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppCon
 use mo_operations::{OperationHandle, OperationStatus};
 
 /// 造一条假操作快照（真操作要走 OperationManager 的后台执行链路，headless 拉不动）。
+/// `pausable = false`：删除这类快操作；传输类（复制 / 移动）快照才带暂停能力。
 fn fake_op(id: u64, status: OperationStatus, done: u64, total: u64) -> OperationHandle {
     OperationHandle {
         id,
         describe: format!("删除（回收站）/Users/demo/file-{id}"),
         status,
         progress: (done, total),
+        pausable: false,
     }
 }
 

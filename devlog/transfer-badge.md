@@ -80,3 +80,25 @@ Esc 收浮层挂在根 `on_key_down` 的 escape 分支里（与右键菜单同�
 **修复**：`RootView::leave_secondary_view(cx)` 统一出口（modal→None + 重置 palette_index / cmd_query），在 7 个导航入口调用：侧栏 5 处 + 工具栏 `spawn_nav`（签名加 entity）+ `submit_address`。B 类对话框有遮罩挡着点不到侧栏，无条件置 None 安全。
 
 测试坑再录一次：`click()` 认 **ElementId**——复合 id 要传 `("sidebar-loc", 0usize)`（usize！i32 不满足 `From`），而不是 debug_selector 的 `mo-sidebar-loc-0`；且目标必须 `.test_support()` 包过。快捷位置行补了包装。
+
+## 6. 速度 / 剩余时间 / 暂停恢复（2026-09-23 晚）
+
+* **估速在 UI 层差分**，不给操作层埋计时器：`RootView::op_speeds(&ops)` 拿相邻两次
+  快照的 `done` 差分出瞬时速度，EMA 平滑（0.6 旧 + 0.4 新），样本记在
+  `op_stats: HashMap<op_id, OpSample>`。采样间隔 <50ms 不可信（抖动被放大），直接沿用旧值。
+  首次快照无差分 → 速度 0 → UI 只显示百分比。非 Running（暂停/结束）**清样本**——
+  暂停期间不搬字节，把暂停时长摊进速度会把「恢复后的速度」算虚低；恢复后从零重新观测。
+* **暂停是真的能停**：`Operation::pause()` 原本只置标记，`copy_tree` 从不检查——死代码。
+  新增 `fs_util::wait_if_paused(state)`：协作式检查点（进等待把状态标成 `Paused`，
+  恢复标回 `Running`，等待中收到取消返回 true），在 `copy_tree` 每个条目 / 每个文件前调用。
+  轮询 50ms（恢复延迟肉眼无感，不空转 CPU）。只有复制 / 移动是传输循环，单文件快操作
+  （删除 / 回收站）没有可停的检查点。
+* **按钮不能骗人**：trait 加 `pausable()`（默认 false，Copy/Move 覆写 true），
+  `OperationHandle` 快照带 `pausable` 字段，UI 行尾据此给「暂停 / 继续」或「取消」——
+  否则对删除操作按暂停毫无反应。`OperationManager` 加 `pause/resume`，
+  `AppState` 加 `pause_operation/resume_operation`（与 cancel 同形的 async 门面）。
+* 文案：速度 `B/s → TB/s` 换档（≥100 取整、否则一位小数）；剩余 `8s / 1m20s / 2h05m`；
+  速度或剩余估不出就不显示，不给「剩余 0s」这种话。行尾标签语义集中在 `status_tail` +
+  `render_op_row` 的 label 分流（暂停/继续/取消/✕ 四态）。
+* 守卫：mo-operations `wait_if_paused_blocks_until_resume_or_cancel`（真线程阻塞语义）；
+  mo-ui `op_speeds_averages_progress_deltas`（建样本 → 差分出正速度 → 暂停清样本 → 恢复归零）。

@@ -9,6 +9,9 @@ pub struct OperationHandle {
     pub describe: String,
     pub status: OperationStatus,
     pub progress: (u64, u64),
+    /// 该操作是否支持暂停（复制 / 移动这类字节级传输）。UI 据此决定
+    /// 行尾给「暂停 / 继续」还是「取消」——不支持的操作给了暂停按钮也停不下来。
+    pub pausable: bool,
 }
 
 /// 操作管理器：维护操作队列与每个操作的句柄。
@@ -54,6 +57,20 @@ impl OperationManager {
         }
     }
 
+    /// 暂停一个支持暂停的操作（复制 / 移动）。
+    pub fn pause(&self, id: u64) {
+        if let Some(op) = self.handles.get(&id) {
+            op.pause();
+        }
+    }
+
+    /// 恢复一个已暂停的操作。
+    pub fn resume(&self, id: u64) {
+        if let Some(op) = self.handles.get(&id) {
+            op.resume();
+        }
+    }
+
     /// 查询操作状态。
     pub fn status(&self, id: u64) -> Option<OperationStatus> {
         self.handles.get(&id).map(|o| o.status())
@@ -68,6 +85,7 @@ impl OperationManager {
                 describe: o.describe(),
                 status: o.status(),
                 progress: o.progress(),
+                pausable: o.pausable(),
             })
             .collect()
     }

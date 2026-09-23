@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::OpInner;
+use crate::{OpInner, OperationStatus};
 
 /// 取消导致的 IO 错误。
 pub(crate) fn cancelled() -> io::Error {
@@ -81,7 +81,37 @@ pub fn unique_path(to: &Path) -> PathBuf {
     parent.join(format!("{stem} {nanos}{ext}"))
 }
 
-/// 递归复制 `from` → `to`，按字节累计 `total` / `done`，并尊重取消标记。
+/// 阻塞当前线程直到恢复或取消（`copy_tree` 的检查点用）。
+///
+/// 暂停是**协作式**的：`pause()` 只置标记，真正停下来是在传输循环的下个检查点。
+/// 进入等待时把状态标成 [`OperationStatus::Paused`]（进度面板才显示「已暂停」），
+/// 恢复后标回 `Running`。返回 `true` 表示等待期间收到了取消——调用方直接走
+/// 取消分支（终态由 `run()` 收口时判定）。
+pub(crate) fn wait_if_paused(state: &Arc<Mutex<OpInner>>) -> bool {
+    let mut paused_shown = false;
+    loop {
+        {
+            let mut s = state.lock();
+            if s.cancel {
+                return true;
+            }
+            if !s.pause {
+                if paused_shown {
+                    s.status = OperationStatus::Running;
+                }
+                return false;
+            }
+            if !paused_shown {
+                s.status = OperationStatus::Paused;
+                paused_shown = true;
+            }
+        }
+        // 轮询间隔：暂停不是热路径，50ms 的恢复延迟肉眼无感，也不空转烧 CPU。
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 递归复制 `from` → `to`，按字节累计 `total` / `done`，并尊重取消 / 暂停标记。
 pub(crate) fn copy_tree(from: &Path, to: &Path, state: &Arc<Mutex<OpInner>>) -> io::Result<()> {
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
@@ -89,6 +119,9 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, state: &Arc<Mutex<OpInner>>) -> 
             let entry = entry?;
             let p = entry.path();
             let dest = to.join(entry.file_name());
+            if wait_if_paused(state) {
+                return Err(cancelled());
+            }
             copy_tree(&p, &dest, state)?;
             if state.lock().cancel {
                 return Err(cancelled());
@@ -100,7 +133,7 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, state: &Arc<Mutex<OpInner>>) -> 
                 std::fs::create_dir_all(parent)?;
             }
         }
-        if state.lock().cancel {
+        if wait_if_paused(state) {
             return Err(cancelled());
         }
         let data = std::fs::read(from)?;
@@ -140,4 +173,42 @@ pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<()> {
     let state = Arc::new(Mutex::new(OpInner::new()));
     copy_tree(from, to, &state)?;
     remove_path(from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 暂停的语义：阻塞中的检查点把状态标成 Paused；恢复后标回 Running；
+    /// 取消能让等待方立即返回 true（终态 Cancelled 由 run() 收口时判定）。
+    #[test]
+    fn wait_if_paused_blocks_until_resume_or_cancel() {
+        let state = Arc::new(Mutex::new(OpInner::new()));
+        state.lock().status = OperationStatus::Running;
+        state.lock().pause = true;
+
+        let s2 = state.clone();
+        let t = std::thread::spawn(move || wait_if_paused(&s2));
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            state.lock().status,
+            OperationStatus::Paused,
+            "暂停中应标成 Paused"
+        );
+        assert!(!t.is_finished(), "没恢复就不该解除阻塞");
+
+        // 恢复：等待方返回 false，状态标回 Running。
+        state.lock().pause = false;
+        assert!(!t.join().unwrap(), "恢复后应正常放行");
+        assert_eq!(state.lock().status, OperationStatus::Running);
+
+        // 取消：阻塞中的等待方立即返回 true。
+        state.lock().pause = true;
+        let s3 = state.clone();
+        let t2 = std::thread::spawn(move || wait_if_paused(&s3));
+        std::thread::sleep(Duration::from_millis(120));
+        state.lock().cancel = true;
+        assert!(t2.join().unwrap(), "取消应让等待方立即返回");
+    }
 }

@@ -2,6 +2,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_operations::{OperationHandle, OperationStatus};
+use std::collections::HashMap;
 
 use crate::{theme, RootView};
 
@@ -13,11 +14,12 @@ use crate::{theme, RootView};
 /// 不是悬空的浮层，也没有第二份重复内容。点标题 / 点面板外 / Esc 收起。
 ///
 /// 数据来自 `OperationManager::snapshot()`（经 `tab.ops` 快照），由事件总线驱动刷新。
+/// `speeds` 是 UI 层对相邻快照差分出的估速（`RootView::op_speeds`），
+/// 进行中的任务显示「速度 · 剩余时间」，首次观测 / 估不出时不显示。
 /// 面板整体绝对定位，**不占布局**：有没有任务，文件区高度都不变。
-///
-/// `open` 由调用方（`RootView`）传入：渲染函数拿不到 cx，读不了实体状态。
 pub fn render_overlay(
     ops: &[OperationHandle],
+    speeds: &HashMap<u64, (f32, f64)>,
     app: &AppState,
     open: bool,
     entity: &Entity<RootView>,
@@ -106,7 +108,10 @@ pub fn render_overlay(
                 .border_t_1()
                 .border_color(theme::separator())
                 .debug_selector(|| "mo-ops-popover".to_string())
-                .children(ops.iter().map(|op| render_op_row(op, app, entity))),
+                .children(
+                    ops.iter()
+                        .map(|op| render_op_row(op, speeds.get(&op.id).copied(), app, entity)),
+                ),
         );
     } else {
         // ── 折叠态：只显示一个任务 + 底部通栏细进度条，整行点击展开 ──────
@@ -155,7 +160,7 @@ pub fn render_overlay(
                     div()
                         .flex_shrink_0()
                         .text_color(theme::muted())
-                        .child(text!(status_tail(op, ratio))),
+                        .child(text!(status_tail(op, ratio, speeds.get(&op.id).copied()))),
                 );
             let toggle = entity.clone();
             badge.interactivity().on_click(move |_, _window, cx| {
@@ -180,6 +185,7 @@ pub fn render_overlay(
 /// 展开列表里的一行：两行式——上行「状态点 + 描述 + 动作」，下行「进度条 + 尾标」。
 fn render_op_row(
     op: &OperationHandle,
+    speed: Option<(f32, f64)>,
     app: &AppState,
     entity: &Entity<RootView>,
 ) -> impl IntoElement {
@@ -188,11 +194,25 @@ fn render_op_row(
         op.status,
         OperationStatus::Pending | OperationStatus::Running
     );
+    let paused = op.status == OperationStatus::Paused;
 
-    // 行尾动作：进行中 / 排队 → 取消；已结束 → ✕ 移除（句柄不摘会一直堆着）。
+    // 行尾动作按状态分流：可暂停的传输在跑 → 暂停；已暂停 → 继续；
+    // 其余进行中 / 排队 → 取消；已结束 → ✕ 移除（句柄不摘会一直堆着）。
+    // 「暂停 / 继续」只给 `pausable` 的操作：单文件快操作按了也没处停。
     let app_click = app.clone();
     let entity_click = entity.clone();
     let id = op.id;
+    let label = if paused {
+        "继续"
+    } else if running {
+        if op.pausable {
+            "暂停"
+        } else {
+            "取消"
+        }
+    } else {
+        "✕"
+    };
     let mut action = div()
         .id(("mo-ops-action", op.id))
         .flex_shrink_0()
@@ -201,17 +221,19 @@ fn render_op_row(
         .text_size(px(11.0))
         .text_color(theme::muted())
         .hover(|s| s.bg(theme::hover_bg()))
-        .child(text!(if running { "取消" } else { "✕" }.to_string()));
+        .child(text!(label.to_string()));
     action.interactivity().on_click(move |_, _window, cx| {
         // ⚠️ 行本身没有 on_click，这里不需要 stop_propagation；
         // 若将来给行加了点击语义，记得先拦冒泡。
         let app = app_click.clone();
         let entity = entity_click.clone();
+        let label = label;
         cx.spawn(async move |cx| {
-            if running {
-                app.cancel_operation(id).await;
-            } else {
-                app.dismiss_operation(id).await;
+            match label {
+                "暂停" => app.pause_operation(id).await,
+                "继续" => app.resume_operation(id).await,
+                "取消" => app.cancel_operation(id).await,
+                _ => app.dismiss_operation(id).await,
             }
             entity.update(cx, |_, cx| cx.notify());
         })
@@ -282,7 +304,7 @@ fn render_op_row(
                         } else {
                             status_color(op)
                         })
-                        .child(text!(status_tail(op, ratio))),
+                        .child(text!(status_tail(op, ratio, speed))),
                 ),
         )
 }
@@ -300,12 +322,54 @@ fn ratio_of(op: &OperationHandle) -> f32 {
     }
 }
 
-/// 行尾的小字：进行中给百分比；结束态给中文状态（不再出现「完成 0%」这种
-/// 自相矛盾的组合）。
-fn status_tail(op: &OperationHandle, ratio: f32) -> String {
+/// 行尾的小字：进行中给百分比，估得出速度再补「速度 · 剩余时间」；
+/// 结束态给中文状态（不再出现「完成 0%」这种自相矛盾的组合）。
+fn status_tail(op: &OperationHandle, ratio: f32, speed: Option<(f32, f64)>) -> String {
     match op.status {
-        OperationStatus::Pending | OperationStatus::Running => format!("{:.0}%", ratio * 100.0),
+        OperationStatus::Pending | OperationStatus::Running => {
+            let mut s = format!("{:.0}%", ratio * 100.0);
+            if let Some((bps, eta)) = speed {
+                // 首次观测还没差分出速度（或样本太少），只显示百分比。
+                if bps > 0.0 {
+                    s.push_str(&format!(" · {}", speed_label(bps)));
+                    if eta > 0.0 {
+                        s.push_str(&format!(" · {}", eta_label(eta)));
+                    }
+                }
+            }
+            s
+        }
         _ => status_label(op).to_string(),
+    }
+}
+
+/// 字节速度的人类可读形式（1 MB/s 级别之前保留一位小数，往上取整省宽度）。
+fn speed_label(bps: f32) -> String {
+    const UNITS: [&str; 5] = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
+    let mut v = bps.max(0.0);
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    // 字节档没有小数；大数值（≥100）取整也够读，省一行宽度。
+    if i == 0 || v >= 100.0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// 剩余时间的人类可读形式：秒 → 「剩余 8s」，分钟 → 「剩余 1m20s」，
+/// 小时 → 「剩余 2h05m」。速度估不出时调用方就不显示，不给「剩余 0s」。
+fn eta_label(secs: f64) -> String {
+    let s = secs.ceil() as u64;
+    if s >= 3600 {
+        format!("剩余 {}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("剩余 {}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("剩余 {s}s")
     }
 }
 

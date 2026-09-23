@@ -56,6 +56,9 @@ impl Operation for CopyOperation {
     fn resume(&self) {
         self.state.lock().pause = false;
     }
+    fn pausable(&self) -> bool {
+        true
+    }
     fn run(&self) -> Result<(), MoError> {
         {
             let mut s = self.state.lock();

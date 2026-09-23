@@ -794,3 +794,24 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
   `window.scroll(id)` 都点不中列表，一律用 `debug_bounds` + `window.drag(p,p)` /
   直接派发 `ScrollWheelEvent`。
 * 单测约定同步：`box_row_range` 的滚动用例改传 `-24.0`（向下滚一行）。
+
+## 21. 统一设置窗口：三个选择器收进一个带标签页的模态
+
+* 原状：主题（B 类浮层）/ 布局（B 类浮层）/ 快捷键（A 类占中央区）各自为政，
+  入口都散在命令面板与用户命令里。
+* 收口：新增 `Modal::Settings` + `SettingsTab { Layout, Theme, Keys }`，
+  `render_settings` = 左侧标签栏（点击 / ←→ 循环切换）+ 右侧当前页正文。
+  三个旧入口 `open_theme_picker / open_layout_picker / open_keys_picker` 保留函数名、
+  改为 `open_settings(tab)` 的薄壳——**所有调用点零改动**，只是各自开到对应标签页。
+* 正文复用：`theme_body / layout_body / keys_body` 就是原三个渲染器的列表本体，
+  外壳统一由 `dialog_overlay` 提供（标题「设置」+ 右侧灰字页名）。正文统一限高
+  340px 滚动——卡片不随标签页内容多少改变高度，翻页不跳。
+* 语义随页走的按键（`handle_modal_key` 的 `Modal::Settings` 臂）：
+  - 捕获态（快捷键页）优先吞键，←→ 不换页；
+  - Esc：外观页 = `theme_cancel`（还原预览 + 关窗），其它页 = 直接关；
+  - 点遮罩（`dismiss_modal`）与 Esc 同语义：`Settings && tab == Theme` 特判；
+  - 外观页翻页**离开**时 `theme_revert_preview`——预览只是换了全局调色板没写配置，
+    把预览色留在界面上就是脏状态。Enter（theme_commit）改为**不关窗**，应用后可继续逛。
+* A/B 分类账本更新：快捷键从 A 类（占中央区）迁到 B 类（浮层），
+  `central_views_take_over_the_browsing_area` 用例数 3→2；`dialogs_are_full_viewport_overlays`
+  的「布局」用例换成「设置窗口」。

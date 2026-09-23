@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
@@ -6,7 +8,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::{RenameSpec, SortKey};
-use mo_operations::{HashAlgo, OperationHandle, TrashEntry};
+use mo_operations::{HashAlgo, OperationHandle, OperationStatus, TrashEntry};
 use mo_preview::{Preview, PreviewKind};
 use mo_search::SearchHit;
 
@@ -34,6 +36,20 @@ pub(crate) const CONNECT_ADDRESS_PLACEHOLDER: &str =
 
 /// 同步计划最多列出这么多项（再多也只报总数，避免一次画几千行）。
 const PLAN_LIMIT: usize = 400;
+
+/// 传输速度采样的上一次观测（按操作 ID 记账）。
+///
+/// 进度面板每 ≈150ms 拿一次快照，两次快照的 `done` 差分即是瞬时速度；
+/// 小文件场景瞬时值抖得很厉害，用 EMA 平滑后才像人话里的「速度」。
+#[derive(Clone, Copy)]
+struct OpSample {
+    /// 上次观测到的已完成字节数。
+    done: u64,
+    /// 上次观测的时间点。
+    at: Instant,
+    /// 指数平滑后的字节速度（B/s）。
+    ema: f32,
+}
 
 /// 当前打开的模态层（占用中央区；Esc 关闭）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,12 +81,11 @@ pub(crate) enum Modal {
     Workflow,
     /// 文件夹同步（配对 / 计划 / 执行）。
     Sync,
-    /// 主题选择器（↑↓ 实时预览，Enter 应用并持久化，Esc 还原）。
-    Theme,
-    /// 布局设置器（侧边栏 / 状态栏 / 斑马纹 / 默认视图 / 恢复默认）。
-    Layout,
-    /// 快捷键设置器（可重映射 / 解绑 / 捕获按键）。
-    Keys,
+    /// 统一设置窗口：界面 / 外观 / 快捷键三个标签页（见 [`SettingsTab`]）。
+    ///
+    /// 原先是主题、布局、快捷键三个各开各的弹窗，入口散在命令面板与用户命令里；
+    /// 收进一个带标签栏的窗口后入口只换标签页，不再各自为政。
+    Settings,
     /// 扩展管理器（列出已加载的扩展，可启停）。
     Extensions,
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
@@ -80,6 +95,31 @@ pub(crate) enum Modal {
     /// 只在服务器**真的拒绝**了匿名登录时出现（`ConnectFailure::NeedsCredentials`），
     /// 所以地址里没写凭据不等于会弹它：匿名能进就直接进了。
     ConnectAuth,
+}
+
+/// 统一设置窗口（[`Modal::Settings`](Modal)）里的标签页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    /// 界面：侧边栏 / 状态栏 / 斑马纹 / 默认视图 / 图标缩放 / 分组。
+    Layout,
+    /// 外观：主题实时预览 + 当前调色板色卡。
+    Theme,
+    /// 快捷键：重映射 / 解绑 / 捕获。
+    Keys,
+}
+
+impl SettingsTab {
+    /// 全部标签页（顺序即 ← / → 循环切换的顺序）。
+    const ALL: [SettingsTab; 3] = [SettingsTab::Layout, SettingsTab::Theme, SettingsTab::Keys];
+
+    /// 标签栏上的显示名。
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Layout => "界面",
+            SettingsTab::Theme => "外观",
+            SettingsTab::Keys => "快捷键",
+        }
+    }
 }
 
 /// 认证弹窗的状态。
@@ -631,6 +671,10 @@ pub struct RootView {
     appearance_dark: bool,
     /// 主题选择器的光标位。
     theme_index: usize,
+    /// 统一设置窗口当前停在的标签页。
+    settings_tab: SettingsTab,
+    /// 传输速度采样（进度面板估速用，见 [`OpSample`]）。
+    op_stats: HashMap<u64, OpSample>,
     /// 界面布局偏好（侧边栏 / 状态栏 / 斑马纹 / 默认视图），启动时从配置读入。
     ui: mo_app::UiPrefs,
     /// 布局设置器的光标位。
@@ -855,6 +899,8 @@ impl RootView {
                 .iter()
                 .position(|c| *c == theme_name)
                 .unwrap_or(0),
+            settings_tab: SettingsTab::Layout,
+            op_stats: HashMap::new(),
             ui: app.ui_prefs(),
             layout_index: 0,
             keymap: crate::keys::Keymap::build(&app.keybindings()),
@@ -968,6 +1014,55 @@ impl RootView {
             for tab in &pane.tabs {
                 out.extend(tab.ops.iter().cloned());
             }
+        }
+        out
+    }
+
+    /// 由相邻两次快照的进度差分估每个进行中操作的速度，顺带算剩余时间。
+    ///
+    /// 只需要「上次到这次搬了多少字节」，所以在渲染路径上差分即可，不用让
+    /// 操作层再埋一套计时器。返回 `op_id -> (字节速度 B/s, 预计剩余秒)`；
+    /// 首次观测（没有上一次）速度为 0，UI 层就不显示速度。非 Running 的操作
+    /// 清样本——暂停期间不累计字节，恢复后从零重新观测，避免把暂停时长摊进速度。
+    fn op_speeds(&mut self, ops: &[OperationHandle]) -> HashMap<u64, (f32, f64)> {
+        let now = Instant::now();
+        let mut out = HashMap::new();
+        for op in ops {
+            if op.status != OperationStatus::Running {
+                self.op_stats.remove(&op.id);
+                continue;
+            }
+            let (done, total) = op.progress;
+            let speed = match self.op_stats.get_mut(&op.id) {
+                Some(s) => {
+                    let dt = now.duration_since(s.at).as_secs_f64();
+                    // 采样间隔太短（<50ms）不可信：差分常数级抖动会被放大。
+                    if dt >= 0.05 {
+                        let inst = (done.saturating_sub(s.done)) as f64 / dt;
+                        s.ema = s.ema * 0.6 + inst as f32 * 0.4;
+                        s.done = done;
+                        s.at = now;
+                    }
+                    s.ema as f64
+                }
+                None => {
+                    self.op_stats.insert(
+                        op.id,
+                        OpSample {
+                            done,
+                            at: now,
+                            ema: 0.0,
+                        },
+                    );
+                    0.0
+                }
+            };
+            let eta = if speed > 1.0 && total > done {
+                (total - done) as f64 / speed
+            } else {
+                0.0
+            };
+            out.insert(op.id, (speed as f32, eta));
         }
         out
     }
@@ -2401,16 +2496,9 @@ impl RootView {
         self.repaint_theme(cx);
     }
 
-    /// 打开主题选择器（光标停在当前主题）。
+    /// 打开主题选择器（光标停在当前主题）——统一设置窗口的「外观」页。
     pub(crate) fn open_theme_picker(&mut self, cx: &mut Context<Self>) {
-        let app = self.app();
-        let names = crate::theme::choices(&app.custom_themes());
-        self.theme_index = names
-            .iter()
-            .position(|n| *n == self.theme_name)
-            .unwrap_or(0);
-        self.modal = Modal::Theme;
-        cx.notify();
+        self.open_settings(SettingsTab::Theme, cx);
     }
 
     /// 主题选择器：↑↓ 移动光标并实时预览（不写配置）。
@@ -2426,7 +2514,7 @@ impl RootView {
         self.repaint_theme(cx);
     }
 
-    /// 主题选择器：Enter 确认当前项并持久化。
+    /// 主题选择器：Enter 确认当前项并持久化（设置窗口保持打开）。
     fn theme_commit(&mut self, cx: &mut Context<Self>) {
         let app = self.app();
         let names = crate::theme::choices(&app.custom_themes());
@@ -2434,18 +2522,24 @@ impl RootView {
             app.set_theme(&name);
             self.theme_name = name;
         }
-        self.modal = Modal::None;
         self.repaint_theme(cx);
     }
 
-    /// 主题选择器：Esc 放弃预览，还原到进入前配置里的主题。
-    fn theme_cancel(&mut self, cx: &mut Context<Self>) {
+    /// 还原主题预览（不关窗）：外观页翻页 / 切走时用——预览只是全局调色板
+    /// 换了个样子，没写配置，离开这一页就该回到配置里的主题。
+    fn theme_revert_preview(&mut self, cx: &mut Context<Self>) {
         self.theme_name = self.app().theme_setting();
-        self.modal = Modal::None;
         self.repaint_theme(cx);
     }
 
-    fn render_theme(&self, entity: &Entity<RootView>) -> impl IntoElement {
+    /// 主题选择器：Esc 放弃预览，还原到进入前配置里的主题并关窗。
+    fn theme_cancel(&mut self, cx: &mut Context<Self>) {
+        self.theme_revert_preview(cx);
+        self.modal = Modal::None;
+    }
+
+    /// 外观页正文：主题列表（↑↓ 预览）+ 当前调色板色卡。外壳由 [`Self::render_settings`] 提供。
+    fn theme_body(&self, entity: &Entity<RootView>) -> Div {
         let app = self.app();
         let names = crate::theme::choices(&app.custom_themes());
         let mut body = div().flex().flex_col().gap(px(2.0));
@@ -2528,13 +2622,7 @@ impl RootView {
                 )
                 .child(swatches),
         );
-        dialog_overlay(
-            entity,
-            "主题",
-            "",
-            body,
-            "↑↓ 预览 · Enter 应用 · Esc 还原 · 自定义主题写在 config.json 的 custom_themes",
-        )
+        body
     }
 
     /// 打开扩展管理器。
@@ -3606,12 +3694,9 @@ impl RootView {
         }
     }
 
-    /// 打开快捷键设置器。
+    /// 打开快捷键设置器——统一设置窗口的「快捷键」页。
     pub(crate) fn open_keys_picker(&mut self, cx: &mut Context<Self>) {
-        self.keys_index = 0;
-        self.keys_capturing = None;
-        self.modal = Modal::Keys;
-        cx.notify();
+        self.open_settings(SettingsTab::Keys, cx);
     }
 
     /// 设置器里当前聚焦的动作 id。
@@ -3673,7 +3758,8 @@ impl RootView {
         cx.notify();
     }
 
-    fn render_keys(&self, entity: &Entity<RootView>) -> Div {
+    /// 快捷键页正文：绑定列表 + 恢复默认。外壳由 [`Self::render_settings`] 提供。
+    fn keys_body(&self, entity: &Entity<RootView>) -> Div {
         let mut body = div()
             .flex()
             .flex_col()
@@ -3765,12 +3851,7 @@ impl RootView {
             reset_ent.update(cx, |v, cx| v.keys_reset_all(cx));
         });
         body = body.child(list).child(reset_row);
-        central_view(
-            "快捷键",
-            "",
-            body,
-            "↑↓ 选择 · Enter 捕获 · Delete 解绑 · R 复位 · Esc 关闭",
-        )
+        body
     }
 
     // ------------------------------------------------------------ 布局
@@ -3852,11 +3933,48 @@ impl RootView {
         .detach();
     }
 
-    /// 打开布局设置器。
-    pub(crate) fn open_layout_picker(&mut self, cx: &mut Context<Self>) {
-        self.layout_index = 0;
-        self.modal = Modal::Layout;
+    /// 打开统一设置窗口并停在某个标签页（各标签页光标复位语义与原选择器一致）。
+    pub(crate) fn open_settings(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        match tab {
+            SettingsTab::Layout => self.layout_index = 0,
+            SettingsTab::Theme => {
+                // 光标停在当前主题上。
+                let app = self.app();
+                let names = crate::theme::choices(&app.custom_themes());
+                self.theme_index = names
+                    .iter()
+                    .position(|n| *n == self.theme_name)
+                    .unwrap_or(0);
+            }
+            SettingsTab::Keys => {
+                self.keys_index = 0;
+                self.keys_capturing = None;
+            }
+        }
+        self.settings_tab = tab;
+        self.modal = Modal::Settings;
         cx.notify();
+    }
+
+    /// ← / → 循环切换设置标签页；离开外观页时还原未提交的预览。
+    fn settings_step(&mut self, dir: isize, cx: &mut Context<Self>) {
+        let all = SettingsTab::ALL;
+        let n = all.len();
+        let i = all
+            .iter()
+            .position(|t| *t == self.settings_tab)
+            .unwrap_or(0) as isize;
+        let next = all[(i + dir).rem_euclid(n as isize) as usize];
+        if self.settings_tab == SettingsTab::Theme && next != SettingsTab::Theme {
+            // 预览没提交（Enter）就翻页：还原到配置里的主题，别把预览色留在界面上。
+            self.theme_revert_preview(cx);
+        }
+        self.open_settings(next, cx);
+    }
+
+    /// 打开布局设置器——统一设置窗口的「界面」页。
+    pub(crate) fn open_layout_picker(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(SettingsTab::Layout, cx);
     }
 
     /// 立刻把当前 `ui` 写回配置。
@@ -3977,7 +4095,8 @@ impl RootView {
         cx.notify();
     }
 
-    fn render_layout(&self, entity: &Entity<RootView>) -> impl IntoElement {
+    /// 界面页正文：布局开关与默认值行。外壳由 [`Self::render_settings`] 提供。
+    fn layout_body(&self, entity: &Entity<RootView>) -> Div {
         let mut body = div().flex().flex_col().gap(px(2.0));
         for (i, (label, value)) in self.layout_rows().into_iter().enumerate() {
             let selected = i == self.layout_index;
@@ -4017,13 +4136,89 @@ impl RootView {
             });
             body = body.child(row);
         }
-        dialog_overlay(
-            entity,
-            "布局",
-            "",
-            body,
-            "↑↓ 选择 · Enter 切换 · 改动即时生效并写入 config.json · Esc 关闭",
-        )
+        body
+    }
+
+    /// 统一设置窗口：左侧标签栏（界面 / 外观 / 快捷键）+ 右侧当前页正文。
+    ///
+    /// 三个标签页的正文（[`Self::layout_body`] / [`Self::theme_body`] /
+    /// [`Self::keys_body`]）就是原布局 / 主题 / 快捷键三个独立选择器的列表本体，
+    /// 外壳（标题栏 / 提示行 / Esc 与点遮罩语义）由 [`dialog_overlay`] 统一提供。
+    /// 正文统一限高滚动：卡片不再随标签页内容多少改变高度，翻页不跳。
+    fn render_settings(&self, entity: &Entity<RootView>) -> impl IntoElement {
+        let mut rail = div().flex().flex_col().gap(px(2.0)).w(px(76.0));
+        for (i, tab) in SettingsTab::ALL.iter().enumerate() {
+            let active = *tab == self.settings_tab;
+            let ent = entity.clone();
+            let mut row = div()
+                .id(format!("settings-tab-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .px(px(8.0))
+                .h(px(26.0))
+                .rounded(px(4.0))
+                .bg(if active {
+                    theme::hover_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_color(if active {
+                    theme::text()
+                } else {
+                    theme::muted()
+                })
+                .hover(|s| s.bg(theme::hover_bg()))
+                .child(text!(tab.label().to_string()));
+            row.interactivity().on_click(move |_ev, _window, cx| {
+                ent.update(cx, |v, cx| {
+                    if v.settings_tab != *tab {
+                        v.settings_step(
+                            SettingsTab::ALL.iter().position(|t| t == tab).unwrap_or(0) as isize
+                                - SettingsTab::ALL
+                                    .iter()
+                                    .position(|t| *t == v.settings_tab)
+                                    .unwrap_or(0) as isize,
+                            cx,
+                        );
+                    }
+                });
+            });
+            rail = rail.child(row);
+        }
+        let inner: Div = match self.settings_tab {
+            SettingsTab::Layout => self.layout_body(entity),
+            SettingsTab::Theme => self.theme_body(entity),
+            SettingsTab::Keys => self.keys_body(entity),
+        };
+        let body = div()
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .min_h_0()
+            .child(rail)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(340.0))
+                    .overflow_y_scrollbar()
+                    .child(inner),
+            );
+        let hint = match self.settings_tab {
+            SettingsTab::Layout => {
+                "↑↓ 选择 · Enter 切换 · 改动即时生效并写入 config.json · ←→ 换页 · Esc 关闭"
+            }
+            SettingsTab::Theme => {
+                "↑↓ 预览 · Enter 应用 · Esc 还原并关闭 · 自定义主题写在 config.json 的 custom_themes"
+            }
+            SettingsTab::Keys => {
+                "↑↓ 选择 · Enter 捕获 · Delete 解绑 · R 复位 · ←→ 换页 · Esc 关闭"
+            }
+        };
+        dialog_overlay(entity, "设置", self.settings_tab.label(), body, hint)
     }
 
     // ------------------------------------------------------------ 列视图
@@ -5416,8 +5611,7 @@ impl Render for RootView {
             | Modal::Properties
             | Modal::Archive
             | Modal::Tags
-            | Modal::Theme
-            | Modal::Layout
+            | Modal::Settings
             | Modal::CommandPalette => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
@@ -5447,7 +5641,7 @@ impl Render for RootView {
             // 次级视图（A 类）：占满中央区，由 `central_view` 提供标题栏。
             // 其中「浏览型」的两个（全局搜索 / 回收站）**保留侧栏**——它们本质上
             // 还是在挑文件，左侧导航得一直在（用户报：进回收站左侧整个没了）。
-            // 其余（快捷键 / 扩展 / 比较…）是工具页，全宽无妨。
+            // 其余（扩展 / 比较…）是工具页，全宽无妨。
             Modal::GlobalSearch | Modal::Trash => {
                 let in_trash = matches!(self.modal, Modal::Trash);
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
@@ -5482,15 +5676,15 @@ impl Render for RootView {
             Modal::Diff => self.render_diff(),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
-            Modal::Keys => self.render_keys(&entity),
             Modal::Extensions => self.render_extensions(&entity),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
         };
 
-        let panel = self.panel();
         let ops = self.all_ops();
+        let op_speeds = self.op_speeds(&ops);
+        let panel = self.panel();
         let app = panel.app.clone();
         let selection_count = panel.selection.count();
         let can_undo = app.can_undo();
@@ -5536,6 +5730,7 @@ impl Render for RootView {
         // 原先是整条横幅铺在窗口底部，任务会把状态栏顶上去一截，已废弃。
         root = root.child(progress_panel::render_overlay(
             &ops,
+            &op_speeds,
             &app,
             self.ops_open,
             &entity,
@@ -5755,8 +5950,7 @@ impl Render for RootView {
             Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
             Modal::Archive => root = root.child(dialogs::archive(self, &entity)),
             Modal::Tags => root = root.child(dialogs::tags(&entity, self)),
-            Modal::Theme => root = root.child(self.render_theme(&entity)),
-            Modal::Layout => root = root.child(self.render_layout(&entity)),
+            Modal::Settings => root = root.child(self.render_settings(&entity)),
             Modal::CommandPalette => root = root.child(self.render_command_palette(&entity)),
             _ => {}
         }
@@ -6399,8 +6593,8 @@ fn handle_modal_key(
             }),
             _ => {}
         },
-        Modal::Keys => {
-            // 捕获态：下一次按键就是新键位（Esc 取消，不绑）。
+        Modal::Settings => {
+            // 捕获态（快捷键页）：下一次按键就是新键位（Esc 取消，不绑）。
             let capturing = entity.update(cx, |v, _cx| v.keys_capturing.is_some());
             if capturing {
                 if key == "escape" {
@@ -6414,55 +6608,73 @@ fn handle_modal_key(
                 entity.update(cx, |v, cx| v.keys_capture(&combo, cx));
                 return;
             }
+            // ← / → 在三个标签页之间循环切换（各页 ↑↓ 语义不同，先分流）。
             match key {
-                "escape" => close_modal(entity, cx),
-                "up" | "arrowup" => entity.update(cx, |v, cx| {
-                    v.keys_index = v.keys_index.saturating_sub(1);
-                    cx.notify();
-                }),
-                "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                    let n = crate::keys::BINDINGS.len();
-                    v.keys_index = (v.keys_index + 1).min(n - 1);
-                    cx.notify();
-                }),
-                "enter" => entity.update(cx, |v, cx| {
-                    v.keys_capturing = v.keys_focused();
-                    cx.notify();
-                }),
-                "delete" | "backspace" => entity.update(cx, |v, cx| v.keys_unbind(cx)),
-                "r" => entity.update(cx, |v, cx| v.keys_reset_one(cx)),
+                "left" | "arrowleft" => entity.update(cx, |v, cx| v.settings_step(-1, cx)),
+                "right" | "arrowright" => entity.update(cx, |v, cx| v.settings_step(1, cx)),
+                "escape" => {
+                    // 外观页的预览没落盘：Esc 与点遮罩一致——还原预览并关窗
+                    //（theme_cancel 自己会把 modal 置回 None）。
+                    if entity.read(cx).settings_tab == SettingsTab::Theme {
+                        entity.update(cx, |v, cx| v.theme_cancel(cx));
+                    } else {
+                        close_modal(entity, cx);
+                    }
+                }
+                "up" | "arrowup" | "down" | "arrowdown" | "enter" | "delete" | "backspace"
+                | "r" => {
+                    let tab = entity.read(cx).settings_tab;
+                    match tab {
+                        SettingsTab::Layout => match key {
+                            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                                let n = v.layout_rows().len();
+                                if n > 0 {
+                                    v.layout_index = (v.layout_index + n - 1) % n;
+                                }
+                                cx.notify();
+                            }),
+                            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                                let n = v.layout_rows().len();
+                                if n > 0 {
+                                    v.layout_index = (v.layout_index + 1) % n;
+                                }
+                                cx.notify();
+                            }),
+                            "enter" => entity.update(cx, |v, cx| {
+                                let i = v.layout_index;
+                                v.layout_activate(i, cx);
+                            }),
+                            _ => {}
+                        },
+                        SettingsTab::Theme => match key {
+                            "up" | "arrowup" => entity.update(cx, |v, cx| v.theme_move(-1, cx)),
+                            "down" | "arrowdown" => entity.update(cx, |v, cx| v.theme_move(1, cx)),
+                            "enter" => entity.update(cx, |v, cx| v.theme_commit(cx)),
+                            _ => {}
+                        },
+                        SettingsTab::Keys => match key {
+                            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                                v.keys_index = v.keys_index.saturating_sub(1);
+                                cx.notify();
+                            }),
+                            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                                let n = crate::keys::BINDINGS.len();
+                                v.keys_index = (v.keys_index + 1).min(n - 1);
+                                cx.notify();
+                            }),
+                            "enter" => entity.update(cx, |v, cx| {
+                                v.keys_capturing = v.keys_focused();
+                                cx.notify();
+                            }),
+                            "delete" | "backspace" => entity.update(cx, |v, cx| v.keys_unbind(cx)),
+                            "r" => entity.update(cx, |v, cx| v.keys_reset_one(cx)),
+                            _ => {}
+                        },
+                    }
+                }
                 _ => {}
             }
         }
-        Modal::Layout => match key {
-            "escape" => close_modal(entity, cx),
-            "up" | "arrowup" => entity.update(cx, |v, cx| {
-                let n = v.layout_rows().len();
-                if n > 0 {
-                    v.layout_index = (v.layout_index + n - 1) % n;
-                }
-                cx.notify();
-            }),
-            "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = v.layout_rows().len();
-                if n > 0 {
-                    v.layout_index = (v.layout_index + 1) % n;
-                }
-                cx.notify();
-            }),
-            "enter" => entity.update(cx, |v, cx| {
-                let i = v.layout_index;
-                v.layout_activate(i, cx);
-            }),
-            _ => {}
-        },
-        Modal::Theme => match key {
-            "escape" => entity.update(cx, |v, cx| v.theme_cancel(cx)),
-            "up" | "arrowup" => entity.update(cx, |v, cx| v.theme_move(-1, cx)),
-            "down" | "arrowdown" => entity.update(cx, |v, cx| v.theme_move(1, cx)),
-            "enter" => entity.update(cx, |v, cx| v.theme_commit(cx)),
-            _ => {}
-        },
         Modal::Workflow => {
             if key == "escape" {
                 entity.update(cx, |v, cx| v.workflow_dismiss(cx));
@@ -7969,7 +8181,7 @@ const DIALOG_RADIUS: f32 = 12.0;
 
 /// **带遮罩的浮层对话框**：半透明遮罩铺满视口 + 居中卡片。
 ///
-/// 所有短小的弹窗都走这里——属性、压缩、标签、主题、布局、命令面板、
+/// 所有短小的弹窗都走这里——属性、压缩、标签、统一设置、命令面板、
 /// 连接到服务器，以及 [`Modal::Info`](Modal) 的信息提示。下层内容照常渲染、
 /// 透过遮罩可见，但被 `.occlude()` 挡住点不到。点遮罩空白 / Esc 关闭
 /// （按键路由见 `handle_modal_key`）。
@@ -8062,10 +8274,13 @@ pub(crate) fn dialog_overlay(
 
 /// 关闭当前对话框，收尾与该模态的 **Esc 保持一致**。
 ///
-/// 点遮罩空白与按 Esc 必须走同一套语义：主题是「↑↓ 实时预览」的，Esc 是
-/// `theme_cancel`（还原预览）；若遮罩走了通用关闭，会让没提交的预览留在配置里。
+/// 点遮罩空白与按 Esc 必须走同一套语义：设置窗口停在外观页时主题是
+/// 「↑↓ 实时预览」的，Esc 是 `theme_cancel`（还原预览）；若遮罩走了通用关闭，
+/// 会让没提交的预览留在配置里。
 fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
-    if matches!(entity.read(cx).modal, Modal::Theme) {
+    if matches!(entity.read(cx).modal, Modal::Settings)
+        && entity.read(cx).settings_tab == SettingsTab::Theme
+    {
         entity.update(cx, |v, cx| v.theme_cancel(cx));
         return;
     }
@@ -8349,7 +8564,10 @@ mod tests {
     use gpui_kit::{px, Context, TestAppContext};
     use mo_app::AppState;
 
-    use super::{box_row_range, filtered_apps, ConnectAuthState, Modal, RootView};
+    use super::{
+        box_row_range, filtered_apps, ConnectAuthState, Modal, OperationHandle, RootView,
+        SettingsTab,
+    };
     use crate::panel::Panel;
 
     /// 橡皮筋 y → 行区间的折算：行带按顶边对齐（floor），与渲染出的行一一对应。
@@ -8574,8 +8792,8 @@ mod tests {
         let cases: [(&str, OpenDialog); 4] = [
             ("连接到服务器", |v, cx| v.open_connect_dialog(cx)),
             ("信息提示", |v, cx| v.notice("测试消息", None, cx)),
-            ("布局", |v, cx| {
-                v.modal = Modal::Layout;
+            ("设置窗口", |v, cx| {
+                v.modal = Modal::Settings;
                 cx.notify();
             }),
             ("命令面板", |v, cx| {
@@ -8733,9 +8951,9 @@ mod tests {
             "初始应当渲染浏览区（文件列表）"
         );
 
-        let cases: [(&str, Modal); 3] = [
+        // 快捷键页已并入统一设置窗口（B 类浮层），不再是次级视图。
+        let cases: [(&str, Modal); 2] = [
             ("全局搜索", Modal::GlobalSearch),
-            ("快捷键", Modal::Keys),
             ("扩展", Modal::Extensions),
         ];
         for (name, modal) in cases {
@@ -9551,6 +9769,148 @@ mod tests {
         assert_eq!(restored.0, start_theme, "Esc 应当还原预览");
         assert_eq!(restored.1, Modal::None, "Esc 之后选择器应当关掉");
         cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    /// 统一设置窗口：三个旧入口（界面 / 外观 / 快捷键）都开进**同一个**模态、
+    /// 各自落到对应标签页；← → 循环换页；带着未提交的主题预览翻页要还原预览。
+    #[test]
+    fn settings_window_unifies_the_three_pickers() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // 三个入口 → 同一个 Modal::Settings，各自落在自己的标签页。
+        let (modal, tab) = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.open_layout_picker(cx);
+                (v.modal.clone(), v.settings_tab)
+            })
+        });
+        assert!(matches!(modal, Modal::Settings), "布局入口应开设置窗口");
+        assert_eq!(tab, SettingsTab::Layout, "布局入口应停在「界面」页");
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_keys_picker(cx)));
+        let tab = cx.update(|_window, cx| root.update(cx, |v, _| v.settings_tab));
+        assert_eq!(tab, SettingsTab::Keys, "快捷键入口应停在「快捷键」页");
+
+        // ←→ 循环换页：Keys ←→ Theme；从 Theme 翻走要还原未提交的预览。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.keys_capturing = None;
+                v.settings_step(-1, cx);
+            })
+        });
+        let (tab, _theme) =
+            cx.update(|_window, cx| root.update(cx, |v, _| (v.settings_tab, v.theme_name.clone())));
+        assert_eq!(tab, SettingsTab::Theme, "← 应循环到「外观」页");
+
+        // ↓ 预览下一个主题（不落盘），然后翻页离开：预览必须被还原。
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.theme_move(1, cx)));
+        let previewed = cx.update(|_window, cx| root.update(cx, |v, _| v.theme_name.clone()));
+        let (tab, restored) = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.settings_step(1, cx);
+                (v.settings_tab, v.theme_name.clone())
+            })
+        });
+        assert_eq!(tab, SettingsTab::Keys, "→ 应循环回「快捷键」页");
+        assert_ne!(previewed, restored, "翻页后预览主题应被还原");
+        let want = crate::theme::resolve(&restored, &HashMap::new(), false);
+        assert_eq!(crate::theme::current(), want, "调色板应回到配置主题");
+
+        // 渲染一遍确认卡片画了出来（外壳走 dialog_overlay）。
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-dialog-card").is_some(),
+            "设置窗口应渲染成带遮罩的浮层卡片"
+        );
+        let _ = root;
+    }
+
+    /// 传输估速：首次快照只建样本（速度 0 不显示），间隔后差分出速度与剩余时间；
+    /// 操作不再 Running（暂停 / 结束）时样本清空，恢复 Running 从零重新观测。
+    #[test]
+    fn op_speeds_averages_progress_deltas() {
+        crate::isolate_config_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        let mk = |done: u64, status: mo_operations::OperationStatus| OperationHandle {
+            id: 7,
+            describe: "复制 /a → /b".to_string(),
+            status,
+            progress: (done, 1000),
+            pausable: true,
+        };
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                crate::inject_ops_for_tests(v, vec![mk(0, mo_operations::OperationStatus::Running)])
+            })
+        });
+        let first = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                let ops = v.all_ops();
+                let mut speeds = v.op_speeds(&ops);
+                speeds.remove(&7).unwrap()
+            })
+        });
+        assert_eq!(first.0, 0.0, "首次观测没有上一次差分，速度应为 0");
+
+        // 睡过最小采样间隔，再喂一段确定推进的进度：差分速度必须为正。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let second = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                crate::inject_ops_for_tests(
+                    v,
+                    vec![mk(300, mo_operations::OperationStatus::Running)],
+                );
+                let ops = v.all_ops();
+                let mut speeds = v.op_speeds(&ops);
+                speeds.remove(&7).unwrap()
+            })
+        });
+        assert!(
+            second.0 > 0.0 && second.1 > 0.0,
+            "推进 300/1000 字节后应有正速度与剩余时间：{second:?}"
+        );
+
+        // 暂停后样本清空：恢复 Running 时从零重新观测（速度回到 0）。
+        let after_pause = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                crate::inject_ops_for_tests(
+                    v,
+                    vec![mk(300, mo_operations::OperationStatus::Paused)],
+                );
+                let ops = v.all_ops();
+                let mut speeds = v.op_speeds(&ops);
+                speeds.remove(&7)
+            })
+        });
+        assert!(after_pause.is_none(), "暂停的操作不应出现在估速表里");
+        let resumed = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                crate::inject_ops_for_tests(
+                    v,
+                    vec![mk(300, mo_operations::OperationStatus::Running)],
+                );
+                let ops = v.all_ops();
+                let mut speeds = v.op_speeds(&ops);
+                speeds.remove(&7).unwrap()
+            })
+        });
+        assert_eq!(
+            resumed.0, 0.0,
+            "恢复后应从零重新观测，而不是沿用暂停前的速度"
+        );
     }
 
     /// 组合键要真的经过键表 → 派发这条链路（headless 派发按键，不靠模拟输入）。

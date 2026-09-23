@@ -2542,6 +2542,16 @@ impl AppState {
         self.ops.lock().await.cancel(id);
     }
 
+    /// 暂停一个支持暂停的操作（复制 / 移动；其它操作在 UI 层就不给暂停按钮）。
+    pub async fn pause_operation(&self, id: u64) {
+        self.ops.lock().await.pause(id);
+    }
+
+    /// 恢复一个已暂停的操作。
+    pub async fn resume_operation(&self, id: u64) {
+        self.ops.lock().await.resume(id);
+    }
+
     /// 从操作列表里移除一条**已结束**的操作（传输浮层里的 ✕）。
     ///
     /// `OperationManager::remove` 只摘句柄，不动正在跑的后台任务；
