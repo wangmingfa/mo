@@ -87,9 +87,15 @@ pub(crate) fn to_dir_error(e: std::io::Error) -> MoError {
 }
 
 /// 在 unix 上用 `st_dev` + `st_ino` 构造稳定 `FileId`；其他平台退回基于路径的占位 ID。
+///
+/// 必须 **lstat**（`symlink_metadata`）而不是 stat：符号链接是目录里**独立的一条**，
+/// 身份应是它自身的 inode。走 stat 的话，指向同一目标的两个软链会拿到目标的
+/// dev+ino → FileId 撞车 → 按 FileId 记账的选择/缓存把两条目当成同一个
+/// （实测：点 `.bluework-config` 会把 `.bluework-ui-config` 一起选中）。断链的
+/// 软链 stat 会失败退回路径哈希，lstat 则总能给出稳定 ID——这里也更稳。
 #[cfg(unix)]
 pub(crate) fn file_id_for(path: &Path) -> FileId {
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
         use std::os::unix::fs::MetadataExt;
         return FileId::new(meta.dev(), meta.ino() as u128);
     }

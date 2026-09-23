@@ -215,6 +215,51 @@ mod tests {
 mod unix_tests {
     use super::*;
 
+    /// 指向**同一目标**的两个软链必须有**不同的** FileId（回归：点一个选中两个）。
+    ///
+    /// `file_id_for` 原来走 stat（跟随软链），两个指向同目标的软链拿到目标的
+    /// dev+ino → FileId 撞车 → 选择模型按 FileId 记账，点其中一条两条全亮。
+    /// 修后走 lstat，软链以自身 inode 为身份。
+    #[test]
+    fn symlinks_to_the_same_target_get_distinct_file_ids() {
+        let dir = std::env::temp_dir().join(format!("mo-fs-symlink-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let target = dir.join("real-config");
+        std::fs::write(&target, b"x").expect("写目标文件");
+        let a = dir.join(".bluework-config");
+        let b = dir.join(".bluework-ui-config");
+        std::os::unix::fs::symlink(&target, &a).expect("建软链 a");
+        std::os::unix::fs::symlink(&target, &b).expect("建软链 b");
+
+        let entries = LocalFileSystem.read_dir_blocking(&dir).expect("列目录");
+        let id_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.id)
+                .unwrap_or_else(|| panic!("目录里该有 {name}"))
+        };
+        let (ida, idb) = (id_of(".bluework-config"), id_of(".bluework-ui-config"));
+        assert_ne!(ida, idb, "两个不同 inode 的软链不该共用 FileId");
+        assert_ne!(ida, id_of("real-config"), "软链也不该和目标共用 FileId");
+        // 断链的软链同样要有稳定 ID（lstat 仍成功），不能退回路径哈希之外的东西。
+        std::fs::remove_file(&target).expect("删目标造断链");
+        let broken = dir.join(".broken-link");
+        std::os::unix::fs::symlink(&target, &broken).expect("建断链软链");
+        let entries = LocalFileSystem
+            .read_dir_blocking(&dir)
+            .expect("断链目录也要能列");
+        let broken_entry = entries
+            .iter()
+            .find(|e| e.name == ".broken-link")
+            .expect("断链条目在");
+        assert_ne!(broken_entry.id, ida, "断链软链有自己的 inode");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dotfiles_and_flagged_files_are_hidden() {
         let dir = std::env::temp_dir().join("mo-fs-hidden-test");

@@ -56,3 +56,20 @@ UI 本地 `panel.selection` 只做即时反馈，异步 `pull_selection` 回灌�
   无匹配/空串不动选择）、`invert_selection_flips_visible_set_only`（翻转变为另两项、全选后反选为空）。
 * `mo-ui/src/context_menu.rs`：`blank_area_shows_directory_level_actions_only` 期望 8 项含
   `InvertSelection`；`panel_height_accounts_for_separators` 同步 `blank.len() == 8`。
+
+## 6. 点一个软链选中两条 → FileId 必须走 lstat（2026-09-23）
+
+* 现象：`~/.bluework-config` 与 `~/.bluework-ui-config` 是**指向同一目标的两个软链**，
+  点任何一个两条全亮。
+* 根因：`mo-fs::file_id_for`（unix 分支）用 `std::fs::metadata`（**stat，跟随软链**）取
+  `st_dev+st_ino` 构造 FileId——同目标的软链拿到目标的 inode → FileId 撞车 →
+  选择模型按 FileId 记账，两条目被当成同一个。
+* 修法（`f0b3901`）：改 `symlink_metadata`（lstat），软链以**自身 inode** 为身份——
+  软链本来就是目录里独立的一条。附带收益：断链软链 stat 会失败退回路径哈希占位，
+  lstat 总能给出稳定 ID。
+* 影响面核查：全仓只有这一处按 inode 构造 FileId（`Grep meta.ino()` 唯一命中）；
+  缩略图/预览缓存键会让软链与目标各占一份（更正确，原先是软链顶掉目标的键）；
+  dedup/perms/预览大小照旧走 stat（展示目标大小不变）。
+* 回归测试：`mo-fs/local.rs::symlinks_to_the_same_target_get_distinct_file_ids`
+  （同目标双链 id 互异、与目标互异、断链也有独立 id）。反向验证：撤掉 lstat 改回
+  stat，测试红在第一条断言——正是用户症状。
