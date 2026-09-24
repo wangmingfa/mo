@@ -156,6 +156,24 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     }
 }
 
+/// 取一个**扩展名**在系统里的图标（访达给 `.txt` 显示的那种文本文档图标），
+/// 契约与 [`file_icon_raster`] 完全一致：主线程做、只交像素、编码归调用方。
+///
+/// 与 [`file_icon_raster`] 的关键差别：它**不碰文件路径**，问的是「这个扩展名
+/// 长什么样」——文件本体已经不存在的条目（回收站的原路径）也能拿到真系统图标。
+/// `ext` 不带点（`"txt"`）；拿不到返回 `None`，上层退回内置 SVG。
+pub fn ext_icon_raster(ext: &str, px: u32) -> Option<IconRaster> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::ext_icon_raster(ext, px)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (ext, px);
+        None
+    }
+}
+
 /// 取**通用文件夹**的系统图标（访达里那种蓝色文件夹），契约与 [`file_icon_raster`]
 /// 完全一致：主线程做、只交像素、编码归调用方。
 ///

@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+// `on_prepaint` 挂在 `ElementExt` 上（回收站面板的斑马纹铺满一屏要靠它回写高度）。
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
@@ -833,6 +835,9 @@ pub struct RootView {
     indexed: usize,
     /// 回收站条目快照（回收站面板数据源）。`pub(crate)` 仅为测试注入。
     pub(crate) trash_entries: Vec<TrashEntry>,
+    /// 回收站面板内容区高度（prepaint 回写）——「斑马纹铺满一屏」算补足行数用，
+    /// 与文件列表的 `list_origin` 同一套机制（回收站没有 pane/tab，单独立一个字段）。
+    trash_body_h: f32,
     /// 比较 / diff 结果缓存（比较模态数据源）。
     diff_cache: Option<mo_diff::Comparison>,
     /// 模态内表单的当前字段下标。
@@ -1069,6 +1074,7 @@ impl RootView {
             dedup_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexed: 0,
             trash_entries: Vec::new(),
+            trash_body_h: 0.0,
             diff_cache: None,
             form_index: 0,
             prop: None,
@@ -5183,6 +5189,28 @@ impl RootView {
         count.max(fit)
     }
 
+    /// prepaint 回写回收站面板内容区高度；值变化时返回 `true`（调用方借此 notify，
+    /// 下一帧才能把斑马纹补满一屏——与 [`Self::set_list_origin`] 同一条规矩）。
+    pub(crate) fn set_trash_body_h(&mut self, h: f32) -> bool {
+        let changed = (self.trash_body_h - h).abs() > f32::EPSILON;
+        if changed {
+            self.trash_body_h = h;
+        }
+        changed
+    }
+
+    /// 「回收站斑马纹铺满一屏」要补的占位行数：内容区装得下多少 24px 行，减去
+    /// 真实行数就是补足数。首帧高度还没回写时返回 0（prepaint 后下一帧自然铺满）。
+    pub(crate) fn trash_fill_rows(&self) -> usize {
+        const ROW_H: f32 = 24.0;
+        // body 的 py(6.0)：上下各 6px 的内边距不参与斑马纹。
+        const BODY_PAD: f32 = 12.0;
+        if self.trash_body_h <= BODY_PAD {
+            return 0;
+        }
+        (((self.trash_body_h - BODY_PAD) / ROW_H).floor().max(0.0)) as usize
+    }
+
     /// 把每个标签页的网格 / 画廊**列数**记下来（键盘定位换算单元行要用）。
     ///
     /// 列数取决于容器宽度与图标缩放，只有渲染路径知道（`available` 是每窗格宽）；
@@ -8959,6 +8987,24 @@ impl RootView {
             .px(px(12.0))
             .py(px(6.0))
             .overflow_y_scrollbar();
+        // prepaint 回写内容区高度，下一帧才能把斑马纹补满一屏（首帧先按实际
+        // 行数渲染；高度变了才 notify，不会造成重绘循环）。
+        let entity_h = entity.clone();
+        body = body.on_prepaint(move |bounds, _window, cx| {
+            let h = f32::from(bounds.size.height);
+            entity_h.update(cx, |v, cx| {
+                if v.set_trash_body_h(h) {
+                    cx.notify();
+                }
+            });
+        });
+        // 系统图标链路与文件列表**同一条**（`AppState::file_icon` 纯查表 + 后台泵
+        // 补齐；用户报：回收站的文件图标不是系统图标）。类型图标按扩展名向系统要
+        // （`iconForFileType:`）——回收站条目的原路径多半已不存在，按路径问只会得到
+        // 一张通用白纸图标；目录行在真图标就位前有蓝文件夹占位图。整页本地，直接取
+        // 一次 `AppState`，行循环里零分配。
+        let app = self.app();
+        let slot = crate::listing::icon_slot(ViewMode::List);
         for (i, e) in self.trash_entries.iter().enumerate() {
             let selected = i == idx;
             let name = e
@@ -8971,8 +9017,9 @@ impl RootView {
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // 回收站里的原路径多半已不存在，系统图标查不到 → 用内置 Lucide
-            // 字形：目录 FOLDER，文件按扩展名挑（与 file_item 的兜底同源）。
+            // 系统图标拿不到才退回内置 Lucide 字形：目录 FOLDER，文件按扩展名挑
+            // （与 file_item 的兜底同源）。headless 测试里平台层不可用，走的正是
+            // 这条兜底——两条路径都要能画。
             let glyph = if e.is_dir {
                 crate::icons::FOLDER
             } else {
@@ -8983,6 +9030,14 @@ impl RootView {
             } else {
                 theme::text()
             };
+            let icon_el: AnyElement =
+                match crate::file_item::system_icon(Some(&app), &e.original, e.is_dir, slot)
+                    .as_ref()
+                    .and_then(crate::bitmap::image_source)
+                {
+                    Some(source) => img(source).w(px(slot)).h(px(slot)).into_any_element(),
+                    None => crate::icons::icon(glyph, slot, fg).into_any_element(),
+                };
 
             // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
             let mut row = div()
@@ -9008,7 +9063,7 @@ impl RootView {
                 row = row.hover(|s| s.bg(theme::hover_bg()));
             }
             row = row
-                .child(crate::icons::icon(glyph, 16.0, fg))
+                .child(icon_el)
                 .child(
                     // 文件名：给个不宽死的上限，路径列吃剩余空间。
                     div()
@@ -9051,6 +9106,31 @@ impl RootView {
                 });
             });
             body = body.child(row);
+        }
+        // 「斑马纹铺满一屏」（用户报：回收站只有两条记录时下面一片白，不像同一个
+        // 应用）：真实行数不够一屏时，底下补**只有底色、没有任何内容**的占位行。
+        // 底色规则与数据行逐字一致（同一斑马纹开关、同一奇偶、同一 px(4.0)），行高
+        // 同为 24px——真数据出现时文字直接浮现在同一块底色上。行 ID 不能省：多条
+        // 占位行共享无 ID 路径会撞 a11y NodeId（见 file_list 占位行的同一条注释）。
+        let fill = self.trash_fill_rows();
+        for i in self.trash_entries.len()..fill {
+            body = body.child(
+                div()
+                    .id(format!("trash-ph-{i}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .h(px(24.0))
+                    .px(px(4.0))
+                    .bg(if i % 2 == 1 {
+                        theme::zebra()
+                    } else {
+                        theme::surface()
+                    })
+                    // 测试用（release no-op）：按绝对行号定位占位行。
+                    .debug_selector(move || format!("mo-trash-ph-{i}")),
+            );
         }
         if self.trash_entries.is_empty() {
             body = body.child(

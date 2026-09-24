@@ -344,6 +344,14 @@ impl IconCache {
         }
     }
 
+    /// 认命：这个键**永远**拿不到系统图标了（原路径已不存在等——重试没有意义），
+    /// 键记进「问过」账本防止渲染路径每帧重排，在途重试与失败账一并清掉。
+    pub fn give_up(&mut self, key: &IconKey) {
+        self.asked.insert(key.clone());
+        self.attempts.remove(key);
+        self.retry_queue.retain(|(_, k, _)| k != key);
+    }
+
     /// 记一次「问了但系统没给」：没到重试上限就排进重试队列（带**指数退避**冷却），
     /// 返回 `true` 表示还会再试；到上限了返回 `false`——清掉该键的在途重试、键留在
     /// `asked` 里，这一行就此停在内置 SVG 上（多半是文件真没了，或者系统彻底不给）。
@@ -587,6 +595,32 @@ mod tests {
         // 换了档位是另一个键，该排就排（否则切到画廊时那批图标永远补不上）。
         assert!(c.request(Path::new("/tmp/a.txt"), false, SLOT_LARGE));
         assert_eq!(c.queued(), 1);
+    }
+
+    /// 认命（`give_up`）之后：在途重试清空、同键不再入队（`request` / 预取同一套
+    /// `asked` 账本）——否则「原路径已不存在」的条目（回收站是典型）会每帧重排、
+    /// 泵永远空转在注定失败的键上。
+    #[test]
+    fn give_up_keeps_the_key_from_being_requested_again() {
+        let mut c = IconCache::default();
+        let p = Path::new("/Users/me/gone-dir");
+        let key = icon_key(p, true, SLOT_SMALL);
+        assert!(c.request(p, true, SLOT_SMALL), "首次入队");
+        assert_eq!(
+            c.pop_next(Instant::now()),
+            Some((p.to_path_buf(), key.clone()))
+        );
+        // 模拟「失败已排进重试」的中间态，认命要把在途重试一并清掉。
+        assert!(c.note_failure(p, &key, Instant::now()));
+        assert_eq!(c.queued(), 1, "失败后应有一条在途重试");
+
+        c.give_up(&key);
+        assert_eq!(c.queued(), 0, "认命后队列必须全空");
+        assert!(!c.request(p, true, SLOT_SMALL), "认命后同键不得再次入队");
+        assert!(
+            !c.request_prefetch(p, true, SLOT_SMALL),
+            "预取与请求共用同一本「问过」账，也不得入队"
+        );
     }
 
     /// 一条类型记录要同时让「同类型的新路径」和「原路径」都命中——否则往目录里

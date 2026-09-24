@@ -492,6 +492,33 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     })
 }
 
+/// 取一个**扩展名**在系统里的图标（`NSWorkspace.iconForFileType:`），契约同
+/// [`file_icon_raster`]：主线程做、只交像素、编码归调用方。
+///
+/// 给「文件本体已不在、扩展名还在」的场景用——**回收站条目**是典型：原路径多半
+/// 已经不存在，`iconForFile:` 对不存在的路径只会给一张通用白纸图标；按扩展名问
+/// 拿到的就是访达里那个「.txt = 文本文档」的真图标。`ext` **不带点**（`"txt"`，
+/// 带点也会被剥掉）；空扩展名返回 `None`。
+///
+/// ⚠️ `iconForFileType:` 自 10.13 标了 deprecated（官方建议换 `iconForContentType:`，
+/// 那要引 CoreServices + UTType 桥接，收益只是消一条提醒）——它依然工作正常，
+/// 继续用，账记在这里。
+pub fn ext_icon_raster(ext: &str, px: u32) -> Option<IconRaster> {
+    let ext = ext.trim_start_matches('.').to_string();
+    if ext.is_empty() {
+        return None;
+    }
+    on_main_thread(move || unsafe {
+        let ns_ext = nsstring(&ext)?;
+        let ws = workspace().ok()?;
+        let image: *mut Object = msg_send![ws, iconForFileType: ns_ext];
+        if image.is_null() {
+            return None;
+        }
+        draw_ns_image_to_raster(image, px)
+    })
+}
+
 /// 取**通用文件夹**的系统图标（`NSImage imageNamed: NSFolder`），契约同
 /// [`file_icon_raster`]：主线程做、只交像素、编码归调用方。
 ///

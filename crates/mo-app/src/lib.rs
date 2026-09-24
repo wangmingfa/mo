@@ -1585,8 +1585,27 @@ impl AppState {
             // 第一段（主线程）：问系统 + 重绘到这一档要的尺寸 + 拷像素。
             // 尺寸取自**键**（键里存的就是要取的档位），而不是某个全局默认值——
             // 不然列表问来的 40px 会顶掉画廊要的 128px。
+            //
+            // **类型键按扩展名问**（`iconForFileType:`）：类型缓存本来就是一个扩展名
+            // 共享一张图，按扩展名问正好对齐这个模型；更重要的是「文件本体已不在」
+            // 的条目（回收站的原路径是典型）也能拿到真系统图标——拿不存在的路径去
+            // 问只会得到一张通用白纸图标，还会把整个类型的共享缓存污染掉。
+            // **路径键**（目录 / 包 / 无后缀文件）才按路径问，且路径必须真实存在：
+            // 不存在的路径问出来毫无价值，直接认命（渲染退回内置 SVG / 蓝文件夹占位）。
             let started = std::time::Instant::now();
-            let raster = mo_platform::file_icon_raster(&path, key.px());
+            let raster = match &key {
+                icon::IconKey::Type(ext, px) => {
+                    mo_platform::ext_icon_raster(ext.trim_start_matches('.'), *px)
+                }
+                icon::IconKey::Path(..) => {
+                    if !path.exists() {
+                        main_thread_spent += started.elapsed();
+                        self.icon_cache.lock().unwrap().give_up(&key);
+                        continue;
+                    }
+                    mo_platform::file_icon_raster(&path, key.px())
+                }
+            };
             main_thread_spent += started.elapsed();
             // 第二段（后台）：预乘还原 + 换成 BGRA 内存位图——不再编码 PNG、不再
             // 写盘，UI 拿 `ImageSource::Render` 同步上屏（`img(path)` 的异步空窗

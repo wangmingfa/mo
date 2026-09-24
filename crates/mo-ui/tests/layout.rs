@@ -37,7 +37,11 @@ fn open_app(
     //     布局断言——这些测试要守的仍然照守。
     // 少了这一句，`cargo test` 会随机红在「哪条 layout 测试」上，而与被测布局无关。
     cx.dispatcher.allow_parking();
-    let app = AppState::new();
+    // 回收站根也要**隔离**：`AppState::new()` 用真实 `~/.mo-trash`，测试机上有
+    // 真实条目时 `open_trash_panel` 一刷新就会把注入的假条目顶掉（曾让回收站
+    // 相关断言靠机器状态侥幸通过）。
+    let trash_root = std::env::temp_dir().join(format!("mo-layout-trash-{}", std::process::id()));
+    let app = AppState::with_trash(trash_root);
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     // Home 目录是异步加载的；这里只关心布局，跑一轮让首帧画出来即可。
@@ -437,7 +441,8 @@ fn sidebar_trash_entry_opens_the_trash_panel(cx: &mut TestAppContext) {
     let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
 
     // 注入两条假回收站记录（真记录要走 Trash 索引链路，headless 拉不动），
-    // 行样式 / 侧栏保留的断言靠它们渲染出来。
+    // 行样式 / 侧栏保留的断言靠它们渲染出来。⚠️ 必须**先点开面板再注入**：
+    // `open_trash_panel` 会用 `AppState::trash_list()` 刷新条目，先注入会被顶掉。
     let mk = |name: &str, is_dir: bool| mo_operations::TrashEntry {
         id: format!("t-{name}"),
         original: std::path::PathBuf::from("/Users/demo").join(name),
@@ -445,14 +450,6 @@ fn sidebar_trash_entry_opens_the_trash_panel(cx: &mut TestAppContext) {
         is_dir,
         at: 1_700_000_000,
     };
-    window
-        .update(cx, |root, _window, _cx| {
-            mo_ui::inject_trash_for_tests(
-                root,
-                vec![mk("新建文本.txt", false), mk("trae-cn", true)],
-            );
-        })
-        .expect("注入回收站条目失败");
 
     let sidebar = bounds(&mut vcx, "mo-sidebar");
     let trash = bounds(&mut vcx, "mo-sidebar-trash");
@@ -465,6 +462,14 @@ fn sidebar_trash_entry_opens_the_trash_panel(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("mo-central-view").is_none());
 
     vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_trash_for_tests(
+                root,
+                vec![mk("新建文本.txt", false), mk("trae-cn", true)],
+            );
+        })
+        .expect("注入回收站条目失败");
     vcx.update(|window, cx| window.render_frame(cx));
     assert!(
         vcx.debug_bounds("mo-central-view").is_some(),
@@ -962,5 +967,68 @@ fn content_search_panel_renders_its_skeleton(cx: &mut TestAppContext) {
     assert!(
         vcx.debug_bounds("mo-content-row-0").is_none(),
         "还没搜，不应有命中行"
+    );
+}
+
+/// 回收站条目不足一屏时，斑马纹要一直铺到视口底部（用户报：只有两条记录时
+/// 下面一片白，不像同一个应用）。补出来的行没有数据、只有底色
+/// （`mo-trash-ph-*`），底色 / 行高与数据行同一套规矩。
+#[gpui_kit::test]
+fn trash_zebra_stripes_fill_the_viewport(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let mk = |name: &str, is_dir: bool| mo_operations::TrashEntry {
+        id: format!("t-{name}"),
+        original: std::path::PathBuf::from("/Users/demo").join(name),
+        trashed: std::path::PathBuf::from("/tmp/mo-trash").join(name),
+        is_dir,
+        at: 1_700_000_000,
+    };
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_trash_for_tests(root, vec![mk("a.txt", false), mk("b", true)]);
+        })
+        .expect("注入回收站条目失败");
+    // 第一帧 prepaint 记下内容区高度并 notify；这一帧补足行才画出来。
+    vcx.update(|window, cx| window.render_frame(cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    // 第一条占位行必须紧贴最后一条真实行（无缝，底色才接得上）。
+    let row1 = bounds(&mut vcx, "mo-trash-row-1");
+    let ph0 = bounds(&mut vcx, "mo-trash-ph-2");
+    assert_eq!(f32::from(ph0.size.height), 24.0, "占位行高必须与数据行一致");
+    assert_eq!(
+        f32::from(ph0.origin.y),
+        f32::from(row1.origin.y) + f32::from(row1.size.height),
+        "占位行与真实行之间出现缝隙：row1={row1:?} ph0={ph0:?}"
+    );
+
+    // 连续占位行逐行 24px 往下排。
+    let ph3 = bounds(&mut vcx, "mo-trash-ph-3");
+    assert_eq!(
+        f32::from(ph3.origin.y),
+        f32::from(ph0.origin.y) + 24.0,
+        "占位行之间没有按 24px 行高连续排布"
+    );
+
+    // 铺满一屏：从第一条占位行往下数到断档，最后一行必须盖过视口大半
+    // （700px 窗口，内容区高约 500px；若只画真实行这里只有 48px）。
+    let mut last_bottom = f32::from(ph0.origin.y) + f32::from(ph0.size.height);
+    let mut i = 3;
+    loop {
+        // `debug_bounds` 要 `&'static str`，循环里构造的选择子直接泄漏一块
+        // （测试进程生命周期内就这一小段，无所谓）。
+        let sel: &'static str = Box::leak(format!("mo-trash-ph-{i}").into_boxed_str());
+        let Some(b) = vcx.debug_bounds(sel) else {
+            break;
+        };
+        last_bottom = f32::from(b.origin.y) + f32::from(b.size.height);
+        assert_eq!(f32::from(b.size.height), 24.0, "占位行 {i} 行高不是 24px");
+        i += 1;
+    }
+    assert!(i - 2 >= 10, "补足行只有 {} 条：斑马纹没铺满一屏", i - 2);
+    assert!(
+        last_bottom > 550.0,
+        "斑马纹只铺到 y={last_bottom}，没到视口底部"
     );
 }
