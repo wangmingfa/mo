@@ -9,11 +9,12 @@
 //! * 没有对应实现的平台给 [`PlatformError::Unsupported`]，上层退回自己的做法，
 //!   而不是静默失败。
 //!
-//! ## 为什么「回收站」必须走系统
+//! ## 为什么「回收站」要走系统
 //!
 //! 自己往 `~/.Trash` 里搬文件在 macOS 上只对**启动卷**成立：外接卷宗的废纸篓在卷
 //! 宗根目录下（`.Trashes/<uid>`），而且访达的「清空废纸篓」、系统「关于本机」里的
-//! 容量统计都只认系统那份。用 `NSWorkspace recycleURLs:` 才是正解。
+//! 容量统计都只认系统那份。用 `trashItemAtURL:resultingItemURL:` 让系统搬、Mo
+//! 拿回落点记账才是正解（探针结论见 `devlog/trash-unify.md`）。
 
 mod macos;
 
@@ -35,18 +36,21 @@ pub fn supports_trash() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// 把 `paths` 送进系统回收站（可撤销 —— 由系统的废纸篓负责）。
+/// 把 `path` 送进系统回收站，返回它在废纸篓里的**实际落点**。
+///
+/// 落点是上层记账的依据（Mo 的回收站账本要靠它还原 / 永久删除）；系统负责
+/// 处理重名改名与外接卷宗的就地 `.Trashes`。
 ///
 /// 返回 `Err(PlatformError::Unsupported)` 时上层应当退回自己的回收站实现
 /// （`mo_operations` 那套目录），不要静默吞掉。
-pub fn recycle(paths: &[PathBuf]) -> Result<(), PlatformError> {
+pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
     #[cfg(target_os = "macos")]
     {
-        macos::recycle(paths)
+        macos::recycle_one(path)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = paths;
+        let _ = path;
         Err(PlatformError::Unsupported("回收站"))
     }
 }
@@ -361,11 +365,17 @@ mod tests {
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"x").expect("写临时文件");
 
-        recycle(std::slice::from_ref(&victim)).expect("应当能进系统废纸篓");
+        let trashed = recycle_one(&victim).expect("应当能进系统废纸篓");
         assert!(!victim.exists(), "进了废纸篓，原处就不该还在");
+        assert!(
+            trashed.is_file() && trashed != victim,
+            "落点应当是废纸篓里的真实文件：{trashed:?}"
+        );
+        // 记账的另一半：落点文件可以直接抹掉（永久删除语义）。
+        std::fs::remove_file(&trashed).expect("落点应当可删");
 
         // 第二次必须**报错**（而不是静默「成功」）——用户会以为又删了一份。
-        let err = recycle(std::slice::from_ref(&victim)).expect_err("同一个文件第二次应当失败");
+        let err = recycle_one(&victim).expect_err("同一个文件第二次应当失败");
         assert!(
             err.to_string().contains("victim.txt"),
             "错误里要说清是哪一条失败：{err}"

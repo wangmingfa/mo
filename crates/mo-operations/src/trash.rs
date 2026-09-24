@@ -1,17 +1,29 @@
-//! 回收站：把被删除的文件 / 目录移入隔离目录，并记录可还原的映射。
+//! 回收站：把被删除的文件移走，并记录可还原的映射。
 //!
 //! 设计要点：
-//! * 每个被回收项放进 `<root>/<uuid>/<原名>`，按 uuid 隔离，避免同名冲突。
+//! * **隔离模式**（默认 / 测试）：被回收项放进 `<root>/<uuid>/<原名>`，按 uuid
+//!   隔离，避免同名冲突；`root` 里既有数据也有 `index.json`。
+//! * **系统模式**（注入搬移器）：由平台把文件送进**系统**废纸篓（macOS 上是
+//!   `trashItemAtURL`，落点在 `~/.Trash` 或卷宗 `.Trashes/<uid>`），Mo 只拿回落点
+//!   记账。`root` 里只有 `index.json`，账本悬空（用户清倒废纸篓）时还原会报
+//!   「文件已不在」。
 //! * 索引（`<root>/index.json`）持久化 `TrashEntry`，进程重启后仍能还原 / 清空。
 //! * 还原时按「原路径」回找最近一条记录，因此撤销「删除」无需持有 entry 生命周期。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fs_util::move_path;
+
+/// 注入式搬移器：把一个本地路径交给平台回收站，返回它在废纸篓里的**实际落点**。
+///
+/// 生产实现是 `mo_platform::recycle_one`（系统负责重名改名与跨卷落点）；测试注入
+/// 一个搬进临时目录的假搬移器，不碰真实废纸篓。
+pub type TrashMover = Arc<dyn Fn(&Path) -> Result<PathBuf> + Send + Sync>;
 
 /// 一条回收站记录。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,22 +58,45 @@ pub type Result<T> = std::result::Result<T, TrashError>;
 pub struct Trash {
     root: PathBuf,
     entries: PlMutex<Vec<TrashEntry>>,
+    /// `Some` = 系统模式（搬移交给平台，`root` 只放索引）；`None` = 隔离模式。
+    mover: Option<TrashMover>,
 }
 
 impl Trash {
-    /// 打开（或创建）回收站根目录，并加载持久化索引。
+    /// 打开（或创建）回收站根目录，并加载持久化索引（隔离模式）。
     pub fn new(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         let entries = load_index(&root).unwrap_or_default();
         Ok(Self {
             root,
             entries: PlMutex::new(entries),
+            mover: None,
+        })
+    }
+
+    /// 打开回收站并注入系统搬移器（系统模式）：文件由平台送进系统废纸篓，
+    /// `root` 只承载 `index.json` 账本。
+    pub fn with_mover(root: PathBuf, mover: TrashMover) -> Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        let entries = load_index(&root).unwrap_or_default();
+        Ok(Self {
+            root,
+            entries: PlMutex::new(entries),
+            mover: Some(mover),
         })
     }
 
     /// 回收站根目录。
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 这条记录是不是旧式隔离条目（`trashed` 在 `root` 的 `<uuid>/` 下）。
+    ///
+    /// 只有隔离条目的父目录才允许整目录清理；系统条目的父目录是
+    /// `~/.Trash` / 卷宗 `.Trashes`，动它就是灾难。
+    fn is_isolated(&self, trashed: &Path) -> bool {
+        self.mover.is_none() && trashed.starts_with(&self.root)
     }
 
     fn index_path(&self) -> PathBuf {
@@ -74,9 +109,12 @@ impl Trash {
         Ok(())
     }
 
-    /// 把 `path` 移入回收站（保留原文件名，按 id 隔离），返回记录。
+    /// 把 `path` 移入回收站，返回记录。
     ///
-    /// 入站使用 `move_path`（rename 快路径，跨设备自动复制 + 删除源）。
+    /// * 隔离模式：入站用 `move_path`（rename 快路径，跨设备自动复制 + 删除源），
+    ///   落到 `<root>/<uuid>/<原名>`。
+    /// * 系统模式：搬移交给注入的搬移器（平台系统废纸篓），落点以它返回的为准；
+    ///   重名改名、跨卷落点都由系统处理，账本只管如实记下。
     pub fn trash(&self, path: &Path) -> Result<TrashEntry> {
         if !path.exists() {
             return Err(TrashError::Io(std::io::Error::new(
@@ -90,8 +128,14 @@ impl Trash {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| id.clone());
-        let trashed = self.root.join(&id).join(&name);
-        move_path(path, &trashed)?;
+        let trashed = match &self.mover {
+            Some(mover) => mover(path)?,
+            None => {
+                let trashed = self.root.join(&id).join(&name);
+                move_path(path, &trashed)?;
+                trashed
+            }
+        };
 
         let entry = TrashEntry {
             id,
@@ -113,9 +157,11 @@ impl Trash {
             }
         }
         move_path(&entry.trashed, &entry.original)?;
-        // 清理 uuid 隔离目录（可能残留空父）。
-        if let Some(id_dir) = entry.trashed.parent() {
-            let _ = std::fs::remove_dir_all(id_dir);
+        // 清理 uuid 隔离目录（可能残留空父）。仅限隔离条目。
+        if self.is_isolated(&entry.trashed) {
+            if let Some(id_dir) = entry.trashed.parent() {
+                let _ = std::fs::remove_dir_all(id_dir);
+            }
         }
         self.remove_entry(&entry.id)
     }
@@ -149,21 +195,37 @@ impl Trash {
     }
 
     /// 永久删除某一条记录（不还原，直接抹掉文件与索引）。
+    ///
+    /// 账本悬空（系统废纸篓里文件已被清倒）不算错——目的本来就达成了一半，
+    /// 这里只负责把索引抹掉。
     pub fn purge(&self, entry: &TrashEntry) -> Result<()> {
-        // 删除 uuid 隔离目录，连同其中的被回收文件 / 目录。
-        if let Some(id_dir) = entry.trashed.parent() {
-            let _ = std::fs::remove_dir_all(id_dir);
+        if self.is_isolated(&entry.trashed) {
+            // 删除 uuid 隔离目录，连同其中的被回收文件 / 目录。
+            if let Some(id_dir) = entry.trashed.parent() {
+                let _ = std::fs::remove_dir_all(id_dir);
+            }
+        } else {
+            // 系统条目只许动文件本身（可能是目录）。
+            if entry.trashed.is_dir() {
+                let _ = std::fs::remove_dir_all(&entry.trashed);
+            } else {
+                let _ = std::fs::remove_file(&entry.trashed);
+            }
         }
-        // 兜底（trashed 无父目录等罕见情况）。
-        let _ = std::fs::remove_file(&entry.trashed);
         self.remove_entry(&entry.id)
     }
 
     /// 清空回收站（删除所有被回收的文件 + 索引）。
     pub fn empty(&self) -> Result<()> {
-        let ids: Vec<String> = self.entries.lock().iter().map(|e| e.id.clone()).collect();
-        for id in ids {
-            let _ = std::fs::remove_dir_all(self.root.join(&id));
+        let snapshot: Vec<TrashEntry> = self.entries.lock().clone();
+        for e in &snapshot {
+            if self.is_isolated(&e.trashed) {
+                let _ = std::fs::remove_dir_all(self.root.join(&e.id));
+            } else if e.trashed.is_dir() {
+                let _ = std::fs::remove_dir_all(&e.trashed);
+            } else {
+                let _ = std::fs::remove_file(&e.trashed);
+            }
         }
         self.entries.lock().clear();
         self.persist()
@@ -304,6 +366,88 @@ mod tests {
         );
         t.restore(&entry).unwrap();
         assert!(src.join("inner.txt").exists(), "还原后目录内容应回来");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 系统模式：搬移交给注入的假搬移器，账本记**实际落点**；`root` 里只有索引；
+    /// purge 只删落点文件本身，绝不动「废纸篓目录」（生产上那是 `~/.Trash`）。
+    #[test]
+    fn system_mode_records_real_location_and_purge_never_touches_parent() {
+        let (root, _) = tmp_trash("sys");
+        let fake_trash = root.join("fake-trash");
+        std::fs::create_dir_all(&fake_trash).unwrap();
+        let ft = fake_trash.clone();
+        let t = Trash::with_mover(
+            root.join("trash"),
+            Arc::new(move |p: &Path| {
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                let mut to = ft.join(&name);
+                let mut n = 2;
+                while to.exists() {
+                    to = ft.join(format!("{name} {n}"));
+                    n += 1;
+                }
+                std::fs::rename(p, &to)?;
+                Ok(to)
+            }),
+        )
+        .unwrap();
+
+        let src = root.join("note.txt");
+        file(&src, b"hello");
+        let entry = t.trash(&src).unwrap();
+        assert!(!src.exists(), "原路径应已消失");
+        assert!(
+            entry.trashed.starts_with(&fake_trash),
+            "账本应记假废纸篓里的落点：{:?}",
+            entry.trashed
+        );
+        assert!(
+            !root.join("trash").join(&entry.id).exists(),
+            "系统模式不在 root 下建 uuid 隔离目录"
+        );
+
+        t.purge(&entry).unwrap();
+        assert!(!entry.trashed.exists(), "落点文件应被永久删除");
+        assert!(fake_trash.exists(), "废纸篓目录本身绝不能被整目录清掉");
+        assert_eq!(t.count(), 0, "索引应同步抹掉");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 系统模式的还原与清空：还原照账本把文件搬回原路径；empty 清掉各落点
+    /// 文件但保留废纸篓目录本身。
+    #[test]
+    fn system_mode_restore_and_empty() {
+        let (root, _) = tmp_trash("syse");
+        let fake_trash = root.join("fake-trash");
+        std::fs::create_dir_all(&fake_trash).unwrap();
+        let ft = fake_trash.clone();
+        let t = Trash::with_mover(
+            root.join("trash"),
+            Arc::new(move |p: &Path| {
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                let to = ft.join(&name);
+                std::fs::rename(p, &to)?;
+                Ok(to)
+            }),
+        )
+        .unwrap();
+
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        file(&a, b"a");
+        file(&b, b"b");
+        let ea = t.trash(&a).unwrap();
+        t.trash(&b).unwrap();
+
+        t.restore(&ea).unwrap();
+        assert!(a.exists(), "按账本还原应搬回原路径");
+        assert!(!fake_trash.join("a.txt").exists());
+
+        t.empty().unwrap();
+        assert!(!fake_trash.join("b.txt").exists(), "清空应删掉落点文件");
+        assert!(fake_trash.exists(), "清空不动废纸篓目录本身");
+        assert_eq!(t.count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

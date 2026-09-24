@@ -115,7 +115,7 @@ unsafe impl objc::Encode for NSRect {
     }
 }
 
-/// 把一批路径送进**系统**废纸篓（访达里那份）。
+/// 把一个路径送进**系统**废纸篓（访达里那份），返回它在废纸篓里的**实际落点**。
 ///
 /// 用 `NSFileManager.trashItemAtURL:resultingItemURL:error:` 而不是
 /// `NSWorkspace.recycleURLs:completionHandler:`：
@@ -125,34 +125,50 @@ unsafe impl objc::Encode for NSRect {
 /// * 前者同步、返回 `NSError`，可以原样把系统的说法带给用户（「宗卷不支持废纸篓」
 ///   这种只有系统知道）。
 ///
+/// `resultingItemURL` 是自记账的关键（见 `devlog/trash-unify.md`）：系统负责搬
+/// （重名自动改名、外接卷进卷上 `.Trashes/<uid>`），落点只有它知道——拿到它，
+/// Mo 的回收站账本才能在还原 / 永久删除时定位文件。
+///
 /// `NSFileManager` 是线程安全的，不必绕主线程。
-pub fn recycle(paths: &[PathBuf]) -> Result<(), PlatformError> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    for (done, p) in paths.iter().enumerate() {
-        let Some(url) = nsurl_for(p) else {
+pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
+    let Some(url) = nsurl_for(path) else {
+        return Err(PlatformError::Failed(format!(
+            "无法把路径交给系统：{}",
+            path.display()
+        )));
+    };
+    unsafe {
+        let manager: *mut Object = msg_send![class("NSFileManager")?, defaultManager];
+        let mut error: *mut Object = std::ptr::null_mut();
+        let mut out_url: *mut Object = std::ptr::null_mut();
+        let ok: bool = msg_send![manager, trashItemAtURL: url resultingItemURL: &mut out_url error: &mut error];
+        if !ok {
+            let why = error_text(error).unwrap_or_else(|| "系统没有说明原因".to_string());
             return Err(PlatformError::Failed(format!(
-                "无法把路径交给系统：{}",
-                p.display()
+                "无法把 {} 送进废纸篓：{why}",
+                path.display()
             )));
-        };
-        // 任一条失败就停下，绝不「跳过它继续」——用户以为删了三条，实际只进了两条
-        // 废纸篓。但已经进去的那些没法撤回，所以错误里要写清楚进了几条。
-        unsafe {
-            let manager: *mut Object = msg_send![class("NSFileManager")?, defaultManager];
-            let mut error: *mut Object = std::ptr::null_mut();
-            let ok: bool = msg_send![manager, trashItemAtURL: url resultingItemURL: std::ptr::null_mut::<Object>() error: &mut error];
-            if !ok {
-                let why = error_text(error).unwrap_or_else(|| "系统没有说明原因".to_string());
-                return Err(PlatformError::Failed(format!(
-                    "无法把 {} 送进废纸篓：{why}（前面 {done} 条已经进去了）",
-                    p.display()
-                )));
-            }
         }
+        if out_url.is_null() {
+            return Err(PlatformError::Failed(format!(
+                "系统没有返回 {} 在废纸篓里的落点，无法记账",
+                path.display()
+            )));
+        }
+        let path_obj: *mut Object = msg_send![out_url, path];
+        let c_str: *const std::os::raw::c_char = msg_send![path_obj, UTF8String];
+        if c_str.is_null() {
+            return Err(PlatformError::Failed(format!(
+                "落点路径无法解析：{}",
+                path.display()
+            )));
+        }
+        Ok(PathBuf::from(
+            std::ffi::CStr::from_ptr(c_str)
+                .to_string_lossy()
+                .into_owned(),
+        ))
     }
-    Ok(())
 }
 
 /// 「在访达中显示」：选中并滚动到那个条目。

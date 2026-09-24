@@ -162,6 +162,20 @@ pub(crate) enum Modal {
     /// 只在服务器**真的拒绝**了匿名登录时出现（`ConnectFailure::NeedsCredentials`），
     /// 所以地址里没写凭据不等于会弹它：匿名能进就直接进了。
     ConnectAuth,
+    /// 回收站危险操作确认（清空 / 永久删除单条）。
+    ///
+    /// 回收站面板**保留在遮罩后面**（渲染上把这一档当成 `Modal::Trash` 画），
+    /// Enter / 红色确认按钮执行，Esc / 取消 / 点遮罩回到面板。
+    ConfirmTrash(TrashConfirm),
+}
+
+/// [`Modal::ConfirmTrash`] 携带的待确认动作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrashConfirm {
+    /// 清空回收站（条目数在渲染时从 `trash_entries` 现读，避免快照过期）。
+    Empty,
+    /// 永久删除单条（携带打开确认卡那一刻选中的条目）。
+    Purge(Box<TrashEntry>),
 }
 
 /// 统一设置窗口（[`Modal::Settings`](Modal)）里的标签页。
@@ -299,8 +313,6 @@ pub(crate) enum CommandId {
     DisconnectServer,
     /// 在系统的文件管理器里显示（macOS = 在访达中显示）：平台没实现时不进目录。
     RevealInFileManager,
-    /// 把选中项交给**系统**废纸篓（不可逆；平台没实现时不进目录）。
-    RecycleToSystem,
     /// 在当前目录查找重复文件。
     FindDuplicates,
     /// 文件夹同步面板。
@@ -670,19 +682,12 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             category: "排序".to_string(),
         },
     ];
-    // 平台原生的那两条（在访达中显示 / 移到系统废纸篓）：**没有实现的平台不列**
+    // 平台原生的那一条（在访达中显示）：**没有实现的平台不列**
     // ——列出来点了只会报「不支持」，不如不出现。
     if mo_platform::supports_reveal() {
         out.push(CmdDef {
             id: CommandId::RevealInFileManager,
             title: format!("{}（选中项 / 当前目录）", mo_platform::reveal_label()),
-            category: "操作".to_string(),
-        });
-    }
-    if mo_platform::supports_trash() {
-        out.push(CmdDef {
-            id: CommandId::RecycleToSystem,
-            title: "移到系统废纸篓（选中项）".to_string(),
             category: "操作".to_string(),
         });
     }
@@ -774,7 +779,7 @@ pub struct RootView {
     /// 全局搜索结果。
     search_results: Vec<SearchHit>,
     /// 快速预览独立窗口（`None` = 未开；已开时复用换内容，不重复开）。
-    preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
+    pub(crate) preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
     /// 预览**代际**：每次 `show_preview` 递增。
     ///
     /// 图片的降采样副本在后台生成，回来时可能已经换了预览对象（翻页）——
@@ -2889,6 +2894,37 @@ impl RootView {
             cx.spawn(async move |_weak, _cx| {
                 if let Err(e) = app.open_with_system(&path).await {
                     tracing::warn!("打开 {path:?} 失败：{e}");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// 打开回收站条目的**实际落点**（双击语义）。
+    ///
+    /// 与 [`RootView::open_entry`] 的差别：落点必然是**本地**路径
+    /// （`~/.Trash` / 卷上 `.Trashes`），所以目录走 `open_local`（本地入口
+    /// 纪律），文件交给系统默认应用。目录还会先退出回收站面板——浏览替代
+    /// 管理，面板任务已结束。
+    pub(crate) fn open_trash_entry(
+        &mut self,
+        trashed: PathBuf,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if is_dir {
+            self.modal = Modal::None;
+            cx.notify();
+            let app = self.app();
+            cx.spawn(async move |_weak, _cx| {
+                let _ = app.open_local(&trashed).await;
+            })
+            .detach();
+        } else {
+            let app = self.app();
+            cx.spawn(async move |_weak, _cx| {
+                if let Err(e) = app.open_with_system(&trashed).await {
+                    tracing::warn!("打开回收站条目 {trashed:?} 失败：{e}");
                 }
             })
             .detach();
@@ -5709,7 +5745,7 @@ impl RootView {
             Some((p, d)) => (Some(p), d),
             None => (None, true),
         };
-        // 本机专属动作（在访达中显示 / 移到系统废纸篓）要不要出现，就看这一刻
+        // 本机专属动作（在访达中显示）要不要出现，就看这一刻
         // 是不是在看远程——菜单里的可见性必须在**打开时**定下来（之后列表可能变）。
         let remote = self
             .panel_at(pane, tab)
@@ -5946,21 +5982,6 @@ impl RootView {
                     if let Err(e) = app.delete_selection().await {
                         this.update(cx, |v, cx| {
                             v.notice(format!("删除失败：{e}"), None, cx);
-                        });
-                    }
-                })
-                .detach();
-            }
-            A::SystemTrash => {
-                // 交给系统废纸篓：不可逆、不进回收站面板，所以**不**入撤销栈
-                // （`delete_selection` 那条路才会压 `Reversible::Delete`）。
-                let app = self.app();
-                let this = cx.entity().clone();
-                let paths = menu.paths.clone();
-                cx.spawn(async move |_weak, cx| {
-                    if let Err(e) = app.recycle_to_system(paths).await {
-                        this.update(cx, |v, cx| {
-                            v.notice(format!("移到系统废纸篓失败：{e}"), None, cx);
                         });
                     }
                 })
@@ -6253,6 +6274,9 @@ impl Render for RootView {
         //   所以这里与 `None` 一样渲染正常浏览区，而不是顶掉整个中央区；
         // * **次级视图**（A 类）：内容多、要停留，正当占满中央区，
         //   由 `central_view` 提供标题栏（见 `dialogs.rs` / 各 `render_*`）。
+        // 例外：`ConfirmTrash` 虽是 B 类浮层，但它是**从回收站面板里**弹出来的
+        // 确认卡——中央区要渲染的是回收站面板（见下一档的 ConfirmTrash 分支），
+        // 而不是确认前的浏览区。
         let body: Div = match &self.modal {
             // 对话框（B 类）：走带遮罩的浮层，中央区照常渲染浏览区。
             Modal::None
@@ -6297,8 +6321,9 @@ impl Render for RootView {
             // 其中「浏览型」的两个（全局搜索 / 回收站）**保留侧栏**——它们本质上
             // 还是在挑文件，左侧导航得一直在（用户报：进回收站左侧整个没了）。
             // 其余（扩展 / 比较…）是工具页，全宽无妨。
-            Modal::GlobalSearch | Modal::Trash | Modal::ContentSearch => {
-                let in_trash = matches!(self.modal, Modal::Trash);
+            // 回收站确认卡（ConfirmTrash）也按回收站画：面板保留在遮罩后面。
+            Modal::GlobalSearch | Modal::Trash | Modal::ContentSearch | Modal::ConfirmTrash(_) => {
+                let in_trash = matches!(self.modal, Modal::Trash | Modal::ConfirmTrash(_));
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 if self.ui.sidebar {
                     // 回收站里没有「当前位置」可言：别把进面板前的目录高亮留着，
@@ -6620,6 +6645,9 @@ impl Render for RootView {
                     .clone()
                     .unwrap_or_else(|| "知道了".to_string());
                 root = root.child(render_notice_overlay(msg, &label, &entity));
+            }
+            Modal::ConfirmTrash(action) => {
+                root = root.child(render_trash_confirm(self, action, &entity));
             }
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
             Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
@@ -7151,6 +7179,35 @@ fn handle_modal_key(
             "enter" => on_trash_restore(entity, cx),
             "delete" => on_trash_purge(entity, cx),
             "e" if plain => on_trash_empty(entity, cx),
+            // 空格 = 快速预览**实际落点**文件（Finder 废纸篓同款 Quick Look）。
+            // 预览的是 `trashed`（真在 ~/.Trash / 卷上 .Trashes 的本地文件），
+            // 不是已不存在的原路径。
+            "space" if plain => {
+                let selected = entity.update(cx, |v, _cx| {
+                    v.trash_entries
+                        .get(v.palette_index)
+                        .map(|e| e.trashed.clone())
+                });
+                if let Some(path) = selected {
+                    let app = entity.update(cx, |v, _cx| v.app());
+                    let this = entity.clone();
+                    cx.spawn(async move |cx| match app.preview(&path) {
+                        Ok(pv) => show_preview_twopass(&app, &this, pv, cx),
+                        Err(e) => {
+                            this.update(cx, |v, cx| {
+                                v.modal = Modal::Info(format!("无法预览 {}：{e}", path.display()));
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .detach();
+                }
+            }
+            _ => {}
+        },
+        Modal::ConfirmTrash(_) => match key {
+            "escape" => dismiss_trash_confirm(entity, cx),
+            "enter" => confirm_trash_action(entity, cx),
             _ => {}
         },
         Modal::Properties => match key {
@@ -7480,27 +7537,59 @@ fn on_trash_restore(entity: &Entity<RootView>, cx: &mut App) {
     }
 }
 
-/// 回收站：永久删除选中条目。
+/// 回收站：永久删除选中条目——**先弹确认卡**，不直接执行。
 fn on_trash_purge(entity: &Entity<RootView>, cx: &mut App) {
-    let (entry, app) = entity.update(cx, |v, cx| {
-        let e = v.trash_entries.get(v.palette_index).cloned();
+    entity.update(cx, |v, cx| {
+        let Some(e) = v.trash_entries.get(v.palette_index).cloned() else {
+            return;
+        };
+        v.modal = Modal::ConfirmTrash(TrashConfirm::Purge(Box::new(e)));
+        cx.notify();
+    });
+}
+
+/// 回收站：清空——**先弹确认卡**，不直接执行。
+fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        v.modal = Modal::ConfirmTrash(TrashConfirm::Empty);
+        cx.notify();
+    });
+}
+
+/// 确认卡上点了「确认」（或按 Enter）：真正执行，然后回到回收站面板。
+///
+/// 取消（Esc / 取消按钮 / 点遮罩）走 [`dismiss_trash_confirm`]。
+fn confirm_trash_action(entity: &Entity<RootView>, cx: &mut App) {
+    let action = entity.update(cx, |v, cx| {
+        let action = match std::mem::replace(&mut v.modal, Modal::Trash) {
+            Modal::ConfirmTrash(a) => a,
+            other => {
+                // 不在确认卡上（竞态 / 重复触发）：原样放回，什么都不做。
+                v.modal = other;
+                return None;
+            }
+        };
+        // 列表马上要变：选中索引归零（原 `on_trash_purge` 的收尾搬到这里）。
         v.palette_index = 0;
         cx.notify();
-        (e, v.app())
+        Some(action)
     });
-    if let Some(e) = entry {
-        app.purge_trash_entry(e);
+    let Some(action) = action else { return };
+    let app = entity.read(cx).app();
+    match action {
+        TrashConfirm::Purge(e) => app.purge_trash_entry(*e),
+        TrashConfirm::Empty => app.empty_trash(),
     }
 }
 
-/// 回收站：清空。
-fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
-    let app = entity.update(cx, |v, cx| {
-        v.palette_index = 0;
-        cx.notify();
-        v.app()
+/// 取消确认：回到回收站面板（**不是** `close_modal`——那会把面板整个关掉）。
+fn dismiss_trash_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if matches!(v.modal, Modal::ConfirmTrash(_)) {
+            v.modal = Modal::Trash;
+            cx.notify();
+        }
     });
-    app.empty_trash();
 }
 
 fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
@@ -7714,30 +7803,6 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                                 None,
                                 cx,
                             );
-                        });
-                    }
-                })
-                .detach();
-                v.cmd_query.clear();
-                v.palette_index = 0;
-                cx.notify();
-            });
-        }
-        Some(CommandId::RecycleToSystem) => {
-            entity.update(cx, |v, cx| {
-                let app = v.app();
-                let this = cx.entity().clone();
-                cx.spawn(async move |_weak, cx| {
-                    let paths = app.selection_paths().await;
-                    if paths.is_empty() {
-                        this.update(cx, |v, cx| {
-                            v.notice("没有选中任何条目".to_string(), None, cx);
-                        });
-                        return;
-                    }
-                    if let Err(e) = app.recycle_to_system(paths).await {
-                        this.update(cx, |v, cx| {
-                            v.notice(format!("移到系统废纸篓失败：{e}"), None, cx);
                         });
                     }
                 })
@@ -8103,7 +8168,6 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::ConnectServer
         | CommandId::DisconnectServer
         | CommandId::RevealInFileManager
-        | CommandId::RecycleToSystem
         | CommandId::User(_) => {}
     }
 }
@@ -9097,15 +9161,27 @@ impl RootView {
                         .child(text!(human_ago(e.at, now))),
                 );
 
-            // 点击选中这一行（键盘 ↑↓ 的 palette_index 与鼠标共用同一游标）。
+            // 点击选中这一行（键盘 ↑↓ 的 palette_index 与鼠标共用同一游标）；
+            // 双击 = 打开实际落点（文件用系统默认应用，目录进当前窗口浏览）——
+            // 与文件列表双击同语义（`ev.click_count()`，Finder 废纸篓也支持）。
             let entity_click = entity.clone();
-            row.interactivity().on_click(move |_, _window, cx| {
+            let trashed = e.trashed.clone();
+            let is_dir = e.is_dir;
+            row.interactivity().on_click(move |ev, _window, cx| {
+                if ev.click_count() >= 2 {
+                    entity_click
+                        .update(cx, |v, cx| v.open_trash_entry(trashed.clone(), is_dir, cx));
+                    return;
+                }
                 entity_click.update(cx, |v, cx| {
                     v.palette_index = i;
                     cx.notify();
                 });
             });
-            body = body.child(row);
+            // `.test_support()` 必须**最后**包（挂完 children 再包，与 sidebar /
+            // status_bar 同款）：过早包会把后续的 hover / child 挂到 Observed 包装
+            // 上，headless 的 click / double_click 通道点不中行（实测踩到）。
+            body = body.child(row.test_support());
         }
         // 「斑马纹铺满一屏」（用户报：回收站只有两条记录时下面一片白，不像同一个
         // 应用）：真实行数不够一屏时，底下补**只有底色、没有任何内容**的占位行。
@@ -9532,6 +9608,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         entity.update(cx, |v, cx| v.theme_cancel(cx));
         return;
     }
+    // 回收站确认卡：点遮罩 = 取消（回面板），不是关掉整个面板。
+    if matches!(entity.read(cx).modal, Modal::ConfirmTrash(_)) {
+        dismiss_trash_confirm(entity, cx);
+        return;
+    }
     close_modal(entity, cx);
 }
 
@@ -9572,6 +9653,107 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
                     .on_click(move |_, _window, cx| close_modal(&ok_close, cx))
                     .child(text!(ok_label.to_string())),
             ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 回收站危险操作确认卡（`Modal::ConfirmTrash`）。
+///
+/// 与 [`render_notice_overlay`] 共用 [`dialog_overlay`] 外壳；差别是两颗按钮：
+/// 取消（中性）+ 确认（警示红 `rgba(0xd70015)`，项目没有危险色角色，用固定值）。
+/// 回收站面板保留在遮罩后面，Esc / 取消 / 点遮罩都回到面板——**不能**走
+/// [`close_modal`]，那会把面板整个关掉。
+fn render_trash_confirm(
+    v: &RootView,
+    action: &TrashConfirm,
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
+    let (title, message, ok_label) = match action {
+        TrashConfirm::Empty => (
+            "清空回收站",
+            format!(
+                "将永久删除回收站里的全部 {} 项，此操作不可恢复。",
+                v.trash_entries.len()
+            ),
+            "清空",
+        ),
+        TrashConfirm::Purge(e) => {
+            let name = e
+                .original
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| e.original.display().to_string());
+            (
+                "永久删除",
+                format!("将永久删除「{name}」，此操作不可恢复。"),
+                "永久删除",
+            )
+        }
+    };
+    let cancel = entity.clone();
+    let ok = entity.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(theme::text())
+                        .child(text!(title.to_string())),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme::muted())
+                        .child(text!(message)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                // 取消：中性按钮（描边），语义上把用户送回面板。
+                .child(
+                    div()
+                        .id("trash-confirm-cancel")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| dismiss_trash_confirm(&cancel, cx))
+                        .child(text!("取消")),
+                )
+                // 确认：警示红主按钮。
+                .child(
+                    div()
+                        .id("trash-confirm-ok")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(rgba(0xd70015))
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| confirm_trash_action(&ok, cx))
+                        .child(text!(ok_label.to_string())),
+                ),
         );
     dialog_overlay(entity, "", "", body, "")
 }

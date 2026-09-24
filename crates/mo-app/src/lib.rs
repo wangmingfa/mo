@@ -710,24 +710,35 @@ struct Source {
 }
 
 impl AppState {
-    /// 默认回收站根目录：用户主目录下的 `.mo-trash`。
+    /// 回收站账本目录：用户主目录下的 `.mo-trash`。
+    ///
+    /// ⚠️ 只存 `index.json` 账本，**不存文件**——macOS 生产模式下被删文件由系统
+    /// 送进废纸篓（`~/.Trash` / 卷宗 `.Trashes`），账本里记的是实际落点。
+    /// 旧版本的 `<uuid>/<原名>` 隔离条目依然可还原 / 清理（见 `Trash` 的
+    /// 隔离 / 系统双模式）。
     fn default_trash_root() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".mo-trash")
     }
 
-    /// 以默认回收站（~/.mo-trash）构造。
+    /// 生产构造：回收站走**系统废纸篓 + Mo 账本**（macOS）。
     pub fn new() -> Self {
-        Self::with_trash(Self::default_trash_root())
+        Self::build(
+            Self::default_trash_root(),
+            session_registry(),
+            staging::staging(),
+            true,
+        )
     }
 
     /// 以指定回收站根目录构造（测试可传入临时目录以保持隔离）。
     ///
-    /// 会话表用**进程级**那一份：同一进程里的所有标签页共享同一批远程连接，
-    /// 这正是「关标签页不断开」的实现基础。
+    /// 回收站是**隔离模式**（文件搬进 `trash_root` 自管）——测试绝不能碰真实的
+    /// 系统废纸篓。会话表用**进程级**那一份：同一进程里的所有标签页共享同一批
+    /// 远程连接，这正是「关标签页不断开」的实现基础。
     pub fn with_trash(trash_root: PathBuf) -> Self {
-        Self::build(trash_root, session_registry(), staging::staging())
+        Self::build(trash_root, session_registry(), staging::staging(), false)
     }
 
     /// ⚠️ 仅供测试 / 需要显式指定会话表时用。
@@ -737,7 +748,7 @@ impl AppState {
     /// `AppState`，就等于两个标签页——这正是「关标签页不断开」的验证方式。
     #[doc(hidden)]
     pub fn with_sessions(trash_root: PathBuf, sessions: Arc<SessionRegistry>) -> Self {
-        Self::build(trash_root, sessions, staging::staging())
+        Self::build(trash_root, sessions, staging::staging(), false)
     }
 
     /// ⚠️ 仅供测试：连暂存区一起指定，免得同一测试进程里并行跑的用例共用一个
@@ -748,14 +759,19 @@ impl AppState {
         sessions: Arc<SessionRegistry>,
         staging: Arc<PlMutex<Staging>>,
     ) -> Self {
-        Self::build(trash_root, sessions, staging)
+        Self::build(trash_root, sessions, staging, false)
     }
 
-    /// 以指定回收站、会话表与暂存区构造（三个公开构造器共用）。
+    /// 以指定回收站、会话表与暂存区构造（各构造器共用）。
+    ///
+    /// `system_trash`：macOS 生产模式下为 `true`——删除经
+    /// `mo_platform::recycle_one` 送进系统废纸篓，Mo 只拿回落点记账。测试一律
+    /// 传 `false`（隔离模式），绝不能把测试文件删进真实废纸篓。
     fn build(
         trash_root: PathBuf,
         sessions: Arc<SessionRegistry>,
         staging: Arc<PlMutex<Staging>>,
+        system_trash: bool,
     ) -> Self {
         let cache = match MetadataCache::open_default() {
             Ok(c) => Some(Arc::new(c)),
@@ -764,7 +780,21 @@ impl AppState {
                 None
             }
         };
-        let trash = Arc::new(Trash::new(trash_root).expect("failed to init trash"));
+        let trash = if system_trash && cfg!(target_os = "macos") {
+            Arc::new(
+                Trash::with_mover(
+                    trash_root,
+                    Arc::new(|p: &Path| {
+                        mo_platform::recycle_one(p).map_err(|e| {
+                            mo_operations::TrashError::Io(std::io::Error::other(e.to_string()))
+                        })
+                    }),
+                )
+                .expect("failed to init trash"),
+            )
+        } else {
+            Arc::new(Trash::new(trash_root).expect("failed to init trash"))
+        };
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 navigation: NavigationState::new(),
@@ -2174,7 +2204,7 @@ impl AppState {
     /// 列表里查得到 = 它就是当前后端列出来的条目；在看远程时即远程条目。
     /// 判据与 [`AppState::entry_is_dir`] 同源，都不碰本机磁盘。
     ///
-    /// 对外暴露的原因：平台原生动作（在访达中显示 / 移到系统废纸篓）也按这条分流，
+    /// 对外暴露的原因：平台原生动作（在访达中显示）也按这条分流，
     /// 上层（UI 的菜单裁剪）与测试都要问同一个问题，别各写一份判据。
     ///
     /// ⚠️ **传输不要用它判两端**：这条判据只答得出一页内的情况——粘贴到当前目录时
@@ -3724,51 +3754,13 @@ impl AppState {
             .map_err(|e| MoError::Other(e.to_string()))
     }
 
-    /// 把本地文件交给**系统**废纸篓（macOS 上就是访达那份）。
-    ///
-    /// 与 [`AppState::trash_paths`]（Mo 自己的回收站）是**两条路**：
-    ///
-    /// | | Mo 回收站 | 系统废纸篓（这里） |
-    /// |---|---|---|
-    /// | 撤销 / 回收站面板 | 支持 | 不支持（交出去就由系统负责） |
-    /// | 同宗卷删除 | 搬文件（大文件慢） | O(1) 重命名 |
-    /// | 外接卷宗 / 网络盘 | 搬回本机（慢，可能失败） | 就地进卷宗自己的废纸篓 |
-    ///
-    /// 所以它是**显式动作**（右键 / 命令面板），不接在 ⌘⌫ 上——默认删除仍走
-    /// Mo 回收站，那才是「可撤销、面板里看得见」的那条路。
-    pub async fn recycle_to_system(&self, paths: Vec<PathBuf>) -> Result<(), MoError> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        // 同样按「这条路径属于哪个后端」过滤：远程条目走不了这条路（它在本机不存在），
-        // 但**本地**路径（去重 / 同步送来的副本）在看远程时也要照办。
-        let mut local = Vec::with_capacity(paths.len());
-        for p in paths {
-            if !self.goes_through_remote(&p).await {
-                local.push(p);
-            }
-        }
-        if local.is_empty() {
-            return Err(MoError::Other(
-                "远程条目没法进本机废纸篓（请用「删除」）".to_string(),
-            ));
-        }
-        let paths = local;
-        let history = paths.clone();
-        let r = self
-            .spawn_blocking(move || mo_platform::recycle(&paths))
-            .await
-            .map_err(|e| MoError::Other(format!("删除任务失败：{e}")))?
-            .map_err(|e| MoError::Other(e.to_string()));
-        if r.is_ok() {
-            self.record_history("移到系统废纸篓", history, None);
-        }
-        // 刷新失败不该盖掉删除结果（列表没跟上用户手动刷一下就是了）。
-        let _ = self.refresh().await;
-        r
-    }
-
     // ---- 回收站 ----
+    //
+    // 「移到系统废纸篓」这条独立的显式通道已移除（2026-09-24）：菜单 / 命令面板
+    // 只保留一个「移到废纸篓」。macOS 上 [`AppState::new`] 构造的回收站本身就是
+    // 「系统废纸篓 + Mo 账本」——删除经 `mo_platform::recycle_one` 由系统搬进
+    // `~/.Trash` / 卷宗 `.Trashes`，落点记入账本，可撤销、面板可见。双入口的
+    // 心智负担没有了，跨卷就地的优点也保住了（探针与设计见 `devlog/trash-unify.md`）。
 
     /// 回收站条目快照（最新在前）。
     pub fn trash_list(&self) -> Vec<TrashEntry> {

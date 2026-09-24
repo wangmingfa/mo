@@ -1089,12 +1089,15 @@ fn smb_and_nfs_are_mounted_by_the_system_not_connected() {
     });
 }
 
-/// 平台原生的那两条（在访达中显示 / 移到系统废纸篓）**只认本地路径**。
+/// 平台原生的「在访达中显示」**只认本地路径**。
 ///
 /// 远程条目（`/pub/x`）在本机磁盘上不存在，把这种路径交给系统文件管理器只会
-/// 静默失败（访达不跳转、`trashItemAtURL` 报「文件不存在」），用户看到的就是
-/// 「点了没反应」。所以这里直接挡掉，UI 那边也不给菜单项——守卫见
+/// 静默失败（访达不跳转），用户看到的就是「点了没反应」。所以这里直接挡掉，
+/// UI 那边也不给菜单项——守卫见
 /// `mo-ui::context_menu::remote_page_hides_host_only_actions`。
+///
+/// （「移到系统废纸篓」这条并列的通道已于 2026-09-24 移除：回收站只有一个入口，
+/// macOS 生产模式删除本身就经系统废纸篓，见 `devlog/trash-unify.md`。）
 #[test]
 fn host_only_actions_refuse_remote_paths() {
     let app = tab(&Arc::new(SessionRegistry::new()));
@@ -1114,14 +1117,6 @@ fn host_only_actions_refuse_remote_paths() {
         assert!(
             reveal.to_string().contains("远程"),
             "错误要说明原因（而不是丢一句系统报错）：{reveal}"
-        );
-        let recycle = app
-            .recycle_to_system(remote)
-            .await
-            .expect_err("远程条目没法进本机废纸篓");
-        assert!(
-            recycle.to_string().contains("远程"),
-            "错误要说明原因：{recycle}"
         );
     });
 }

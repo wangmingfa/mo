@@ -60,9 +60,9 @@ pub(crate) struct ContextMenu {
     pub paths: Vec<PathBuf>,
     /// 当前页是不是在**远程**（FTP / SFTP / WebDAV）。
     ///
-    /// 只有它决定「在访达中显示」「移到系统废纸篓」这类**本机**动作出不出菜单：
-    /// 远程条目在本机磁盘上不存在，给了也是点了没反应（与「目录判据只问列表模型」
-    /// 同一条纪律——别拿路径长相去猜它在哪个后端）。
+    /// 只有它决定「在访达中显示」这类**本机**动作出不出菜单：远程条目在本机
+    /// 磁盘上不存在，给了也是点了没反应（与「目录判据只问列表模型」同一条
+    /// 纪律——别拿路径长相去猜它在哪个后端）。
     pub remote: bool,
 }
 
@@ -90,10 +90,9 @@ pub(crate) enum MenuAction {
     Paste,
     /// 把选中项的路径（每行一个）写进剪贴板。
     CopyPath,
-    /// 移到废纸篓（Mo 自己的回收站：可撤销、回收站面板里看得见）。
+    /// 移到废纸篓（可撤销、回收站面板里看得见）。macOS 生产模式下文件由系统
+    /// 送进废纸篓、Mo 记账还原——对用户来说只有这一个「废纸篓」。
     Trash,
-    /// 移到**系统**废纸篓（交给平台，不可逆、不进回收站面板）。
-    SystemTrash,
     /// 在系统的文件管理器里定位（macOS = 在访达中显示）。
     RevealInFileManager,
     /// 在当前目录新建文件夹。
@@ -318,7 +317,8 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         true,
     ));
 
-    // 删除
+    // 删除。只有一个「废纸篓」入口——macOS 生产模式下它就是「系统废纸篓 +
+    // Mo 账本」，不再有第二条「移到系统废纸篓」（见 devlog/trash-unify.md）。
     out.push(
         MenuItem::new(
             MenuAction::Trash,
@@ -332,21 +332,6 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         )
         .separated(),
     );
-    // 交给**系统**废纸篓：与上面同组（不隔线），但只在平台支持时出现。
-    // 差别写在文档里：这条不可逆、不进回收站面板，换来的是同宗卷 O(1) 与外接
-    // 卷宗就地回收——所以它是显式动作，不抢 ⌘⌫。
-    if !menu.remote && mo_platform::supports_trash() {
-        out.push(MenuItem::new(
-            MenuAction::SystemTrash,
-            if multi {
-                format!("移到系统废纸篓（{} 项）", menu.selected)
-            } else {
-                "移到系统废纸篓".to_string()
-            },
-            "",
-            true,
-        ));
-    }
 
     // 归档
     out.push(MenuItem::new(MenuAction::Compress, "压缩…", "", true).separated());
@@ -734,7 +719,7 @@ mod tests {
         );
     }
 
-    /// 远端页（FTP / SFTP / WebDAV）上**不**出现「在访达中显示 / 移到系统废纸篓」：
+    /// 远端页（FTP / SFTP / WebDAV）上**不**出现「在访达中显示」：
     /// 远程条目在本机磁盘上根本不存在，给了就是点了没反应——与「目录判据只问列表
     /// 模型」同一条纪律。
     #[cfg(target_os = "macos")]
@@ -745,27 +730,24 @@ mod tests {
             host.contains(&MenuAction::RevealInFileManager),
             "本机页应当能「在访达中显示」"
         );
-        assert!(host.contains(&MenuAction::SystemTrash));
 
         let remote = actions(&remote_menu(Some("/pub/a.txt"), false, 1));
         assert!(
             !remote.contains(&MenuAction::RevealInFileManager),
             "远程条目没法在访达里显示"
         );
-        assert!(!remote.contains(&MenuAction::SystemTrash));
-        // 裁剪只针对这两条：常规动作（复制到剪贴板 / 移到 Mo 回收站）照旧。
+        // 裁剪只针对这一条：常规动作（复制到剪贴板 / 移到废纸篓）照旧。
         assert!(remote.contains(&MenuAction::Copy));
         assert!(remote.contains(&MenuAction::Trash));
     }
 
-    /// 平台没实现时（这里是不支持的那几个）这两条压根不该进菜单——列出来点了
-    /// 只会报「不支持」。
+    /// 平台没实现时（这里是不支持的那几个）「在访达中显示」压根不该进菜单——
+    /// 列出来点了只会报「不支持」。
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn unsupported_platform_hides_host_only_actions() {
         let a = actions(&menu(Some("/tmp/a.txt"), false, 1));
         assert!(!a.contains(&MenuAction::RevealInFileManager));
-        assert!(!a.contains(&MenuAction::SystemTrash));
     }
 
     /// 目录：有「在新标签页 / 分栏中打开」，没有「解压」；「打开」而不是「快速查看」。

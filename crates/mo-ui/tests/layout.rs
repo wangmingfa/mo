@@ -23,6 +23,21 @@ fn open_app(
     window_size: Size<Pixels>,
     cx: &mut TestAppContext,
 ) -> (VisualTestContext, WindowHandle<RootView>) {
+    open_app_with_trash(
+        window_size,
+        std::env::temp_dir().join(format!("mo-layout-trash-{}", std::process::id())),
+        cx,
+    )
+}
+
+/// 同 [`open_app`]，但回收站根由调用方指定——需要**预种** index.json 的回收站
+/// 测试各用独立目录（同测试进程内并行跑的用例共享 pid，共用一个根会互相
+/// `remove_dir_all` / 重写 index.json，实测把对方落点文件删到预览读不出）。
+fn open_app_with_trash(
+    window_size: Size<Pixels>,
+    trash_root: std::path::PathBuf,
+    cx: &mut TestAppContext,
+) -> (VisualTestContext, WindowHandle<RootView>) {
     // 钉住配置目录到临时路径：否则视图模式 / 侧边栏开关这些布局偏好会读到人家的
     // 真实 config.json，同一份代码在不同机器上渲染结构不同。
     mo_ui::isolate_config_for_tests();
@@ -40,7 +55,6 @@ fn open_app(
     // 回收站根也要**隔离**：`AppState::new()` 用真实 `~/.mo-trash`，测试机上有
     // 真实条目时 `open_trash_panel` 一刷新就会把注入的假条目顶掉（曾让回收站
     // 相关断言靠机器状态侥幸通过）。
-    let trash_root = std::env::temp_dir().join(format!("mo-layout-trash-{}", std::process::id()));
     let app = AppState::with_trash(trash_root);
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
@@ -1031,4 +1045,187 @@ fn trash_zebra_stripes_fill_the_viewport(cx: &mut TestAppContext) {
         last_bottom > 550.0,
         "斑马纹只铺到 y={last_bottom}，没到视口底部"
     );
+}
+
+/// 永久删除 / 清空回收站必须**先弹确认卡**：Esc / 取消回面板、条目原样；
+/// 确认（Enter 或红色按钮）才执行并回到面板。
+/// 永久删除 / 清空回收站必须**先弹确认卡**：Esc / 取消 / 点遮罩回面板、条目
+/// 原样；确认（Enter 或红色按钮）才真正执行并回到面板。
+///
+/// 条目**预种进 store**（`<root>/index.json` + 真实落点文件）而不是注入视图：
+/// `sync_panel` 会拿 store 的列表覆盖 `trash_entries`，keystroke 泵 effect 时
+/// 注入的视图本地条目会被空 store 顶掉（本测试首次运行时踩到）。
+#[gpui_kit::test]
+fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
+    // 独立的回收站根（见 `open_app_with_trash`）：先清干净再预种两条记录
+    // （含真实落点文件）。
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-confirm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    // index.json 手写（layout 测试不引 serde_json）：字段名与 TrashEntry 的
+    // serde 默认命名逐字一致。
+    let mut records = String::from("[");
+    for (i, name) in ["a.txt", "b.txt"].iter().enumerate() {
+        let id = format!("seed-{i}");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"x").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            dir.join(name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let state = |vcx: &mut VisualTestContext, window: &WindowHandle<mo_ui::RootView>| {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_panel_state_for_tests(root)
+            })
+            .expect("读回收站状态失败")
+    };
+    assert_eq!(state(&mut vcx, &window), (2, false), "前提：两条都在面板上");
+    assert!(vcx.debug_bounds("mo-trash-row-1").is_some());
+
+    // Delete：只弹确认卡，不执行（条目数不变）。
+    cx.simulate_keystrokes(window.into(), "delete");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-dialog-card").is_some(),
+        "永久删除应当先弹确认卡"
+    );
+    assert_eq!(
+        state(&mut vcx, &window),
+        (2, true),
+        "确认卡出现时条目数不能变"
+    );
+    assert!(
+        vcx.debug_bounds("mo-trash-row-1").is_some(),
+        "回收站面板应保留在遮罩后面"
+    );
+
+    // Esc：取消——回面板、条目原样。
+    cx.simulate_keystrokes(window.into(), "escape");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-dialog-card").is_none(),
+        "取消后卡应消失"
+    );
+    assert_eq!(state(&mut vcx, &window), (2, false), "取消后条目应原样");
+
+    // 再 Delete → 点「取消」按钮：同样回面板、条目原样。
+    cx.simulate_keystrokes(window.into(), "delete");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    vcx.update(|window, cx| window.click("trash-confirm-cancel", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(vcx.debug_bounds("mo-dialog-card").is_none());
+    assert_eq!(state(&mut vcx, &window), (2, false));
+
+    // 再 Delete → 点红色「永久删除」：单条被抹掉（store 里只剩一条），回面板。
+    cx.simulate_keystrokes(window.into(), "delete");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    vcx.update(|window, cx| window.click("trash-confirm-ok", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-dialog-card").is_none(),
+        "确认后卡应关闭"
+    );
+    assert_eq!(state(&mut vcx, &window), (1, false), "永久删除后应只剩一条");
+
+    // E：清空也要确认；Enter 确认执行 → 面板清空。
+    cx.simulate_keystrokes(window.into(), "e");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-dialog-card").is_some(),
+        "清空回收站应当先弹确认卡"
+    );
+    cx.simulate_keystrokes(window.into(), "enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(vcx.debug_bounds("mo-dialog-card").is_none());
+    assert_eq!(state(&mut vcx, &window), (0, false), "清空后面板应为空");
+}
+
+/// 回收站条目支持**预览与打开**（Finder 废纸篓同款）：
+/// 空格 = Quick Look 实际落点文件（独立预览窗）；双击 = 打开（文件交系统默认
+/// 应用——headless 不能真开，测目录：退出面板并在当前窗口浏览该目录）。
+///
+/// 条目同样预种 store（理由见 `trash_purge_and_empty_ask_for_confirmation`）。
+/// ⚠️ `Trash::list()` 返回 index.json 的**反序**（最新在前），所以种子要按
+/// [目录, 文件] 写，面板上才是 row0=文件（预览对象）、row1=目录（双击对象）。
+#[gpui_kit::test]
+fn trash_space_previews_and_double_click_opens(cx: &mut TestAppContext) {
+    // 独立的回收站根（见 `open_app_with_trash`）：seed-0 目录里放文件 a.txt
+    // （空格预览的对象），seed-1 是目录（双击打开的对象，里面放一个文件供
+    // 列表断言）。
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(seed.join("seed-0")).unwrap();
+    std::fs::write(seed.join("seed-0").join("a.txt"), b"hello mo").unwrap();
+    std::fs::create_dir_all(seed.join("seed-1")).unwrap();
+    std::fs::write(seed.join("seed-1").join("inner.txt"), b"x").unwrap();
+    // JSON 顺序 = [目录, 文件]：list() 反序后面板 row0=a.txt、row1=目录。
+    std::fs::write(
+        seed.join("index.json"),
+        format!(
+            r#"[{{"id":"seed-1","original":"/Users/demo/folder","trashed":"{}","is_dir":true,"at":1700000000}},{{"id":"seed-0","original":"/Users/demo/a.txt","trashed":"{}","is_dir":false,"at":1700000000}}]"#,
+            seed.join("seed-1").display(),
+            seed.join("seed-0").join("a.txt").display()
+        ),
+    )
+    .unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-trash-row-0").is_some(),
+        "前提：两条都在面板上"
+    );
+    assert!(vcx.debug_bounds("mo-trash-row-1").is_some());
+
+    // 双击目录行：退出回收站面板，在当前窗口浏览该目录（列表出现 inner.txt）。
+    vcx.update(|window, cx| window.double_click("trash-row-1", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-trash-row-0").is_none(),
+        "双击目录后应退出回收站面板"
+    );
+    assert!(
+        vcx.debug_bounds("mo-file-row-0").is_some(),
+        "双击目录后当前窗口应浏览该目录"
+    );
+
+    // 重新打开面板，选中文件行（a.txt 在 row0）后按空格：预览的是 ~/.Trash
+    // 里的实际落点文件。
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    vcx.update(|window, cx| window.click("trash-row-0", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    cx.simulate_keystrokes(window.into(), "space");
+    vcx.run_until_parked();
+    let preview_open = window
+        .update(&mut vcx.cx, |root, _w, _cx| {
+            mo_ui::trash_preview_open_for_tests(root)
+        })
+        .expect("读预览窗口状态失败");
+    assert!(preview_open, "空格应当打开快速预览窗");
 }

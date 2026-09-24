@@ -91,6 +91,21 @@ pub fn inject_trash_for_tests(view: &mut RootView, entries: Vec<mo_operations::T
     view.trash_entries = entries;
 }
 
+/// 测试专用：读回收站面板状态——`(条目数, 是否停在确认卡上)`。
+#[doc(hidden)]
+pub fn trash_panel_state_for_tests(view: &RootView) -> (usize, bool) {
+    (
+        view.trash_entries.len(),
+        matches!(view.modal, crate::app::Modal::ConfirmTrash(_)),
+    )
+}
+
+/// 测试专用：快速预览窗口是否开着（空格预览回收站条目后置位）。
+#[doc(hidden)]
+pub fn trash_preview_open_for_tests(view: &RootView) -> bool {
+    view.preview_window.is_some()
+}
+
 /// 测试专用：驱动当前标签页真实导航到 `dir`。
 ///
 /// headless 里自己铺窗口快照撑不住——Home 目录的元数据回填等后台事件随时会
