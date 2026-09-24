@@ -11,7 +11,7 @@
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_core::plan_batch_rename;
-use mo_operations::mode_string;
+use mo_operations::{mode_string, TrashEntry};
 
 use crate::{
     app::{central_view, dialog_overlay},
@@ -280,6 +280,36 @@ pub fn archive(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
         body,
         "输入文件名 · Enter 执行 · Esc 取消",
     )
+}
+
+/// 回收站条目重命名卡（macOS 面板里 Enter 的落点）：输入新名，Enter 提交、
+/// Esc 回面板。走 [`dialog_overlay`] 外壳，面板保留在遮罩后面。
+pub fn trash_rename(
+    view: &RootView,
+    entry: &TrashEntry,
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
+    let old = entry
+        .original
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| entry.original.to_string_lossy().to_string());
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .child(text!(format!("将「{old}」重命名为："))),
+        )
+        .child(field_row(
+            &view.trash_rename_name,
+            true,
+            "trash-rename-name".to_string(),
+        ));
+    dialog_overlay(entity, "重命名", "", body, "")
 }
 
 /// 磁盘空间分析：同一份统计的两种看法——按大小排序的横向条形图 / 矩形树图

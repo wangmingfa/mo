@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +18,7 @@ use mo_preview::{Preview, PreviewKind};
 use mo_search::SearchHit;
 
 use crate::dialogs;
+use crate::list_view;
 use crate::listing;
 use crate::panel::{ColumnData, Pane, Panel, ViewMode};
 use crate::{columns, file_list, grid, progress_panel, sidebar, status_bar, theme, toolbar};
@@ -162,11 +164,16 @@ pub(crate) enum Modal {
     /// 只在服务器**真的拒绝**了匿名登录时出现（`ConnectFailure::NeedsCredentials`），
     /// 所以地址里没写凭据不等于会弹它：匿名能进就直接进了。
     ConnectAuth,
-    /// 回收站危险操作确认（清空 / 永久删除单条）。
+    /// 回收站危险操作确认（清空）。
     ///
     /// 回收站面板**保留在遮罩后面**（渲染上把这一档当成 `Modal::Trash` 画），
     /// Enter / 红色确认按钮执行，Esc / 取消 / 点遮罩回到面板。
     ConfirmTrash(TrashConfirm),
+    /// 回收站条目重命名（macOS 惯例：面板里 Enter 就是重命名）。
+    ///
+    /// 携带被改名的条目（落点路径），新名字暂存在 [`RootView::trash_rename_name`]；
+    /// Esc / 取消回到面板，Enter 提交。
+    TrashRename(Box<TrashEntry>),
 }
 
 /// [`Modal::ConfirmTrash`] 携带的待确认动作。
@@ -174,8 +181,6 @@ pub(crate) enum Modal {
 pub(crate) enum TrashConfirm {
     /// 清空回收站（条目数在渲染时从 `trash_entries` 现读，避免快照过期）。
     Empty,
-    /// 永久删除单条（携带打开确认卡那一刻选中的条目）。
-    Purge(Box<TrashEntry>),
 }
 
 /// 统一设置窗口（[`Modal::Settings`](Modal)）里的标签页。
@@ -774,6 +779,19 @@ pub struct RootView {
     cmd_query: String,
     /// 命令面板 / 搜索结果的高亮下标。
     palette_index: usize,
+    /// 回收站面板的**多选**集合（行下标）。UI 本地状态：`trash_entries` 快照
+    /// 内容真的变了才作废（见 `sync_panel` 里的比对——任何总线事件都会重跑
+    /// sync，不能见事件就清）。`pub(crate)` 仅为测试探针读取。
+    pub(crate) trash_selected: BTreeSet<usize>,
+    /// 回收站 shift 连选的锚点行（缺失时退化为单选）。
+    trash_anchor: Option<usize>,
+    /// 回收站面板的视图模式。列表 / 网格 / 画廊可用；列视图（Miller 列）逐级
+    /// 展开目录，对回收站这种平铺列表无意义，入口全部不接（按钮置灰）。
+    pub(crate) trash_view_mode: ViewMode,
+    /// 回收站条目大小缓存（键 = 实际落点路径）。账本里没有大小，唯一的来源是
+    /// 对落点 stat——在后台线程做（性能红线：阻塞 IO 不进主线程），回填后渲染
+    /// 只查表。按落点路径键控：还原 / 清空后留下的旧键无害，重进回收站只补缺。
+    trash_sizes: HashMap<PathBuf, u64>,
     /// 全局搜索过滤词。
     search_query: String,
     /// 全局搜索结果。
@@ -855,6 +873,8 @@ pub struct RootView {
     pub(crate) rename_paths: Vec<PathBuf>,
     /// 压缩对话框里的目标文件名。
     pub(crate) archive_name: String,
+    /// 回收站条目重命名的新名字（`Modal::TrashRename` 的输入缓冲）。
+    pub(crate) trash_rename_name: String,
     /// 磁盘空间分析结果（条形图的数据源）。
     pub(crate) usage: Vec<mo_app::DirUsage>,
     /// 磁盘地图的数据源（懒加载：切到地图视图才建树）。
@@ -1045,6 +1065,8 @@ impl RootView {
             modal: Modal::None,
             cmd_query: String::new(),
             palette_index: 0,
+            trash_selected: BTreeSet::new(),
+            trash_anchor: None,
             search_query: String::new(),
             search_results: Vec::new(),
             preview_window: None,
@@ -1080,12 +1102,15 @@ impl RootView {
             indexed: 0,
             trash_entries: Vec::new(),
             trash_body_h: 0.0,
+            trash_view_mode: ViewMode::List,
+            trash_sizes: HashMap::new(),
             diff_cache: None,
             form_index: 0,
             prop: None,
             rename_spec: RenameSpec::default(),
             rename_paths: Vec::new(),
             archive_name: String::new(),
+            trash_rename_name: String::new(),
             usage: Vec::new(),
             usage_tree: None,
             usage_root: None,
@@ -1244,6 +1269,20 @@ impl RootView {
     pub(crate) fn toggle_ops_popover(&mut self, cx: &mut Context<Self>) {
         self.ops_open = !self.ops_open;
         cx.notify();
+    }
+
+    /// 从视图的快照缓存里摘掉指定操作（乐观更新）。
+    ///
+    /// 扫帚「一键清除已完成」用：`dismiss_operation` 只删 `OperationManager`
+    /// 的账，视图快照要等进度泵下一拍才同步——等那一拍，泵带来的中间快照会
+    /// 把浮层打成空、触发自动收起（headless 测试里 manager 是真空的，必现）。
+    /// 这里摘完立刻生效，生产与测试行为一致；泵稍后同步来的快照与此一致。
+    pub(crate) fn remove_ops_from_snapshot(&mut self, ids: &[u64]) {
+        for pane in &mut self.panes {
+            for tab in &mut pane.tabs {
+                tab.ops.retain(|op| !ids.contains(&op.id));
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 暂存区
@@ -1628,12 +1667,120 @@ impl RootView {
         }
     }
 
+    /// 当前是否停在回收站面板（含其上的确认卡 / 重命名卡）。
+    pub(crate) fn is_in_trash(&self) -> bool {
+        matches!(
+            self.modal,
+            Modal::Trash | Modal::ConfirmTrash(_) | Modal::TrashRename(_)
+        )
+    }
+
+    /// 切换「当前活动表面」的视图模式：回收站面板开着切回收站，否则切浏览面板。
+    /// 工具栏按钮与 `view.*` 动作共用这一条收口（两者不许各写一套判断）。
+    pub(crate) fn set_view_mode_for_active_surface(&mut self, mode: ViewMode) {
+        if self.is_in_trash() {
+            // 列视图对平铺的回收站无意义：忽略（按钮已置灰，这里是兜底）。
+            if !matches!(mode, ViewMode::Columns) {
+                self.trash_view_mode = mode;
+            }
+        } else {
+            self.panel_mut().view_mode = mode;
+        }
+    }
+
+    /// 后台回填回收站条目大小（表头「大小」列的数据源）。
+    ///
+    /// 账本（`index.json`）没记大小，唯一来源是对**实际落点**做 stat——阻塞 IO
+    /// 按红线放后台线程（[`AppState::spawn_blocking`]），回填后 notify 重绘；渲染
+    /// 路径只查 [`RootView::trash_sizes`]，永远不碰文件系统。目录不 stat（Finder
+    /// 对文件夹的大小同样是「—」）。缓存按落点路径键控、只补缺失的键：还原 /
+    /// 清空后留下的旧键无害，重进回收站或重拉列表后新条目自动补齐。
+    ///
+    /// ⚠️ fire-and-forget：调用方（开面板 / sync）**不等它**。回填若挂在
+    /// `sync_panel` 的 await 链上，每轮同步都会多出一个外部唤醒点，headless 的
+    /// 确定性调度器等不到就返回（实测：双击打开目录后列表断言直接红）。
+    fn ensure_trash_sizes(&mut self, cx: &mut Context<Self>) {
+        let missing: Vec<PathBuf> = self
+            .trash_entries
+            .iter()
+            .filter(|e| !e.is_dir && !self.trash_sizes.contains_key(&e.trashed))
+            .map(|e| e.trashed.clone())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let app = self.app();
+        cx.spawn(async move |this, cx| {
+            let measured = app
+                .spawn_blocking(move || {
+                    missing
+                        .into_iter()
+                        .map(|p| {
+                            let size = std::fs::metadata(&p).map(|m| m.len()).ok();
+                            (p, size)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+            this.update(cx, |v, cx| {
+                for (p, size) in measured {
+                    if let Some(size) = size {
+                        v.trash_sizes.insert(p, size);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// 打开回收站面板（侧栏入口 / 命令面板共用同一条路）。
     pub(crate) fn open_trash_panel(&mut self, cx: &mut Context<Self>) {
         self.trash_entries = self.app().trash_list();
         self.modal = Modal::Trash;
         self.palette_index = 0;
+        // 不默认选中第一条（用户要求）：进来什么都没选，第一眼干干净净。
+        self.trash_selected.clear();
+        self.trash_anchor = None;
+        // 大小列：后台 stat 落点回填（fire-and-forget，见 `ensure_trash_sizes`）。
+        self.ensure_trash_sizes(cx);
         cx.notify();
+    }
+
+    /// 回收站 shift 连选：以锚点为起点**覆盖**到 `i`（锚点缺失退化为单选）。
+    fn trash_select_range(&mut self, i: usize) {
+        let a = self.trash_anchor.unwrap_or(i);
+        let (lo, hi) = if a <= i { (a, i) } else { (i, a) };
+        self.trash_selected = (lo..=hi).collect();
+    }
+
+    /// 回收站 ↑↓ 移动游标：普通移动 = 单选替换（锚点跟过去）；
+    /// `extend`（shift）= 保持锚点、从锚点覆盖到新游标。
+    fn trash_move_cursor(&mut self, delta: isize, extend: bool) {
+        let n = self.trash_entries.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.palette_index as isize + delta).clamp(0, n as isize - 1) as usize;
+        self.palette_index = next;
+        if extend {
+            if self.trash_anchor.is_none() {
+                self.trash_anchor = Some(next);
+            }
+            self.trash_select_range(next);
+        } else {
+            self.trash_selected.clear();
+            self.trash_selected.insert(next);
+            self.trash_anchor = Some(next);
+        }
+    }
+
+    /// 回收站 ⌘/Ctrl+A：全选。
+    fn trash_select_all(&mut self) {
+        let n = self.trash_entries.len();
+        self.trash_selected = (0..n).collect();
     }
 
     /// 导航类入口（侧栏 / 工具栏 / 地址栏）发起跳转时，把次级视图退回浏览态。
@@ -4175,7 +4322,10 @@ impl RootView {
                     "view.columns" => ViewMode::Columns,
                     _ => ViewMode::List,
                 };
-                self.panel_mut().view_mode = mode;
+                // 收口在 [`RootView::set_view_mode_for_active_surface`]：回收站面板
+                // 开着切**回收站**的视图（用户报：工具栏切了没反应——按钮写的是
+                // 浏览面板的状态，回收站渲染不读），否则切浏览面板。
+                self.set_view_mode_for_active_surface(mode);
                 cx.notify();
             }
             "file.properties" => {
@@ -6151,13 +6301,24 @@ async fn sync_panel(
     // app 侧选择是唯一事实来源；⌘A / 键盘移动等改动都从这里回灌 UI。
     let selection_ids = app.selection_ids().await;
 
-    let outcome = this.update(cx, |v, _cx| {
+    let outcome = this.update(cx, |v, cx| {
         let ui_path = match v.panel_at(pane_idx, tab_idx) {
             Some(p) => p.path.clone(),
             None => return None,
         };
         v.indexed = indexed;
+        // 回收站多选挂在行下标上：内容**真的变了**（还原 / 删除 / 清空，长度
+        // 必变）才作废多选与游标——任何总线事件都会重跑 sync，见事件就清会把
+        // 刚点出来的选择立刻吹掉。
+        if v.trash_entries != trash_entries {
+            v.trash_selected.clear();
+            v.trash_anchor = None;
+            v.palette_index = 0;
+        }
         v.trash_entries = trash_entries;
+        // 回收站条目变了（还原 / 清空 / 新删除）就补缺的大小缓存：
+        // fire-and-forget（无缺键即空转），绝不挂在 sync 的 await 链上。
+        v.ensure_trash_sizes(cx);
         let p = v.panel_at_mut(pane_idx, tab_idx)?;
         // 列表视图当前应该用哪种窗口空间：分组开启才按「行」（含组头）取。
         let want_grouped =
@@ -6322,8 +6483,15 @@ impl Render for RootView {
             // 还是在挑文件，左侧导航得一直在（用户报：进回收站左侧整个没了）。
             // 其余（扩展 / 比较…）是工具页，全宽无妨。
             // 回收站确认卡（ConfirmTrash）也按回收站画：面板保留在遮罩后面。
-            Modal::GlobalSearch | Modal::Trash | Modal::ContentSearch | Modal::ConfirmTrash(_) => {
-                let in_trash = matches!(self.modal, Modal::Trash | Modal::ConfirmTrash(_));
+            Modal::GlobalSearch
+            | Modal::Trash
+            | Modal::ContentSearch
+            | Modal::ConfirmTrash(_)
+            | Modal::TrashRename(_) => {
+                let in_trash = matches!(
+                    self.modal,
+                    Modal::Trash | Modal::ConfirmTrash(_) | Modal::TrashRename(_)
+                );
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 if self.ui.sidebar {
                     // 回收站里没有「当前位置」可言：别把进面板前的目录高亮留着，
@@ -6365,6 +6533,11 @@ impl Render for RootView {
         };
 
         let ops = self.all_ops();
+        // 任务全部移除后**自动收起**任务浮层：空浮层没有存在意义，且下次有新任务
+        // 时应当以常显卡片出现、而不是凭空开着一张旧浮层。
+        if ops.is_empty() && self.ops_open {
+            self.ops_open = false;
+        }
         let op_speeds = self.op_speeds(&ops);
         let panel = self.panel();
         let app = panel.app.clone();
@@ -6391,7 +6564,16 @@ impl Render for RootView {
                 &panel.path,
                 panel.address_editing,
                 panel.address.as_ref(),
-                panel.view_mode,
+                // 回收站面板开着时，视图按钮组读写的是回收站自己的视图状态
+                // （`trash_view_mode`），不是背后目录的。
+                if self.is_in_trash() {
+                    self.trash_view_mode
+                } else {
+                    panel.view_mode
+                },
+                // 回收站面板开着（含其上的确认卡）时，地址栏显示「回收站」，
+                // 不再回显进面板前的目录。
+                self.is_in_trash(),
             ))
             .child(body);
 
@@ -6480,6 +6662,11 @@ impl Render for RootView {
                     if entity_key.read(cx).modal != Modal::None
                         && crate::keys::touches_the_browser(action)
                     {
+                        // 但回收站这类模态自己要吃一部分组合键（⌘A 全选）——
+                        // 先交给模态处理器；其余模态不认识这颗键，结果仍是吞掉
+                        // （原行为）。只路由、不 return 掉语义：模态处理器对
+                        // 不认识的键就是空操作。
+                        handle_modal_key(key, plain, &combo, &entity_key, cx);
                         return;
                     }
                     entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
@@ -6648,6 +6835,9 @@ impl Render for RootView {
             }
             Modal::ConfirmTrash(action) => {
                 root = root.child(render_trash_confirm(self, action, &entity));
+            }
+            Modal::TrashRename(entry) => {
+                root = root.child(dialogs::trash_rename(self, entry, &entity));
             }
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
             Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
@@ -7161,24 +7351,31 @@ fn handle_modal_key(
                 _ => {}
             }
         }
+        // 回收站面板不绑 Esc（关闭）/ Delete（删除选中）/ E（清空）：这些是常规
+        // 面板，快捷键反成误触源（用户要求去掉）；动作一律走面板上的按钮。
         Modal::Trash => match key {
-            "escape" => close_modal(entity, cx),
             "up" | "arrowup" => entity.update(cx, |v, cx| {
-                if v.palette_index > 0 {
-                    v.palette_index -= 1;
-                }
+                v.trash_move_cursor(-1, combo.shift);
                 cx.notify();
             }),
             "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = v.trash_entries.len();
-                if n > 0 {
-                    v.palette_index = (v.palette_index + 1).min(n - 1);
-                }
+                v.trash_move_cursor(1, combo.shift);
                 cx.notify();
             }),
-            "enter" => on_trash_restore(entity, cx),
-            "delete" => on_trash_purge(entity, cx),
-            "e" if plain => on_trash_empty(entity, cx),
+            // ⌘/Ctrl+A 全选（多选操作的动作都作用于**整个选中集**）。
+            "a" if combo.cmd || combo.ctrl => entity.update(cx, |v, cx| {
+                v.trash_select_all();
+                cx.notify();
+            }),
+            // Enter 按平台惯例：macOS = 重命名（Finder 同款）；Windows / Linux =
+            // 打开（资源管理器同款）。还原走面板上方的「还原」按钮。
+            "enter" => {
+                if crate::keys::has_command_key() {
+                    on_trash_rename_start(entity, cx);
+                } else {
+                    on_trash_open(entity, cx);
+                }
+            }
             // 空格 = 快速预览**实际落点**文件（Finder 废纸篓同款 Quick Look）。
             // 预览的是 `trashed`（真在 ~/.Trash / 卷上 .Trashes 的本地文件），
             // 不是已不存在的原路径。
@@ -7208,6 +7405,22 @@ fn handle_modal_key(
         Modal::ConfirmTrash(_) => match key {
             "escape" => dismiss_trash_confirm(entity, cx),
             "enter" => confirm_trash_action(entity, cx),
+            _ => {}
+        },
+        Modal::TrashRename(_) => match key {
+            "escape" => dismiss_trash_rename(entity, cx),
+            "enter" => commit_trash_rename(entity, cx),
+            "backspace" => entity.update(cx, |v, cx| {
+                v.trash_rename_name.pop();
+                cx.notify();
+            }),
+            k if plain && k.chars().count() == 1 => {
+                let ch = k.chars().next().unwrap();
+                entity.update(cx, |v, cx| {
+                    v.trash_rename_name.push(ch);
+                    cx.notify();
+                });
+            }
             _ => {}
         },
         Modal::Properties => match key {
@@ -7521,31 +7734,49 @@ fn handle_modal_key(
     }
 }
 
-/// 回收站：还原选中条目。
+/// 回收站面板当前选中的条目（多选集；空则退化为游标那一条）。
+fn trash_picked(v: &RootView) -> Vec<TrashEntry> {
+    let picked: Vec<TrashEntry> = v
+        .trash_selected
+        .iter()
+        .filter_map(|&i| v.trash_entries.get(i).cloned())
+        .collect();
+    if !picked.is_empty() {
+        return picked;
+    }
+    v.trash_entries
+        .get(v.palette_index)
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
+/// 回收站：还原**选中的**条目（多选集；普通单选时就是一条）。
 fn on_trash_restore(entity: &Entity<RootView>, cx: &mut App) {
-    let (entry, app) = entity.update(cx, |v, cx| {
-        let e = v.trash_entries.get(v.palette_index).cloned();
+    let (entries, app) = entity.update(cx, |v, cx| {
+        let entries = trash_picked(v);
+        v.trash_selected.clear();
+        v.trash_anchor = None;
         v.palette_index = 0;
         cx.notify();
-        (e, v.app())
+        (entries, v.app())
     });
-    if let Some(e) = entry {
+    if !entries.is_empty() {
         cx.spawn(async move |_cx| {
-            app.restore_trash_entry(e.original).await;
+            for e in entries {
+                app.restore_trash_entry(e.original).await;
+            }
         })
         .detach();
     }
 }
 
-/// 回收站：永久删除选中条目——**先弹确认卡**，不直接执行。
-fn on_trash_purge(entity: &Entity<RootView>, cx: &mut App) {
-    entity.update(cx, |v, cx| {
-        let Some(e) = v.trash_entries.get(v.palette_index).cloned() else {
-            return;
-        };
-        v.modal = Modal::ConfirmTrash(TrashConfirm::Purge(Box::new(e)));
-        cx.notify();
-    });
+/// 回收站行 / 格的左键按下就地吃掉：别让「点条目」冒泡成「点空白」清选。
+///
+/// 用函数项而不是闭包：同一个闭包值注册到多个元素上会让 HRTB 推导翻车
+/// （"implementation of `Fn` is not general enough"）。
+fn swallow_trash_press(_ev: &MouseDownEvent, _window: &mut Window, cx: &mut App) {
+    cx.stop_propagation();
 }
 
 /// 回收站：清空——**先弹确认卡**，不直接执行。
@@ -7554,6 +7785,76 @@ fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
         v.modal = Modal::ConfirmTrash(TrashConfirm::Empty);
         cx.notify();
     });
+}
+
+/// 回收站：打开**选中的**条目（Windows / Linux 的 Enter 语义，与双击同款）：
+/// 文件交系统默认应用，目录进当前窗口浏览。
+fn on_trash_open(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        let picked = trash_picked(v);
+        for e in picked {
+            v.open_trash_entry(e.trashed, e.is_dir, cx);
+        }
+        cx.notify();
+    });
+}
+
+/// 回收站：开始重命名**游标条目**（macOS 的 Enter 语义）——弹重命名卡，
+/// 输入缓冲预填当前名。
+fn on_trash_rename_start(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        let Some(e) = v.trash_entries.get(v.palette_index).cloned() else {
+            return;
+        };
+        v.trash_rename_name = e
+            .original
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        v.modal = Modal::TrashRename(Box::new(e));
+        cx.notify();
+    });
+}
+
+/// 取消重命名：回到回收站面板（面板本身没动过，多选保持原样）。
+fn dismiss_trash_rename(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if matches!(v.modal, Modal::TrashRename(_)) {
+            v.modal = Modal::Trash;
+            v.trash_rename_name.clear();
+            cx.notify();
+        }
+    });
+}
+
+/// 重命名提交：改实际落点 + 同步账本（[`AppState::rename_trash_entry`]），
+/// 成功后面板列表经 `TrashChanged` 自动重拉，失败弹提示。
+fn commit_trash_rename(entity: &Entity<RootView>, cx: &mut App) {
+    let plan = entity.update(cx, |v, cx| {
+        let entry = match &v.modal {
+            Modal::TrashRename(e) => (**e).clone(),
+            _ => return None,
+        };
+        let name = v.trash_rename_name.trim().to_string();
+        if name.is_empty() {
+            return None; // 空名不关卡：让用户继续输入或 Esc 取消。
+        }
+        v.modal = Modal::Trash;
+        v.trash_rename_name.clear();
+        cx.notify();
+        Some((entry, name))
+    });
+    let Some((entry, name)) = plan else { return };
+    let app = entity.read(cx).app();
+    let this = entity.clone();
+    cx.spawn(async move |cx| {
+        if let Err(e) = app.rename_trash_entry(entry, name).await {
+            this.update(cx, |v, cx| {
+                v.notice(format!("重命名失败：{e}"), None, cx);
+            });
+        }
+    })
+    .detach();
 }
 
 /// 确认卡上点了「确认」（或按 Enter）：真正执行，然后回到回收站面板。
@@ -7569,7 +7870,7 @@ fn confirm_trash_action(entity: &Entity<RootView>, cx: &mut App) {
                 return None;
             }
         };
-        // 列表马上要变：选中索引归零（原 `on_trash_purge` 的收尾搬到这里）。
+        // 列表马上要变：选中索引归零（清空后列表空了，游标也一起归位）。
         v.palette_index = 0;
         cx.notify();
         Some(action)
@@ -7577,7 +7878,6 @@ fn confirm_trash_action(entity: &Entity<RootView>, cx: &mut App) {
     let Some(action) = action else { return };
     let app = entity.read(cx).app();
     match action {
-        TrashConfirm::Purge(e) => app.purge_trash_entry(*e),
         TrashConfirm::Empty => app.empty_trash(),
     }
 }
@@ -7602,6 +7902,8 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
         v.search_results.clear();
         v.diff_cache = None;
         v.palette_index = 0;
+        v.trash_selected.clear();
+        v.trash_anchor = None;
         // 选择器的壳借的是命令面板：一起收掉，否则下次打开面板还是「打开方式」。
         v.app_picker = None;
         cx.notify();
@@ -9035,22 +9337,66 @@ impl RootView {
     }
 
     fn render_trash(&self, entity: &Entity<RootView>) -> Div {
-        let idx = self.palette_index;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // 吃满中央区剩余高度。行的视觉语言**与文件列表同一套**（用户报：回收站
-        // 的行又高字又大，像另一套 UI）——24px 行高、13px 字号、斑马纹、Lucide
-        // 图标、蓝底选中，见 file_list 的行渲染。
+        // 表头列：与文件列表同一套列语言（宽度同 `ColId::default_width`，收口在
+        // [`list_view::default_col_width`]）。时间列语义 = **删除时间**（账本
+        // `at`；账本里没有文件修改时间，别把两者混称）。
+        let cols = [
+            list_view::Column::flex("name", "名称"),
+            list_view::Column::fixed_right(
+                "date",
+                "删除时间",
+                list_view::default_col_width(SortKey::Modified),
+            ),
+            list_view::Column::fixed_right(
+                "size",
+                "大小",
+                list_view::default_col_width(SortKey::Size),
+            ),
+            list_view::Column::fixed_right(
+                "kind",
+                "种类",
+                list_view::default_col_width(SortKey::Kind),
+            ),
+        ];
+        let grid_mode = matches!(self.trash_view_mode, ViewMode::Grid | ViewMode::Gallery);
+        let slot = crate::listing::icon_slot(self.trash_view_mode);
+        // 网格 / 画廊格子的几何：wrap 流式布局，格宽定长、名字截断（与 grid.rs
+        // 的 cell 同构，只是不虚拟化——回收站条目量级小，全量渲染足够）。
+        let cell_w = if self.trash_view_mode == ViewMode::Gallery {
+            152.0
+        } else {
+            112.0
+        };
+        let cell_h = if self.trash_view_mode == ViewMode::Gallery {
+            140.0
+        } else {
+            100.0
+        };
+
+        // 滚动区。**空白点击清选**：行 / 格内按下会 `stop_propagation`，能落到
+        // 容器这里的一定是空白（占位行 / 列表下方 / 空态）——与文件列表同语义
+        // （用户报：回收站点空白不会取消选中）。
+        let entity_blank = entity.clone();
         let mut body = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .px(px(12.0))
+            // 表头与首行之间留 6px 呼吸（用户要求）；滚到底时末行下方同样有呼吸位。
             .py(px(6.0))
+            .bg(theme::surface())
             .overflow_y_scrollbar();
+        body.interactivity()
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                entity_blank.update(cx, |v, cx| {
+                    if !v.trash_selected.is_empty() || v.trash_anchor.is_some() {
+                        v.trash_selected.clear();
+                        v.trash_anchor = None;
+                        cx.notify();
+                    }
+                });
+            });
         // prepaint 回写内容区高度，下一帧才能把斑马纹补满一屏（首帧先按实际
         // 行数渲染；高度变了才 notify，不会造成重绘循环）。
         let entity_h = entity.clone();
@@ -9062,28 +9408,38 @@ impl RootView {
                 }
             });
         });
+
         // 系统图标链路与文件列表**同一条**（`AppState::file_icon` 纯查表 + 后台泵
-        // 补齐；用户报：回收站的文件图标不是系统图标）。类型图标按扩展名向系统要
-        // （`iconForFileType:`）——回收站条目的原路径多半已不存在，按路径问只会得到
-        // 一张通用白纸图标；目录行在真图标就位前有蓝文件夹占位图。整页本地，直接取
-        // 一次 `AppState`，行循环里零分配。
+        // 补齐）。类型图标按扩展名向系统要（`iconForFileType:`）——回收站条目的
+        // 原路径多半已不存在，按路径问只会得到一张通用白纸图标。headless 测试里
+        // 平台层不可用，走内置 Lucide 字形兜底——两条路径都要能画。
         let app = self.app();
-        let slot = crate::listing::icon_slot(ViewMode::List);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = now;
+
+        // 网格 / 画廊：格子先进 wrap 容器，再整体挂进滚动区。
+        let mut flow = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .content_start()
+            .gap(px(8.0));
+
         for (i, e) in self.trash_entries.iter().enumerate() {
-            let selected = i == idx;
+            // 选中态以**多选集合**为准：⌘A / ⌘点击 / ⇧连选都画在集合上。
+            // ⚠️ 不能用游标 `i == idx` 代替——那是 ⌘A「没反应」的根因：
+            // 状态集合全选了，渲染却只高亮游标一行。
+            let selected = self.trash_selected.contains(&i);
             let name = e
                 .original
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| e.original.to_string_lossy().to_string());
-            let parent = e
-                .original
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
             // 系统图标拿不到才退回内置 Lucide 字形：目录 FOLDER，文件按扩展名挑
-            // （与 file_item 的兜底同源）。headless 测试里平台层不可用，走的正是
-            // 这条兜底——两条路径都要能画。
+            // （与 file_item 的兜底同源）。
             let glyph = if e.is_dir {
                 crate::icons::FOLDER
             } else {
@@ -9103,110 +9459,170 @@ impl RootView {
                     None => crate::icons::icon(glyph, slot, fg).into_any_element(),
                 };
 
+            // 点击 / 双击的选中与打开语义在两种视图下完全一致（提取成闭包对）。
             // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
-            let mut row = div()
-                .id(format!("trash-row-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .w_full()
-                .h(px(24.0))
-                .px(px(4.0))
-                .text_size(px(13.0))
-                // 与文件列表一致：选中蓝底；未选中奇偶斑马纹 + 悬停。
-                .bg(if selected {
-                    theme::selected_bg()
-                } else if i % 2 == 1 {
-                    theme::zebra()
-                } else {
-                    theme::surface()
-                })
-                .debug_selector(move || format!("mo-trash-row-{i}"));
-            if !selected {
-                row = row.hover(|s| s.bg(theme::hover_bg()));
-            }
-            row = row
-                .child(icon_el)
-                .child(
-                    // 文件名：给个不宽死的上限，路径列吃剩余空间。
-                    div()
-                        .flex_shrink_0()
-                        .max_w(px(280.0))
-                        .min_w_0()
-                        .truncate()
-                        .text_color(fg)
-                        .child(text!(name)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(if selected {
-                            theme::selected_text()
-                        } else {
-                            theme::muted()
-                        })
-                        .child(text!(parent)),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(if selected {
-                            theme::selected_text()
-                        } else {
-                            theme::muted()
-                        })
-                        .child(text!(human_ago(e.at, now))),
-                );
-
-            // 点击选中这一行（键盘 ↑↓ 的 palette_index 与鼠标共用同一游标）；
-            // 双击 = 打开实际落点（文件用系统默认应用，目录进当前窗口浏览）——
-            // 与文件列表双击同语义（`ev.click_count()`，Finder 废纸篓也支持）。
             let entity_click = entity.clone();
             let trashed = e.trashed.clone();
             let is_dir = e.is_dir;
-            row.interactivity().on_click(move |ev, _window, cx| {
-                if ev.click_count() >= 2 {
-                    entity_click
-                        .update(cx, |v, cx| v.open_trash_entry(trashed.clone(), is_dir, cx));
-                    return;
+            let on_row_click =
+                move |ev: &gpui_kit::ClickEvent, _window: &mut Window, cx: &mut App| {
+                    if ev.click_count() >= 2 {
+                        entity_click
+                            .update(cx, |v, cx| v.open_trash_entry(trashed.clone(), is_dir, cx));
+                        return;
+                    }
+                    // 修饰键决定选择语义（与文件列表 / Finder 一致）：无修饰 = 单选替换；
+                    // cmd/ctrl = 切换多选；shift = 从锚点连选。
+                    let mods = ev.modifiers();
+                    let multi = mods.platform || mods.control;
+                    let shift = mods.shift;
+                    entity_click.update(cx, |v, cx| {
+                        v.palette_index = i;
+                        if shift {
+                            v.trash_select_range(i);
+                        } else if multi {
+                            if !v.trash_selected.remove(&i) {
+                                v.trash_selected.insert(i);
+                            }
+                            v.trash_anchor = Some(i);
+                        } else {
+                            v.trash_selected.clear();
+                            v.trash_selected.insert(i);
+                            v.trash_anchor = Some(i);
+                        }
+                        cx.notify();
+                    });
+                };
+            // 行内 / 格内按下就地吃掉：别让「点条目」冒泡成「点空白」清选
+            // （见模块级 `swallow_trash_press`）。
+
+            if grid_mode {
+                let mut cell = div()
+                    .id(format!("trash-cell-{i}"))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .w(px(cell_w))
+                    .h(px(cell_h))
+                    .p(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(list_view::row_background(selected, i, false))
+                    .text_size(px(11.0))
+                    .debug_selector(move || format!("mo-trash-cell-{i}"));
+                if !selected {
+                    cell = cell.hover(|s| s.bg(theme::hover_bg()));
                 }
-                entity_click.update(cx, |v, cx| {
-                    v.palette_index = i;
-                    cx.notify();
-                });
-            });
-            // `.test_support()` 必须**最后**包（挂完 children 再包，与 sidebar /
-            // status_bar 同款）：过早包会把后续的 hover / child 挂到 Observed 包装
-            // 上，headless 的 click / double_click 通道点不中行（实测踩到）。
-            body = body.child(row.test_support());
-        }
-        // 「斑马纹铺满一屏」（用户报：回收站只有两条记录时下面一片白，不像同一个
-        // 应用）：真实行数不够一屏时，底下补**只有底色、没有任何内容**的占位行。
-        // 底色规则与数据行逐字一致（同一斑马纹开关、同一奇偶、同一 px(4.0)），行高
-        // 同为 24px——真数据出现时文字直接浮现在同一块底色上。行 ID 不能省：多条
-        // 占位行共享无 ID 路径会撞 a11y NodeId（见 file_list 占位行的同一条注释）。
-        let fill = self.trash_fill_rows();
-        for i in self.trash_entries.len()..fill {
-            body = body.child(
-                div()
-                    .id(format!("trash-ph-{i}"))
+                cell = cell.child(icon_el).child(
+                    div()
+                        .max_w_full()
+                        .truncate()
+                        .text_color(fg)
+                        .child(text!(name.clone())),
+                );
+                cell.interactivity()
+                    .on_mouse_down(MouseButton::Left, swallow_trash_press);
+                cell.interactivity().on_click(on_row_click);
+                // `.test_support()` 最后包（挂完事件再包，见行渲染的同一条注释）。
+                flow = flow.child(cell.test_support());
+            } else {
+                let mut row = div()
+                    .id(format!("trash-row-{i}"))
                     .flex()
                     .flex_row()
                     .items_center()
                     .w_full()
-                    .h(px(24.0))
+                    .h(px(list_view::ROW_H))
                     .px(px(4.0))
-                    .bg(if i % 2 == 1 {
-                        theme::zebra()
-                    } else {
-                        theme::surface()
-                    })
-                    // 测试用（release no-op）：按绝对行号定位占位行。
-                    .debug_selector(move || format!("mo-trash-ph-{i}")),
-            );
+                    .text_size(px(13.0))
+                    // 与文件列表一致：选中蓝底；未选中奇偶斑马纹 + 悬停。
+                    .bg(list_view::row_background(selected, i, true))
+                    .debug_selector(move || format!("mo-trash-row-{i}"));
+                if !selected {
+                    row = row.hover(|s| s.bg(theme::hover_bg()));
+                }
+                // 名称列（弹性）：图标 + 文件名。
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .flex_1()
+                        .min_w_0()
+                        .child(icon_el)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(fg)
+                                .child(text!(name.clone())),
+                        ),
+                );
+                // 三个右对齐固定列：删除时间 / 大小 / 种类——宽度与表头同源
+                // （同一 `cols`），cell 之间**没有 gap**（表头也没有，多了会错位）。
+                let date = crate::file_item::format_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.at),
+                );
+                let size_text = if e.is_dir {
+                    "—".to_string()
+                } else {
+                    self.trash_sizes
+                        .get(&e.trashed)
+                        .map(|s| crate::file_item::format_size(*s))
+                        .unwrap_or_else(|| "…".to_string())
+                };
+                let kind = crate::file_item::trash_kind_label(e.is_dir, &name);
+                let fg2 = if selected {
+                    theme::selected_text()
+                } else {
+                    theme::muted()
+                };
+                for c in cols.iter().skip(1) {
+                    let t = match c.key {
+                        "date" => date.clone(),
+                        "size" => size_text.clone(),
+                        _ => kind.clone(),
+                    };
+                    row = row.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .w(px(c.width))
+                            .flex_shrink_0()
+                            .min_w_0()
+                            .text_color(fg2)
+                            .child(text!(t)),
+                    );
+                }
+                row.interactivity()
+                    .on_mouse_down(MouseButton::Left, swallow_trash_press);
+                row.interactivity().on_click(on_row_click);
+                // `.test_support()` 必须**最后**包（挂完 hover / 事件再包，与 sidebar /
+                // status_bar 同款）：过早包会把后续的 hover / child 挂到 Observed 包装
+                // 上，headless 的 click / double_click 通道点不中行（实测踩到）。
+                body = body.child(row.test_support());
+            }
+        }
+        if grid_mode {
+            body = body.child(flow);
+        }
+        // 「斑马纹铺满一屏」（用户报：回收站只有两条记录时下面一片白，不像同一个
+        // 应用）：真实行数不够一屏时，底下补**只有底色、没有任何内容**的占位行。
+        // 底色规则收口在 [`list_view::row_background`]，与数据行逐字一致。行 ID
+        // 不能省：多条占位行共享无 ID 路径会撞 a11y NodeId。网格 / 画廊是 wrap
+        // 格子，空白就是表面色，不补占位。
+        if !grid_mode {
+            let fill = self.trash_fill_rows();
+            for i in self.trash_entries.len()..fill {
+                body = body.child(list_view::fill_row(
+                    format!("trash-ph-{i}"),
+                    format!("mo-trash-ph-{i}"),
+                    i,
+                ));
+            }
         }
         if self.trash_entries.is_empty() {
             body = body.child(
@@ -9217,11 +9633,82 @@ impl RootView {
                     .child(text!("回收站是空的".to_string())),
             );
         }
-        central_view(
+        // 表头固定在滚动区上方，不随内容滚动（Finder 列表视图行为）；网格 / 画廊
+        // 没有列的概念，不出表头。
+        let mut content = div().flex().flex_col().flex_1().min_h_0().min_w_0();
+        if !grid_mode {
+            content = content.child(list_view::header_row("trash", &cols));
+        }
+        content = content.child(body);
+
+        // 「还原」按钮：只在**有选中**时出现（没有可还的就不占地方）。
+        // Enter 不再还原——macOS 上它是重命名、Win/Linux 上是打开（平台惯例），
+        // 还原这个高频动作给一枚看得见摸得着的按钮。
+        // 「还原」按钮挂在**标题栏右侧的常驻槽位**里，有选中才画出按钮本体。
+        // ⚠️ 槽位必须常驻（定高），按钮不能占列表的流内空间——首次点击选中会让
+        // 按钮凭空出现、列表整体下移，双击的第二下就落在别处了（实测踩到）。
+        let restore_n = self.trash_selected.len();
+        let entity_empty = entity.clone();
+        let mut action = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(24.0))
+            .children((restore_n > 0).then(|| {
+                let entity_restore = entity.clone();
+                let label = if restore_n == 1 {
+                    "还原".to_string()
+                } else {
+                    format!("还原 {restore_n} 项")
+                };
+                div()
+                    .id("trash-restore-btn")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(12.0))
+                    .h_full()
+                    .rounded(px(6.0))
+                    .bg(theme::selected_bg())
+                    .text_size(px(12.0))
+                    .text_color(theme::selected_text())
+                    // 测试用（release no-op）：headless 点这颗按钮还原选中。
+                    .debug_selector(|| "mo-trash-restore".to_string())
+                    .on_click(move |_, _window, cx| on_trash_restore(&entity_restore, cx))
+                    .child(text!(label))
+            }));
+        // 「清空回收站」：回收站还有东西才出现；点了先弹确认卡（二次确认），
+        // 真正执行在确认卡上。
+        if !self.trash_entries.is_empty() {
+            action = action.child(
+                div()
+                    .id("trash-empty-btn")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(12.0))
+                    .h_full()
+                    .rounded(px(6.0))
+                    .bg(theme::hover_bg())
+                    .text_size(px(12.0))
+                    .text_color(theme::text())
+                    // 测试用（release no-op）：headless 点这颗按钮打开清空确认卡。
+                    .debug_selector(|| "mo-trash-empty".to_string())
+                    .on_click(move |_, _window, cx| on_trash_empty(&entity_empty, cx))
+                    .child(text!("清空回收站")),
+            );
+        }
+        // 紧凑版中央视图：标题栏与表头之间、表头与首行之间不留内衬（用户报的
+        // 两段间距），观感对齐文件列表（表头顶格、行紧随表头）。
+        central_view_with_action_compact(
             &format!("回收站（{} 项）", self.trash_entries.len()),
             "",
-            body,
-            "↑↓ 选择 · Enter 还原 · Delete 永久删除 · E 清空 · Esc 关闭",
+            content,
+            "",
+            action.into_any_element(),
         )
     }
     /// 比较 / diff 模态：文件 → 行级 diff；文件夹 → 树比较清单。
@@ -9412,20 +9899,6 @@ impl RootView {
     }
 }
 
-/// 粗略的相对时间（依赖零；用于回收站条目展示）。
-fn human_ago(at: u64, now: u64) -> String {
-    let d = now.saturating_sub(at);
-    if d < 60 {
-        "刚刚".to_string()
-    } else if d < 3600 {
-        format!("{} 分钟前", d / 60)
-    } else if d < 86_400 {
-        format!("{} 小时前", d / 3600)
-    } else {
-        format!("{} 天前", d / 86_400)
-    }
-}
-
 /// **中央区视图**：占据整个中央内容区的次级视图（**不是**对话框）。
 ///
 /// 用于内容多、需要停留与滚动的场景——文件 / 文件夹比较、重复文件、磁盘占用、
@@ -9434,6 +9907,45 @@ fn human_ago(at: u64, now: u64) -> String {
 ///
 /// 反过来，短小的输入 / 确认类弹窗请用 [`dialog_overlay`]——它们不该把浏览区顶掉。
 pub(crate) fn central_view(title: &str, input: &str, body: impl IntoElement, hint: &str) -> Div {
+    central_view_with_action(title, input, body, hint, div())
+}
+
+/// [`central_view`] 的完整版：标题栏右侧多一个**常驻**动作槽位（回收站的
+/// 「还原」按钮用）。槽位本身在不在、多高，直接决定标题栏高度——调用方要保证
+/// 按钮出现 / 消失时标题栏高度不变（回收站的做法是槽位恒在、按钮可选）。
+pub(crate) fn central_view_with_action(
+    title: &str,
+    input: &str,
+    body: impl IntoElement,
+    hint: &str,
+    action: impl IntoElement,
+) -> Div {
+    central_view_inner(title, input, body, hint, action, true)
+}
+
+/// 紧凑版：body 外壳**零内衬**——回收站这类「表头 + 满幅列表」视图用：
+/// 表头**紧贴**标题栏（用户明确要求这里不要缝），表头与首行之间的呼吸位由
+/// body 自己的 padding 负责。文档式视图（diff / 搜索 / 重复文件…）
+/// 仍走四周带内衬的 [`central_view_with_action`]。
+pub(crate) fn central_view_with_action_compact(
+    title: &str,
+    input: &str,
+    body: impl IntoElement,
+    hint: &str,
+    action: impl IntoElement,
+) -> Div {
+    central_view_inner(title, input, body, hint, action, false)
+}
+
+fn central_view_inner(
+    title: &str,
+    input: &str,
+    body: impl IntoElement,
+    hint: &str,
+    action: impl IntoElement,
+    pad_body: bool,
+) -> Div {
+    let action = action.into_any_element();
     let mut head = div()
         .flex()
         .flex_row()
@@ -9477,21 +9989,25 @@ pub(crate) fn central_view(title: &str, input: &str, body: impl IntoElement, hin
                         .flex_row()
                         .flex_1()
                         .min_w_0()
+                        .items_center()
                         .justify_end()
+                        .gap(px(10.0))
+                        .child(action)
                         .text_size(px(12.0))
                         .text_color(theme::muted())
                         .child(text!(hint.to_string())),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .p(px(8.0))
-                .child(body),
-        )
+        .child({
+            let mut shell = div().flex().flex_col().flex_1().min_h_0();
+            if pad_body {
+                // 文档式视图：四周 8px 内衬。
+                shell = shell.p(px(8.0));
+            }
+            // 紧凑版（回收站）：零内衬——表头**紧贴**标题栏（用户明确要求这里
+            // 不要缝），表头与首行之间的呼吸位由 trash body 自己的 padding 给。
+            shell.child(body)
+        })
 }
 
 /// 浮层卡片及其标题栏共用的圆角半径。
@@ -9657,7 +10173,7 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
     dialog_overlay(entity, "", "", body, "")
 }
 
-/// 回收站危险操作确认卡（`Modal::ConfirmTrash`）。
+/// 回收站危险操作确认卡（`Modal::ConfirmTrash`，目前只有「清空回收站」一档）。
 ///
 /// 与 [`render_notice_overlay`] 共用 [`dialog_overlay`] 外壳；差别是两颗按钮：
 /// 取消（中性）+ 确认（警示红 `rgba(0xd70015)`，项目没有危险色角色，用固定值）。
@@ -9665,31 +10181,17 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
 /// [`close_modal`]，那会把面板整个关掉。
 fn render_trash_confirm(
     v: &RootView,
-    action: &TrashConfirm,
+    _action: &TrashConfirm,
     entity: &Entity<RootView>,
 ) -> impl IntoElement {
-    let (title, message, ok_label) = match action {
-        TrashConfirm::Empty => (
-            "清空回收站",
-            format!(
-                "将永久删除回收站里的全部 {} 项，此操作不可恢复。",
-                v.trash_entries.len()
-            ),
-            "清空",
+    let (title, message, ok_label) = (
+        "清空回收站",
+        format!(
+            "将永久删除回收站里的全部 {} 项，此操作不可恢复。",
+            v.trash_entries.len()
         ),
-        TrashConfirm::Purge(e) => {
-            let name = e
-                .original
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| e.original.display().to_string());
-            (
-                "永久删除",
-                format!("将永久删除「{name}」，此操作不可恢复。"),
-                "永久删除",
-            )
-        }
-    };
+        "清空",
+    );
     let cancel = entity.clone();
     let ok = entity.clone();
     let body = div()
@@ -12097,6 +12599,7 @@ mod tests {
     /// 与 `grid_and_gallery_inset_content_and_center_names` 同源——`uniform_list`
     /// 的 padding 四个方向都吃（top 加到条目起点、上下算进滚动内容高度、左右扣
     /// 可用宽度），所以留白挂在 list 上就够，不必每行自己加。
+    /// 左右 12 / 上下 10（用户反馈上下各收 2px）。
     #[test]
     fn file_list_rows_are_inset_from_the_edges() {
         crate::isolate_config_for_tests();
@@ -12123,8 +12626,8 @@ mod tests {
             "列表左侧留白 {left}，应为 12：行的 hover 底色顶到窗口边缘了"
         );
         assert!(
-            (top - 12.0).abs() < 0.51,
-            "列表顶部留白 {top}，应为 12：首行顶着表头了"
+            (top - 10.0).abs() < 0.51,
+            "列表顶部留白 {top}，应为 10：首行顶着表头了"
         );
     }
 

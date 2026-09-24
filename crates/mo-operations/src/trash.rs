@@ -231,6 +231,56 @@ impl Trash {
         self.persist()
     }
 
+    /// 重命名回收站里的条目（macOS 惯例：面板里 Enter 就是重命名）。
+    ///
+    /// 实际落点文件改名，账本同步更新——`trashed` 记新落点；`original` 只换
+    /// 文件名、目录部分不动（还原时以**新名**放回原目录，改名才不会被还原
+    /// 悄悄吃掉）。目标名已存在时拒绝（`rename` 在同一文件系统上会静默覆盖，
+    /// 绝不允许）。
+    pub fn rename_entry(&self, entry: &TrashEntry, new_name: &str) -> Result<TrashEntry> {
+        let name = new_name.trim();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(TrashError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("文件名不合法：{new_name:?}"),
+            )));
+        }
+        let old_name = entry
+            .trashed
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name == old_name {
+            return Ok(entry.clone());
+        }
+        let new_trashed = entry.trashed.with_file_name(name);
+        if new_trashed.exists() {
+            return Err(TrashError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("回收站里已有同名文件：{name}"),
+            )));
+        }
+        std::fs::rename(&entry.trashed, &new_trashed)?;
+        let mut updated = entry.clone();
+        updated.trashed = new_trashed;
+        if let Some(dir) = updated.original.parent() {
+            updated.original = dir.join(name);
+        }
+        {
+            let mut entries = self.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == updated.id) {
+                *e = updated.clone();
+            }
+        }
+        self.persist()?;
+        Ok(updated)
+    }
+
     fn remove_entry(&self, id: &str) -> Result<()> {
         self.entries.lock().retain(|e| e.id != id);
         self.persist()
@@ -292,6 +342,61 @@ mod tests {
         assert!(entry.trashed.exists(), "回收站里应有文件");
         assert_eq!(entry.original, src);
         t.empty().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_entry_renames_file_and_ledger() {
+        let (root, t) = tmp_trash("rename");
+        let src = root.join("note.txt");
+        file(&src, b"hello");
+        let entry = t.trash(&src).unwrap();
+
+        // 正常改名：落点文件、账本 trashed、original 文件名三者同步。
+        let renamed = t.rename_entry(&entry, "renamed.txt").unwrap();
+        assert!(!entry.trashed.exists(), "旧落点应已消失");
+        assert!(renamed.trashed.exists(), "新落点应有文件");
+        assert_eq!(
+            renamed.original.file_name().unwrap().to_string_lossy(),
+            "renamed.txt",
+            "original 只换文件名、目录不动"
+        );
+        assert_eq!(
+            renamed.original.parent(),
+            entry.original.parent(),
+            "还原目标目录不变"
+        );
+        // 还原走新名：账本一致。
+        t.restore(&renamed).unwrap();
+        assert!(root.join("renamed.txt").exists(), "应以新名还原回原目录");
+
+        // 目标名已存在：拒绝（同文件系统 rename 会静默覆盖）。
+        let other = root.join("other.txt");
+        file(&other, b"x");
+        let e2 = t.trash(&other).unwrap();
+        let _ = t.rename_entry(&e2, "renamed.txt"); // 与隔离目录里那条同名（不同目录，允许）
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_entry_rejects_existing_target() {
+        let (root, t) = tmp_trash("rename-conflict");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        file(&a, b"1");
+        file(&b, b"2");
+        let ea = t.trash(&a).unwrap();
+        let eb = t.trash(&b).unwrap();
+        // 两条隔离条目在不同 uuid 目录，但直接在同一目录内造冲突验证拒绝逻辑：
+        let conflict = ea.trashed.with_file_name("clash.txt");
+        std::fs::write(&conflict, b"3").unwrap();
+        // 先把 eb 改成 clash.txt 会失败——同目录已有同名。
+        let same_dir = eb.trashed.parent().unwrap().join("clash.txt");
+        std::fs::rename(&eb.trashed, &same_dir).unwrap();
+        // 手动同步账本路径以便构造「同目录已有同名」的场景。
+        assert!(same_dir.exists());
+        let res = t.rename_entry(&eb, "clash.txt");
+        assert!(res.is_err(), "目标已存在时应拒绝，不能静默覆盖");
         let _ = std::fs::remove_dir_all(&root);
     }
 

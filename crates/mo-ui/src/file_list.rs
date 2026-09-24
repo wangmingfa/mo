@@ -619,11 +619,13 @@ pub fn render(
     // （flex_1 / size_full / h(...)），整个文件列表就会被压成 0 高。
     .flex_1()
     // 四周留白：行的 hover / 选中底色不顶到窗口边缘（Finder 式呼吸感）。
-    // 上下这 12pt 与网格同源（见 `grid::PAD`、devlog §25）：`uniform_list` 的 padding
-    // 四个方向都吃——top 加到条目起点、上下都算进滚动内容高度，所以滚到底最后一行
-    // 下面也留得出来，不是只把首行往下推。原来这里只有 `px`，首行顶着表头、
-    // 末行贴着状态栏。
-    .p(px(12.0))
+    // 左右 12pt 与网格同源（见 `grid::PAD`、devlog §25）；上下 10pt（用户反馈
+    // 组件顶部 / 底部各收 2px）。`uniform_list` 的 padding 四个方向都吃——top
+    // 加到条目起点、上下都算进滚动内容高度，所以滚到底最后一行下面也留得出来，
+    // 不是只把首行往下推。原来这里只有 `px`，首行顶着表头、末行贴着状态栏。
+    .px(px(12.0))
+    .pt(px(10.0))
+    .pb(px(10.0))
     // 滚轮 / 触控板滚动经此 handle 走，滚动条拖动也写回同一 handle。
     .track_scroll(scroll)
     // 测试用：让 tests/layout.rs 能读到这个元素的实际尺寸（release 下 no-op）。

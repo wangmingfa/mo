@@ -67,7 +67,7 @@ use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEve
 use mo_operations::{
     CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle, OperationManager,
     RenameOperation, RestoreOperation, SharedOperation, TransferOperation, Trash, TrashEntry,
-    TrashOperation,
+    TrashError, TrashOperation,
 };
 use mo_preview::Preview;
 use mo_remote::RemoteUrl;
@@ -2001,7 +2001,11 @@ impl AppState {
     }
 
     /// 把一个监听事件增量应用到目录模型，并通过事件总线广播。
-    async fn apply_watcher_event(&self, ev: WatcherEvent) {
+    ///
+    /// pub 语义面：删除走回收站是「rename 出当前目录」，watcher 对它的报告形态
+    /// 因平台而异（见 [`Self::apply_watcher_event`] 内对 `Modified` / `Renamed`
+    /// 的守卫），这条路径要在 `mo-app` 语义测试里直接驱动验证。
+    pub async fn apply_watcher_event(&self, ev: WatcherEvent) {
         match ev {
             WatcherEvent::Created(path) => {
                 let Some(r) = entry_at(&path) else { return };
@@ -2039,21 +2043,18 @@ impl AppState {
                 }
             }
             WatcherEvent::Removed(path) => {
-                let removed = {
-                    let mut inner = self.inner.write().await;
-                    match inner.directory.as_mut() {
-                        // remove_entry 内部会重建索引与视图。
-                        Some(dir) => dir.remove_entry(&path),
-                        None => false,
-                    }
-                };
-                if removed {
-                    self.sync_index_removed(&path);
-                    self.bus.publish(AppEvent::EntryDeleted { path });
-                    self.publish_dir_changed().await;
-                }
+                self.remove_listing_entry(path).await;
             }
             WatcherEvent::Renamed { from, to } => {
+                // 跨目录 rename（Linux inotify 的双路径形态；macOS FSEvents 把它
+                // 报成单路径 `Modify(Name)`，走下面 `Modified` 分支）：源若在当前
+                // 列表里，它已经离开了本目录——按删除处理。不能照单全收把条目的
+                // path 改写到目录外：那一行既点不开、也再不会被任何事件刷新掉，
+                // 就是「文件删了列表还显示」的另一个来源。
+                if from.parent() != to.parent() {
+                    self.remove_listing_entry(from).await;
+                    return;
+                }
                 let renamed = {
                     let mut inner = self.inner.write().await;
                     match inner.directory.as_mut() {
@@ -2087,13 +2088,39 @@ impl AppState {
                         .as_ref()
                         .and_then(|d| d.entries.iter().find(|e| e.path == path).map(|e| e.id))
                 };
-                if let Some(id) = id {
-                    if let Ok(meta) = self.active_fs().metadata(&path).await {
-                        self.update_metadata(id, meta).await;
-                        self.bus.publish(AppEvent::MetadataLoaded { path });
-                    }
+                let Some(id) = id else { return };
+                // macOS FSEvents 把「rename 出当前目录」（搬回收站 / 被 `mv` 走）
+                // 报成**单路径** `Modify(Name)`——上面探过（`mo-fs/examples/
+                // watch_probe.rs`），不报 `Remove`。条目还在列表里、盘上已经没了，
+                // 必须按删除处理，否则这一行永远留在列表里（用户报的「文件删除了，
+                // 但是列表还显示」就是这个）。
+                if entry_at(&path).is_none() {
+                    self.remove_listing_entry(path).await;
+                    return;
+                }
+                if let Ok(meta) = self.active_fs().metadata(&path).await {
+                    self.update_metadata(id, meta).await;
+                    self.bus.publish(AppEvent::MetadataLoaded { path });
                 }
             }
+        }
+    }
+
+    /// 把一个条目从当前列表里摘掉（watcher 的 `Removed` / 「rename 出目录」的
+    /// 收口）：摘条目 + 同步索引 + 广播，条目本来就不在列表里时是空操作。
+    async fn remove_listing_entry(&self, path: PathBuf) {
+        let removed = {
+            let mut inner = self.inner.write().await;
+            match inner.directory.as_mut() {
+                // remove_entry 内部会重建索引与视图。
+                Some(dir) => dir.remove_entry(&path),
+                None => false,
+            }
+        };
+        if removed {
+            self.sync_index_removed(&path);
+            self.bus.publish(AppEvent::EntryDeleted { path });
+            self.publish_dir_changed().await;
         }
     }
 
@@ -2702,6 +2729,35 @@ impl AppState {
     /// 进行中的操作应走 [`Self::cancel_operation`]，取消后 再由用户移除。
     pub async fn dismiss_operation(&self, id: u64) {
         self.ops.lock().await.remove(id);
+    }
+
+    // ---- 测试注入（真管线）----
+
+    /// 测试专用：把操作种进 `OperationManager` 并广播，让 `sync_panel` 拉到快照。
+    ///
+    /// 走**真管线**（`register` + 总线事件），而不是往 UI 快照里塞假句柄——
+    /// headless 测试要验证的正是「事件 → 快照 → 渲染」这一段。同步上下文
+    /// （GPUI 的 `update` 闭包）里调用，所以这里用 `blocking_lock` 且**不** await。
+    /// 同 id 重复种入是幂等的（`register` 按 id 覆盖）。
+    pub fn seed_ops_for_tests(&self, ops: Vec<SharedOperation>) {
+        let mut mgr = self.ops.blocking_lock();
+        for op in ops {
+            let id = op.id();
+            mgr.register(op);
+            self.bus.publish(AppEvent::OperationStarted { id });
+        }
+    }
+
+    /// 测试专用：把操作从 `OperationManager` 摘掉并广播
+    /// （配 [`Self::seed_ops_for_tests`]；广播驱动 `sync_panel` 重新拉快照）。
+    pub fn remove_ops_for_tests(&self, ids: &[u64]) {
+        let mut mgr = self.ops.blocking_lock();
+        for &id in ids {
+            mgr.remove(id);
+        }
+        for &id in ids {
+            self.bus.publish(AppEvent::OperationFinished { id });
+        }
     }
 }
 
@@ -3799,6 +3855,26 @@ impl AppState {
             let _ = app.spawn_blocking(move || trash.empty()).await;
             bus.publish(AppEvent::TrashChanged);
         });
+    }
+
+    /// 重命名回收站条目（实际落点 + 账本同步改名；macOS 面板里 Enter 的语义）。
+    /// 成功后广播 `TrashChanged` 让面板重拉列表。
+    pub async fn rename_trash_entry(
+        &self,
+        entry: TrashEntry,
+        new_name: String,
+    ) -> std::result::Result<TrashEntry, MoError> {
+        let trash = self.trash.clone();
+        let updated = self
+            .spawn_blocking(move || trash.rename_entry(&entry, &new_name))
+            .await
+            .map_err(|e| MoError::Other(format!("重命名任务失败：{e}")))?
+            .map_err(|e| match e {
+                TrashError::Io(io) => MoError::Io(io),
+                TrashError::Json(j) => MoError::Other(j.to_string()),
+            })?;
+        self.bus.publish(AppEvent::TrashChanged);
+        Ok(updated)
     }
 
     /// 执行一条可逆操作的正向（inverse=false）或逆向（inverse=true）版本，提交到操作队列。

@@ -33,7 +33,7 @@ pub struct KeyCombo {
 }
 
 /// 这个平台是否把 ⌘ 当主修饰键。
-const fn has_command_key() -> bool {
+pub const fn has_command_key() -> bool {
     cfg!(target_os = "macos")
 }
 

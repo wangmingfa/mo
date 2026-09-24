@@ -244,9 +244,19 @@ pub fn view(
 }
 
 /// 本地时间格式化，Finder 中文样式：`2026年4月21日 10:33`。
-fn format_modified(t: SystemTime) -> String {
+pub(crate) fn format_modified(t: SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y年%m月%d日 %H:%M").to_string()
+}
+
+/// 回收站条目的「种类」文案：目录固定，文件按扩展名归类（与 [`kind_label`]
+/// 同一套映射，只是回收站条目没有 `Entry` 可包——账本只有 is_dir + 原名）。
+pub(crate) fn trash_kind_label(is_dir: bool, name: &str) -> String {
+    if is_dir {
+        "文件夹".to_string()
+    } else {
+        kind_by_ext(name)
+    }
 }
 
 /// 「种类」列文案：目录 / 链接固定，文件按扩展名归类（与图标分类一致）。

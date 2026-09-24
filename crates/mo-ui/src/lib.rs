@@ -16,6 +16,7 @@ mod icon;
 mod icons;
 mod keys;
 mod list_columns;
+mod list_view;
 mod listing;
 mod panel;
 mod path_label;
@@ -82,6 +83,24 @@ pub fn set_ops_open_for_tests(view: &mut RootView, open: bool) {
     view.ops_open = open;
 }
 
+/// 测试专用：读任务浮层的开合状态与当前快照条数。
+#[doc(hidden)]
+pub fn ops_state_for_tests(view: &RootView) -> (bool, usize) {
+    (
+        view.ops_open,
+        view.panel_at(0, 0).map(|p| p.ops.len()).unwrap_or(0),
+    )
+}
+
+/// 测试专用：拿当前标签页的 [`AppState`]（往 `OperationManager` 种假操作用）。
+#[doc(hidden)]
+pub fn app_state_for_tests(view: &RootView) -> mo_app::AppState {
+    view.panel_at(0, 0)
+        .expect("测试前提：至少有一个标签页")
+        .app
+        .clone()
+}
+
 /// 测试专用：注入假的回收站条目（回收站面板的数据源）。
 ///
 /// 真条目要走 `Trash` 的索引文件与删除链路，headless 拉不动；字段直接置上
@@ -91,6 +110,20 @@ pub fn inject_trash_for_tests(view: &mut RootView, entries: Vec<mo_operations::T
     view.trash_entries = entries;
 }
 
+/// 测试专用：读回收站面板各条目的**原文件名**（面板行显示的名字）。
+#[doc(hidden)]
+pub fn trash_entry_names_for_tests(view: &RootView) -> Vec<String> {
+    view.trash_entries
+        .iter()
+        .map(|e| {
+            e.original
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| e.original.to_string_lossy().to_string())
+        })
+        .collect()
+}
+
 /// 测试专用：读回收站面板状态——`(条目数, 是否停在确认卡上)`。
 #[doc(hidden)]
 pub fn trash_panel_state_for_tests(view: &RootView) -> (usize, bool) {
@@ -98,6 +131,25 @@ pub fn trash_panel_state_for_tests(view: &RootView) -> (usize, bool) {
         view.trash_entries.len(),
         matches!(view.modal, crate::app::Modal::ConfirmTrash(_)),
     )
+}
+
+/// 测试专用：回收站面板的当前多选集合（升序行下标）。
+#[doc(hidden)]
+pub fn trash_selection_for_tests(view: &RootView) -> Vec<usize> {
+    view.trash_selected.iter().copied().collect()
+}
+
+/// 测试专用：回收站面板当前的视图模式（`"list"` / `"grid"` / `"gallery"`）。
+#[doc(hidden)]
+pub fn trash_view_mode_for_tests(view: &RootView) -> &'static str {
+    view.trash_view_mode.key()
+}
+
+/// 测试专用：当前调色板的「选中行」底色（回收站多选的**视觉**回归要对比
+/// `painted_quads()` 的真实绘制输出——⌘A 只改状态不画高亮曾是真 bug）。
+#[doc(hidden)]
+pub fn trash_selected_bg_for_tests() -> gpui_kit::Rgba {
+    crate::theme::selected_bg()
 }
 
 /// 测试专用：快速预览窗口是否开着（空格预览回收站条目后置位）。

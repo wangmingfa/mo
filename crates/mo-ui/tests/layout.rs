@@ -14,7 +14,9 @@
 //! `debug_selector` 只在 test / `test-support` 构建里生效，release 下是 no-op。
 
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{px, size, Bounds, Pixels, Size, TestAppContext, VisualTestContext, WindowHandle};
+use gpui_kit::{
+    px, size, Bounds, InputEvent, Pixels, Size, TestAppContext, VisualTestContext, WindowHandle,
+};
 use mo_app::AppState;
 use mo_ui::RootView;
 
@@ -342,83 +344,174 @@ fn toolbar_is_one_row_and_status_bar_is_pinned_to_the_bottom(cx: &mut TestAppCon
     );
 }
 
-// ── 传输指示（左下角小块 + 浮层）与回收站入口 ────────────────────────────
+// ── 传输指示（左下角卡片 + 任务浮层）与回收站入口 ──────────────────────────
 
-use mo_operations::{OperationHandle, OperationStatus};
+use mo_operations::OperationStatus;
 
-/// 造一条假操作快照（真操作要走 OperationManager 的后台执行链路，headless 拉不动）。
-/// `pausable = false`：删除这类快操作；传输类（复制 / 移动）快照才带暂停能力。
-fn fake_op(id: u64, status: OperationStatus, done: u64, total: u64) -> OperationHandle {
-    OperationHandle {
-        id,
-        describe: format!("删除（回收站）/Users/demo/file-{id}"),
-        status,
-        progress: (done, total),
-        pausable: false,
+/// 假操作：实现 `Operation` trait，只为种进真的 `OperationManager`。
+///
+/// 任务浮层必须走**真管线**验证：视图里的 `tab.ops` 是快照缓存，任何总线事件
+/// 都会触发 `sync_panel` 用 manager 快照覆盖它——注入视图的假条目一拍就被冲掉
+/// （实测踩到）。种进 manager 后，泵 / 事件驱动的同步行为与生产完全一致。
+#[derive(Clone)]
+struct FakeOp {
+    id: u64,
+    status: OperationStatus,
+    progress: (u64, u64),
+}
+
+impl mo_operations::Operation for FakeOp {
+    fn id(&self) -> u64 {
+        self.id
+    }
+    fn describe(&self) -> String {
+        format!("删除（回收站）/Users/demo/file-{}", self.id)
+    }
+    fn status(&self) -> OperationStatus {
+        self.status
+    }
+    fn progress(&self) -> (u64, u64) {
+        self.progress
+    }
+    fn cancel(&self) {}
+    fn pause(&self) {}
+    fn resume(&self) {}
+    fn run(&self) -> Result<(), mo_core::MoError> {
+        Ok(())
     }
 }
 
-fn inject_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ops: Vec<OperationHandle>) {
+/// 种一批假操作进当前标签页的 `OperationManager`（广播事件触发 `sync_panel`）。
+fn seed_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ops: Vec<FakeOp>) {
     window
         .update(cx, |root, _window, _cx| {
-            mo_ui::inject_ops_for_tests(root, ops);
+            let app = mo_ui::app_state_for_tests(root);
+            app.seed_ops_for_tests(
+                ops.into_iter()
+                    .map(|o| std::sync::Arc::new(o) as _)
+                    .collect(),
+            );
         })
-        .expect("注入操作快照失败");
+        .expect("种入假操作失败");
 }
 
-/// 传输任务必须收成**左下角统一任务面板**（折叠态），不能再是整条横幅把状态栏
-/// 顶上去，也不能是悬空浮层加底下一份重复小块。
+/// 从 `OperationManager` 摘掉指定操作（广播事件触发 `sync_panel`）。
+fn remove_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ids: &[u64]) {
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::app_state_for_tests(root).remove_ops_for_tests(ids);
+        })
+        .expect("摘除假操作失败");
+}
+
+/// 种一批假操作并**等到任务卡片真的画出来**。
 ///
-/// 折叠态：面板宽不超过 310px、贴在状态栏上方，且状态栏高度不受任务影响。
+/// seed 的广播事件可能赶在 `tab_loop` 订阅总线之前发出去而丢失（open_home 的
+/// 真 IO 还在路上），所以失败就重发——register 同 id 幂等（HashMap 覆盖）。
+fn seed_ops_until_visible(
+    vcx: &mut VisualTestContext,
+    window: &WindowHandle<RootView>,
+    cx: &mut TestAppContext,
+    ops: &[FakeOp],
+) {
+    for _ in 0..20 {
+        seed_ops(window, cx, ops.to_vec());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if vcx.debug_bounds("mo-ops-badge").is_some() {
+            return;
+        }
+    }
+    panic!("种入操作后任务卡片始终没有出现（事件丢失且重试无效）");
+}
+
+/// 传输任务必须收成**左下角统一任务卡片**（常显长条），不能再是整条横幅把状态栏
+/// 顶上去。
+///
+/// 卡片宽与侧栏同档、贴在状态栏上方，且状态栏高度不受任务影响。
 #[gpui_kit::test]
 fn transfers_render_as_a_corner_badge_above_the_status_bar(cx: &mut TestAppContext) {
     let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
     let baseline = bounds(&mut vcx, "mo-statusbar");
 
-    inject_ops(
+    seed_ops_until_visible(
+        &mut vcx,
         &window,
         cx,
-        vec![
-            fake_op(1, OperationStatus::Running, 3, 10),
-            fake_op(2, OperationStatus::Completed, 5, 5),
+        &[
+            FakeOp {
+                id: 1,
+                status: OperationStatus::Running,
+                progress: (3, 10),
+            },
+            FakeOp {
+                id: 2,
+                status: OperationStatus::Completed,
+                progress: (5, 5),
+            },
         ],
     );
-    vcx.update(|window, cx| window.render_frame(cx));
 
     let badge = bounds(&mut vcx, "mo-ops-badge");
     assert!(
         f32::from(badge.size.width) <= 310.0,
-        "折叠面板宽 {}：又铺回横幅了",
+        "卡片宽 {}：又铺回横幅了",
         badge.size.width
     );
     let status = bounds(&mut vcx, "mo-statusbar");
     assert_eq!(
         status, baseline,
-        "有任务之后状态栏位置/大小变了：面板不该占布局"
+        "有任务之后状态栏位置/大小变了：卡片不该占布局"
     );
     assert!(
         f32::from(badge.origin.y) + f32::from(badge.size.height) <= f32::from(status.origin.y),
-        "面板应悬在状态栏上方：badge={badge:?} status={status:?}"
+        "卡片应悬在状态栏上方：badge={badge:?} status={status:?}"
     );
-    // 默认折叠。
+    // 默认不展开浮层。
     assert!(vcx.debug_bounds("mo-ops-popover").is_none());
 }
 
-/// 点折叠态的小块原地展开成任务列表，再点一次收起——同一张卡片，不是
-/// 悬空浮层 + 底下还留一份重复小块。
+/// 聚合进度条必须收在卡片的**直边区**里：这个 fork 的 `div` 不把子元素裁进
+/// 父级圆角（`overflow_hidden()` 不被消费），通栏贴边会从 8px 圆角底下戳出去
+/// （用户截图：进度条跑到圆角外面）。修法是左右收进 10px（≥ 圆角半径）。
+#[gpui_kit::test]
+fn aggregate_bar_stays_inside_the_badge_corners(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    seed_ops_until_visible(
+        &mut vcx,
+        &window,
+        cx,
+        &[FakeOp {
+            id: 1,
+            status: OperationStatus::Running,
+            progress: (3, 10),
+        }],
+    );
+
+    let badge = bounds(&mut vcx, "mo-ops-badge");
+    let bar = bounds(&mut vcx, "mo-ops-bar");
+    let inset_l = f32::from(bar.origin.x - badge.origin.x);
+    let inset_r = f32::from((badge.origin.x + badge.size.width) - (bar.origin.x + bar.size.width));
+    assert!(
+        inset_l >= 8.0 && inset_r >= 8.0,
+        "进度条距卡片左右缘只有 {inset_l}/{inset_r}px：会从 8px 圆角底下戳出去"
+    );
+}
+
+/// 点常显卡片在**上方**弹出任务浮层，再点一次收起——浮层贴卡片顶部展开、
+/// 左缘对齐（top-start），不是把卡片原地长高。
 #[gpui_kit::test]
 fn badge_click_toggles_the_transfer_popover(cx: &mut TestAppContext) {
     let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
-
-    inject_ops(
+    seed_ops_until_visible(
+        &mut vcx,
         &window,
         cx,
-        vec![fake_op(1, OperationStatus::Running, 0, 4)],
-    );
-    vcx.update(|window, cx| window.render_frame(cx));
-    assert!(
-        vcx.debug_bounds("mo-ops-badge").is_some(),
-        "有任务时应画出小块"
+        &[FakeOp {
+            id: 1,
+            status: OperationStatus::Running,
+            progress: (0, 4),
+        }],
     );
 
     vcx.update(|window, cx| window.click("mo-ops-badge", cx));
@@ -426,25 +519,105 @@ fn badge_click_toggles_the_transfer_popover(cx: &mut TestAppContext) {
     let pop = bounds(&mut vcx, "mo-ops-popover");
     assert!(
         f32::from(pop.size.width) <= 400.0,
-        "展开面板宽 {}：不该铺满窗口",
+        "浮层宽 {}：不该铺满窗口",
         pop.size.width
     );
-    // 列表在标题行（mo-ops-badge）**正下方**、同一张卡片内：左缘对齐，中间无缝。
+    // 浮层贴在卡片**上方**（top-start）：底缘不越过卡片顶、左缘对齐。
     let badge = bounds(&mut vcx, "mo-ops-badge");
     assert!(
-        f32::from(pop.origin.y) >= f32::from(badge.origin.y) + f32::from(badge.size.height),
-        "任务列表应紧跟标题行下方：pop={pop:?} badge={badge:?}"
+        f32::from(pop.origin.y) + f32::from(pop.size.height) <= f32::from(badge.origin.y),
+        "任务浮层应贴在卡片上方：pop={pop:?} badge={badge:?}"
     );
     assert_eq!(
         pop.origin.x, badge.origin.x,
-        "展开面板与折叠小块左缘不对齐：不像同一张卡片"
+        "任务浮层与常显卡片左缘不对齐：不是 top-start"
     );
 
     vcx.update(|window, cx| window.click("mo-ops-badge", cx));
     vcx.update(|window, cx| window.render_frame(cx));
     assert!(
         vcx.debug_bounds("mo-ops-popover").is_none(),
-        "再点一次标题行应收起任务列表"
+        "再点一次卡片应收起任务浮层"
+    );
+}
+
+/// 浮层右上角的扫帚：一键清除**已完成**的任务（进行中的原样保留）；
+/// 任务全部移除后浮层自动收起，新任务再来时只显示常显卡片（不自动展开）。
+#[gpui_kit::test]
+fn broom_clears_completed_and_popover_auto_closes(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    seed_ops_until_visible(
+        &mut vcx,
+        &window,
+        cx,
+        &[
+            FakeOp {
+                id: 1,
+                status: OperationStatus::Running,
+                progress: (3, 10),
+            },
+            FakeOp {
+                id: 2,
+                status: OperationStatus::Completed,
+                progress: (5, 5),
+            },
+        ],
+    );
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(vcx.debug_bounds("mo-ops-row-1").is_some());
+    assert!(
+        vcx.debug_bounds("mo-ops-row-2").is_some(),
+        "前提：两条都在浮层上"
+    );
+
+    // 扫帚：清除已完成（id=2）——dismiss 走真 manager，视图侧乐观更新先摘行，
+    // 泵 / 事件随后的快照同步与之一致。浮层应保持开着（还有进行中任务）。
+    vcx.update(|window, cx| window.click("mo-ops-broom", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-ops-row-2").is_none(),
+        "扫帚应清掉已完成的任务"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-row-1").is_some(),
+        "进行中的任务应原样保留"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-popover").is_some(),
+        "还有进行中任务，浮层应保持开着"
+    );
+
+    // 任务全部移除（从真 manager 摘掉最后一条，事件触发 sync_panel）：
+    // 浮层自动收起、卡片消失。
+    remove_ops(&window, cx, &[1]);
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-ops-popover").is_none(),
+        "任务清空后浮层应自动收起"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-badge").is_none(),
+        "任务清空后常显卡片应消失"
+    );
+
+    // 新任务再来：只显示常显卡片，浮层保持收起（不凭空展开旧浮层）。
+    seed_ops_until_visible(
+        &mut vcx,
+        &window,
+        cx,
+        &[FakeOp {
+            id: 3,
+            status: OperationStatus::Running,
+            progress: (0, 4),
+        }],
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-popover").is_none(),
+        "自动收起后新任务不应把浮层重新弹开"
     );
 }
 
@@ -621,9 +794,10 @@ fn clicking_blank_below_the_list_clears_the_selection(cx: &mut TestAppContext) {
     );
 
     // 再点最后一行之下的空白：选择应清空，而不是选中最后一行。
+    // （列表底部 padding 是 10px，取剩余空白的中点，别贴着末行边缘。）
     let p_blank = point(
         list.origin.x + px(200.0),
-        list.origin.y + list.size.height - px(10.0),
+        list.origin.y + list.size.height - px(5.0),
     );
     vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
     vcx.run_until_parked();
@@ -1047,16 +1221,14 @@ fn trash_zebra_stripes_fill_the_viewport(cx: &mut TestAppContext) {
     );
 }
 
-/// 永久删除 / 清空回收站必须**先弹确认卡**：Esc / 取消回面板、条目原样；
-/// 确认（Enter 或红色按钮）才执行并回到面板。
-/// 永久删除 / 清空回收站必须**先弹确认卡**：Esc / 取消 / 点遮罩回面板、条目
-/// 原样；确认（Enter 或红色按钮）才真正执行并回到面板。
+/// 清空回收站必须**先弹确认卡**（面板标题栏「清空回收站」按钮）：Esc / 取消 /
+/// 点遮罩回面板、条目原样；确认（Enter 或红色按钮）才真正执行并回到面板。
 ///
 /// 条目**预种进 store**（`<root>/index.json` + 真实落点文件）而不是注入视图：
 /// `sync_panel` 会拿 store 的列表覆盖 `trash_entries`，keystroke 泵 effect 时
 /// 注入的视图本地条目会被空 store 顶掉（本测试首次运行时踩到）。
 #[gpui_kit::test]
-fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
+fn trash_empty_asks_for_confirmation(cx: &mut TestAppContext) {
     // 独立的回收站根（见 `open_app_with_trash`）：先清干净再预种两条记录
     // （含真实落点文件）。
     let seed = std::env::temp_dir().join(format!("mo-layout-trash-confirm-{}", std::process::id()));
@@ -1095,13 +1267,13 @@ fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
     assert_eq!(state(&mut vcx, &window), (2, false), "前提：两条都在面板上");
     assert!(vcx.debug_bounds("mo-trash-row-1").is_some());
 
-    // Delete：只弹确认卡，不执行（条目数不变）。
-    cx.simulate_keystrokes(window.into(), "delete");
+    // 点「清空回收站」按钮：只弹确认卡，不执行（条目数不变）。
+    vcx.update(|window, cx| window.click("trash-empty-btn", cx));
     vcx.run_until_parked();
     vcx.update(|window, cx| window.render_frame(cx));
     assert!(
         vcx.debug_bounds("mo-dialog-card").is_some(),
-        "永久删除应当先弹确认卡"
+        "清空回收站应当先弹确认卡"
     );
     assert_eq!(
         state(&mut vcx, &window),
@@ -1123,8 +1295,8 @@ fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
     );
     assert_eq!(state(&mut vcx, &window), (2, false), "取消后条目应原样");
 
-    // 再 Delete → 点「取消」按钮：同样回面板、条目原样。
-    cx.simulate_keystrokes(window.into(), "delete");
+    // 再点按钮 → 点「取消」按钮：同样回面板、条目原样。
+    vcx.update(|window, cx| window.click("trash-empty-btn", cx));
     vcx.run_until_parked();
     vcx.update(|window, cx| window.render_frame(cx));
     vcx.update(|window, cx| window.click("trash-confirm-cancel", cx));
@@ -1133,8 +1305,8 @@ fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("mo-dialog-card").is_none());
     assert_eq!(state(&mut vcx, &window), (2, false));
 
-    // 再 Delete → 点红色「永久删除」：单条被抹掉（store 里只剩一条），回面板。
-    cx.simulate_keystrokes(window.into(), "delete");
+    // 再点按钮 → 点红色「清空」：面板清空（store 里两条记录都被抹掉）。
+    vcx.update(|window, cx| window.click("trash-empty-btn", cx));
     vcx.run_until_parked();
     vcx.update(|window, cx| window.render_frame(cx));
     vcx.update(|window, cx| window.click("trash-confirm-ok", cx));
@@ -1144,20 +1316,6 @@ fn trash_purge_and_empty_ask_for_confirmation(cx: &mut TestAppContext) {
         vcx.debug_bounds("mo-dialog-card").is_none(),
         "确认后卡应关闭"
     );
-    assert_eq!(state(&mut vcx, &window), (1, false), "永久删除后应只剩一条");
-
-    // E：清空也要确认；Enter 确认执行 → 面板清空。
-    cx.simulate_keystrokes(window.into(), "e");
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
-    assert!(
-        vcx.debug_bounds("mo-dialog-card").is_some(),
-        "清空回收站应当先弹确认卡"
-    );
-    cx.simulate_keystrokes(window.into(), "enter");
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
-    assert!(vcx.debug_bounds("mo-dialog-card").is_none());
     assert_eq!(state(&mut vcx, &window), (0, false), "清空后面板应为空");
 }
 
@@ -1228,4 +1386,604 @@ fn trash_space_previews_and_double_click_opens(cx: &mut TestAppContext) {
         })
         .expect("读预览窗口状态失败");
     assert!(preview_open, "空格应当打开快速预览窗");
+}
+
+/// 任务多时浮层列表必须是**定高滚动区**：`Scrollable` 需要定高上下文，
+/// auto 高度链 + `max_h` 撑不出滚动区——此前任务多时既滚不动也看不到滚动条
+/// （用户实测）。8 行 × 56 = 448 > 300 上限，浮层总高必须被钳住。
+#[gpui_kit::test]
+fn task_popover_list_is_bounded_when_many_tasks(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let many: Vec<FakeOp> = (1..=8)
+        .map(|i| FakeOp {
+            id: i,
+            status: OperationStatus::Running,
+            progress: (1, 2),
+        })
+        .collect();
+    seed_ops_until_visible(&mut vcx, &window, cx, &many);
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let pop = bounds(&mut vcx, "mo-ops-popover");
+    // 列表 300 + 头部 ~36 + 分隔线/边框 ~3：浮层总高 ~339，绝不跟随 448 的内容长。
+    assert!(
+        f32::from(pop.size.height) <= 342.0,
+        "浮层高 {}：任务列表没有钳在 300px 定高滚动区里",
+        pop.size.height
+    );
+}
+
+/// 少任务时列表按内容自适应（高度 = 行数 × 行高），不该被撑到滚动上限。
+#[gpui_kit::test]
+fn task_popover_list_fits_content_when_few_tasks(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    let few = vec![
+        FakeOp {
+            id: 1,
+            status: OperationStatus::Running,
+            progress: (1, 2),
+        },
+        FakeOp {
+            id: 2,
+            status: OperationStatus::Completed,
+            progress: (2, 2),
+        },
+    ];
+    seed_ops_until_visible(&mut vcx, &window, cx, &few);
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let pop = bounds(&mut vcx, "mo-ops-popover");
+    // 2 行 × 56 + 头部 ~36 ≈ 152，远小于 342 的上限。
+    assert!(
+        f32::from(pop.size.height) < 200.0,
+        "2 个任务的浮层高 {}：不该被撑到滚动上限",
+        pop.size.height
+    );
+}
+
+/// 在 headless 里对指定 debug_selector 的元素派发一次**带修饰键**的左键点击
+/// （gpui-kit 的 `click` 助手恒为无修饰键，回收站的 ⌘/⇧ 多选语义测不到）。
+fn click_with_modifiers(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+    mods: gpui_kit::Modifiers,
+) {
+    let b = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} 没有渲染"));
+    let center = gpui_kit::point(
+        b.origin.x + b.size.width / 2.0,
+        b.origin.y + b.size.height / 2.0,
+    );
+    vcx.update(|window, cx| {
+        window.dispatch_event(
+            gpui_kit::MouseDownEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: center,
+                modifiers: mods,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(
+            gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: center,
+                modifiers: mods,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+}
+
+/// 断言某个 debug_selector 的行**有没有真的画出**选中底色——比对
+/// `painted_quads()` 的真实绘制输出（⌘A 只改状态集合、渲染不画高亮
+/// 曾是真 bug：headless 探针读状态全绿、真机没反应）。
+fn row_has_selected_bg(
+    vcx: &mut VisualTestContext,
+    selector: &'static str,
+    bg: gpui_kit::Rgba,
+) -> bool {
+    let Some(b) = vcx.debug_bounds(selector) else {
+        return false;
+    };
+    let scale = vcx.update(|window, _cx| window.scale_factor());
+    let (x, y, w, h) = (
+        f32::from(b.origin.x) * scale,
+        f32::from(b.origin.y) * scale,
+        f32::from(b.size.width) * scale,
+        f32::from(b.size.height) * scale,
+    );
+    let near = |a: f32, c: f32| (a - c).abs() < 0.5;
+    let quads = vcx.update(|window, _cx| window.painted_quads());
+    quads.iter().any(|q| {
+        near(q.bounds.origin.x.as_f32(), x)
+            && near(q.bounds.origin.y.as_f32(), y)
+            && near(q.bounds.size.width.as_f32(), w)
+            && near(q.bounds.size.height.as_f32(), h)
+            && q.background == gpui_kit::Background::from(bg)
+    })
+}
+
+/// 回收站面板支持**多选**（Finder / 资源管理器同款语义）：
+/// 普通左键 = 单选替换；⌘/Ctrl + 左键 = 切换；⇧ + 左键 = 从锚点连选；
+/// ⇧ + ↑↓ = 键盘延伸；普通 ↑↓ = 单选替换；⌘/Ctrl + A = 全选。
+#[gpui_kit::test]
+fn trash_panel_supports_multi_select(cx: &mut TestAppContext) {
+    // 预种三条记录（理由见 trash_purge_and_empty_ask_for_confirmation）。
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    let mut records = String::from("[");
+    for i in 0..3 {
+        let id = format!("seed-{i}");
+        let name = format!("f{i}.txt");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            dir.join(&name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    // 还没进回收站：地址栏是普通浏览态，没有「回收站」胶囊。
+    assert!(
+        vcx.debug_bounds("mo-address-trash").is_none(),
+        "普通浏览态不该出现回收站地址胶囊"
+    );
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(vcx.debug_bounds("mo-trash-row-2").is_some(), "三条都应渲染");
+    // 进了回收站：地址栏换成「回收站」胶囊（用户报：进回收站地址栏没变）。
+    assert!(
+        vcx.debug_bounds("mo-address-trash").is_some(),
+        "回收站模式地址栏应显示「回收站」胶囊"
+    );
+
+    let sel = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> Vec<usize> {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_selection_for_tests(root)
+            })
+            .expect("读回收站多选失败")
+    };
+    let redraw = |vcx: &mut VisualTestContext| {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+    };
+
+    // 普通左键 = 单选替换。
+    vcx.update(|window, cx| window.click("trash-row-1", cx));
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![1]);
+    // 视觉回归：选中底色必须**真的画出来**（曾出现状态全选、渲染只亮游标）。
+    let bg = mo_ui::trash_selected_bg_for_tests();
+    assert!(
+        row_has_selected_bg(&mut vcx, "mo-trash-row-1", bg),
+        "row1 单选后应画选中底色"
+    );
+    assert!(
+        !row_has_selected_bg(&mut vcx, "mo-trash-row-0", bg),
+        "row0 未选中不应亮"
+    );
+
+    // ⇧ + ↓：从锚点（1）延伸到 2。
+    cx.simulate_keystrokes(window.into(), "shift-down");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![1, 2]);
+
+    // ⇧ + ↑：收回一格。
+    cx.simulate_keystrokes(window.into(), "shift-up");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![1]);
+    // 再 ⇧ + ↑：越过锚点向上连选。
+    cx.simulate_keystrokes(window.into(), "shift-up");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0, 1]);
+
+    // 普通 ↓：回到单选替换。
+    cx.simulate_keystrokes(window.into(), "down");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![1]);
+
+    // ⌘A：全选。
+    cx.simulate_keystrokes(window.into(), "cmd-a");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0, 1, 2]);
+    // 视觉回归：三行都得画上选中底色。
+    for s in ["mo-trash-row-0", "mo-trash-row-1", "mo-trash-row-2"] {
+        assert!(
+            row_has_selected_bg(&mut vcx, s, bg),
+            "{s} ⌘A 后应画选中底色"
+        );
+    }
+
+    // ⌘ + 左键：把 row2 从全选里切掉。
+    click_with_modifiers(
+        &mut vcx,
+        "mo-trash-row-2",
+        gpui_kit::Modifiers {
+            platform: true,
+            ..Default::default()
+        },
+    );
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0, 1]);
+
+    // 普通左键：单选替换。
+    vcx.update(|window, cx| window.click("trash-row-0", cx));
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0]);
+
+    // ⇧ + 左键：从锚点（0）连选到 2。
+    click_with_modifiers(
+        &mut vcx,
+        "mo-trash-row-2",
+        gpui_kit::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0, 1, 2]);
+}
+
+/// 多选时**动作作用于整个选中集**：「还原」按钮把所有选中项一起还原（按钮
+/// 文案带条数）。动作后多选清空。
+#[gpui_kit::test]
+fn trash_multi_select_restore_acts_on_the_selection(cx: &mut TestAppContext) {
+    let seed =
+        std::env::temp_dir().join(format!("mo-layout-trash-multi-act-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    let mut records = String::from("[");
+    for i in 0..3 {
+        let id = format!("seed-{i}");
+        let name = format!("f{i}.txt");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            seed.display(),
+            dir.join(&name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let state = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_panel_state_for_tests(root)
+            })
+            .expect("读回收站状态失败")
+    };
+    let sel = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> Vec<usize> {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_selection_for_tests(root)
+            })
+            .expect("读回收站多选失败")
+    };
+    let redraw = |vcx: &mut VisualTestContext| {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+    };
+
+    // 选中 0、1 两行，Enter 还原——两条一起走（还原落点是 seed 下的 demo-f*.txt，
+    // 与预种目录互不相干）。
+    vcx.update(|window, cx| window.click("trash-row-0", cx));
+    redraw(&mut vcx);
+    cx.simulate_keystrokes(window.into(), "shift-down");
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0, 1]);
+
+    // Enter 不再还原（macOS = 重命名）：还原走面板上方的「还原」按钮。
+    assert!(
+        vcx.debug_bounds("mo-trash-restore").is_some(),
+        "有选中时还原按钮应出现"
+    );
+    vcx.update(|window, cx| window.click("trash-restore-btn", cx));
+    for _ in 0..20 {
+        redraw(&mut vcx);
+        if state(&mut vcx, &window).0 == 1 {
+            break;
+        }
+    }
+    assert_eq!(state(&mut vcx, &window).0, 1, "两条选中项应一起被还原");
+    assert!(
+        sel(&mut vcx, &window).is_empty(),
+        "动作后多选应清空（列表变了）"
+    );
+}
+
+/// 回收站 Enter 平台语义 + 还原按钮显隐：
+/// * 进面板**不默认选中**任何行；「还原」按钮只在有选中时出现；
+/// * macOS 上 Enter = 重命名：弹重命名卡（预填当前名），提交后实际落点文件
+///   与面板列表同步改名（账本一致，之后还原仍可用）。
+#[gpui_kit::test]
+fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppContext) {
+    // 预种三条（f0..f2；列表最新在前 → 行序 f2, f1, f0）。
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    let mut records = String::from("[");
+    for i in 0..3 {
+        let id = format!("seed-{i}");
+        let name = format!("f{i}.txt");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            seed.display(),
+            dir.join(&name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed.clone(), cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let names = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> Vec<String> {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_entry_names_for_tests(root)
+            })
+            .expect("读条目名失败")
+    };
+    let sel = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> Vec<usize> {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_selection_for_tests(root)
+            })
+            .expect("读回收站多选失败")
+    };
+    let redraw = |vcx: &mut VisualTestContext| {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+    };
+
+    // ① 不默认选中第一条：无选中、无还原按钮。
+    assert!(
+        sel(&mut vcx, &window).is_empty(),
+        "进面板不应默认选中任何行"
+    );
+    assert!(
+        vcx.debug_bounds("mo-trash-restore").is_none(),
+        "无选中时不应出现还原按钮"
+    );
+
+    // ② 选中一行 → 还原按钮出现。
+    vcx.update(|window, cx| window.click("trash-row-0", cx));
+    redraw(&mut vcx);
+    assert_eq!(sel(&mut vcx, &window), vec![0]);
+    assert!(
+        vcx.debug_bounds("mo-trash-restore").is_some(),
+        "有选中时应出现还原按钮"
+    );
+
+    // ③ macOS Enter = 重命名：弹卡并预填游标行的当前名（原路径的文件名）。
+    assert_eq!(
+        names(&mut vcx, &window),
+        vec!["demo-f2.txt", "demo-f1.txt", "demo-f0.txt"]
+    );
+    cx.simulate_keystrokes(window.into(), "enter");
+    redraw(&mut vcx);
+    assert!(
+        vcx.debug_bounds("mo-dialog-card").is_some(),
+        "Enter 应弹重命名卡"
+    );
+    // Esc 回面板，多选保持。
+    cx.simulate_keystrokes(window.into(), "escape");
+    redraw(&mut vcx);
+    assert!(vcx.debug_bounds("mo-dialog-card").is_none());
+    assert_eq!(sel(&mut vcx, &window), vec![0]);
+
+    // ④ 再进重命名卡：清空预填 → 输入新名 → Enter 提交。
+    cx.simulate_keystrokes(window.into(), "enter");
+    redraw(&mut vcx);
+    cx.simulate_keystrokes(
+        window.into(),
+        "backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace",
+    );
+    cx.simulate_keystrokes(window.into(), "r e n a m e d . t x t");
+    cx.simulate_keystrokes(window.into(), "enter");
+    for _ in 0..20 {
+        redraw(&mut vcx);
+        if names(&mut vcx, &window)[0] == "renamed.txt" {
+            break;
+        }
+    }
+    assert_eq!(
+        names(&mut vcx, &window),
+        vec!["renamed.txt", "demo-f1.txt", "demo-f0.txt"],
+        "提交后面板列表应显示新名"
+    );
+    // 实际落点文件也改了名（旧路径没了、新路径在）。
+    assert!(!seed.join("seed-2").join("f2.txt").exists());
+    assert!(seed.join("seed-2").join("renamed.txt").exists());
+}
+
+/// 回收站列表视图要有**表头**（名称 / 列表同源的四列），且**点空白清选**
+/// （用户报：回收站点空白不会取消选中文件）。
+#[gpui_kit::test]
+fn trash_header_and_blank_click_clears_selection(cx: &mut TestAppContext) {
+    // 预种两条（真实落点文件，大小列才有得算）。
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-header-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    let mut records = String::from("[");
+    for (i, name) in ["a.txt", "b.txt"].iter().enumerate() {
+        let id = format!("seed-{i}");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"hello").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            dir.join(name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let sel = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> Vec<usize> {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_selection_for_tests(root)
+            })
+            .expect("读回收站多选失败")
+    };
+
+    // 表头存在，且在数据行上方。
+    let header = bounds(&mut vcx, "mo-trash-header");
+    let row0 = bounds(&mut vcx, "mo-trash-row-0");
+    assert!(
+        header.origin.y + header.size.height <= row0.origin.y,
+        "表头应位于数据行上方：header={header:?} row0={row0:?}"
+    );
+
+    // 点第一行 → 选中；再点最后一行之下的空白 → 清选（坐标级真实鼠标事件）。
+    vcx.update(|window, cx| window.click("trash-row-0", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(sel(&mut vcx, &window), vec![0], "点行应选中");
+
+    let row1 = bounds(&mut vcx, "mo-trash-row-1");
+    let p_blank = point(
+        row1.origin.x + px(200.0),
+        row1.origin.y + row1.size.height + px(30.0),
+    );
+    vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
+    vcx.run_until_parked();
+    assert!(
+        sel(&mut vcx, &window).is_empty(),
+        "点空白应清空选择，不是保持 / 改动选中"
+    );
+}
+
+/// 回收站的视图切换要**真的生效**（用户报：工具栏切了没反应——按钮写的
+/// 是浏览面板的状态，回收站渲染不读）：List 有表头有行；Grid / Gallery 变
+/// 格子；列视图置灰不接；切回 List 一切复原。
+#[gpui_kit::test]
+fn trash_view_switch_really_switches(cx: &mut TestAppContext) {
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    std::fs::create_dir_all(&seed).unwrap();
+    let mut records = String::from("[");
+    for i in 0..2 {
+        let id = format!("seed-{i}");
+        let name = format!("f{i}.txt");
+        let dir = seed.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), b"x").unwrap();
+        if i > 0 {
+            records.push(',');
+        }
+        records.push_str(&format!(
+            r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
+            seed.display(),
+            dir.join(&name).display()
+        ));
+    }
+    records.push(']');
+    std::fs::write(seed.join("index.json"), records).unwrap();
+
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let redraw = |vcx: &mut VisualTestContext| {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+    };
+    let mode = |vcx: &mut VisualTestContext, window: &WindowHandle<RootView>| -> &'static str {
+        window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_view_mode_for_tests(root)
+            })
+            .expect("读回收站视图模式失败")
+    };
+
+    // 初始 List：行 + 表头都在，格子不存在。
+    assert_eq!(mode(&mut vcx, &window), "list");
+    assert!(vcx.debug_bounds("mo-trash-row-0").is_some());
+    assert!(vcx.debug_bounds("mo-trash-header").is_some());
+    assert!(vcx.debug_bounds("mo-trash-cell-0").is_none());
+
+    // 切网格：格子出现，行 / 表头退场。
+    vcx.update(|window, cx| window.click("view-mode-grid", cx));
+    redraw(&mut vcx);
+    assert_eq!(mode(&mut vcx, &window), "grid", "点网格按钮应切到 grid");
+    assert!(
+        vcx.debug_bounds("mo-trash-cell-0").is_some(),
+        "网格下应画格子"
+    );
+    assert!(
+        vcx.debug_bounds("mo-trash-row-0").is_none(),
+        "网格下不该还有表格行"
+    );
+    assert!(
+        vcx.debug_bounds("mo-trash-header").is_none(),
+        "网格没有列，不该有表头"
+    );
+
+    // 切画廊：仍是格子。
+    vcx.update(|window, cx| window.click("view-mode-gallery", cx));
+    redraw(&mut vcx);
+    assert_eq!(mode(&mut vcx, &window), "gallery");
+    assert!(vcx.debug_bounds("mo-trash-cell-0").is_some());
+
+    // 列视图置灰：点了不切。
+    vcx.update(|window, cx| window.click("view-mode-columns", cx));
+    redraw(&mut vcx);
+    assert_eq!(
+        mode(&mut vcx, &window),
+        "gallery",
+        "列视图对回收站无意义，点击不应生效"
+    );
+
+    // 切回列表：行 + 表头复原。
+    vcx.update(|window, cx| window.click("view-mode-list", cx));
+    redraw(&mut vcx);
+    assert_eq!(mode(&mut vcx, &window), "list");
+    assert!(vcx.debug_bounds("mo-trash-row-0").is_some());
+    assert!(vcx.debug_bounds("mo-trash-header").is_some());
 }

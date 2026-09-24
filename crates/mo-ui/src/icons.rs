@@ -22,6 +22,9 @@ pub const ROTATE_CW: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBo
 
 pub const CHEVRON_RIGHT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>"##;
 
+/// 扫帚（Lucide「brush」形，斜握的刷帚）：任务浮层右上角「一键清除已完成」。
+pub const BROOM: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08"/><path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z"/></svg>"##;
+
 // ---- 窗口控制按钮图标（Win11 风格，24×24、描边 1.5、更细更克制）----
 // 顶栏右侧的最小化 / 最大化 / 还原 / 关闭。刻意用细描边贴近原生观感。
 

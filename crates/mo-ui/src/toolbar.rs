@@ -47,6 +47,7 @@ pub fn render(
     address_editing: bool,
     address: Option<&Entity<InputState>>,
     view_mode: ViewMode,
+    in_trash: bool,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -87,9 +88,16 @@ pub fn render(
             let entity = entity.clone();
             move |cx: &mut App| spawn_nav(cx, app.clone(), &entity, Nav::Refresh)
         }))
-        .child(address_bar(app, entity, path, address_editing, address))
+        .child(address_bar(
+            app,
+            entity,
+            path,
+            address_editing,
+            address,
+            in_trash,
+        ))
         // 视图模式：四个模式**平铺**成一排图标按钮（Finder 工具栏那组），当前模式高亮。
-        .child(view_mode_buttons(view_mode, entity))
+        .child(view_mode_buttons(view_mode, entity, in_trash))
 }
 
 /// 顶栏里一段可拖拽的空白条带（仅 Windows / Linux 使用）。
@@ -305,6 +313,7 @@ fn address_bar(
     path: &Option<PathBuf>,
     editing: bool,
     input: Option<&Entity<InputState>>,
+    in_trash: bool,
 ) -> Div {
     let mut pill = div()
         .flex()
@@ -320,6 +329,25 @@ fn address_bar(
         .overflow_hidden()
         // 测试探针：断言地址栏在工具栏内。
         .debug_selector(|| "mo-address".to_string());
+
+    // 回收站模式：中央区已经是回收站面板，地址栏不再回显进面板前的目录
+    // （用户报「进回收站地址栏没变」）——画一枚静态「回收站」胶囊，不可编辑。
+    if in_trash {
+        return pill.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(6.0))
+                .h(px(24.0))
+                .text_color(theme::muted())
+                .child(icon(icons::TRASH, 12.0, theme::muted()))
+                .child(text!("回收站"))
+                // 测试探针：回收站模式地址栏（区别于普通面包屑）。
+                .debug_selector(|| "mo-address-trash".to_string()),
+        );
+    }
 
     if editing {
         // 编辑态交给框架的真实输入框：选区 / 光标定位 / 双击选词 / ⌘A / 剪切复制
@@ -602,7 +630,11 @@ pub(crate) fn segment_offset(index: usize) -> f32 {
 /// 读起来是「一个四段的切换控件」而不是四个各自独立的按钮 —— 没有框时它们和旁边
 /// 的刷新 / 搜索按钮长得一模一样，看不出这四个是**互斥**的一组。外框用的是地址栏
 /// 那枚胶囊同一套描边（`separator()` + `rounded(8)`），工具栏里两处控件因此统一。
-fn view_mode_buttons(mode: ViewMode, entity: &Entity<RootView>) -> impl IntoElement {
+fn view_mode_buttons(
+    mode: ViewMode,
+    entity: &Entity<RootView>,
+    in_trash: bool,
+) -> impl IntoElement {
     let active_index = ViewMode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
     let mut group = div()
         .id("view-mode-group")
@@ -649,10 +681,14 @@ fn view_mode_buttons(mode: ViewMode, entity: &Entity<RootView>) -> impl IntoElem
     for (index, m) in ViewMode::ALL.into_iter().enumerate() {
         let active = index == active_index;
         let key = m.key();
+        // 回收站里列视图无意义（平铺列表没有层级可逐级展开）：置灰 + 不接点击。
+        // 其余三枚照常——回收站面板有自己的视图状态（`trash_view_mode`）。
+        let disabled = in_trash && m == ViewMode::Columns;
         let mut button = div()
             // ⚠️ 每个按钮都要唯一 ID：同一 `text!`/`svg` 站点会重复渲染多次，
             // 没有 ID 链就会产生相同的 a11y NodeId。
             .id(format!("view-mode-{key}"))
+            .test_support()
             .flex()
             .items_center()
             .justify_center()
@@ -663,25 +699,36 @@ fn view_mode_buttons(mode: ViewMode, entity: &Entity<RootView>) -> impl IntoElem
             .debug_selector(move || format!("mo-view-mode-{key}"));
         // 选中的那枚**不画**底色：高亮归下层那个会滑动的指示块，否则会叠出
         // 「一块跟着滑、一块死死钉在原处」的双影。
-        if !active {
+        if !active && !disabled {
             button = button.hover(|s| s.bg(theme::hover_bg()));
         }
-        let target = entity.clone();
-        button.interactivity().on_click(move |_, _window, cx| {
-            target.update(cx, |v, cx| {
-                if v.panel().view_mode != m {
-                    v.panel_mut().view_mode = m;
-                    cx.notify();
-                }
+        if !disabled {
+            let target = entity.clone();
+            button.interactivity().on_click(move |_, _window, cx| {
+                target.update(cx, |v, cx| {
+                    // 回收站面板开着时切的是回收站的视图，不是背后那个目录的。
+                    let current = if v.is_in_trash() {
+                        v.trash_view_mode
+                    } else {
+                        v.panel().view_mode
+                    };
+                    if current != m {
+                        v.set_view_mode_for_active_surface(m);
+                        cx.notify();
+                    }
+                });
+                // 点按钮属于「点进控件」：别让事件继续冒泡到顶栏的拖拽 / 双击缩放。
+                cx.stop_propagation();
             });
-            // 点按钮属于「点进控件」：别让事件继续冒泡到顶栏的拖拽 / 双击缩放。
-            cx.stop_propagation();
-        });
+        }
         group = group.child(button.child(icons::icon(
             icons::view_mode_icon(m),
             16.0,
             if active {
                 theme::text()
+            } else if disabled {
+                // 禁用档：比未选中再暗一截，一眼读出「点不动」。
+                crate::theme::separator()
             } else {
                 theme::muted()
             },
