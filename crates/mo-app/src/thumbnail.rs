@@ -89,9 +89,20 @@ impl ThumbnailScheduler {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                let handle = app_task.spawn_blocking(move || cache.get_or_create(&id, &path, size));
+                // 一趟 blocking 干完两件事：磁盘缓存（命中 / 生成，跨会话复用）→
+                // 解码成**内存位图**。UI 的 `img(path)` 要异步读盘解码，位图没到
+                // 之前那一格什么都不画（切目录时图标闪烁的另一半来源）；位图交给
+                // UI 后 `ImageSource::Render` 同步上屏。缓存 PNG 很小（128px），
+                // 解开是亚毫秒级的后台活。
+                let handle = app_task.spawn_blocking(move || {
+                    cache.get_or_create(&id, &path, size).and_then(|p| {
+                        mo_thumbnails::decode_bitmap(&p).ok_or_else(|| {
+                            mo_thumbnails::ThumbnailError::Decode(p.display().to_string())
+                        })
+                    })
+                });
                 let state = match handle.await {
-                    Ok(Ok(p)) => ThumbnailState::Loaded(p),
+                    Ok(Ok(bm)) => ThumbnailState::Loaded(std::sync::Arc::new(bm)),
                     Ok(Err(e)) => {
                         tracing::debug!("缩略图生成失败 {id}：{e}");
                         ThumbnailState::Failed

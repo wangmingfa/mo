@@ -747,3 +747,220 @@ fn clicking_a_row_after_scrolling_still_selects_it(cx: &mut TestAppContext) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 暂存区抽屉：默认不占地方，点状态栏入口展开，且**贴在状态栏之上**、不挤掉它。
+///
+/// 抽屉是常驻 UI（不是模态），所以它必须在布局里真占一行、且只在展开时占——
+/// 收起时文件区的高度不该变（与传输浮层绝对定位不占布局是不同的取舍）。
+#[gpui_kit::test]
+fn staging_tray_is_toggled_from_the_status_bar(cx: &mut TestAppContext) {
+    let (mut vcx, _window) = open_app(size(px(1000.), px(700.)), cx);
+
+    assert!(
+        vcx.debug_bounds("mo-staging-tray").is_none(),
+        "抽屉默认收起，不该出现在渲染帧里"
+    );
+    let list_before = bounds(&mut vcx, "mo-file-list");
+
+    vcx.update(|window, cx| window.click("statusbar-staging", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let tray = bounds(&mut vcx, "mo-staging-tray");
+    let status = bounds(&mut vcx, "mo-statusbar");
+    let list_after = bounds(&mut vcx, "mo-file-list");
+    assert!(
+        f32::from(tray.origin.y) + f32::from(tray.size.height) <= f32::from(status.origin.y),
+        "抽屉应贴在状态栏上方：tray={tray:?} status={status:?}"
+    );
+    assert_eq!(
+        tray.size.width, status.size.width,
+        "抽屉通栏：与状态栏同宽，不是浮在角落的一块"
+    );
+    // 抽屉真占布局（状态栏始终贴底不动，被挤的是文件区）——所以它才有
+    // 「常驻」的意义，而不是像传输浮层那样绝对定位悬着。
+    assert!(
+        f32::from(list_after.size.height) < f32::from(list_before.size.height),
+        "展开后文件区应让出高度：before={list_before:?} after={list_after:?}"
+    );
+
+    // 再点一次收起：文件区高度还原。
+    vcx.update(|window, cx| window.click("statusbar-staging", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-staging-tray").is_none(),
+        "再点一次应收起"
+    );
+    assert_eq!(
+        bounds(&mut vcx, "mo-file-list").size.height,
+        list_before.size.height,
+        "收起后文件区应回到原高度"
+    );
+}
+
+/// 磁盘地图：块铺满画布，且**面积与大小成正比**——这是 treemap 唯一的硬契约。
+///
+/// 数据用假树注入（真统计要递归扫盘，不该在测试里做）；布局算法本身由
+/// `mo-app` 的单测守着，这里守的是「UI 真把它画出来了、几何没走形」。
+#[gpui_kit::test]
+fn disk_usage_treemap_tiles_are_proportional(cx: &mut TestAppContext) {
+    use mo_app::UsageTree;
+
+    let tree = UsageTree {
+        path: std::path::PathBuf::from("/tmp/usage-root"),
+        name: "usage-root".to_string(),
+        size: 1000,
+        is_dir: true,
+        children: vec![
+            UsageTree {
+                path: std::path::PathBuf::from("/tmp/usage-root/big"),
+                name: "big".to_string(),
+                size: 600,
+                is_dir: false,
+                children: vec![],
+            },
+            UsageTree {
+                path: std::path::PathBuf::from("/tmp/usage-root/mid"),
+                name: "mid".to_string(),
+                size: 300,
+                is_dir: false,
+                children: vec![],
+            },
+            UsageTree {
+                path: std::path::PathBuf::from("/tmp/usage-root/small"),
+                name: "small".to_string(),
+                size: 100,
+                is_dir: false,
+                children: vec![],
+            },
+        ],
+    };
+
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    window
+        .update(cx, |v, _window, cx| {
+            mo_ui::inject_usage_tree_for_tests(v, tree);
+            cx.notify();
+        })
+        .expect("注入磁盘地图树失败");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let canvas = bounds(&mut vcx, "mo-usage-treemap");
+    let area = |b: Bounds<Pixels>| f32::from(b.size.width) * f32::from(b.size.height);
+    let canvas_area = area(canvas);
+    assert!(canvas_area > 0.0, "画布应该有尺寸");
+
+    let tiles: Vec<Bounds<Pixels>> = (0..3)
+        .map(|i| {
+            bounds(
+                &mut vcx,
+                Box::leak(format!("mo-usage-tile-{i}").into_boxed_str()),
+            )
+        })
+        .collect();
+    let sum: f32 = tiles.iter().map(|t| area(*t)).sum();
+    assert!(
+        (sum - canvas_area).abs() / canvas_area < 0.02,
+        "块应当铺满画布：sum={sum} canvas={canvas_area}"
+    );
+
+    // 面积比例 = 大小比例（6 : 3 : 1），每个块都单独核对。
+    for (i, want) in [0.6f32, 0.3, 0.1].iter().enumerate() {
+        let got = area(tiles[i]) / canvas_area;
+        assert!(
+            (got - want).abs() < 0.02,
+            "第 {i} 块的面积占比 {got} 应当约等于 {want}"
+        );
+    }
+}
+
+/// 分栏对比的图例条：常驻一行、贴在状态栏上方、点「关闭对比」即退场。
+///
+/// 它跟暂存区抽屉一样是**占布局**的一行（不是浮层）：对比是个持续状态，
+/// 用户得一直看得见「现在正在对比」，而不是点开一次就忘。关掉之后文件区
+/// 高度必须还原——少一步就是漏了一块永久占位。
+#[gpui_kit::test]
+fn compare_legend_occupies_a_row_and_closes(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    assert!(
+        vcx.debug_bounds("mo-compare-legend").is_none(),
+        "默认不在对比，不该有图例条"
+    );
+    let list_before = bounds(&mut vcx, "mo-file-list");
+
+    window
+        .update(cx, |v, _window, cx| {
+            mo_ui::inject_compare_for_tests(v, (3, 2, 1));
+            cx.notify();
+        })
+        .expect("注入对比状态失败");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let legend = bounds(&mut vcx, "mo-compare-legend");
+    let status = bounds(&mut vcx, "mo-statusbar");
+    let list_after = bounds(&mut vcx, "mo-file-list");
+    assert!(
+        f32::from(legend.origin.y) + f32::from(legend.size.height) <= f32::from(status.origin.y),
+        "图例应贴在状态栏上方：legend={legend:?} status={status:?}"
+    );
+    assert_eq!(
+        legend.size.width, status.size.width,
+        "图例通栏：与状态栏同宽"
+    );
+    assert!(
+        f32::from(list_after.size.height) < f32::from(list_before.size.height),
+        "对比期间文件区应让出一行高度：before={list_before:?} after={list_after:?}"
+    );
+
+    vcx.update(|window, cx| window.click("compare-close", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        vcx.debug_bounds("mo-compare-legend").is_none(),
+        "点「关闭对比」后图例应退场"
+    );
+    assert_eq!(
+        bounds(&mut vcx, "mo-file-list").size.height,
+        list_before.size.height,
+        "关掉后文件区应回到原高度"
+    );
+}
+
+/// 内容搜索面板：打开后骨架完整——四个开关胶囊 + 搜索按钮 + 结果区占位都在。
+///
+/// 它跟全局搜索共用「中央区 + 侧栏」框架，区别在结果区是 grep 报告而非文件列表。
+/// 这里只守骨架（范围 / 命中细节由 `mo-search` 单测管），确保打开不白屏、控件齐。
+#[gpui_kit::test]
+fn content_search_panel_renders_its_skeleton(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    assert!(
+        vcx.debug_bounds("mo-content-body").is_none(),
+        "默认不在内容搜索，不该有结果区"
+    );
+
+    window
+        .update(cx, |v, _window, cx| {
+            mo_ui::inject_content_search_for_tests(v);
+            cx.notify();
+        })
+        .expect("打开内容搜索失败");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    // 结果区骨架。
+    bounds(&mut vcx, "mo-content-body");
+    // 四个开关胶囊 + 搜索按钮齐全。
+    for i in 0..4 {
+        let sel = Box::leak(format!("mo-content-opt-{i}").into_boxed_str());
+        bounds(&mut vcx, sel);
+    }
+    bounds(&mut vcx, "mo-content-go");
+
+    // 没跑过搜索 → 结果区是「输入即搜」提示，不该出现命中行。
+    assert!(
+        vcx.debug_bounds("mo-content-row-0").is_none(),
+        "还没搜，不应有命中行"
+    );
+}

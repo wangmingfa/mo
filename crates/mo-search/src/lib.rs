@@ -9,8 +9,12 @@
 //! 索引用 SQLite 存储（path / name_lower / size / modified / is_dir），
 //! 搜索走子串匹配 + 相关度排序。索引可由 [`crawl`] 从某个根目录递归建立。
 
+mod content;
 mod crawl;
 mod index;
 
+pub use content::{
+    search_content, ContentQuery, ContentReport, FileHit, LineHit, DEFAULT_MAX_FILE_BYTES,
+};
 pub use crawl::crawl;
 pub use index::{FileIndex, SearchError, SearchHit};

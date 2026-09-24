@@ -2,16 +2,38 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
-/// 状态栏：左侧条目统计，右侧快捷键提示（当前路径在地址栏，不再重复）。
+use crate::RootView;
+
+/// 状态栏左侧那一串数字。
+///
+/// 打包成结构而不是九个参数：参数个数一多，调用点就把「已选」和「已索引」
+/// 传反过还看不出来（clippy 的 7 参上限也是这么来的）。
+pub struct Stats {
+    pub count: usize,
+    pub selection_count: usize,
+    pub indexed: usize,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// 暂存区里的条数：**始终**显示入口（哪怕为 0）——暂存区没有别的常驻入口，
+    /// 藏起来就没人找得到；有内容时上底色，一眼看得出「里面还有东西」。
+    pub staged: usize,
+}
+
+/// 状态栏：左侧条目统计，右侧暂存区入口 + 快捷键提示（当前路径在地址栏，不再重复）。
 pub fn render(
-    count: usize,
+    stats: Stats,
     _path: &Option<PathBuf>,
     query: &str,
-    selection_count: usize,
-    indexed: usize,
-    can_undo: bool,
-    can_redo: bool,
+    entity: &Entity<RootView>,
 ) -> impl IntoElement {
+    let Stats {
+        count,
+        selection_count,
+        indexed,
+        can_undo,
+        can_redo,
+        staged,
+    } = stats;
     let mut left = if query.is_empty() {
         format!("{count} 项")
     } else {
@@ -34,6 +56,33 @@ pub fn render(
     }
     right.push_str(" · ⌘⇧P 命令 · Space 预览");
 
+    // 暂存区入口：点了开合底部抽屉。
+    let toggle = entity.clone();
+    let mut chip = div()
+        // ⚠️ 必须有元素 ID：无 ID 的裸 div 拿不到 element_state，on_click 永远不触发。
+        .id("statusbar-staging")
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .text_size(px(11.0))
+        .child(text!(format!("暂存区 {staged}")))
+        .debug_selector(|| "mo-statusbar-staging".to_string());
+    if staged > 0 {
+        chip = chip
+            .bg(crate::theme::accent())
+            .text_color(crate::theme::text());
+    } else {
+        chip = chip
+            .text_color(crate::theme::muted())
+            .hover(|s| s.bg(crate::theme::hover_bg()));
+    }
+    chip.interactivity().on_click(move |_, _window, cx| {
+        toggle.update(cx, |v, cx| v.toggle_staging(cx));
+    });
+
     div()
         .flex()
         .flex_row()
@@ -51,5 +100,13 @@ pub fn render(
         // 测试用（release no-op）：tests/layout.rs 断言状态栏贴着窗口底部
         .debug_selector(|| "mo-statusbar".to_string())
         .child(text!(left))
-        .child(text!(right))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(chip.test_support())
+                .child(text!(right)),
+        )
 }

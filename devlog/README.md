@@ -16,6 +16,9 @@
 | [customization.md](customization.md) | 自定义系统：配置文件 BOM、主题取色的全局槽位、深色档语义色 |
 | [search.md](search.md) | 全局搜索与索引：落盘、启动自举、增量维护、爬取上限 |
 | [preview.md](preview.md) | 缩略图与快速预览：降采样编码选择、先开窗后到图、入场动画 |
+| [remote-transfer.md](remote-transfer.md) | 跨端点传输：`Endpoint` 判据、`FileSystem::read_file/is_dir`、`TransferOperation` |
+| [selection.md](selection.md) | 选择交互：反选 / 框选 / type-ahead、软链 FileId |
+| [transfer-badge.md](transfer-badge.md) | 传输指示与任务面板：小块 + 浮层、估速、暂停恢复、回收站面板 |
 
 ## 约定
 

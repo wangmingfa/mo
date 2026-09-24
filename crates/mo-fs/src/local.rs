@@ -78,6 +78,15 @@ impl FileSystem for LocalFileSystem {
         std::fs::create_dir_all(path).map_err(MoError::Io)
     }
 
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        std::fs::read(path).map_err(MoError::Io)
+    }
+
+    async fn is_dir(&self, path: &Path) -> bool {
+        // 跟随软链（与列目录的语义一致：软链指向目录就当目录）。
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         // 用 `create_new` 而不是 `std::fs::write`：后者会**静默覆盖**已存在的文件。
         let mut f = std::fs::OpenOptions::new()

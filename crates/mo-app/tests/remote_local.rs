@@ -31,6 +31,11 @@
 //!    管线，远程条目那条路径在本机不存在，结果就是「成功」地什么都不做；反过来把
 //!    本地路径当远程发给服务器更糟。判据是「它是不是当前列表里那一行」，**不是**
 //!    「我现在在看远程吗」——去重 / 同步会拿着本地路径调同一批 API。
+//! 9. **传输的端点由「拥有那一头的那一页」回答**。第 8 条那个判据答不出传输需要的
+//!    东西：粘贴到当前目录时 `dest` 自己不是列表里的行，分栏拖拽时目标那一头根本
+//!    不在源 `AppState` 的列表里。所以两端走 [`Endpoint`]（本地 / 那条会话），
+//!    UI 侧源窗格与落点窗格各问各的。远程有一端时走 `TransferOperation`，
+//!    并**刻意不**记可逆项（撤销模型里的路径都是本地路径）。
 //!
 //! 为什么守卫落在 `mo-app` 而不是 UI 层：headless 的 GPUI 测试调度器会把「后台
 //! tokio 线程唤醒测试任务」判成不确定性直接 panic（点击回调最终 `await` 到
@@ -42,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mo_app::{AppState, ConnectFailure, SessionRegistry};
+use mo_app::{AppState, ConnectFailure, Endpoint, SessionRegistry};
 use mo_core::{EntryKind, FileId, FileMetadata, MoError};
 use mo_fs::{FileSystem, ReadDirEntry};
 use mo_remote::RemoteUrl;
@@ -195,6 +200,17 @@ impl FileSystem for FakeRemoteFs {
             .unwrap()
             .push(format!("write_file:{}", path.display()));
         Ok(())
+    }
+
+    /// 只会「读」它列表里那一条（内容固定 `from-remote`），其余路径照旧不支持。
+    ///
+    /// 跨端点传输的下载侧要它：没有这一条，「远程 → 本机」那一半根本走不通。
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        if path == Path::new(&format!("/{}", self.marker)) {
+            Ok(b"from-remote".to_vec())
+        } else {
+            Err(Self::unsupported())
+        }
     }
 
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
@@ -1143,6 +1159,177 @@ fn local_paths_stay_local_while_browsing_remote() {
             !app.goes_through_remote(Path::new("/not-in-the-listing.txt"))
                 .await,
             "列表里查不到的远程风格路径按本地处理（判据只认当前列表）"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 远程端内复制，目标取**当前目录**：必须发给后端，不能判成本地。
+///
+/// 这是粘贴 / 同窗格拖拽的默认形态，也是模板里那个洞最容易漏的一条：目标就是当前
+/// 目录，而**当前目录不是自己列表里的一行**——按「它是不是当前列表里那一行」
+/// （`goes_through_remote`）去判，远程页上的粘贴会被当成「下载到本机」，
+/// 于是把 `/pub/remote.txt` 交给 `std::fs`。
+#[test]
+fn copying_into_the_current_remote_dir_goes_through_the_backend() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/pub"))
+            .await
+            .expect("进入远程 /pub");
+        assert!(app.browsing_remote(), "前提：当前页在远程");
+        assert!(
+            !app.goes_through_remote(Path::new("/pub")).await,
+            "前提：当前目录自己不在列表里——正是这条判据答不出来的地方"
+        );
+
+        app.transfer(vec![PathBuf::from("/remote.txt")], Path::new("/pub"), false)
+            .await;
+
+        let written = "write_file:/pub/remote.txt".to_string();
+        let mut seen = false;
+        for _ in 0..200 {
+            if log.lock().unwrap().contains(&written) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seen, "远程页内复制必须发给后端");
+        assert!(
+            !Path::new("/pub/remote.txt").exists(),
+            "不该落到本机磁盘（判成本地时就会写向本机的 /pub）"
+        );
+    });
+}
+
+/// **传输的端点**由「拥有那一头的那一页」回答，不照路径猜。
+///
+/// 上面那条 `goes_through_remote` 的判据（「它是不是当前列表里的一行」）答不出传输
+/// 需要的东西：粘贴到**当前目录**时 `dest` 自己不是列表里的行，分栏拖拽时目标那一头
+/// 根本不在这个 `AppState` 的列表里。这条钉住 `Endpoint` 跟着页走。
+#[test]
+fn endpoint_follows_the_side_the_tab_is_browsing() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let dir = local_tree("endpoint-follows");
+
+    runtime().block_on(async {
+        assert!(
+            matches!(app.endpoint(), Endpoint::Local),
+            "没连远程时端点就是本机"
+        );
+
+        connect_fake(&app);
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        assert!(
+            matches!(app.endpoint(), Endpoint::Remote(_)),
+            "在看远程时端点必须是那条会话——否则远程条目会被交回本机管线"
+        );
+
+        app.open_local(&dir).await.expect("切回本地");
+        assert!(
+            matches!(app.endpoint(), Endpoint::Local),
+            "切回本地后端点跟着回本机（连接还留着，但这一页不是它）"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 本地 → **远程端点**：字节写进远程后端，**不**落到本机磁盘。
+///
+/// 分栏拖拽的典型样子：源窗格在看本机，目标窗格连着 FTP。若端点照路径猜
+/// （`dest` 是远程服务器上的绝对路径 → `Path::exists()` 说「本机没有」→ 判成本地），
+/// 这一步会交给 `std::fs` 去写。
+///
+/// ⚠️ 断言里那个 `dest` 目录**在本机是真实存在的**：这正是最危险的那种误判——
+/// 远程路径 `/pub` 撞上本机真的有个 `/pub` 时，「以为在下载」会静悄悄写进本机。
+#[test]
+fn uploading_to_a_remote_endpoint_writes_through_the_backend() {
+    let dir = local_tree("remote-upload");
+    // 目标目录在本机真实存在：端点判错的话文件就会出现在这儿。
+    let dest = dir.join("remote-side");
+    std::fs::create_dir_all(&dest).unwrap();
+    let src = dir.join("local.txt");
+
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        let remote = app.endpoint();
+
+        app.transfer_between(vec![src.clone()], Endpoint::Local, &dest, remote, false)
+            .await;
+
+        let written = format!("write_file:{}", dest.join("local.txt").display());
+        let mut seen = false;
+        for _ in 0..200 {
+            if log.lock().unwrap().contains(&written) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            seen,
+            "上传必须发给远程后端（记录里一条都没有 = 走了本机管线）"
+        );
+        assert!(
+            !dest.join("local.txt").exists(),
+            "不该落到本机磁盘：端点判错时文件会出现在这个真实存在的目录里"
+        );
+        assert!(
+            !app.can_undo(),
+            "远程传输刻意不记可逆项——撤销模型里的路径都是本地路径"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 远程端点 → 本地：字节落到本机目录（下载侧）。
+///
+/// 与上一条成对：传输的三条方向（上传 / 下载 / 远程内复制）都得真跑通一次。
+#[test]
+fn downloading_from_a_remote_endpoint_writes_locally() {
+    let dir = local_tree("remote-download");
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    connect_fake(&app);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        let remote = app.endpoint();
+
+        app.transfer_between(
+            vec![PathBuf::from("/remote.txt")],
+            remote,
+            &dir,
+            Endpoint::Local,
+            false,
+        )
+        .await;
+
+        let dst = dir.join("remote.txt");
+        for _ in 0..200 {
+            if dst.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read(&dst).expect("下载应当在本机落盘"),
+            b"from-remote",
+            "落盘的必须是远程后端那份内容"
         );
     });
 

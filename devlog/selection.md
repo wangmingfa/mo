@@ -29,11 +29,14 @@ UI 本地 `panel.selection` 只做即时反馈，异步 `pull_selection` 回灌�
 
 ## 3. type-ahead：输入即**定位**（不再过滤）
 
-* **定位 ≠ 过滤**：敲字符只逐字累积 `panel.query` 前缀缓冲，调 `app.focus_by_prefix(prefix)`
-  在可见条目里找**文件名**以输入串开头的第一条、单选它、返回可见下标；UI 用
-  `scroll.scroll_to_item(idx, ScrollStrategy::Nearest)` 跟随。**不再调用 `apply_filter`**
-  ——敲字符不再隐藏其它文件，跟 Finder / 资源管理器「打字跳到文件」一致。
+* **定位 ≠ 过滤**：敲字符只逐字累积 `panel.query` 前缀缓冲，调 `app.locate_by_prefix(prefix, skip)`
+  在可见条目里找**文件名**匹配的第一条、单选它、返回 `LocateHit { pos, row }`；UI 用
+  `scroll.scroll_to_item(located_row(panel, hit), ScrollStrategy::Nearest)` 跟随。
+  **不再调用 `apply_filter`**——敲字符不再隐藏其它文件，跟 Finder / 资源管理器「打字跳到文件」一致。
+  （`focus_by_prefix` 仍在，是 `locate_by_prefix(.., false)` 取 `.row` 的薄壳。）
 * 比较大小写不敏感；空串 / 无匹配返回 `None` 且不改选择。
+* **二轮打磨**（连按同字母跳下一个、子序列兜底、两个索引空间）见
+  [gpui-layout-and-interaction.md §22](gpui-layout-and-interaction.md)。
 * **自动重置**：每次输入 / 退格都自增 `panel.type_ahead_gen`；定位后起一个 `cx.background_executor().timer(400ms)`
   定时器，触发时仅当 `type_ahead_gen` 未变（期间无新输入）才清空 `query`。代数是为了让
   **更早的定时器失效**——否则后一次输入会被前一次定时器误清空。`app.set_filter` 仍保留

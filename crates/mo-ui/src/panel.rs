@@ -9,8 +9,10 @@
 //!
 //! UI 侧同样不持有整份目录：每个面板只有可见区的窗口快照。
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui_kit::component::input::InputState;
 use gpui_kit::{Entity, Subscription, UniformListScrollHandle};
@@ -162,6 +164,18 @@ pub(crate) struct Panel {
     pub can_forward: bool,
     /// 呈现方式（列表 / 网格 / 画廊 / 列视图）。
     pub view_mode: ViewMode,
+    /// 网格 / 画廊**这一帧的列数**（渲染时按容器宽度与缩放算出来，写回这里）。
+    ///
+    /// 为什么留在 Panel 上：`uniform_list` 在网格 / 画廊里的行是「单元行」
+    /// （一行 `cols` 个），键盘定位要把**条目位**换算成单元行才滚得对，
+    /// 而列数只在渲染路径上知道（要容器宽度），所以渲染时把它记下来给滚动用。
+    /// 列表 / 列视图不使用（恒为 1）。
+    pub grid_cols: usize,
+    /// 分栏对比时**这一页**里每条的状态（按绝对路径查）。`None` = 没在对比。
+    ///
+    /// 放在 Panel 而不是 RootView：行渲染拿到的是 `&Panel`，四个视图都要按路径
+    /// 查一次，别把「这一页对比到哪两个目录了」塞进全局态。
+    pub diff: Option<Arc<HashMap<PathBuf, mo_diff::TreeStatus>>>,
     /// 地址栏是否处于编辑态（Win11 式：点击空白 / 铅笔进入，Esc / 失焦退出）。
     pub address_editing: bool,
     /// 地址栏的**真实**文本输入状态（首次进入编辑时懒创建，之后复用）。
@@ -214,6 +228,8 @@ impl Panel {
             can_back: false,
             can_forward: false,
             view_mode: ViewMode::default(),
+            grid_cols: 1,
+            diff: None,
             address_editing: false,
             address: None,
             address_sub: None,

@@ -45,6 +45,26 @@ pub trait FileSystem: Send + Sync {
     /// 读取单个文件/目录的元数据。
     async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError>;
 
+    /// 读取**整个文件**的内容（跨文件系统的传输用它做下载侧）。
+    ///
+    /// 默认实现返回错误：只有真能读内容的后端才覆写（本地与三个远程协议），
+    /// 省得每个实现都被迫写一遍「不支持」。大文件是整份进内存的——当前传输
+    /// 就是「整份读、整份写」，分块流式是后续的事。
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        Err(MoError::Other(format!(
+            "该文件系统不支持读取文件内容：{}",
+            path.display()
+        )))
+    }
+
+    /// 这个路径是不是目录（跨文件系统传输按它分流「递归」还是「读字节」）。
+    ///
+    /// 默认实现用「能不能列目录」探：本地与 SFTP 直接读 `metadata` 更准，
+    /// 这两个后端都有覆写；这里只作兜底。
+    async fn is_dir(&self, path: &Path) -> bool {
+        self.read_dir(path).await.is_ok()
+    }
+
     /// 创建目录（含父目录）。
     async fn create_dir(&self, path: &Path) -> Result<(), MoError>;
 

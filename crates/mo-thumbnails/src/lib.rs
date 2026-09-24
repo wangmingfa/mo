@@ -271,15 +271,13 @@ pub fn generate_to(src: &Path, dst: &Path, size: u32) -> Result<PathBuf, Thumbna
     generate_to_with(src, dst, size, Encoded::Png)
 }
 
-/// 把一张 RGBA8 位图编码成 PNG 字节。
+/// 把一张 RGBA8 位图编码成 PNG 字节（直通 alpha）。
 ///
-/// 这是给「系统图标」那条链路的：平台层只能在主线程交出**像素**
-/// （`mo_platform::file_icon_raster`，里面的 AppKit 调用必须主线程），而「像素 →
-/// PNG」这一步很贵——实测占图标整段耗时的 **70%**（0.62ms / 0.9ms）。把它放在
-/// 调用方的后台线程里做，主线程单价就掉下来了。
+/// 通用工具：现在给 PDF 首页预览那条链路用（平台层交出的预乘像素先
+/// [`unpremultiply_rgba`]，再由这里编码落盘）。
 ///
 /// `rgba` 长度必须正好是 `width * height * 4`；长度不符或编码失败都返回 `None`
-/// （调用方按「这张图标没取到」处理即可，不必区分）。
+/// （调用方按「这张图没生成」处理即可，不必区分）。
 pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     if rgba.len() != (width as usize) * (height as usize) * 4 {
         return None;
@@ -290,6 +288,24 @@ pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> 
         .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
         .ok()?;
     Some(out)
+}
+
+/// 磁盘上的 PNG → 解码好的内存位图（BGRA、直通 alpha）。
+///
+/// 给「列表直接吃内存位图」的链路用：UI 的 `img(path)` 要异步读盘解码，位图没到
+/// 之前那一格什么都不画（切目录时的图标闪烁正是这么来的）；先在这里把缓存 PNG
+/// 解成 [`Bitmap`]，UI 侧就能 `ImageSource::Render` 同步上屏。
+///
+/// **阻塞**（读盘 + 解码），必须在 blocking 池调用。任何失败返回 `None`。
+pub fn decode_bitmap(png: &Path) -> Option<mo_core::Bitmap> {
+    let img = image::ImageReader::open(png)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let (w, h) = (img.width(), img.height());
+    mo_core::Bitmap::from_rgba(w, h, img.into_rgba8().into_raw())
 }
 
 /// 把**预乘 alpha** 的 RGBA 还原成直通 alpha（原地）。

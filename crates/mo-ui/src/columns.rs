@@ -11,6 +11,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::EntryKind;
+use std::path::PathBuf;
 
 use crate::panel::{ColumnData, ViewMode};
 use crate::{theme, RootView};
@@ -31,6 +32,8 @@ pub fn render(
     tab: usize,
     columns_data: &[ColumnData],
     app: &AppState,
+    // 分栏对比时这一页的条目状态（按路径查）；`None` = 没在对比。
+    diff: Option<&std::collections::HashMap<PathBuf, mo_diff::TreeStatus>>,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
@@ -49,7 +52,7 @@ pub fn render(
         );
     }
     for (i, data) in columns_data.iter().enumerate() {
-        row = row.child(column_box(entity, pane, tab, i, data, app));
+        row = row.child(column_box(entity, pane, tab, i, data, app, diff));
     }
     row
 }
@@ -62,6 +65,7 @@ fn column_box(
     index: usize,
     data: &ColumnData,
     app: &AppState,
+    diff: Option<&std::collections::HashMap<PathBuf, mo_diff::TreeStatus>>,
 ) -> Stateful<Div> {
     let mut col = div()
         // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
@@ -123,6 +127,10 @@ fn column_box(
             .px(px(6.0))
             .bg(if selected {
                 theme::selected_bg()
+            } else if let Some(c) =
+                crate::app::compare_tint(diff.and_then(|m| m.get(&e.path)).copied())
+            {
+                c
             } else {
                 theme::surface()
             })
@@ -169,25 +177,29 @@ fn column_box(
         // 槽位取自 `listing::icon_slot` 那张表（列视图与列表行同为 16pt），取位图时
         // 也就只问小档（40px）。
         let slot = crate::listing::icon_slot(ViewMode::Columns);
-        line = line.child(
-            match crate::file_item::system_icon(Some(app), &e.path, e.kind.is_dir(), slot) {
-                Some(p) => img(p.as_path())
-                    .w(px(slot))
-                    .h(px(slot))
-                    .flex_shrink_0()
-                    .into_any_element(),
-                None => crate::icons::icon(
-                    crate::icons::icon_for_kind_and_name(e.kind, &e.name),
-                    slot,
-                    if selected {
-                        theme::selected_text()
-                    } else {
-                        theme::text()
-                    },
-                )
+        // 系统图标是后台备好的内存位图，`ImageSource::Render` 同步上屏（不走
+        // `img(path)` 的异步读盘，那一格不会空着等）。
+        let raster_source =
+            crate::file_item::system_icon(Some(app), &e.path, e.kind.is_dir(), slot)
+                .as_ref()
+                .and_then(crate::bitmap::image_source);
+        line = line.child(match raster_source {
+            Some(src) => img(src)
+                .w(px(slot))
+                .h(px(slot))
+                .flex_shrink_0()
                 .into_any_element(),
-            },
-        );
+            None => crate::icons::icon(
+                crate::icons::icon_for_kind_and_name(e.kind, &e.name),
+                slot,
+                if selected {
+                    theme::selected_text()
+                } else {
+                    theme::text()
+                },
+            )
+            .into_any_element(),
+        });
         line = line.child(div().flex_1().truncate().child(text!(e.name.clone())));
         body = body.child(line);
     }

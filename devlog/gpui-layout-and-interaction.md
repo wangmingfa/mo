@@ -812,6 +812,50 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
   - 点遮罩（`dismiss_modal`）与 Esc 同语义：`Settings && tab == Theme` 特判；
   - 外观页翻页**离开**时 `theme_revert_preview`——预览只是换了全局调色板没写配置，
     把预览色留在界面上就是脏状态。Enter（theme_commit）改为**不关窗**，应用后可继续逛。
+* 入口直连：`keys.rs` 加 `settings.open`（默认 `cmd+,`，macOS 惯例；`BINDINGS` 33→34，
+  **不进** `BROWSER_SCOPED`——它是窗口级动作，模态打开时不该被吞），`dispatch_action`
+  落到 `open_settings(SettingsTab::Layout)`。
+  ⚠️ 主键本身就是逗号，与 `cmd+-` / `cmd+=` 同属「主键是符号」那一类：键串分隔符是 `+`，
+  别让分割逻辑把逗号吃掉（守卫 `comma_opens_settings`）。
 * A/B 分类账本更新：快捷键从 A 类（占中央区）迁到 B 类（浮层），
   `central_views_take_over_the_browsing_area` 用例数 3→2；`dialogs_are_full_viewport_overlays`
   的「布局」用例换成「设置窗口」。
+
+## 22. type-ahead 二轮：连按同字母跳下一个 + 子序列兜底 + 网格/画廊的滚动行空间
+
+* 三条需求（Finder / 资源管理器的习惯）：
+  1. **连按同一个字母**跳到**下一个**匹配项（不是每次都回到第一个）；
+  2. 严格前缀全无命中时退一步做**子序列**匹配（`dc` → `Documents`）；
+  3. 网格 / 画廊里方向键与 type-ahead 也要滚**对**位置。
+
+* 根上的麻烦是**两套索引空间**：`uniform_list` 的 item_count 在列表视图是**行**
+  （分组开启时含组头行，`view.row_count()`），在网格 / 画廊是**格子行**
+  （`ceil(count / cols)`）——同一份「第几条」在两边不是同一个数。
+  → `mo-app` 的定位函数一律返回 `LocateHit { pos, row }`（条目位 + 列表行），
+  由 UI 按当前视图模式二选一：`mo-ui::located_row(panel, hit)`
+  （Grid / Gallery 用 `pos / panel.grid_cols.max(1)`，其余 `row`）。
+* 收口做法：`focus_by_prefix` / `move_cursor` 降级成**薄壳**
+  （`locate_by_prefix(.., false)` / `locate_cursor(..)` 再取 `.row`），旧调用点与旧
+  测试的契约不变；新调用点（type-ahead、方向键）直接用 `LocateHit`。
+
+* **连按同字母**：`locate_by_prefix(prefix, skip_current)`，`skip_current = true` 时
+  从**当前焦点之后**起环绕扫描（`visible.position(focused_id) + 1`，找不到焦点就从 0）。
+  UI 侧判据 `type_ahead_repeats_one_char(buf)`：**长度 ≥ 2 且字符全同**才算重复——
+  首字符（`"a"`）仍从第一个匹配项开始，`"ab"` 这种正常前缀不受影响。
+* **子序列兜底**：`match_pos` 走两趟，先严格前缀，全军覆没才轮到 `is_subsequence`。
+  放宽只在「严格匹配一条都没有」时生效；否则有 `Desktop` 时敲 `dc` 会莫名跳到
+  `Documents`。
+* ⚠️ 名字**只把小写化用于比较**，展示名保留原大小写——测试断言别写成小写
+  （`subsequence_fallback_locates_when_no_prefix_matches` 第一版就写了 `mars.txt`，
+  实际命中的是 `Mars.txt`）。
+* `cols` 只有渲染时才算得出来（要容器宽 + 图标缩放）→ 加 `Panel.grid_cols`，
+  由 `sync_grid_cols(per_pane_w)` 在 render 里**每帧渲染前**写一遍（幂等、不 notify，
+  与 `list_origin` 同一条约定；网格 / 画廊之外记 1）。第 19 节里「网格按 cols 另算
+  ——那是另一处的已知限制」就此收口。
+
+* 测试：
+  - `mo-app/tests/type_ahead.rs`：连按同字母依次落到第 2 / 第 3 个匹配项、子序列
+    兜底、前缀优先于子序列、`locate_cursor` 同时报出两个空间（薄壳
+    `move_cursor` 仍只给列表行）。
+  - `mo-ui/src/app.rs` 单测：`located_row` 的四种视图换算（含 `grid_cols = 0`
+    按 1 列算、不 panic）与连按检测的边界（`""` / `"a"` / `"ab"` / `"aaa"`）。

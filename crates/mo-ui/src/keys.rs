@@ -314,11 +314,17 @@ pub struct Binding {
 }
 
 /// 全部可重映射动作。id 是配置里的键，一旦发布就不要改名。
-pub const BINDINGS: [Binding; 33] = [
+pub const BINDINGS: [Binding; 40] = [
     Binding {
         id: "app.quit",
         label: "退出应用",
         default: "cmd+q",
+    },
+    // macOS 惯例：⌘, 开偏好设置（统一设置窗口的第一页是「界面」）。
+    Binding {
+        id: "settings.open",
+        label: "打开设置",
+        default: "cmd+,",
     },
     Binding {
         id: "palette.open",
@@ -330,6 +336,13 @@ pub const BINDINGS: [Binding; 33] = [
         label: "全局搜索",
         default: "cmd+f",
     },
+    // 与 ⌘F（已索引的全局搜索）区分：⌘⇧F 是**按内容 grep 当前目录子树**，
+    // 不依赖索引、能看命中行、能跳进去。
+    Binding {
+        id: "search.content",
+        label: "按内容搜索当前目录…",
+        default: "cmd+shift+f",
+    },
     Binding {
         id: "select.all",
         label: "全选",
@@ -339,6 +352,33 @@ pub const BINDINGS: [Binding; 33] = [
         id: "select.invert",
         label: "反选",
         default: "cmd+shift+a",
+    },
+    // 暂存区（收集夹）：⌘⇧S 收集、⌘⌥S 开合抽屉——同主键、一个带 ⇧ 一个带 ⌥，好记。
+    Binding {
+        id: "staging.collect",
+        label: "收集到暂存区",
+        default: "cmd+shift+s",
+    },
+    Binding {
+        id: "staging.toggle",
+        label: "暂存区面板",
+        default: "cmd+alt+s",
+    },
+    // 分栏差异着色：⌘⌥D 开对比、⌘⇧↓/↑ 在两侧之间跳下一个差异。
+    Binding {
+        id: "compare.toggle",
+        label: "对比两侧目录",
+        default: "cmd+alt+d",
+    },
+    Binding {
+        id: "compare.jump_next",
+        label: "下一个差异",
+        default: "cmd+shift+down",
+    },
+    Binding {
+        id: "compare.jump_prev",
+        label: "上一个差异",
+        default: "cmd+shift+up",
     },
     Binding {
         id: "edit.undo",
@@ -499,9 +539,17 @@ pub const BINDINGS: [Binding; 33] = [
 ///
 /// ⚠️ 新增绑定若作用于浏览区，记得加进来——`browser_scoped_ids_all_exist` 守住
 /// 拼写（写错的 id 会静默失效，等于没拦）。
-pub const BROWSER_SCOPED: [&str; 14] = [
+pub const BROWSER_SCOPED: [&str; 19] = [
     "select.all",
     "select.invert",
+    // 收集读的是**当前选择**：模态打开时按它选中的是后面的文件，与 ⌘C 同理。
+    "staging.collect",
+    // 对比读的是两侧窗格的目录；跳转会改选择与滚动，同样属于下层浏览区。
+    "compare.toggle",
+    "compare.jump_next",
+    "compare.jump_prev",
+    // 内容搜索针对「当前目录子树」，焦点在模态里时不应误触发（打开它要先有浏览区）。
+    "search.content",
     "edit.undo",
     "edit.redo",
     "file.properties",
@@ -725,6 +773,20 @@ mod tests {
 
         // 配置里另一种自然写法 `cmd+shift+=` 也折到同一条。
         assert_eq!(ks("cmd+shift+="), plus_binding);
+    }
+
+    /// `cmd+,`（macOS「偏好设置」惯例）能解析、能查表，且不打到别的动作上。
+    ///
+    /// 主键**本身就是逗号**，与 `cmd+-` / `cmd+=` 同属「主键是符号」那一类：
+    /// 分隔符是 `+`，逗号不该被分割逻辑吃掉；键名也不该被 `known_key` 判成幽灵键。
+    #[test]
+    fn comma_opens_settings() {
+        let map = Keymap::build(&HashMap::new());
+        let comma = ks("cmd+,");
+        assert_eq!(comma.key, ",", "逗号是主键，不能被分隔符切掉");
+        assert_eq!(map.lookup(&comma), Some("settings.open"));
+        // 反向：不带修饰的裸逗号不该命中任何动作（避免误吞输入）。
+        assert_eq!(map.lookup(&ks(",")), None);
     }
 
     /// 回归：空格必须能从**真实按键事件**命中默认绑定。

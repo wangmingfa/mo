@@ -1,7 +1,8 @@
 use gpui_kit::*;
 use mo_app::AppState;
-use mo_core::{Entry, EntryKind, MetadataState, ThumbnailState};
-use std::path::{Path, PathBuf};
+use mo_core::{Bitmap, Entry, EntryKind, MetadataState, ThumbnailState};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::list_columns::{ColId, ColumnLayout};
@@ -29,11 +30,12 @@ pub(crate) fn wants_system_icon(thumbnail: &ThumbnailState) -> bool {
     )
 }
 
-/// 问系统图标（访达同款 PNG 的缓存路径）：**四个视图共用这一条链路**。
+/// 问系统图标（访达同款位图，后台已解码成内存位图）：**四个视图共用这一条链路**。
 ///
-/// 纯查表，命中给 PNG 路径、没命中只记一笔账并返回 `None`——调用方就此退回内置
-/// SVG，真活由后台图标泵补（见 `AppState::spawn_icon_pump`）。所以这里可以每帧每行
-/// 地调，零 IO。
+/// 纯查表，命中给位图、没命中只记一笔账并返回 `None`——调用方就此退回内置
+/// SVG，真活由后台图标泵补（见 `AppState::spawn_icon_pump`）。所以这里可以每帧
+/// 每行地调，零 IO。位图经 [`crate::bitmap::image_source`] 包成 `RenderImage`
+/// 后同步上屏——不走 `img(path)` 的异步读盘，那一格永远不会空着等。
 ///
 /// `slot_pt` 是显示槽位的边长（[`crate::listing::icon_slot`]）：系统图标是光栅图，
 /// 得先知道要放进多大的地方，才知道该取 40px 还是 128px 那一档。
@@ -46,7 +48,7 @@ pub(crate) fn system_icon(
     path: &Path,
     is_dir: bool,
     slot_pt: f32,
-) -> Option<PathBuf> {
+) -> Option<Arc<Bitmap>> {
     app.and_then(|a| a.file_icon(path, is_dir, slot_pt))
 }
 
@@ -56,7 +58,7 @@ pub(crate) fn entry_system_icon(
     app: Option<&AppState>,
     entry: &Entry,
     slot_pt: f32,
-) -> Option<PathBuf> {
+) -> Option<Arc<Bitmap>> {
     if !wants_system_icon(&entry.thumbnail) {
         return None;
     }
@@ -68,14 +70,15 @@ pub(crate) fn entry_system_icon(
 /// 列顺序 / 宽度全部取自 `layout`（表头与数据行共用同一份，保证上下对齐）：
 /// 名称列弹性可伸缩，其余列固定宽右对齐。用户拖动表头改列宽 / 列顺序后，
 /// 数据行下一帧就跟着变——渲染逻辑里没有任何写死的列序。
-/// 缩略图来自 `mo-thumbnails` 生成的磁盘缓存；GPUI 可以直接从文件路径加载图片，
-/// 因此这里只需把缓存路径交给 `img()`——领域层不必知道任何 UI 类型。
+/// 位图（缩略图 / 系统图标）由后台泵备成内存位图，这里经
+/// [`crate::bitmap::image_source`] 转成 `ImageSource::Render` 同步上屏——
+/// `img(path)` 的异步读盘会让那一格空一两帧（切目录时的闪烁），不走。
 pub fn view(
     entry: &Entry,
     selected: bool,
     tag: Option<String>,
     layout: &ColumnLayout,
-    system_icon: Option<PathBuf>,
+    system_icon: Option<Arc<Bitmap>>,
 ) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
@@ -124,30 +127,28 @@ pub fn view(
         .flex_1()
         .overflow_hidden();
 
-    name_cell = match &entry.thumbnail {
-        ThumbnailState::Loaded(path) => name_cell.child(icon_slot(
-            img(path.as_path())
-                .w(px(ICON_PX))
-                .h(px(ICON_PX))
-                .into_any_element(),
+    // 这一行「名称列图标槽」里要画的位图：缩略图优先，其次系统图标，
+    // 都没有才退回内置 Lucide 描边 SVG（`Loading` 态是空槽，生产从不置位）。
+    // 位图源是同步的（`ImageSource::Render`），永不出现空窗。
+    let raster_source = match &entry.thumbnail {
+        ThumbnailState::Loaded(b) => crate::bitmap::image_source(b),
+        ThumbnailState::Loading => None,
+        _ => system_icon.as_ref().and_then(crate::bitmap::image_source),
+    };
+
+    name_cell = match raster_source {
+        Some(src) => name_cell.child(icon_slot(
+            img(src).w(px(ICON_PX)).h(px(ICON_PX)).into_any_element(),
         )),
-        ThumbnailState::Loading => {
+        None if matches!(entry.thumbnail, ThumbnailState::Loading) => {
             name_cell.child(icon_slot(text!("".to_string()).into_any_element()))
         }
-        _ => {
-            // 没有缩略图时：能用**系统**图标（访达同款真实图标）就用它，
-            // 否则退回内置 Lucide 单色 SVG。系统图标是光栅 PNG，没法随选中态改色，
-            // 但胜在「.app 是真 App 图标、文档是所属 App 图标」，与系统一致。
-            //
-            // 位图（缩略图 / 系统图标）铺满槽位、描边 SVG 缩一圈（`GLYPH_PX`）：
-            // 两者视觉大小才对得上。
-            let icon = match &system_icon {
-                Some(p) => img(p.as_path())
-                    .w(px(ICON_PX))
-                    .h(px(ICON_PX))
-                    .into_any_element(),
-                None => crate::icons::icon(icon_data, GLYPH_PX, icon_color).into_any_element(),
-            };
+        // 没有位图时退回内置 Lucide 单色 SVG。系统图标是光栅位图，没法随选中态
+        // 改色，但胜在「.app 是真 App 图标、文档是所属 App 图标」，与系统一致。
+        //
+        // 位图铺满槽位、描边 SVG 缩一圈（`GLYPH_PX`）：两者视觉大小才对得上。
+        None => {
+            let icon = crate::icons::icon(icon_data, GLYPH_PX, icon_color).into_any_element();
             name_cell.child(icon_slot(icon))
         }
     };

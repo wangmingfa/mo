@@ -295,6 +295,42 @@ impl FileSystem for FtpFileSystem {
         .await
     }
 
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        use tokio::io::AsyncReadExt as _;
+        let remote = Self::remote(path);
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            // `retr` 的闭包是异步的，且要把数据流**还回去**（suppaftp 12 的约定：
+            // 由它自己 finish 并读取完成应答，我们不能在闭包里 finish）。
+            conn.retr(&remote, |mut stream| {
+                Box::pin(async move {
+                    let mut buf = Vec::new();
+                    stream
+                        .read_to_end(&mut buf)
+                        .await
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    Ok::<_, suppaftp::FtpError>((buf, stream))
+                })
+            })
+            .await
+            .map_err(|e| MoError::from(transport_error("下载", e)))
+        })
+        .await
+    }
+
+    async fn is_dir(&self, path: &Path) -> bool {
+        // FTP 没有「这是什么类型」的直接指令：沿用 `metadata` 那条约定
+        // ——目录没有 SIZE 语义（多数服务器直接报 550），SIZE 失败即当目录。
+        let remote = Self::remote(path);
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            conn.size(&remote).await.is_err()
+        })
+        .await
+    }
+
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         // future 要 `'static`：内容拷一份进去（远程往返期间 `contents` 的借用不能悬着）。

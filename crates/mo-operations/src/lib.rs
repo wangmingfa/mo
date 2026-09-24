@@ -20,6 +20,7 @@ mod perms;
 mod rename;
 mod restore_op;
 mod sync;
+mod transfer;
 mod trash;
 mod trash_op;
 
@@ -39,6 +40,7 @@ pub use sync::{
     apply as apply_sync_plan, plan as plan_sync, Action as SyncAction,
     ConflictPolicy as SyncConflictPolicy, Plan as SyncPlan, SyncMode, SyncOptions, SyncReport,
 };
+pub use transfer::TransferOperation;
 pub use trash::{Trash, TrashEntry, TrashError};
 pub use trash_op::TrashOperation;
 

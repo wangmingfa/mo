@@ -418,6 +418,12 @@ pub fn render(
                 // ⚠️ 必须有元素 ID：gpui 的 click 事件分发依赖 element_state，
                 // 无 ID 的裸 div 拿不到 state，on_click 回调永远不会注册。
                 // 用全列表绝对索引保证滚动后 ID 稳定。
+                // 分栏对比：开着时按这一条的状态上色（相同不染）。
+                let tint = panel
+                    .diff
+                    .as_ref()
+                    .and_then(|m| m.get(&entry_path))
+                    .copied();
                 let mut row = div()
                     .id(format!("file-row-{pane}-{tab}-{i}"))
                     .flex()
@@ -427,8 +433,11 @@ pub fn render(
                     .h(px(24.0))
                     .px(px(4.0))
                     // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
+                    // 对比色排在斑马纹**前面**：它比「奇偶行」信息量大得多。
                     .bg(if selected {
                         crate::theme::selected_bg()
+                    } else if let Some(c) = crate::app::compare_tint(tint) {
+                        c
                     } else if zebra && i % 2 == 1 {
                         crate::theme::zebra()
                     } else {

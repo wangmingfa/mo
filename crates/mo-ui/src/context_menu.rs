@@ -112,6 +112,8 @@ pub(crate) enum MenuAction {
     SelectAll,
     /// 反选：把可见条目里没选中的换上来（与「全选」同一条「只动可见集」的边界）。
     InvertSelection,
+    /// 收集到暂存区：与「复制」同组但语义是**追加**（见 `mo-app::staging`）。
+    Stage,
 }
 
 /// 一行菜单项。`separator_before` 为真时它上方还有一条分隔线。
@@ -301,6 +303,18 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         MenuAction::CopyPath,
         "拷贝路径",
         crate::keys::hint("clipboard.copy_path"),
+        true,
+    ));
+    // 收集到暂存区：与上面同组（不隔线）——它也是「把这几个文件收起来待用」，
+    // 只是收的地方不同（累积清单 vs 一次性剪贴板）。
+    out.push(MenuItem::new(
+        MenuAction::Stage,
+        if multi {
+            format!("收集到暂存区（{} 项）", menu.selected)
+        } else {
+            "收集到暂存区".to_string()
+        },
+        crate::keys::hint("staging.collect"),
         true,
     ));
 

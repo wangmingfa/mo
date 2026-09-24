@@ -4,6 +4,8 @@
 //! [`mo_app::AppState`] 发命令、通过事件总线订阅变化，不直接操作文件系统。
 
 mod app;
+/// 内存位图 → gpui 渲染图的转换缓存（`ImageSource::Render` 同步上屏的根）。
+mod bitmap;
 mod columns;
 mod context_menu;
 mod dialogs;
@@ -20,6 +22,8 @@ mod path_label;
 mod preview;
 mod progress_panel;
 mod sidebar;
+/// 暂存区抽屉（跨目录收集待处理文件）。
+mod staging;
 mod status_bar;
 mod theme;
 /// 公开仅为测试读取 `TOOLBAR_HEIGHT`（红绿灯居中的依据）。
@@ -115,6 +119,41 @@ pub fn panel_selection_count_for_tests(view: &RootView) -> usize {
     view.panel_at(0, 0)
         .map(|p| p.selection.count())
         .unwrap_or(0)
+}
+
+/// 测试专用：注入一棵假的磁盘地图树并切到地图视图。
+///
+/// 真的树要递归扫几万个文件（headless 里拉不动，也不该在测试里扫真盘），
+/// 而 layout 的正确性由 `mo-app` 的单测守着——这里只验证「画出来了、面积对」。
+#[doc(hidden)]
+pub fn inject_usage_tree_for_tests(view: &mut RootView, tree: mo_app::UsageTree) {
+    view.usage_root = Some(tree.path.clone());
+    view.usage_tree = Some(tree);
+    view.usage_map = true;
+    view.modal = app::Modal::DiskUsage;
+}
+
+/// 测试专用：打开分栏对比的图例条（只给统计，不真扫盘）。
+///
+/// 真的 `compare_trees` 要递归扫两棵树；「两侧该怎么染」的语义由
+/// `app::tests::compare_maps_*` 守着，这里只验证图例条真进了布局。
+#[doc(hidden)]
+pub fn inject_compare_for_tests(view: &mut RootView, stats: (usize, usize, usize)) {
+    view.compare = true;
+    view.compare_stats = Some(stats);
+}
+
+/// 测试专用：直接打开内容搜索面板（不依赖当前目录，范围写死 `/`）。
+///
+/// 真的 `open_content_search` 从当前面板取路径；布局测试只验证「面板长什么样」，
+/// 不关心范围，故这里直接给定。结果区由 `mo-search` 单测守着，本测试只看骨架。
+#[doc(hidden)]
+pub fn inject_content_search_for_tests(view: &mut RootView) {
+    view.content_root = Some(std::path::PathBuf::from("/"));
+    view.content_report = None;
+    view.content_index = 0;
+    view.content_dirty = true;
+    view.modal = app::Modal::ContentSearch;
 }
 
 /// 测试专用：当前标签页的窗口快照是否已同步到 `rows` 行（导航等待用）。

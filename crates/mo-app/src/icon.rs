@@ -3,8 +3,8 @@
 //! ## 为什么必须挪
 //!
 //! 「问系统拿一张图标」的完整代价是：`NSWorkspace.iconForFile:` → 新建 40px 画布
-//! 重绘 → TIFF → PNG 编码 → 写盘。实测**每张 1.5–12ms**（普通文件 1.5ms，`.app`
-//! 这种要读自己图标的包 12ms 起，进程内第一张还要额外几十毫秒预热）。
+//! 重绘 → TIFF → 拷像素。实测**每张 0.9–12ms**（普通文件 0.9ms，`.app` 这种要读
+//! 自己图标的包 12ms 起，进程内第一张还要额外几十毫秒预热）。
 //!
 //! 而列表渲染是**渲染线程**上的事：一屏三十来行，进去一个新目录时全部是冷路径 →
 //! 30×1.5ms 到 30×12ms，也就是**一帧里卡住 50–400ms**。这正是用户报的「进入内容
@@ -16,8 +16,12 @@
 //! * **渲染路径**（[`super::AppState::file_icon`]）：只查表；查不到就记一笔「这行
 //!   要图标」并返回 `None`（调用方就此退回内置 SVG）。零 IO、零 AppKit。
 //! * **图标泵**（[`super::AppState::spawn_icon_pump`]）：把它记下的键**按时间配额
-//!   一条条**拿出来问系统、写盘、落缓存，然后置 `dirty` 让 UI 在下一个 120ms 节拍
+//!   一条条**拿出来问系统、落缓存，然后置 `dirty` 让 UI 在下一个 120ms 节拍
 //!   重绘——图标于是「晚一两帧浮现」，而不是「当场把界面冻住」。
+//!
+//! 产物是**解码好的内存位图**（[`Bitmap`]，BGRA），不是磁盘上的 PNG：UI 的
+//! `img(path)` 要异步读盘解码，位图没到之前那一格什么都不画（切目录时的图标
+//! 闪烁）。内存位图让 UI 用 `ImageSource::Render` 同步上屏，整条链路零 IO。
 //!
 //! ## `dispatch_sync` 的活是主线程干的：把单价拆开看
 //!
@@ -33,8 +37,8 @@
 //!
 //! 于是两头一起收：
 //!
-//! * **编码挪走**——平台层只交出**像素**（[`mo_platform::file_icon_raster`]），
-//!   预乘还原 + PNG 编码交给 [`encode_icon_png`]，它在 blocking 池里跑，
+//! * **编码整个省掉**——平台层只交出**像素**（[`mo_platform::file_icon_raster`]），
+//!   预乘还原交给 [`icon_bitmap`]（不再编码 PNG、不再写盘），它在 blocking 池里跑，
 //!   主线程单价掉到 ~0.2ms；
 //! * **按时间配额滴灌**——泵每拍只花 `ICON_BUDGET_MS`，一条条取，配额用完把剩下的
 //!   留在队列里等下一拍。以前一拍抓 40 张 = 主线程连着忙 40ms 以上，那正是用户报的
@@ -68,7 +72,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use mo_core::Bitmap;
 
 /// 小档位图的边长（物理像素）：列表 / 列视图的 16pt 槽位按 @2x 屏取 40px，留了点余量。
 pub const ICON_PX_SMALL: u32 = 40;
@@ -165,12 +172,12 @@ fn is_package_ext(ext: &str) -> bool {
 /// 真正的系统调用只在 `take` 出去的那批上做，且发生在后台线程。
 #[derive(Default)]
 pub struct IconCache {
-    /// (路径, 档位) → 已落盘的 PNG。
+    /// (路径, 档位) → 解码好的内存位图。
     ///
     /// 主键带上档位：同一个目录在列表里要 40px、在画廊里要 128px，两张不能互相顶掉。
-    by_path: HashMap<(PathBuf, u32), PathBuf>,
-    /// (类型, 档位) → 已落盘的 PNG（同类型同档位共享一张）。
-    by_type: HashMap<(String, u32), PathBuf>,
+    by_path: HashMap<(PathBuf, u32), Arc<Bitmap>>,
+    /// (类型, 档位) → 解码好的内存位图（同类型同档位共享一张）。
+    by_type: HashMap<(String, u32), Arc<Bitmap>>,
     /// 已经问过系统的键——**成功与否都记**。彻底问不到的（重试用尽、文件已被删）
     /// 不重复排队，省得每帧都去撞一次系统。
     asked: HashSet<IconKey>,
@@ -184,16 +191,24 @@ pub struct IconCache {
     retry_queue: VecDeque<(PathBuf, IconKey, Instant)>,
     /// 每个键已经失败的次数——达到 [`MAX_ICON_ATTEMPTS`] 才认命。
     attempts: HashMap<IconKey, u8>,
-    /// 通用文件夹占位图（档位 → 已落盘 PNG）。目录行在真图标就位前先画它，
+    /// 通用文件夹占位图（档位 → 内存位图）。目录行在真图标就位前先画它，
     /// 免得露出内置描边 SVG 再「跳」成系统图标。
-    folder_fallback: HashMap<u32, PathBuf>,
+    folder_fallback: HashMap<u32, Arc<Bitmap>>,
     /// 占位图取失败的次数（每档一份，到 [`FALLBACK_MAX_TRIES`] 就不再试）。
     fallback_failures: HashMap<u32, u8>,
+    /// 缓存位图的字节总量（`w * h * 4` 逐张累加）。超过 [`ICON_CACHE_BYTES_MAX`]
+    /// 整清——位图常驻内存后，光按条数封顶在「画廊逛大目录」时会松。
+    bytes: usize,
 }
 
 /// 缓存条数上限：超过就整个清空重来（否则长时间浏览会把内存涨满）。
 /// 只清缓存、不清「问过」的账本意义不大，所以一起清——反正清了就得重新问。
 const ICON_CACHE_MAX: usize = 4000;
+
+/// 缓存位图的**字节**预算：超过整清。最坏的一档是 128px 位图（65 KB/张），
+/// 128 MiB ≈ 2000 张大档或 3 万张小档——日常浏览（几十个目录 × 几十种类型）
+/// 远够不着，真逛到了就整清重来（重新问系统，观感只是图标「重新浮现一遍」）。
+const ICON_CACHE_BYTES_MAX: usize = 128 * 1024 * 1024;
 
 /// 同一个键**最多问几次系统**（含第一次）。
 ///
@@ -241,7 +256,7 @@ impl IconCache {
     ///
     /// [小档]: ICON_PX_SMALL
     /// [大档]: ICON_PX_LARGE
-    pub fn lookup(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<PathBuf> {
+    pub fn lookup(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<Arc<Bitmap>> {
         let px = icon_px_for_slot(slot_pt);
         if let Some(hit) = self.by_path.get(&(path.to_path_buf(), px)) {
             return Some(hit.clone());
@@ -300,15 +315,31 @@ impl IconCache {
     }
 
     /// 落库：按路径、按类型（同类型共享）都能命中。档位取自 `key`。
-    pub fn insert(&mut self, path: &Path, key: &IconKey, png: PathBuf) {
-        self.by_path
-            .insert((path.to_path_buf(), key.px()), png.clone());
+    ///
+    /// 字节账的模型：**只数 `by_path` 里各条位图的大小**。`by_type` 的那张图与
+    /// 「该类型第一个落库的路径」共享同一条分配（`Arc`），不重复记；同键替换时
+    /// 旧的分配随之释放，减旧加新。账只用于触发整清（[`ICON_CACHE_BYTES_MAX`]），
+    /// 系上用 `saturating_sub` 防意外漂移成下溢——宁可早清，不可崩。
+    pub fn insert(&mut self, path: &Path, key: &IconKey, bitmap: Arc<Bitmap>) {
+        let len = bitmap.bgra().len();
+        match self
+            .by_path
+            .insert((path.to_path_buf(), key.px()), bitmap.clone())
+        {
+            Some(old) => {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(old.bgra().len())
+                    .saturating_add(len);
+            }
+            None => self.bytes += len,
+        }
         if let IconKey::Type(t, px) = key {
-            self.by_type.insert((t.clone(), *px), png);
+            self.by_type.insert((t.clone(), *px), bitmap);
         }
         // 成功了，失败账清零（下次同键重新过期——档位不同是另一个键，互不影响）。
         self.attempts.remove(key);
-        if self.by_path.len() > ICON_CACHE_MAX {
+        if self.by_path.len() > ICON_CACHE_MAX || self.bytes > ICON_CACHE_BYTES_MAX {
             self.clear();
         }
     }
@@ -348,8 +379,8 @@ impl IconCache {
     }
 
     /// 落一个档位的占位图（渲染查表从此直接给目录行用）。
-    pub fn set_folder_fallback(&mut self, px: u32, png: PathBuf) {
-        self.folder_fallback.insert(px, png);
+    pub fn set_folder_fallback(&mut self, px: u32, bitmap: Arc<Bitmap>) {
+        self.folder_fallback.insert(px, bitmap);
     }
 
     /// 占位图取失败记一笔。
@@ -358,7 +389,7 @@ impl IconCache {
     }
 
     /// 目录行的**占位图**：真图标还没就位时先给这张（系统蓝文件夹），渲染路径纯查表。
-    pub fn folder_fallback(&self, px: u32) -> Option<PathBuf> {
+    pub fn folder_fallback(&self, px: u32) -> Option<Arc<Bitmap>> {
         self.folder_fallback.get(&px).cloned()
     }
 
@@ -371,6 +402,7 @@ impl IconCache {
         self.prefetch.clear();
         self.retry_queue.clear();
         self.attempts.clear();
+        self.bytes = 0;
     }
 
     /// 只清**预取**队列：切目录时上一目录还没消化完的预取作废（那些行多半看不到了，
@@ -399,18 +431,26 @@ impl IconCache {
     }
 }
 
-/// 图标像素 → PNG 字节：预乘还原 + 编码。
+/// 平台层交出的**预乘** RGBA 光栅 → 解码好的内存位图（[`Bitmap`]，BGRA）。
 ///
-/// **在后台（blocking 池）跑**，别在主线程调：这两步占了图标整段耗时的 70%
-/// （实测编码 0.62ms / 总 0.9ms），留在主线程是白卡界面。平台层
-/// （[`mo_platform::file_icon_raster`]）只做必须主线程的那部分——问系统 + 重绘 +
-/// 拷像素。
+/// 原来这一步是「预乘还原 + PNG 编码 + 写盘」，UI 再拿路径喂 `img()` 异步读回来
+/// ——`img()` 缓存未命中时那一格**什么都不画**，切目录时「文字先出、图标晚到」
+/// 的闪烁正是这么来的。现在直接产出内存位图：UI 用 `ImageSource::Render` 同步
+/// 上屏，零 IO、零空窗，还省掉了占原链路 70% 耗时的 PNG 编码。
 ///
-/// AppKit 交出来的像素是**预乘 alpha**（半透明像素的 RGB 被压过），PNG 存的是直通
-/// alpha，所以先还原再编码，否则抗锯齿边缘发暗。
-pub fn encode_icon_png(raster: &mut mo_platform::IconRaster) -> Option<Vec<u8>> {
+/// 在后台（blocking 池）跑。平台层（[`mo_platform::file_icon_raster`]）只做必须
+/// 主线程的那部分——问系统 + 重绘 + 拷像素。
+///
+/// AppKit 交出来的像素是**预乘 alpha**（半透明像素的 RGB 被压过），[`Bitmap`]
+/// 存直通 alpha，所以先还原再交换，否则抗锯齿边缘发暗。
+pub fn icon_bitmap(raster: &mut mo_platform::IconRaster) -> Option<Arc<Bitmap>> {
     mo_thumbnails::unpremultiply_rgba(&mut raster.rgba);
-    mo_thumbnails::encode_rgba_png(raster.width, raster.height, &raster.rgba)
+    Bitmap::from_rgba(
+        raster.width,
+        raster.height,
+        std::mem::take(&mut raster.rgba),
+    )
+    .map(Arc::new)
 }
 
 #[cfg(test)]
@@ -421,6 +461,11 @@ mod tests {
     /// ——视图侧那张表在 `mo_ui::listing::icon_slot`，这里只验本模块的档位判据）。
     const SLOT_SMALL: f32 = 16.0;
     const SLOT_LARGE: f32 = 96.0;
+
+    /// 一张 1×1 的测试位图。每次调用都是**新 id**——断言拿落库时的那个句柄来比。
+    fn bm() -> Arc<Bitmap> {
+        Arc::new(Bitmap::from_rgba(1, 1, vec![10, 20, 30, 255]).expect("1×1 合法"))
+    }
 
     /// 同扩展名的普通文件共享一个键：三百个 `.txt` 只该问系统一次。
     #[test]
@@ -497,14 +542,11 @@ mod tests {
         let mut c = IconCache::default();
         // 按类型：小档落了库，大档查不到。
         let small = icon_key(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
-        c.insert(
-            Path::new("/tmp/a.txt"),
-            &small,
-            PathBuf::from("/icons/txt-40.png"),
-        );
+        let txt = bm();
+        c.insert(Path::new("/tmp/a.txt"), &small, txt.clone());
         assert_eq!(
             c.lookup(Path::new("/tmp/b.txt"), false, SLOT_SMALL),
-            Some(PathBuf::from("/icons/txt-40.png")),
+            Some(txt),
             "同类型同档位该命中"
         );
         assert_eq!(
@@ -514,11 +556,8 @@ mod tests {
         );
         // 按路径：同理。
         let dir_small = icon_key(Path::new("/Users/me/Downloads"), true, SLOT_SMALL);
-        c.insert(
-            Path::new("/Users/me/Downloads"),
-            &dir_small,
-            PathBuf::from("/icons/dl-40.png"),
-        );
+        let dl = bm();
+        c.insert(Path::new("/Users/me/Downloads"), &dir_small, dl.clone());
         assert_eq!(
             c.lookup(Path::new("/Users/me/Downloads"), false, SLOT_LARGE),
             None,
@@ -556,19 +595,16 @@ mod tests {
     fn a_type_hit_serves_every_path_of_that_type() {
         let mut c = IconCache::default();
         let key = icon_key(Path::new("/tmp/a.txt"), false, SLOT_SMALL);
-        c.insert(
-            Path::new("/tmp/a.txt"),
-            &key,
-            PathBuf::from("/icons/txt.png"),
-        );
+        let txt = bm();
+        c.insert(Path::new("/tmp/a.txt"), &key, txt.clone());
 
         assert_eq!(
             c.lookup(Path::new("/tmp/a.txt"), false, SLOT_SMALL),
-            Some(PathBuf::from("/icons/txt.png"))
+            Some(txt.clone())
         );
         assert_eq!(
             c.lookup(Path::new("/tmp/后来才出现的.txt"), false, SLOT_SMALL),
-            Some(PathBuf::from("/icons/txt.png")),
+            Some(txt),
             "同类型的新文件应当直接命中，不必再问系统"
         );
         assert_eq!(c.lookup(Path::new("/tmp/c.pdf"), false, SLOT_SMALL), None);
@@ -588,15 +624,12 @@ mod tests {
             IconKey::Path(PathBuf::from("/Applications/A.app"), ICON_PX_SMALL),
             "包即使呈现为文件（符号链接）也必须按路径问"
         );
-        c.insert(
-            Path::new("/Applications/A.app"),
-            &key,
-            PathBuf::from("/icons/a.png"),
-        );
+        c.insert(Path::new("/Applications/A.app"), &key, bm());
 
-        assert_eq!(
-            c.lookup(Path::new("/Applications/A.app"), false, SLOT_SMALL),
-            Some(PathBuf::from("/icons/a.png"))
+        assert!(
+            c.lookup(Path::new("/Applications/A.app"), false, SLOT_SMALL)
+                .is_some(),
+            "按路径落的库，同路径该命中"
         );
         assert_eq!(
             c.lookup(Path::new("/Applications/B.app"), false, SLOT_SMALL),
@@ -679,10 +712,10 @@ mod tests {
         for _ in 0..3 {
             c.note_failure(path, &key, now);
         }
-        c.insert(path, &key, PathBuf::from("/icons/dir.png"));
-        assert_eq!(
-            c.lookup(path, true, SLOT_SMALL),
-            Some(PathBuf::from("/icons/dir.png"))
+        c.insert(path, &key, bm());
+        assert!(
+            c.lookup(path, true, SLOT_SMALL).is_some(),
+            "成功落库后同键可查"
         );
         // 再失败：账从零起算，还能重试。之前的在途重试还在（重问一次也只是
         // 重复落同一张图，无害），加上这次的新重试共 4 条。
@@ -794,17 +827,15 @@ mod tests {
     fn folder_fallback_is_served_once_fetched() {
         let mut c = IconCache::default();
         assert_eq!(c.pending_folder_fallback(), Some(ICON_PX_SMALL), "小档先取");
-        c.set_folder_fallback(ICON_PX_SMALL, PathBuf::from("/icons/folder-40.png"));
+        let small = bm();
+        c.set_folder_fallback(ICON_PX_SMALL, small.clone());
         assert_eq!(
             c.pending_folder_fallback(),
             Some(ICON_PX_LARGE),
             "小档齐了轮到大档"
         );
-        assert_eq!(
-            c.folder_fallback(ICON_PX_SMALL),
-            Some(PathBuf::from("/icons/folder-40.png"))
-        );
-        c.set_folder_fallback(ICON_PX_LARGE, PathBuf::from("/icons/folder-128.png"));
+        assert_eq!(c.folder_fallback(ICON_PX_SMALL), Some(small));
+        c.set_folder_fallback(ICON_PX_LARGE, bm());
         assert_eq!(c.pending_folder_fallback(), None, "齐了就没活");
         assert!(c.is_idle(), "队列空 + 占位齐 = 空闲");
 
@@ -829,8 +860,27 @@ mod tests {
         for i in 0..over {
             let p = PathBuf::from(format!("/tmp/dir{i}"));
             let key = icon_key(&p, true, SLOT_SMALL);
-            c.insert(&p, &key, PathBuf::from("/icons/dir.png"));
+            c.insert(&p, &key, bm());
         }
         assert!(c.cached_paths() <= ICON_CACHE_MAX, "封顶后不该还留这么多");
+    }
+
+    /// 字节账要跟实际存活的位图对上：同键替换不堆账，整清后归零。
+    ///
+    /// 字节预算（[`ICON_CACHE_BYTES_MAX`]）真要灌满得 2000 张 128px——单测里灌
+    /// 不现实，这里只验两个可观测行为：替换减账（不虚胖）、整清归零（清完还能
+    /// 正常落库，不被残留账误清）。
+    #[test]
+    fn byte_accounting_tracks_replacements_and_clears() {
+        let mut c = IconCache::default();
+        let p = PathBuf::from("/tmp/replace-dir");
+        let key = icon_key(&p, true, SLOT_SMALL);
+        for _ in 0..3 {
+            c.insert(&p, &key, bm());
+        }
+        assert!(c.cached_paths() <= 1, "同键重复落库不该堆条目");
+        c.clear();
+        c.insert(&p, &key, bm());
+        assert_eq!(c.cached_paths(), 1, "整清后应能正常落库");
     }
 }

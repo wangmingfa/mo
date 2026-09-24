@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::bitmap::Bitmap;
 use crate::file_id::FileId;
 use crate::metadata::FileMetadata;
 
@@ -35,16 +37,18 @@ pub enum MetadataState {
 
 /// 缩略图的加载状态。
 ///
-/// 缩略图由 mo-thumbnails 在后台解码生成，落盘到缓存目录；
-/// 这里只持有**缓存文件的路径**，避免让领域层依赖任何 UI 框架的图片类型。
+/// 缩略图由 mo-thumbnails 在后台解码（磁盘缓存命中则读缓存，未命中解码原图），
+/// 最终以**解码好的内存位图**（[`Bitmap`]，BGRA）交付——UI 直接用它同步上屏，
+/// 不必再走「磁盘路径 → 异步读盘解码」那一遭（`img(path)` 缓存未命中时那一格
+/// 什么都不画，切目录时的图标闪烁正是这么来的）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThumbnailState {
     /// 还没请求过。
     Idle,
     /// 正在后台生成。
     Loading,
-    /// 已生成，值是磁盘缓存中的图片路径。
-    Loaded(PathBuf),
+    /// 已生成，值是解码好的内存位图。
+    Loaded(Arc<Bitmap>),
     /// 生成失败（解码失败 / IO 错误）。
     Failed,
     /// 该类型不支持缩略图（如文件夹、文本）。

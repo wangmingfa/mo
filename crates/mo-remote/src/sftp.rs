@@ -253,6 +253,31 @@ impl FileSystem for SftpFileSystem {
         .map_err(|e| MoError::from(transport_error("建目录", e)))
     }
 
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        let remote = Self::remote(path);
+        let sftp = self.sftp.clone();
+        self.run(async move {
+            let s = sftp.lock().await;
+            s.read(remote).await
+        })
+        .await
+        .map_err(|e| MoError::from(transport_error("下载", e)))
+    }
+
+    async fn is_dir(&self, path: &Path) -> bool {
+        // SFTP 的 attrs 自带类型位（不用启发式猜），一次 metadata 就能定。
+        let remote = Self::remote(path);
+        let sftp = self.sftp.clone();
+        self.run(async move {
+            let s = sftp.lock().await;
+            s.metadata(remote)
+                .await
+                .map(|a| a.is_dir())
+                .unwrap_or(false)
+        })
+        .await
+    }
+
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let contents = contents.to_vec();

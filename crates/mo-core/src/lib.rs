@@ -7,6 +7,7 @@
 //! 因为与 UI 解耦，核心逻辑可以单独单元测试，并且在以后替换搜索引擎、
 //! 缓存机制甚至文件系统实现时，UI 都不需要改动。
 
+pub mod bitmap;
 pub mod command;
 pub mod directory;
 pub mod entry;
@@ -22,6 +23,7 @@ pub mod view;
 #[cfg(test)]
 mod tests;
 
+pub use bitmap::Bitmap;
 pub use command::FileCommand;
 pub use directory::{Directory, DirectoryError, DirectoryId};
 pub use entry::{Entry, EntryKind, LightEntry, MetadataState, ThumbnailState};

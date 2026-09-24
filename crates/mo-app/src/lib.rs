@@ -23,7 +23,11 @@ mod icon;
 mod metadata;
 /// 系统 shell 集成（默认打开 / 打开方式）。
 pub mod shell;
+/// 暂存区：跨目录累积待处理文件（见模块文档里与剪贴板的区别）。
+mod staging;
 mod thumbnail;
+/// 磁盘地图的布局算法（squarified treemap）：纯计算，矩形是归一化的。
+pub mod treemap;
 /// 用户自定义命令（占位符 / 清单 / 执行）。
 pub mod usercmds;
 /// 自动化工作流：多步命令顺序执行。
@@ -36,6 +40,9 @@ pub use icon::{icon_px_for_slot, ICON_PX_LARGE, ICON_PX_SMALL};
 // 分组模型经应用层再导出：UI 只依赖 mo-app。
 pub use metadata::MetadataScheduler;
 pub use mo_core::{GroupKey, Grouping};
+// 暂存区的类型要给 UI（抽屉要列条目），进程级那一份经 AppState 取，不直接导出。
+pub use staging::{StagedEntry, Staging};
+pub use treemap::{Rect, Tile, UsageTree};
 // 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
 pub use mo_config::{
     clamp_icon_scale, ColumnPrefs, Config, SavedServer, ThemeColors, UiPrefs, UserCommand,
@@ -53,13 +60,14 @@ use std::time::Duration;
 
 use mo_cache::MetadataCache;
 use mo_core::{
-    AppEvent, Directory, Entry, EventBus, FileId, FileMetadata, LightEntry, MetadataState, MoError,
-    NavigationState, SelectionModel, SortDir, SortKey, ThumbnailState,
+    AppEvent, Bitmap, Directory, Entry, EventBus, FileId, FileMetadata, LightEntry, MetadataState,
+    MoError, NavigationState, SelectionModel, SortDir, SortKey, ThumbnailState,
 };
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
     CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle, OperationManager,
-    RenameOperation, RestoreOperation, SharedOperation, Trash, TrashEntry, TrashOperation,
+    RenameOperation, RestoreOperation, SharedOperation, TransferOperation, Trash, TrashEntry,
+    TrashOperation,
 };
 use mo_preview::Preview;
 use mo_remote::RemoteUrl;
@@ -85,8 +93,57 @@ impl WindowRow {
         }
     }
 }
+
+/// 键盘定位（type-ahead / 方向键）的结果，**同时**给两种空间的下标。
+///
+/// 两种空间在分组 / 网格下并不相等，谁都不能从另一个推出来，所以一起返回：
+/// * `pos` = 可见序列（已排序 + 已过滤）里的**条目位**——网格 / 画廊的
+///   `uniform_list` 按条目计（`item_count = ceil(count / cols)`），滚动要的是它
+///   除以列数；列视图同理。
+/// * `row` = **列表行**下标（分组开启时含分组头行，`pos_to_row` 之后的值）——
+///   列表视图的 `uniform_list` 按行计，滚动要的是它。
+///
+/// 调用方（UI）按当前视图模式二选一，见 `mo-ui::located_row`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocateHit {
+    pub pos: usize,
+    pub row: usize,
+}
+
+/// `needle` 的字符是否**按序**出现在 `hay` 里（不要求连续）。
+///
+/// type-ahead 的兜底匹配用（严格前缀全无命中才轮到它），双方都已小写化。
+fn is_subsequence(needle: &str, hay: &str) -> bool {
+    let mut it = hay.chars();
+    needle.chars().all(|c| it.any(|h| h == c))
+}
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::{Mutex, RwLock};
+
+/// 传输的**一端**：本机磁盘，或某条远程会话的文件系统。
+///
+/// 为什么端点必须显式传、不能照路径猜——两条路都问不出真话：
+/// - `Path::exists()/is_dir()` 对远程路径在本机恒为假（远程路径是**服务器上**的
+///   绝对路径），问本机磁盘只会得到「不存在」；
+/// - 「它是不是当前列表里的那一行」（即 [`AppState::goes_through_remote`]）只答得
+///   出**这一页**的情况：粘贴到当前目录时 `dest` 自己不是列表里的一行；分栏拖拽时
+///   目标那一头根本不在源窗格的列表里。
+///
+/// 于是「谁是远程」由**拥有那一头的窗格**回答（`mo-ui` 的 `run_transfer` 手里正好
+/// 有源 / 目标两个窗格的 `AppState`），这里只负责把两端拼起来。
+#[derive(Clone)]
+pub enum Endpoint {
+    /// 本机磁盘。
+    Local,
+    /// 一条远程会话（同一会话可同时作为两端：远程目录内复制）。
+    Remote(Arc<dyn FileSystem>),
+}
+
+/// 跨端点传输的「一段路」：读端、写端，以及进度条上那个动词（上传 / 下载 / 复制）。
+///
+/// 抽出来只为压掉 `clippy::type_complexity`；语义就是 [`AppState::transfer_between`]
+/// 里那张方向表的行。
+type TransferLeg = (Arc<dyn FileSystem>, Arc<dyn FileSystem>, &'static str);
 
 /// 应用可变状态（全部放在 RwLock 内，便于 UI 与后台任务并发访问）。
 pub struct AppStateInner {
@@ -161,6 +218,12 @@ pub struct AppState {
     redo_stack: Arc<PlMutex<Vec<Reversible>>>,
     /// 应用内剪贴板（⌘C / ⌘X / ⌘V 的文件复制与剪切）。
     clipboard: Arc<Mutex<Option<Clipboard>>>,
+    /// 暂存区（收集夹）：**进程级**共享的一份清单，见 [`staging`] 的模块文档。
+    ///
+    /// 之所以与剪贴板同层但不是一个东西：剪贴板是「替换 + 立刻粘贴」，这里是
+    /// 「追加 + 攒够再做」。放在 `AppState` 上（而不是 UI 里）是因为所有动作
+    /// （复制 / 移动 / 删除 / 压缩）都得经 `AppState` 提交，UI 只负责画。
+    staging: Arc<PlMutex<Staging>>,
     /// 「正在打开的目录」（`None` = 空闲）。
     ///
     /// 读一个大目录要 100–300ms（`read_dir` + 建视图 + 缓存预填，全在 blocking 池），
@@ -622,17 +685,6 @@ const ICON_BATCH: usize = 40;
 /// 绰绰有余。
 const ICON_BUDGET_MS: u64 = 3;
 
-/// 图标 PNG 的文件名 = 缓存**键**的哈希。
-///
-/// 按类型共享的图标只写一份文件（同类型的其它文件在缓存里指向它），按路径问的则
-/// 各写各的。不能用路径算哈希了——那会让同类型的每一行都落一份同样的 PNG。
-fn icon_file_hash(key: &icon::IconKey) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
-    h.finish()
-}
-
 /// 本进程的会话注册表。
 ///
 /// 与共享 tokio runtime 同理：会话的生命周期就是进程的生命周期——「只有退出应用才
@@ -675,7 +727,7 @@ impl AppState {
     /// 会话表用**进程级**那一份：同一进程里的所有标签页共享同一批远程连接，
     /// 这正是「关标签页不断开」的实现基础。
     pub fn with_trash(trash_root: PathBuf) -> Self {
-        Self::build(trash_root, session_registry())
+        Self::build(trash_root, session_registry(), staging::staging())
     }
 
     /// ⚠️ 仅供测试 / 需要显式指定会话表时用。
@@ -685,11 +737,26 @@ impl AppState {
     /// `AppState`，就等于两个标签页——这正是「关标签页不断开」的验证方式。
     #[doc(hidden)]
     pub fn with_sessions(trash_root: PathBuf, sessions: Arc<SessionRegistry>) -> Self {
-        Self::build(trash_root, sessions)
+        Self::build(trash_root, sessions, staging::staging())
     }
 
-    /// 以指定回收站与会话表构造（两个公开构造器共用）。
-    fn build(trash_root: PathBuf, sessions: Arc<SessionRegistry>) -> Self {
+    /// ⚠️ 仅供测试：连暂存区一起指定，免得同一测试进程里并行跑的用例共用一个
+    /// 进程级清单互相串味（同 [`AppState::with_sessions`] 的道理）。
+    #[doc(hidden)]
+    pub fn with_staging(
+        trash_root: PathBuf,
+        sessions: Arc<SessionRegistry>,
+        staging: Arc<PlMutex<Staging>>,
+    ) -> Self {
+        Self::build(trash_root, sessions, staging)
+    }
+
+    /// 以指定回收站、会话表与暂存区构造（三个公开构造器共用）。
+    fn build(
+        trash_root: PathBuf,
+        sessions: Arc<SessionRegistry>,
+        staging: Arc<PlMutex<Staging>>,
+    ) -> Self {
         let cache = match MetadataCache::open_default() {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
@@ -732,6 +799,7 @@ impl AppState {
             undo_stack: Arc::new(PlMutex::new(Vec::new())),
             redo_stack: Arc::new(PlMutex::new(Vec::new())),
             clipboard: Arc::new(Mutex::new(None)),
+            staging,
             opening: Arc::new(std::sync::Mutex::new(None)),
             show_hidden: Arc::new(AtomicBool::new(
                 mo_config::Config::load(&Self::config_path())
@@ -814,6 +882,15 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    /// 当前页所在会话的文件系统（在看本地 / 会话已断时为 `None`）。
+    ///
+    /// 与 [`AppState::active_fs`] 的区别：那个是「现在读写走谁」的回落版（一定给得出
+    /// 一个实现），这个是「有没有远程会话」的判据——跨端点传输要按方向挑两端，
+    /// 拿它拼 [`Endpoint`]（见 [`AppState::endpoint`]）。
+    pub fn session_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        self.active_session().and_then(|id| self.sessions.fs_of(id))
     }
 
     /// 操作管理器（提交 / 取消文件操作）。
@@ -1373,19 +1450,21 @@ impl AppState {
 
     /// 取一个文件在**系统**里的图标（macOS 走 `NSWorkspace.iconForFile:`）。
     ///
-    /// 返回的是缓存后的 PNG 文件路径——GPUI 的 `img()` 吃路径。系统图标是光栅图，
-    /// 没法像内置 SVG 那样用文字色描边，所以这里直接出 PNG。
+    /// 返回的是**解码好的内存位图**（BGRA）——UI 侧包成 `RenderImage` 后用
+    /// `ImageSource::Render` 同步上屏，不走 `img(path)` 的异步读盘（那会在位图
+    /// 就位前留一帧空槽，切目录时的图标闪烁正是这么来的）。系统图标是光栅图，
+    /// 没法像内置 SVG 那样用文字色描边，所以出位图。
     ///
     /// ⚠️ 这是**纯查表**，渲染路径每帧都来问：
     ///
-    /// * 命中（同一个文件 / 同扩展名问过）→ 返回 PNG 路径；
+    /// * 命中（同一个文件 / 同扩展名问过）→ 返回位图；
     /// * 没命中 → **只记一笔**「这一行要图标」并返回 `None`，调用方就此退回内置 SVG；
     ///   真去问系统由后台的图标泵做（见 [`AppState::spawn_icon_pump`]），取到后置
     ///   `dirty`，UI 在下一个节拍重绘时图标就位。
     ///
-    /// 为什么不让它在渲染里同步问：一次 `iconForFile:` 连带重绘 + PNG 编码 + 写盘
+    /// 为什么不让它在渲染里同步问：一次 `iconForFile:` 连带重绘 + 拷像素
     /// 要好几毫秒（`.app` 十几毫秒），进一个新目录时一屏几十行全是冷路径 → 一帧卡
-    /// 几十到几百毫秒。这是「渲染路径上不许出现 AppKit + 编码 + 写盘」的正面例子，
+    /// 几十到几百毫秒。这是「渲染路径上不许出现 AppKit + IO」的正面例子，
     /// 别再改回去。
     ///
     /// `is_dir` 决定缓存键：目录 / 包 / 无扩展名的文件按路径（图标各不相同），
@@ -1398,7 +1477,7 @@ impl AppState {
     ///
     /// 当前在看远程时整页都是远程条目，本机没有这些文件，系统给不出图标，返回
     /// `None`——调用方退回内置 SVG 图标。非 macOS 也返回 `None`。
-    pub fn file_icon(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<PathBuf> {
+    pub fn file_icon(&self, path: &Path, is_dir: bool, slot_pt: f32) -> Option<Arc<Bitmap>> {
         if self.browsing_remote() {
             return None;
         }
@@ -1422,14 +1501,14 @@ impl AppState {
 
     /// 启动图标泵：把渲染路径记下的「这一行还没图标」在后台补齐。
     ///
-    /// 与 [`AppState::spawn_refresh_pump`] 同款节拍循环：攒一批 → 问系统 → 落盘落缓存
+    /// 与 [`AppState::spawn_refresh_pump`] 同款节拍循环：攒一批 → 问系统 → 位图落缓存
     /// → 置 `dirty`（由刷新泵合并成一次重绘）。
     ///
     /// ⚠️ **一拍只花 `ICON_BUDGET_MS`**：取图标那一段（`iconForFile:` → 重绘 → 拷像素）
     /// 跑在 `on_main_thread` 里，也就是 `dispatch_sync` 回主队列——活是**主线程**干的。
-    /// PNG 编码（原本占整段 70%）已经在 [`AppState::extract_icons`] 里挪去后台，但剩
-    /// 下这段仍是主线程时间：一拍抓 40 张就等于让它连着忙 40×单价。所以按配额一条条取，
-    /// 剩下的留在队列里等下一拍。
+    /// 换 BGRA（原本 PNG 编码占整段 70%）已经在 [`AppState::extract_icons`] 里挪去
+    /// 后台，但剩下这段仍是主线程时间：一拍抓 40 张就等于让它连着忙 40×单价。所以
+    /// 按配额一条条取，剩下的留在队列里等下一拍。
     ///
     /// 两处刻意的保守处理：
     /// * `stopped`（关标签页 / 切会话）就收工，别为已经不在看的目录白解码；
@@ -1455,40 +1534,31 @@ impl AppState {
         });
     }
 
-    /// 图标泵的干活侧：按 `ICON_BUDGET_MS` 的时间配额问系统、写盘、落缓存。
+    /// 图标泵的干活侧：按 `ICON_BUDGET_MS` 的时间配额问系统、落内存缓存。
     ///
     /// 在 blocking 池里跑，但**取图标那一段在主线程**（`file_icon_raster` 内部
-    /// `dispatch_sync`），配额算的就是它——编码在后台花多久都不影响界面。
+    /// `dispatch_sync`），配额算的就是它——换 BGRA 排布在后台花多久都不影响界面。
     ///
     /// ⚠️ 全程**不持 `icon_cache` 的锁**：渲染路径每帧都要拿那把锁查表，这里要是
     /// 跨着 `iconForFile:`（10ms 级）持锁，等于把停顿原封不动搬回渲染线程。
     fn extract_icons(&self) {
-        let dir = std::env::temp_dir().join("mo-icons");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
         // 先把**通用文件夹占位图**备齐（哪个档位缺就取哪个）：目录行在真图标就位前
         // 全靠它顶住，不露内置描边。走系统资产目录（`NSFolder`），不碰文件路径，
         // 不吃图标服务的抖动；万一这拍没取到，下一拍再试（有尝试上限）。
         //
         // ⚠️ 值必须先绑出来再 `if let`：2021 edition 下 `if let Some(px) =
         // self.icon_cache.lock()…` 的 MutexGuard 临时**活到整个 if-let 结束**，
-        // 体里 1448 行再锁同一把 Mutex = 泵线程持锁自死锁，主线程渲染查表跟着
+        // 体里再锁同一把 Mutex = 泵线程持锁自死锁，主线程渲染查表跟着
         // 全部卡死（启动转彩球就是这么来的）。
         let pending_fallback = self.icon_cache.lock().unwrap().pending_folder_fallback();
         if let Some(px) = pending_fallback {
             let fetched = mo_platform::folder_icon_raster(px)
-                .and_then(|mut raster| icon::encode_icon_png(&mut raster).map(|bytes| (px, bytes)));
+                .and_then(|mut raster| icon::icon_bitmap(&mut raster).map(|bm| (px, bm)));
             let mut cache = self.icon_cache.lock().unwrap();
             match fetched {
-                Some((px, bytes)) => {
-                    let out = dir.join(format!("folder-fallback-{px}.png"));
-                    if std::fs::write(&out, &bytes).is_ok() {
-                        cache.set_folder_fallback(px, out);
-                        self.dirty.store(true, Ordering::Relaxed);
-                    } else {
-                        cache.note_folder_fallback_failure(px);
-                    }
+                Some((px, bm)) => {
+                    cache.set_folder_fallback(px, bm);
+                    self.dirty.store(true, Ordering::Relaxed);
                 }
                 None => cache.note_folder_fallback_failure(px),
             }
@@ -1518,16 +1588,14 @@ impl AppState {
             let started = std::time::Instant::now();
             let raster = mo_platform::file_icon_raster(&path, key.px());
             main_thread_spent += started.elapsed();
-            // 第二段（后台）：预乘还原 + PNG 编码——占整段 70%，挪出主线程就是这一刀。
+            // 第二段（后台）：预乘还原 + 换成 BGRA 内存位图——不再编码 PNG、不再
+            // 写盘，UI 拿 `ImageSource::Render` 同步上屏（`img(path)` 的异步空窗
+            // 就是闪烁的来源）。
             let mut ok = false;
             if let Some(mut raster) = raster {
-                if let Some(bytes) = icon::encode_icon_png(&mut raster) {
-                    // 文件名按**键**算：同类型共享同一份 PNG，不必一个文件写一份。
-                    let out = dir.join(format!("{:x}.png", icon_file_hash(&key)));
-                    ok = std::fs::write(&out, &bytes).is_ok();
-                    if ok {
-                        self.icon_cache.lock().unwrap().insert(&path, &key, out);
-                    }
+                if let Some(bm) = icon::icon_bitmap(&mut raster) {
+                    self.icon_cache.lock().unwrap().insert(&path, &key, bm);
+                    ok = true;
                 }
             }
             if ok {
@@ -2089,6 +2157,10 @@ impl AppState {
     ///
     /// 对外暴露的原因：平台原生动作（在访达中显示 / 移到系统废纸篓）也按这条分流，
     /// 上层（UI 的菜单裁剪）与测试都要问同一个问题，别各写一份判据。
+    ///
+    /// ⚠️ **传输不要用它判两端**：这条判据只答得出一页内的情况——粘贴到当前目录时
+    /// `dest` 自己不是列表里的行，分栏拖拽时目标那一头不在这个 `AppState` 的列表里。
+    /// 传输的端点请用 [`Endpoint`]（见 [`AppState::transfer_between`]）。
     pub async fn goes_through_remote(&self, path: &Path) -> bool {
         self.browsing_remote() && self.entry_is_dir(path).await.is_some()
     }
@@ -2461,6 +2533,29 @@ impl AppState {
         self.inner.write().await.selection.clear();
     }
 
+    /// 按路径选中**当前目录**里的一个条目；返回是否真选中了。
+    ///
+    /// 选择模型只认 FileId，而搜索结果 / 回收站还原这类入口手上是路径——
+    /// 换算这一层放在这里而不是 UI：UI 不该为了拿 id 去翻列表快照，更不该
+    /// 自己造 FileId（那会绕过「FileId 必须 lstat」那条规矩）。
+    ///
+    /// 目录还没读回来，或这个文件不在当前目录里，就什么都不做（返回 `false`）——
+    /// 「跳过去但不选中」远好过选中一个不存在的 id。
+    pub async fn select_path(&self, path: &Path) -> bool {
+        let want = path.to_path_buf();
+        let mut inner = self.inner.write().await;
+        let id = inner
+            .directory
+            .as_ref()
+            .and_then(|d| d.entries.iter().find(|e| e.path == want))
+            .map(|e| e.id);
+        let Some(id) = id else {
+            return false;
+        };
+        inner.selection.select(id);
+        true
+    }
+
     // ---- 文件操作 ----
 
     /// 提交一个文件操作：注册到队列 → 后台执行 → 周期性广播进度。
@@ -2732,6 +2827,34 @@ impl AppState {
     /// 索引中的文件总数。
     pub fn index_count(&self) -> usize {
         self.index.lock().count()
+    }
+
+    /// 按**文件内容**搜索（grep），在 `root` 这棵子树里找 `q`。
+    ///
+    /// 与 [`AppState::global_search`] 是两件事：那个查索引里的文件名（毫秒级、
+    /// 跨整个文件系统），这个要真的去读每个文件的字节，所以它：
+    ///
+    /// * **只认本机路径**——远程端点意味着把每个文件下载一遍，那是另一种成本
+    ///   模型，这里直接挡掉（判据 [`AppState::goes_through_remote`]）；
+    /// * **必须走 blocking 池**——全程同步 IO，压在 async worker 上会把 UI 的
+    ///   补窗任务排到后面（与 `analyze_usage` 同一条纪律）；
+    /// * **可中断**——`stop` 由调用方持有，关掉搜索框 / 切目录时置位。
+    pub async fn content_search(
+        &self,
+        root: PathBuf,
+        q: mo_search::ContentQuery,
+        stop: Arc<AtomicBool>,
+    ) -> Result<mo_search::ContentReport, MoError> {
+        if self.goes_through_remote(&root).await {
+            return Err(MoError::Other(
+                "内容搜索只支持本机目录：远程要逐个下载文件，代价太大".to_string(),
+            ));
+        }
+        self.spawn_blocking(move || mo_search::search_content(&root, &q, &stop))
+            .await
+            .map_err(|e| MoError::Other(format!("内容搜索的后台任务失败：{e}")))?
+            // 搜索词为空 / 正则写坏：`search_content` 给的是能直接给人看的话。
+            .map_err(|e| MoError::Other(e.to_string()))
     }
 
     // ---- 文件预览 ----
@@ -3045,14 +3168,47 @@ impl AppState {
         self.select_range(from, to).await;
     }
 
-    /// 键盘输入即定位（type-ahead）：在可见条目里找**文件名**以 `prefix` 开头的第一条，
-    /// 选中它（单选替换）并返回它的**列表行下标**，供 UI 滚动跟随。找不到返回 `None`。
+    /// 键盘输入即定位（type-ahead）：选中第一个匹配项并返回它的**列表行下标**。
     ///
-    /// 行下标而非条目位：分组开启时列表的 `uniform_list` 以行计数（含分组头），
-    /// `scroll_to_item` 要的是行。无分组时两者相等。
-    /// 比较大小写不敏感（中文文件名直接比字符）；`prefix` 来自逐字符累积的输入串。
-    /// 与 Finder / 资源管理器一致：打字跳到第一个匹配项，不碰其余选择语义。
+    /// 薄壳，等价于 [`AppState::locate_by_prefix(prefix, false)`](AppState::locate_by_prefix)；
+    /// 需要条目位（网格 / 画廊滚动）的调用方直接用后者拿 [`LocateHit`]。
     pub async fn focus_by_prefix(&self, prefix: &str) -> Option<usize> {
+        self.locate_by_prefix(prefix, false).await.map(|h| h.row)
+    }
+
+    /// 定位的第一个匹配项的**可见下标**（只看名字匹配，不动选择）。
+    ///
+    /// 匹配规则（两轮，都是大小写不敏感、从 `start` 起环绕扫描）：
+    /// 1. **前缀**：文件名以输入串开头（常规 type-ahead）；
+    /// 2. 一轮都没命中才退到**子序列**：输入串的字符按序出现在文件名里——`dc`
+    ///    能落到 `Documents`。放宽只在「严格匹配全军覆没」时生效，避免
+    ///    有 `Desktop` 时敲 `dc` 反而跳到 `Documents`。
+    fn match_pos(names: &[Option<String>], needle: &str, start: usize) -> Option<usize> {
+        let n = names.len();
+        if n == 0 || needle.is_empty() {
+            return None;
+        }
+        let walk = || (0..n).map(move |k| (start + k) % n);
+        if let Some(p) =
+            walk().find(|&p| names[p].as_deref().is_some_and(|s| s.starts_with(needle)))
+        {
+            return Some(p);
+        }
+        walk().find(|&p| {
+            names[p]
+                .as_deref()
+                .is_some_and(|s| is_subsequence(needle, s))
+        })
+    }
+
+    /// type-ahead 定位：在可见条目里找匹配项、**单选替换**选中它，并返回
+    /// [`LocateHit`]（条目位 + 列表行，供不同视图滚动跟随）。找不到返回 `None`。
+    ///
+    /// `skip_current = true` 时从**当前焦点之后**开始找（环绕）——这正是 Finder /
+    /// 资源管理器「连按同一个字母跳到下一个匹配项」的行为：UI 侧判定「本次输入让
+    /// 缓冲变成同一个字符的重复」时传 `true`（见 `mo-ui::app` 的输入分支）。
+    /// 比较大小写不敏感（中文文件名直接比字符）。
+    pub async fn locate_by_prefix(&self, prefix: &str, skip_current: bool) -> Option<LocateHit> {
         if prefix.is_empty() {
             return None;
         }
@@ -3060,19 +3216,27 @@ impl AppState {
         let mut inner = self.inner.write().await;
         let dir = inner.directory.as_ref()?;
         let visible = dir.view.visible_indices();
-        let mut hit = None;
-        for (pos, &vi) in visible.iter().enumerate() {
-            if let Some(e) = dir.entries.get(vi) {
-                if e.name.to_lowercase().starts_with(&needle) {
-                    hit = Some((pos, e.id));
-                    break;
-                }
-            }
-        }
-        let (idx, id) = hit?;
-        let row = dir.view.pos_to_row(idx);
+        // 可见位 → 小写文件名（`visible_indices` 与 `entries` 可能对不齐，缺的留 None）。
+        let names: Vec<Option<String>> = visible
+            .iter()
+            .map(|&vi| dir.entries.get(vi).map(|e| e.name.to_lowercase()))
+            .collect();
+        let start = if skip_current {
+            let cur = inner.selection.focused().and_then(|f| {
+                visible
+                    .iter()
+                    .filter_map(|&vi| dir.entries.get(vi))
+                    .position(|e| e.id == f)
+            });
+            cur.map(|p| p + 1).unwrap_or(0)
+        } else {
+            0
+        };
+        let pos = Self::match_pos(&names, &needle, start)?;
+        let id = visible.get(pos).and_then(|&vi| dir.entries.get(vi))?.id;
+        let row = dir.view.pos_to_row(pos);
         inner.selection.select(id);
-        Some(row)
+        Some(LocateHit { pos, row })
     }
 
     /// 当前选择集的快照（UI 以 app 侧为唯一事实来源，用它回灌本地缓存）。
@@ -3089,9 +3253,16 @@ impl AppState {
 
     /// 键盘 ↑↓ 移动焦点：`step` 为相对位移（-1 / +1），`extend` 为 Shift 连选。
     ///
-    /// 返回移动后的可见下标（供 UI 滚动跟随 / Enter 打开时定位）。
-    /// 焦点条目基于可见（已过滤 + 已排序）序列，与列表渲染顺序一致。
+    /// 返回移动后的**列表行下标**（列表视图直接用它滚屏；网格 / 画廊要用条目位，
+    /// 走 [`AppState::locate_cursor`]）。焦点条目基于可见（已过滤 + 已排序）序列，
+    /// 与列表渲染顺序一致。
     pub async fn move_cursor(&self, step: isize, extend: bool) -> Option<usize> {
+        self.locate_cursor(step, extend).await.map(|h| h.row)
+    }
+
+    /// 方向键移动的完整结果（条目位 + 列表行）：`move_cursor` 的薄壳之上，
+    /// 多给一个 `pos` 供网格 / 画廊换算滚动行（见 [`LocateHit`]）。
+    pub async fn locate_cursor(&self, step: isize, extend: bool) -> Option<LocateHit> {
         let ids: Vec<FileId> = {
             let inner = self.inner.read().await;
             let dir = inner.directory.as_ref()?;
@@ -3132,7 +3303,7 @@ impl AppState {
             self.select(ids[next]).await;
         }
         // 返回**列表行下标**（分组开启时 ≠ 条目位）：UI 只拿它做 scroll_to_item，
-        // 而列表的 item_count 在分组时按行计（含分组头）。
+        // 而列表的 item_count 在分组时按行计（含分组头）。条目位一并带出（网格 / 画廊）。
         let row = {
             let inner = self.inner.read().await;
             inner
@@ -3141,7 +3312,7 @@ impl AppState {
                 .map(|d| d.view.pos_to_row(next))
                 .unwrap_or(next)
         };
-        Some(row)
+        Some(LocateHit { pos: next, row })
     }
 
     /// 侧边栏快捷访问位置（存在才列出）。
@@ -3317,14 +3488,83 @@ impl AppState {
     /// 与 [`AppState::copy_selection`] 的区别：这里不读取当前选择，
     /// 而是用调用方给的一批路径——拖拽时拖的可能是「选中集合」，
     /// 也可能只是鼠标下那一行。
+    ///
+    /// 两端都按 `self` 当前所在的后端算：粘贴、同窗格内拖拽时源与目标同属一页，
+    /// 这是对的。分栏跨窗格（尤其「本地窗格 → 远程窗格」）必须走
+    /// [`AppState::transfer_between`]——那一头的后端不在 `self` 身上。
     pub async fn transfer(&self, paths: Vec<PathBuf>, dest: &Path, move_: bool) -> Vec<u64> {
+        let here = self.endpoint();
+        self.transfer_between(paths, here.clone(), dest, here, move_)
+            .await
+    }
+
+    /// `self` 当前所在的一端（本机 / 正在浏览的那条远程会话）。
+    ///
+    /// 会话在浏览期间被别处断开时回落本地：绝不拿一条已经关掉的连接当端点。
+    pub fn endpoint(&self) -> Endpoint {
+        match self.session_fs() {
+            Some(fs) => Endpoint::Remote(fs),
+            None => Endpoint::Local,
+        }
+    }
+
+    /// 跨端点传输：两端由调用方给定（见 [`Endpoint`] 的注释：照路径猜不出来）。
+    ///
+    /// 两端都在本地时仍走本机管线（`CopyOperation` / `MoveOperation`）并记可逆项；
+    /// 只要有一端在远程就走 [`TransferOperation`]（逐文件读整份 / 写整份，不赌协议的
+    /// COPY 命令），并**刻意不**记可逆项——撤销模型里的路径都是本地路径。
+    pub async fn transfer_between(
+        &self,
+        paths: Vec<PathBuf>,
+        src_ep: Endpoint,
+        dest: &Path,
+        dest_ep: Endpoint,
+        move_: bool,
+    ) -> Vec<u64> {
         let mut ids = Vec::new();
+        let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
         for src in paths {
             let name = src
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let to = dest.join(name);
+
+            // 方向决定两端谁读谁写，以及进度条上那个动词怎么说。
+            let remote: Option<TransferLeg> = match (&src_ep, &dest_ep) {
+                (Endpoint::Local, Endpoint::Local) => None,
+                // 远程之间（同一会话内复制）：读整份再写整份。
+                (Endpoint::Remote(f), Endpoint::Remote(g)) => Some((f.clone(), g.clone(), "复制")),
+                // 远程 → 本地：下载。
+                (Endpoint::Remote(f), Endpoint::Local) => Some((f.clone(), local.clone(), "下载")),
+                // 本地 → 远程：上传。
+                (Endpoint::Local, Endpoint::Remote(f)) => Some((local.clone(), f.clone(), "上传")),
+            };
+
+            if let Some((src_fs, dst_fs, label)) = remote {
+                let id = self.ops.lock().await.next_id();
+                let op = TransferOperation::new(
+                    id,
+                    src_fs,
+                    dst_fs,
+                    src.clone(),
+                    to.clone(),
+                    move_,
+                    if move_ { "移动" } else { label },
+                );
+                let hid = self.submit_operation(op).await;
+                self.record_history(
+                    if move_ { "移动" } else { label },
+                    vec![src.clone()],
+                    Some(dest.to_path_buf()),
+                );
+                // ⚠️ 刻意**不** push 可逆项：撤销模型里的路径都是本地路径
+                // （`Reversible::Copy { dest }` 的撤销 = 删掉 dest），对远程端点
+                // 既删不动也删不对，宁可让「撤销」对这一步无效，也不做错事。
+                ids.push(hid);
+                continue;
+            }
+
             let id = self.ops.lock().await.next_id();
             let op: SharedOperation = if move_ {
                 MoveOperation::new(id, src.clone(), to.clone())
@@ -4122,6 +4362,85 @@ impl AppState {
         ids
     }
 
+    // ---------------------------------------------------------------- 暂存区
+
+    /// 把当前选择**追加**进暂存区，返回新增条数。
+    ///
+    /// `from` 记的是收集那一刻所在目录（抽屉里灰字显示来源）。选择为空时不做事
+    /// ——「收集了 0 项」只会让人以为坏了。
+    pub async fn stage_selection(&self) -> usize {
+        let paths = self.selection_paths().await;
+        if paths.is_empty() {
+            return 0;
+        }
+        let from = self.current_path().await.unwrap_or_default();
+        let mut items = Vec::with_capacity(paths.len());
+        for p in paths {
+            let is_dir = self.entry_is_dir(&p).await.unwrap_or(false);
+            items.push((p, is_dir));
+        }
+        self.staging.lock().collect(from, items)
+    }
+
+    /// 收集一批指定路径（`from` 为来源目录）。
+    pub async fn stage_paths(&self, from: PathBuf, paths: Vec<PathBuf>) -> usize {
+        let mut items = Vec::with_capacity(paths.len());
+        for p in paths {
+            let is_dir = self.entry_is_dir(&p).await.unwrap_or(false);
+            items.push((p, is_dir));
+        }
+        self.staging.lock().collect(from, items)
+    }
+
+    /// 暂存区快照（UI 抽屉的数据源）。
+    pub fn staged(&self) -> Vec<StagedEntry> {
+        self.staging.lock().entries().to_vec()
+    }
+
+    pub fn staged_count(&self) -> usize {
+        self.staging.lock().len()
+    }
+
+    /// 移除一条（抽屉行尾的 ×）。
+    pub fn unstage(&self, path: &Path) -> bool {
+        self.staging.lock().remove(path)
+    }
+
+    /// 清空暂存区。
+    pub fn clear_staged(&self) {
+        self.staging.lock().clear();
+    }
+
+    /// 把暂存区整批投递到 `dest`（`None` = 当前目录）。
+    ///
+    /// 走 [`AppState::transfer`] 而不是自己拼操作：那一头已经处理了「两端谁在
+    /// 远程」（上传 / 下载 / 远程内复制）与目标名去重，这里再抄一份就是两份判据。
+    ///
+    /// `move_` 为真的会在提交后清空清单——源已经不在原处了，留着一批指不到
+    /// 文件的条目只会让下一次「粘贴」变成一堆失败。复制则**保留**：往好几个
+    /// 目录各放一份正是它的用法。
+    pub async fn paste_staged(&self, dest: Option<PathBuf>, move_: bool) -> Vec<u64> {
+        let paths: Vec<PathBuf> = self
+            .staging
+            .lock()
+            .entries()
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let dest = match dest.or(self.current_path().await) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let ids = self.transfer(paths, &dest, move_).await;
+        if move_ {
+            self.clear_staged();
+        }
+        ids
+    }
+
     /// 磁盘用量分析：统计 `root` 的**每个直接子目录**的递归大小。
     ///
     /// 递归全在 blocking 池里完成——几万个文件的深度遍历若在 async worker
@@ -4151,6 +4470,84 @@ impl AppState {
         })
         .await
         .map_err(|e| MoError::Other(format!("磁盘分析的后台任务失败：{e}")))?
+    }
+
+    /// 磁盘地图的数据源：递归建一棵「目录树 + 递归大小」。
+    ///
+    /// 与 [`AppState::analyze_usage`] 扫的是同一批路径，但保留**层级**——条形图
+    /// 只关心「每个直接子项多大」，treemap 还得知道大目录里面是谁在占。
+    ///
+    /// 与那一头同样只认**本机**路径（递归走 `std::fs`）：远程端点的「大小」得按
+    /// 后端的列目录结果逐个问，代价是整棵树一遍网络往返，留到远程分析那一轮。
+    pub async fn usage_tree(&self, root: PathBuf, max_depth: usize) -> Result<UsageTree, MoError> {
+        let entries = self.list_dir(&root).await.unwrap_or_default();
+        let children: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
+        self.spawn_blocking(move || {
+            // 节点预算：碰到 `/Library` 这种上万条目的目录，建满整棵树要几秒，
+            // 而铺出来的块早就在屏幕上看不见了。超预算的目录不再往下展开，
+            // 它自己成一块（点进去再算）。
+            let mut budget = USAGE_TREE_BUDGET;
+            let mut kids: Vec<UsageTree> = Vec::with_capacity(children.len());
+            for p in &children {
+                kids.push(build_usage_node(p, 0, max_depth, &mut budget));
+            }
+            kids.sort_by_key(|k| std::cmp::Reverse(k.size));
+            Ok(UsageTree {
+                name: dir_name(&root),
+                path: root,
+                size: kids.iter().map(|k| k.size).sum(),
+                is_dir: true,
+                children: kids,
+            })
+        })
+        .await
+        .map_err(|e| MoError::Other(format!("磁盘地图的后台任务失败：{e}")))?
+    }
+}
+
+/// 一棵磁盘地图树最多建多少个节点（含目录与文件）。
+const USAGE_TREE_BUDGET: usize = 4000;
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// 递归建一个节点（`depth` 为它在结果树里的层，`max_depth` 到底就不再展开）。
+///
+/// 符号链接**不跟随**（`symlink_metadata`）：跟着走可能绕回祖先，递归就没完了。
+fn build_usage_node(path: &Path, depth: usize, max_depth: usize, budget: &mut usize) -> UsageTree {
+    let meta = std::fs::symlink_metadata(path).ok();
+    let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+    let mut size = if is_dir {
+        0
+    } else {
+        meta.map(|m| m.len()).unwrap_or(0)
+    };
+    let mut children = Vec::new();
+    if is_dir && depth < max_depth && *budget > 0 {
+        if let Ok(rd) = std::fs::read_dir(path) {
+            let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            // 稳定顺序：同一目录两次分析出来的树应当一致（不排序会随 readdir 顺序抖）。
+            entries.sort();
+            for p in entries {
+                if *budget == 0 {
+                    break;
+                }
+                *budget -= 1;
+                let c = build_usage_node(&p, depth + 1, max_depth, budget);
+                size += c.size;
+                children.push(c);
+            }
+        }
+    }
+    UsageTree {
+        path: path.to_path_buf(),
+        name: dir_name(path),
+        size,
+        is_dir,
+        children,
     }
 }
 

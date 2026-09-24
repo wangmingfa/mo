@@ -60,6 +60,9 @@ notify = "7"
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# 正则（内容搜索的「正则模式」）。已在依赖树里（传递依赖），提为直接依赖不新增下载。
+regex = "1"
+
 # 哈希（校验和）
 md-5 = "0.10"
 sha1 = "0.10"

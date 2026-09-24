@@ -7,7 +7,6 @@
 use gpui_kit::base::Scrollbar;
 use gpui_kit::*;
 use mo_core::{Entry, MetadataState, ThumbnailState};
-use std::path::{Path, PathBuf};
 
 use crate::listing::{self, Zoom, BUFFER};
 use crate::panel::ViewMode;
@@ -106,6 +105,11 @@ pub fn render(
                     mode,
                     zoom,
                     panel.selection.is_selected(&entry.id),
+                    panel
+                        .diff
+                        .as_ref()
+                        .and_then(|m| m.get(&entry.path))
+                        .copied(),
                     &entity_c,
                     pane,
                     tab,
@@ -153,11 +157,13 @@ fn cell(
     mode: ViewMode,
     zoom: Zoom,
     selected: bool,
+    // 分栏对比时这一格的状态（`None` = 没在对比 / 两侧相同）。
+    tint: Option<mo_diff::TreeStatus>,
     entity: &Entity<RootView>,
     pane: usize,
     tab: usize,
     global_idx: usize,
-    system_icon: Option<PathBuf>,
+    system_icon: Option<std::sync::Arc<mo_core::Bitmap>>,
 ) -> Stateful<Div> {
     let visual = visual(entry, mode, zoom, selected, system_icon);
     // 文字随缩放走但阻尼（见 `listing::zoom_text`）：方框可以 2×，名字不能。
@@ -184,6 +190,8 @@ fn cell(
         .rounded(px(6.0))
         .bg(if selected {
             crate::theme::selected_bg()
+        } else if let Some(c) = crate::app::compare_tint(tint) {
+            c
         } else {
             crate::theme::surface()
         })
@@ -320,18 +328,19 @@ fn kind_icon(entry: &Entry) -> &'static [u8] {
 /// `mo-grid-visual` 容器是固定 `visual_box` 见方的，变的只是它里面装什么。
 ///
 /// 位图（缩略图 / 系统图标）铺满方框、描边 SVG 缩一圈（[`ICON_IN_BOX`]）——与列表
-/// 行的 `file_item`（位图 16 / 描边 12）是同一条约定。
+/// 行的 `file_item`（位图 16 / 描边 12）是同一条约定。位图源是同步的
+/// （`ImageSource::Render`，见 `crate::bitmap`）——「晚一两帧浮现」还在（泵节拍），
+/// 但浮现的那一刻不会再有一帧空槽。
 fn visual(
     entry: &Entry,
     mode: ViewMode,
     zoom: Zoom,
     selected: bool,
-    system_icon: Option<PathBuf>,
+    system_icon: Option<std::sync::Arc<mo_core::Bitmap>>,
 ) -> AnyElement {
     let box_px = zoom.visual_box(mode);
-    // 位图铺满方框，圆角与缩略图一致（系统图标也是位图，不能一个圆角一个直角）。
-    let raster = |p: &Path| {
-        img(p)
+    let raster = |src: gpui_kit::ImageSource| {
+        img(src)
             .w(px(box_px))
             .h(px(box_px))
             .rounded(px(4.0))
@@ -339,25 +348,30 @@ fn visual(
             .debug_selector(|| "mo-grid-raster".to_string())
             .into_any_element()
     };
-    let inner: AnyElement = match &entry.thumbnail {
-        ThumbnailState::Loaded(p) => raster(p.as_path()),
-        ThumbnailState::Loading => text!("⏳".to_string()).into_any_element(),
-        // 没有缩略图时优先用**系统**图标（与列表行同一条链路，见
-        // `file_item::entry_system_icon`），再没有才退回内置 SVG。
-        _ => match system_icon {
-            Some(p) => raster(p.as_path()),
-            None => crate::icons::icon(
-                kind_icon(entry),
-                box_px * ICON_IN_BOX,
-                if selected {
-                    crate::theme::selected_text()
-                } else {
-                    crate::theme::text()
-                },
-            )
-            .debug_selector(|| "mo-grid-glyph".to_string())
-            .into_any_element(),
-        },
+    // 这格要画的位图：缩略图优先，其次系统图标（与列表行同一条链路，见
+    // `file_item::entry_system_icon`），都没有才退回内置 SVG。
+    let raster_source = match &entry.thumbnail {
+        ThumbnailState::Loaded(b) => crate::bitmap::image_source(b),
+        ThumbnailState::Loading => None,
+        _ => system_icon.as_ref().and_then(crate::bitmap::image_source),
+    };
+    let inner: AnyElement = match raster_source {
+        Some(src) => raster(src),
+        // `Loading` 态画「⏳」占位（生产从不置位，行为保留）；其余空态画描边图。
+        None if matches!(entry.thumbnail, ThumbnailState::Loading) => {
+            text!("⏳".to_string()).into_any_element()
+        }
+        None => crate::icons::icon(
+            kind_icon(entry),
+            box_px * ICON_IN_BOX,
+            if selected {
+                crate::theme::selected_text()
+            } else {
+                crate::theme::text()
+            },
+        )
+        .debug_selector(|| "mo-grid-glyph".to_string())
+        .into_any_element(),
     };
     div()
         .flex()
@@ -384,24 +398,14 @@ mod tests {
         div, px, size, Context, IntoElement, ParentElement, Render, Styled, TestAppContext,
         VisualTestContext, Window,
     };
-    use mo_core::{Entry, EntryKind, FileId, MetadataState, ThumbnailState};
+    use mo_core::{Bitmap, Entry, EntryKind, FileId, MetadataState, ThumbnailState};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
-    /// 1×1 透明 PNG。`img()` 要真能解出一张图——拿一个不存在的路径当源，加载失败时
-    /// 元素的绘制范围就不一定还是我们给的尺寸，那样这条断言就白测了。
-    const PNG_1X1: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60,
-        0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01, 0xe9, 0xfa, 0xdc, 0xd8, 0x00, 0x00, 0x00, 0x00,
-        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-
-    /// 往临时目录里落一张真 PNG，返回它的路径（每次调用一个新名字，免得并行串）。
-    fn temp_png(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("mo-grid-test-{tag}-{}.png", std::process::id()));
-        std::fs::write(&p, PNG_1X1).expect("写测试用 PNG");
-        p
+    /// 一张 2×2 的测试位图。位图源是同步的 `ImageSource::Render`，不再需要
+    /// 「真 PNG 文件」——`img(path)` 时代要落盘一张可解码的图，位图时代直接给像素。
+    fn test_bitmap() -> Arc<Bitmap> {
+        Arc::new(Bitmap::from_rgba(2, 2, vec![0xAA; 16]).expect("2×2 合法"))
     }
 
     fn entry(thumbnail: ThumbnailState) -> Entry {
@@ -417,7 +421,7 @@ mod tests {
     }
 
     /// 摆一格出来（只画上半部分那块方框）。
-    struct Probe(Entry, ViewMode, Zoom, Option<PathBuf>);
+    struct Probe(Entry, ViewMode, Zoom, Option<Arc<Bitmap>>);
 
     impl Render for Probe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -448,7 +452,7 @@ mod tests {
         entry: Entry,
         mode: ViewMode,
         zoom: Zoom,
-        system_icon: Option<PathBuf>,
+        system_icon: Option<Arc<Bitmap>>,
     ) -> (Bounds, Option<Bounds>, Option<Bounds>) {
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
@@ -469,7 +473,7 @@ mod tests {
     fn probe_bounds(
         entry: Entry,
         mode: ViewMode,
-        system_icon: Option<PathBuf>,
+        system_icon: Option<Arc<Bitmap>>,
     ) -> (Bounds, Option<Bounds>, Option<Bounds>) {
         probe_bounds_at(entry, mode, Zoom(1.0), system_icon)
     }
@@ -496,21 +500,19 @@ mod tests {
     /// 是骗不过 `mo-grid-raster` / `mo-grid-glyph` 这两个判据的。
     #[test]
     fn the_visual_box_holds_a_full_bleed_bitmap_or_a_smaller_glyph() {
-        let thumb_png = temp_png("thumb");
-        let icon_png = temp_png("icon");
         for mode in [ViewMode::Grid, ViewMode::Gallery] {
             let expect = crate::listing::visual_box(mode);
-            let cases: [(&str, Entry, Option<PathBuf>, Inner); 4] = [
+            let cases: [(&str, Entry, Option<Arc<Bitmap>>, Inner); 4] = [
                 (
                     "缩略图",
-                    entry(ThumbnailState::Loaded(thumb_png.clone())),
+                    entry(ThumbnailState::Loaded(test_bitmap())),
                     None,
                     Inner::Bitmap,
                 ),
                 (
                     "系统图标",
                     entry(ThumbnailState::Idle),
-                    Some(icon_png.clone()),
+                    Some(test_bitmap()),
                     Inner::Bitmap,
                 ),
                 ("内置 SVG", entry(ThumbnailState::Idle), None, Inner::Glyph),
@@ -575,12 +577,11 @@ mod tests {
     /// 所以这里量的是**画出来的** bounds，不是算出来的数。
     #[test]
     fn zooming_scales_the_painted_box_and_bitmap() {
-        let png = temp_png("zoom");
         for mode in [ViewMode::Grid, ViewMode::Gallery] {
             let base = crate::listing::visual_box(mode);
             for k in [0.75, 1.5, 2.0] {
                 let (frame, raster, glyph) = probe_bounds_at(
-                    entry(ThumbnailState::Loaded(png.clone())),
+                    entry(ThumbnailState::Loaded(test_bitmap())),
                     mode,
                     Zoom(k),
                     None,

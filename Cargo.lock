@@ -4921,6 +4921,7 @@ dependencies = [
 name = "mo-operations"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "flate2",
  "md-5",
  "mo-core",
@@ -4983,6 +4984,7 @@ dependencies = [
  "anyhow",
  "mo-core",
  "mo-fs",
+ "regex",
  "rusqlite",
  "thiserror 2.0.20",
  "tracing",

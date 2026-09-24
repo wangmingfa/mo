@@ -282,8 +282,186 @@ pub fn archive(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
     )
 }
 
-/// 磁盘空间分析：按大小排序的横向条形图（占满中央区的次级视图）。
+/// 磁盘空间分析：同一份统计的两种看法——按大小排序的横向条形图 / 矩形树图
+/// （占满中央区的次级视图）。
+///
+/// 条形图回答「哪个子项最大」（排名），地图回答「这块盘是怎么被吃掉的」（比例
+/// 与层级）。两种都留着而不是换掉前者：十个以内条目条形图更好读，几十个往上
+/// 就只有地图看得清结构。
 pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
+    let usage = &view.usage;
+    let total: u64 = usage.iter().map(|u| u.size).sum::<u64>().max(1);
+
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .gap(px(6.0))
+        .p(px(8.0))
+        .child(usage_mode_switch(view, entity));
+
+    body = if view.usage_map {
+        body.child(usage_treemap(view, entity))
+    } else {
+        body.child(usage_bars(view, entity))
+    };
+
+    central_view(
+        "磁盘空间分析",
+        &format!("合计 {}", human_size(total)),
+        body,
+        if view.usage_map {
+            "点击下钻 · 双击打开 · M 切条形图 · Esc 关闭"
+        } else {
+            "↑↓ 选择 · 双击进入 · M 切地图 · Esc 关闭"
+        },
+    )
+}
+
+/// 两种视图的切换（同一行，选中那枚上底色）。
+fn usage_mode_switch(view: &RootView, entity: &Entity<RootView>) -> Div {
+    let mk = |id: &'static str, label: &'static str, active: bool| -> Stateful<Div> {
+        let e = entity.clone();
+        let mut b = div()
+            .id(id)
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            .text_size(px(11.0))
+            .border_1()
+            .border_color(theme::separator())
+            .child(text!(label))
+            .debug_selector(move || format!("mo-{id}"));
+        b = if active {
+            b.bg(theme::accent()).text_color(theme::text())
+        } else {
+            b.text_color(theme::muted())
+                .hover(|s| s.bg(theme::hover_bg()))
+        };
+        b.interactivity().on_click(move |_, _window, cx| {
+            e.update(cx, |v, cx| {
+                if v.usage_map != (id == "usage-mode-map") {
+                    v.toggle_usage_map(cx);
+                }
+            });
+        });
+        b
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(6.0))
+        .flex_shrink_0()
+        .child(mk("usage-mode-bars", "条形图", !view.usage_map))
+        .child(mk("usage-mode-map", "磁盘地图", view.usage_map))
+}
+
+/// 矩形树图：面积 = 大小，点击下钻，双击在浏览器里打开。
+fn usage_treemap(view: &RootView, entity: &Entity<RootView>) -> Stateful<Div> {
+    let Some(tree) = view.usage_tree.as_ref() else {
+        // 与正常分支同型（Stateful<Div>）：`impl IntoElement` 的两个分支必须同型。
+        return div()
+            .id("usage-treemap")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(theme::muted())
+            .child(text!("（正在统计…）".to_string()))
+            .debug_selector(|| "mo-usage-treemap".to_string());
+    };
+
+    let tiles = mo_app::treemap::layout(tree, crate::app::USAGE_MAP_DEPTH);
+    let mut canvas = div()
+        .id("usage-treemap")
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .overflow_hidden()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(theme::separator())
+        .debug_selector(|| "mo-usage-treemap".to_string());
+
+    for (i, t) in tiles.iter().enumerate() {
+        let r = t.rect;
+        let show_label = r.area() >= crate::app::USAGE_MAP_LABEL_AREA;
+        let mut tile = div()
+            .id(("usage-tile", i))
+            .absolute()
+            // 归一化坐标：容器多大只有这一帧才知道，用 `relative()` 交给框架换算。
+            .left(relative(r.x))
+            .top(relative(r.y))
+            .w(relative(r.w))
+            .h(relative(r.h))
+            .bg(tile_color(t))
+            .border_1()
+            .border_color(theme::surface())
+            .overflow_hidden()
+            .px(px(4.0))
+            .pt(px(2.0))
+            .text_size(px(10.0))
+            .text_color(gpui_kit::white())
+            .debug_selector(move || format!("mo-usage-tile-{i}"));
+        if show_label {
+            tile = tile.child(text!(t.name.clone()));
+            if r.area() >= crate::app::USAGE_MAP_LABEL_AREA * 4.0 {
+                tile = tile.child(text!(human_size(t.size)));
+            }
+        }
+        let click_entity = entity.clone();
+        let path = t.path.clone();
+        let is_dir = t.is_dir;
+        tile.interactivity().on_click(move |ev, _window, cx| {
+            let path = path.clone();
+            if is_dir && ev.click_count() >= 2 {
+                // 双击 = 去那儿浏览（与条形图一致）。
+                click_entity.update(cx, |v, cx| v.open_entry(path, true, cx));
+                return;
+            }
+            if is_dir {
+                // 单击 = 下钻：把它当成新的分析根重新统计。
+                click_entity.update(cx, |v, cx| v.analyze_disk_usage(cx, Some(path)));
+            }
+        });
+        canvas = canvas.child(tile);
+    }
+    canvas
+}
+
+/// 一块的配色：目录一个色，文件按类型分（跟 `icons::icon_for_kind_and_name`
+/// 的分类保持一致的直觉：图 / 影音 / 文档 / 压缩包 / 代码 / 其它）。
+fn tile_color(t: &mo_app::Tile) -> gpui_kit::Rgba {
+    if t.is_dir {
+        return rgba(0x6b7f95ff);
+    }
+    let ext = t
+        .path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "tiff" | "bmp" | "svg" => {
+            rgba(0x4f9d69ff)
+        }
+        "mp4" | "mov" | "mkv" | "avi" | "webm" => rgba(0x8f6bd0ff),
+        "mp3" | "flac" | "wav" | "m4a" | "aac" => rgba(0xd08a4fff),
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => rgba(0x8a8f98ff),
+        "rs" | "ts" | "js" | "py" | "go" | "c" | "h" | "cpp" | "java" | "json" | "toml" | "md" => {
+            rgba(0x3fa6a6ff)
+        }
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "pages" | "numbers" => {
+            rgba(0x4f8fd0ff)
+        }
+        _ => rgba(0x9a9a9aff),
+    }
+}
+
+/// 条形图（原来的视图）：按大小排序的横向条。
+fn usage_bars(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
     let usage = &view.usage;
     let total: u64 = usage.iter().map(|u| u.size).sum::<u64>().max(1);
     // 吃满中央区剩余高度（原先写死 380px 是为了配合 640px 卡片）。
@@ -293,7 +471,6 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
         .flex_1()
         .min_h_0()
         .gap(px(4.0))
-        .p(px(8.0))
         .overflow_y_scrollbar();
     if usage.is_empty() {
         body = body.child(text!("（正在统计…）".to_string()));
@@ -358,12 +535,7 @@ pub fn disk_usage(view: &RootView, entity: &Entity<RootView>) -> Div {
         });
         body = body.child(row);
     }
-    central_view(
-        "磁盘空间分析",
-        &format!("合计 {}", human_size(total)),
-        body,
-        "↑↓ 选择 · 双击进入 · Esc 关闭",
-    )
+    body
 }
 
 /// 标签：给选中项选一个颜色（浮层对话框）。

@@ -21,5 +21,9 @@ tar.workspace = true
 flate2.workspace = true
 walkdir.workspace = true
 
+[dev-dependencies]
+# 集成测试里的内存 FileSystem 假实现（FileSystem trait 是 async_trait 的）。
+async-trait.workspace = true
+
 [lints]
 workspace = true

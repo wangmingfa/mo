@@ -373,6 +373,41 @@ impl FileSystem for WebDavFileSystem {
         .await
     }
 
+    async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
+        let remote = Self::remote(path);
+        let client = self.client.clone();
+        self.dispatch("下载", async move {
+            let resp = client
+                .get(&remote)
+                .await
+                .map_err(|e| classify("下载", &e))?;
+            resp.bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| RemoteError::transport("下载", e))
+        })
+        .await
+    }
+
+    async fn is_dir(&self, path: &Path) -> bool {
+        // PROPFIND Depth-0：`resource_type.collection` 有值即目录（与列目录同一条判据）。
+        let remote = Self::remote(path);
+        let client = self.client.clone();
+        self.dispatch("读取元数据", async move {
+            client
+                .list_rsp(&remote, Depth::Number(0))
+                .await
+                .map(|rs| {
+                    rs.iter()
+                        .find_map(ok_prop)
+                        .is_some_and(|p| p.resource_type.collection.is_some())
+                })
+                .map_err(|e| classify("读取元数据", &e))
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         // WebDAV 的 PUT 会覆盖：先探一次存在性，绝不静默覆盖远端数据（与 FTP/SFTP 同法）。

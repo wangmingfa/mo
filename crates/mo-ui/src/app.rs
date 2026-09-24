@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -37,6 +39,14 @@ pub(crate) const CONNECT_ADDRESS_PLACEHOLDER: &str =
 /// 同步计划最多列出这么多项（再多也只报总数，避免一次画几千行）。
 const PLAN_LIMIT: usize = 400;
 
+/// 磁盘地图铺到第几层：再深的块已经小到看不出是谁，点进去再展开更划算
+/// （`AppState::usage_tree` 的 `max_depth` 用的就是它）。
+pub(crate) const USAGE_MAP_DEPTH: usize = 3;
+
+/// 磁盘地图上值得写名字的最小面积（占画布的比例）：比这还小就只留颜色，
+/// 写上去也是被裁掉半截的乱码。
+pub(crate) const USAGE_MAP_LABEL_AREA: f32 = 0.006;
+
 /// 传输速度采样的上一次观测（按操作 ID 记账）。
 ///
 /// 进度面板每 ≈150ms 拿一次快照，两次快照的 `done` 差分即是瞬时速度；
@@ -49,6 +59,59 @@ struct OpSample {
     at: Instant,
     /// 指数平滑后的字节速度（B/s）。
     ema: f32,
+}
+
+/// 内容搜索的四个开关。
+///
+/// 单独一个结构而不是四个 bool：渲染四个胶囊、构造 `ContentQuery`、以及
+/// 「改过就置 dirty」都要拿同一组值，散成四个字段容易漏改一处。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ContentOptions {
+    /// 区分大小写。
+    case_sensitive: bool,
+    /// 正则模式。
+    regex: bool,
+    /// 全词匹配。
+    whole_word: bool,
+    /// 命中行上下各带一行上下文。
+    context: bool,
+}
+
+impl ContentOptions {
+    /// 四个开关在界面上的顺序（渲染与键盘循环都按它）。
+    const ORDER: [fn(&mut Self); 4] = [
+        |o| o.case_sensitive = !o.case_sensitive,
+        |o| o.regex = !o.regex,
+        |o| o.whole_word = !o.whole_word,
+        |o| o.context = !o.context,
+    ];
+
+    fn get(self, i: usize) -> bool {
+        match i {
+            0 => self.case_sensitive,
+            1 => self.regex,
+            2 => self.whole_word,
+            _ => self.context,
+        }
+    }
+
+    fn label(i: usize) -> &'static str {
+        match i {
+            0 => "Aa",
+            1 => ".*",
+            2 => "整词",
+            _ => "上下文",
+        }
+    }
+
+    fn hint(i: usize) -> &'static str {
+        match i {
+            0 => "区分大小写",
+            1 => "正则",
+            2 => "全词匹配",
+            _ => "带上下文行",
+        }
+    }
 }
 
 /// 当前打开的模态层（占用中央区；Esc 关闭）。
@@ -81,6 +144,8 @@ pub(crate) enum Modal {
     Workflow,
     /// 文件夹同步（配对 / 计划 / 执行）。
     Sync,
+    /// 内容搜索（grep）：在一个目录里按文件内容找。
+    ContentSearch,
     /// 统一设置窗口：界面 / 外观 / 快捷键三个标签页（见 [`SettingsTab`]）。
     ///
     /// 原先是主题、布局、快捷键三个各开各的弹窗，入口散在命令面板与用户命令里；
@@ -190,6 +255,8 @@ pub(crate) enum CommandId {
     IndexCurrent,
     StopIndexing,
     OpenGlobalSearch,
+    /// 按**文件内容**搜索（grep）当前目录。
+    ContentSearch,
     QuickLook,
     HashSelection,
     CompareSelection,
@@ -255,6 +322,18 @@ pub(crate) enum CommandId {
     ZoomReset,
     /// 列表分组循环切换（无 → 类型 → 日期），并落为新标签页默认值。
     GroupingCycle,
+    /// 把选中项收进**暂存区**（跨目录累积，见 `mo-app::staging` 的模块文档）。
+    StageSelection,
+    /// 开合暂存区抽屉。
+    ToggleStaging,
+    /// 清空暂存区。
+    ClearStaging,
+    /// 把暂存区整批**复制**到当前目录。
+    StagedCopyHere,
+    /// 把暂存区整批**移动**到当前目录（提交后清空清单）。
+    StagedMoveHere,
+    /// 分栏模式下对比两侧目录，按差异给条目着色。
+    ToggleCompare,
 }
 
 struct CmdDef {
@@ -271,6 +350,11 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         CmdDef {
             id: CommandId::OpenGlobalSearch,
             title: "全局搜索…".to_string(),
+            category: "搜索".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ContentSearch,
+            title: "按内容搜索（grep）…".to_string(),
             category: "搜索".to_string(),
         },
         CmdDef {
@@ -372,6 +456,36 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             id: CommandId::GroupingCycle,
             title: "列表分组：无 → 按类型 → 按日期".to_string(),
             category: "外观".to_string(),
+        },
+        CmdDef {
+            id: CommandId::StageSelection,
+            title: "收集选中到暂存区".to_string(),
+            category: "暂存区".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ToggleStaging,
+            title: "暂存区面板（开 / 关）".to_string(),
+            category: "暂存区".to_string(),
+        },
+        CmdDef {
+            id: CommandId::StagedCopyHere,
+            title: "把暂存区复制到当前目录".to_string(),
+            category: "暂存区".to_string(),
+        },
+        CmdDef {
+            id: CommandId::StagedMoveHere,
+            title: "把暂存区移动到当前目录".to_string(),
+            category: "暂存区".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ClearStaging,
+            title: "清空暂存区".to_string(),
+            category: "暂存区".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ToggleCompare,
+            title: "对比两侧目录（分栏差异着色）".to_string(),
+            category: "视图".to_string(),
         },
         CmdDef {
             id: CommandId::HashSelection,
@@ -646,7 +760,9 @@ pub struct RootView {
     /// 键盘焦点：没有它收不到按键事件。
     focus: FocusHandle,
     /// 当前模态层（全局：一次只显示一个）。
-    modal: Modal,
+    ///
+    /// `pub(crate)` 仅为测试注入（见 `crate::inject_usage_tree_for_tests`）。
+    pub(crate) modal: Modal,
     /// 命令面板过滤词。
     cmd_query: String,
     /// 命令面板 / 搜索结果的高亮下标。
@@ -729,8 +845,37 @@ pub struct RootView {
     pub(crate) rename_paths: Vec<PathBuf>,
     /// 压缩对话框里的目标文件名。
     pub(crate) archive_name: String,
-    /// 磁盘空间分析结果。
+    /// 磁盘空间分析结果（条形图的数据源）。
     pub(crate) usage: Vec<mo_app::DirUsage>,
+    /// 磁盘地图的数据源（懒加载：切到地图视图才建树）。
+    pub(crate) usage_tree: Option<mo_app::UsageTree>,
+    /// 这一轮分析的是哪个目录（地图下钻后会变）。
+    pub(crate) usage_root: Option<std::path::PathBuf>,
+    /// 磁盘分析当前停在哪一种视图：`false` = 条形图，`true` = 磁盘地图。
+    pub(crate) usage_map: bool,
+    /// 分栏对比是否开着（两侧按差异给行上色 + 底部图例条）。
+    pub(crate) compare: bool,
+    /// 这一轮对比的是哪两个目录（任一变了就重比一次）。
+    pub(crate) compare_roots: Option<(PathBuf, PathBuf)>,
+    /// 对比统计 `(仅左侧, 仅右侧, 内容不同)`，图例条上显示。
+    pub(crate) compare_stats: Option<(usize, usize, usize)>,
+    // ---- 内容搜索（grep）----
+    /// 内容搜索词。
+    pub(crate) content_query: String,
+    /// 四个开关（区分大小写 / 正则 / 整词 / 带上下文），渲染成四枚可点的胶囊。
+    pub(crate) content_opts: ContentOptions,
+    /// 这一轮搜的是哪个目录（打开面板时定下来，之后不再跟着导航变）。
+    pub(crate) content_root: Option<PathBuf>,
+    /// 最近一次搜索的结果（`None` = 还没搜过）。
+    pub(crate) content_report: Option<mo_search::ContentReport>,
+    /// 结果行选中下标（在**扁平化的命中行**上走，不跨文件头）。
+    pub(crate) content_index: usize,
+    /// 后台搜索是否在跑（跑着就显示「搜索中…」，并置灰「搜索」按钮）。
+    pub(crate) content_busy: bool,
+    /// 改过查询词 / 开关但还没重搜：Enter 这时才是「搜索」，否则是「跳到命中」。
+    pub(crate) content_dirty: bool,
+    /// 中断旗标：关面板 / 转义 / 改查询时置位，让后台那一轮早点收工。
+    pub(crate) content_stop: Arc<AtomicBool>,
     /// 进行中的拖拽（鼠标按下时记录、抬起时结算）。
     pub(crate) drag: Option<DragState>,
     /// 列表视图的鼠标框选（rubber-band）进行态；`None` = 没在框选。
@@ -752,6 +897,8 @@ pub struct RootView {
     pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
     /// 左下角传输浮层是否展开（小块点击切换；点外面 / Esc 收起）。
     pub(crate) ops_open: bool,
+    /// 底部暂存区抽屉是否展开（收集时自动展开，让用户看见收进去了什么）。
+    pub(crate) staging_open: bool,
     /// 「打开方式」二级菜单的候选应用（菜单打开时对文件目标异步查询注册表）。
     pub(crate) open_with_apps: Vec<mo_app::shell::OpenWithApp>,
     /// 「选择其他应用…」的选择器（复用命令面板的那层壳，见 [`AppPicker`]）。
@@ -929,6 +1076,20 @@ impl RootView {
             rename_paths: Vec::new(),
             archive_name: String::new(),
             usage: Vec::new(),
+            usage_tree: None,
+            usage_root: None,
+            usage_map: false,
+            compare: false,
+            compare_roots: None,
+            compare_stats: None,
+            content_query: String::new(),
+            content_opts: ContentOptions::default(),
+            content_root: None,
+            content_report: None,
+            content_index: 0,
+            content_busy: false,
+            content_dirty: true,
+            content_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drag: None,
             box_selection: None,
             list_origin: std::collections::HashMap::new(),
@@ -938,6 +1099,7 @@ impl RootView {
             header_cells_owner: (0, 0),
             context_menu: None,
             ops_open: false,
+            staging_open: false,
             open_with_apps: Vec::new(),
             app_picker: None,
             ctx_submenu_open: false,
@@ -1070,6 +1232,380 @@ impl RootView {
     /// 左下角传输浮层开合（小块点击切换）。
     pub(crate) fn toggle_ops_popover(&mut self, cx: &mut Context<Self>) {
         self.ops_open = !self.ops_open;
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------- 暂存区
+
+    /// 展开 / 收起暂存区抽屉。
+    pub(crate) fn toggle_staging(&mut self, cx: &mut Context<Self>) {
+        self.staging_open = !self.staging_open;
+        cx.notify();
+    }
+
+    /// 把当前选择收进暂存区。
+    ///
+    /// 收完**自动展开**抽屉：看不见结果的操作容易让人以为没生效（收集不像复制
+    /// 有进度条，也不像删除会让列表少一行）。
+    pub(crate) fn stage_selection(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        self.staging_open = true;
+        cx.spawn(async move |_weak, cx| {
+            let added = app.stage_selection().await;
+            this.update(cx, |v, cx| {
+                if added == 0 {
+                    // 多半是「其实没选中」：说清楚，别让人对着空抽屉猜。
+                    v.notice("没有可收集的文件：先选中一些条目".to_string(), None, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 抽屉行尾的 ×：移除一条。
+    pub(crate) fn unstage(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.app().unstage(&path);
+        cx.notify();
+    }
+
+    /// 清空暂存区。
+    pub(crate) fn clear_staged(&mut self, cx: &mut Context<Self>) {
+        self.app().clear_staged();
+        cx.notify();
+    }
+
+    /// 把暂存区整批投递到当前目录（`move_` = 移动，否则复制）。
+    ///
+    /// 走 `AppState::paste_staged` 而不是自己拼操作：跨端点（上传 / 下载 / 远程内
+    /// 复制）的判据在那一头，UI 这里复制一份就是两份会漂的判据。
+    pub(crate) fn paste_staged(&mut self, cx: &mut Context<Self>, move_: bool) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let ids = app.paste_staged(None, move_).await;
+            this.update(cx, |v, cx| {
+                if ids.is_empty() {
+                    v.notice("暂存区是空的，或当前目录不可用".to_string(), None, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------- 分栏对比
+
+    /// 开 / 关分栏对比：两侧按差异给行上色，并在下方给出图例。
+    pub(crate) fn toggle_compare(&mut self, cx: &mut Context<Self>) {
+        if self.compare {
+            self.stop_compare(cx);
+            return;
+        }
+        if !self.split || self.panes.len() < 2 {
+            self.notice("分栏对比需要两个窗格：先按 ⌘⇧D 分栏".to_string(), None, cx);
+            return;
+        }
+        let left = self
+            .panes
+            .first()
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone());
+        let right = self
+            .panes
+            .get(1)
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone());
+        match (left, right) {
+            (Some(l), Some(r)) => self.run_compare(l, r, cx),
+            _ => self.notice("两个窗格都要停在一个目录上".to_string(), None, cx),
+        }
+    }
+
+    /// 比较 `left` / `right` 两个目录，结果写进两页的 `Panel::diff`。
+    fn run_compare(&mut self, left: PathBuf, right: PathBuf, cx: &mut Context<Self>) {
+        self.compare = true;
+        self.compare_roots = Some((left.clone(), right.clone()));
+        self.compare_stats = None;
+        let t0 = self.panes.first().map(|p| p.active).unwrap_or(0);
+        let t1 = self.panes.get(1).map(|p| p.active).unwrap_or(0);
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let (l, r) = (left.clone(), right.clone());
+            // 递归比较走 `std::fs`：几万个文件的活儿不能压在 async worker 上
+            // （会排在 UI 的补窗任务前面），与 `analyze_usage` 同一条纪律。
+            let res = app
+                .spawn_blocking(move || mo_diff::compare_trees(&l, &r))
+                .await;
+            this.update(cx, |v, cx| match res {
+                Ok(Ok(cmp)) => {
+                    let (lm, rm) = compare_maps(&cmp, &left, &right);
+                    v.compare_stats = Some((cmp.left_only, cmp.right_only, cmp.different));
+                    if let Some(p) = v.panel_at_mut(0, t0) {
+                        p.diff = Some(Arc::new(lm));
+                    }
+                    if let Some(p) = v.panel_at_mut(1, t1) {
+                        p.diff = Some(Arc::new(rm));
+                    }
+                    cx.notify();
+                }
+                Ok(Err(e)) => {
+                    v.compare = false;
+                    v.compare_roots = None;
+                    v.notice(format!("对比失败：{e}"), None, cx);
+                }
+                Err(e) => {
+                    v.compare = false;
+                    v.compare_roots = None;
+                    v.notice(format!("对比失败：{e}"), None, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 收掉对比：清两页的行状态与图例。
+    fn stop_compare(&mut self, cx: &mut Context<Self>) {
+        self.compare = false;
+        self.compare_roots = None;
+        self.compare_stats = None;
+        for i in 0..self.panes.len() {
+            let t = self.panes[i].active;
+            if let Some(p) = self.panel_at_mut(i, t) {
+                p.diff = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 目录变了就重比一次（`sync_panel` 里调：那里才知道导航落地了）。
+    ///
+    /// 判据是「两页当前路径 != 上次比的那两个」——`sync_panel` 跑得很勤（元数据
+    /// 回填也会触发），少了这一步每次都会重扫一遍整棵树。
+    fn refresh_compare_if_stale(&mut self, cx: &mut Context<Self>) {
+        if !self.compare {
+            return;
+        }
+        let Some((a, b)) = self.compare_roots.clone() else {
+            return;
+        };
+        let left = self
+            .panes
+            .first()
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone());
+        let right = self
+            .panes
+            .get(1)
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone());
+        if left.as_deref() == Some(a.as_path()) && right.as_deref() == Some(b.as_path()) {
+            return;
+        }
+        match (left, right) {
+            (Some(l), Some(r)) => self.run_compare(l, r, cx),
+            // 有一边的目录没了（关了分栏 / 关了标签页）：对比失去了对象。
+            _ => self.stop_compare(cx),
+        }
+    }
+
+    /// 跳到下一个 / 上一个**有差异**的条目（`step` 为 +1 / -1）。
+    pub(crate) fn jump_diff(&mut self, cx: &mut Context<Self>, step: isize) {
+        let pane = self.active_pane;
+        let tab = self.panes.get(pane).map(|p| p.active).unwrap_or(0);
+        let Some(panel) = self.panel_at(pane, tab) else {
+            return;
+        };
+        let Some(map) = panel.diff.clone() else {
+            return;
+        };
+        let focused = panel.selection.focused();
+        // 窗口快照按**列表行**排（含组头），跳的行号与滚动用的是同一个空间。
+        let rows = panel.window.clone();
+        if rows.is_empty() {
+            return;
+        }
+        let cur = focused
+            .and_then(|f| {
+                rows.iter()
+                    .position(|r| matches!(r, mo_app::WindowRow::Entry(e) if e.id == f))
+            })
+            .unwrap_or(0);
+        let n = rows.len();
+        let order: Vec<usize> = if step > 0 {
+            (1..=n).map(|k| (cur + k) % n).collect()
+        } else {
+            (1..=n).map(|k| (cur + n - k % n) % n).collect()
+        };
+        let hit = order.into_iter().find(|&i| {
+            rows[i]
+                .entry()
+                .and_then(|e| map.get(&e.path))
+                .is_some_and(|s| !matches!(s, mo_diff::TreeStatus::Identical))
+        });
+        let Some(hit) = hit else {
+            return;
+        };
+        let Some(entry) = rows[hit].entry() else {
+            return;
+        };
+        let id = entry.id;
+        // 先滚到位（行下标只有 UI 侧知道），再让 app 侧选中——顺序反了会先选中
+        // 再滚，中间那一帧的高亮会停在旧位置。
+        if let Some(p) = self.panel_at_mut(pane, tab) {
+            p.scroll
+                .scroll_to_item(hit, gpui_kit::ScrollStrategy::Nearest);
+        }
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            app.select(id).await;
+            pull_selection(&app, &this, cx).await;
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------- 内容搜索
+
+    /// 打开内容搜索面板：范围就定在**当前目录**（打开那一刻定死）。
+    ///
+    /// 范围不跟着导航漂移是刻意的：搜索过程中用户会想点开结果看看，若 range
+    /// 跟着当前目录走，一次跳转就把已经搜出来的结果作废了。
+    pub(crate) fn open_content_search(&mut self, cx: &mut Context<Self>) {
+        let root = self
+            .panel()
+            .path
+            .clone()
+            .or_else(|| self.panel().opening.clone());
+        let Some(root) = root else {
+            self.notice("当前没有打开的目录".to_string(), None, cx);
+            return;
+        };
+        self.content_root = Some(root);
+        self.content_report = None;
+        self.content_index = 0;
+        self.content_dirty = true;
+        self.modal = Modal::ContentSearch;
+        cx.notify();
+    }
+
+    /// 跑一次内容搜索（后台 blocking）。
+    ///
+    /// 只在按 Enter 时跑，不做「输入即搜」：这一头要真读每个文件的字节，
+    /// 每敲一个字扫一遍整棵子树是拿 IO 换回显，会把机器占死。
+    fn run_content_search(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.content_root.clone() else {
+            return;
+        };
+        if self.content_query.is_empty() {
+            self.notice("先输入要找的内容".to_string(), None, cx);
+            return;
+        }
+        // 上一轮还在跑就先叫停：它的结果已经过期，回来也会被这一轮覆盖。
+        self.content_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.content_stop = stop.clone();
+        self.content_busy = true;
+        self.content_dirty = false;
+        self.content_index = 0;
+
+        let mut q = mo_search::ContentQuery::new(&self.content_query);
+        q.case_sensitive = self.content_opts.case_sensitive;
+        q.regex = self.content_opts.regex;
+        q.whole_word = self.content_opts.whole_word;
+        q.context = if self.content_opts.context { 1 } else { 0 };
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let res = app.content_search(root, q, stop).await;
+            this.update(cx, |v, cx| {
+                v.content_busy = false;
+                match res {
+                    Ok(report) => v.content_report = Some(report),
+                    Err(e) => {
+                        v.content_report = None;
+                        v.notice(e.to_string(), None, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 切一个搜索开关（区分大小写 / 正则 / 整词 / 上下文）。
+    fn toggle_content_opt(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(f) = ContentOptions::ORDER.get(i) {
+            f(&mut self.content_opts);
+            // 改了开关就等于改了问题：Enter 该重搜，而不是跳到旧结果上。
+            self.content_dirty = true;
+            cx.notify();
+        }
+    }
+
+    /// 扁平化的命中行：`(文件下标, 行下标)`。
+    ///
+    /// ↑↓ 走的是这个一维序列（跳过纯上下文行——它们只是陪衬，不该占用一次
+    /// 按键）。文件头不进序列：它不可跳，只在渲染时作为分组标题出现。
+    fn content_hits(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if let Some(r) = &self.content_report {
+            for (fi, f) in r.files.iter().enumerate() {
+                for (li, l) in f.lines.iter().enumerate() {
+                    if !l.context {
+                        out.push((fi, li));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 打开当前选中的命中：跳到它所在目录并选中该文件。
+    ///
+    /// 跳目录而不是直接 `open_entry`：命中多半是文本文件，双击语义（打开）
+    /// 会把它当可执行文件丢给系统，那不是用户在搜索结果里按 Enter 想要的。
+    fn open_content_hit(&mut self, cx: &mut Context<Self>) {
+        let hits = self.content_hits();
+        let Some((fi, _li)) = hits.get(self.content_index).copied() else {
+            return;
+        };
+        let Some(path) = self
+            .content_report
+            .as_ref()
+            .and_then(|r| r.files.get(fi))
+            .map(|f| f.path.clone())
+        else {
+            return;
+        };
+        let dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(path.clone());
+        self.modal = Modal::None;
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            // 内容搜索只搜本机，所以走本地入口（与全局搜索命中目录同理）。
+            let _ = app.open_local(&dir).await;
+            // 目录读回来后按路径选中：选择只认 FileId，换算在 app 侧
+            // （`AppState::select_path`）。找不到就只跳目录，不硬选。
+            if app.select_path(&path).await {
+                pull_selection(&app, &this, cx).await;
+            }
+        })
+        .detach();
+    }
+
+    /// 关掉内容搜索面板（顺手叫停在跑的那一轮）。
+    fn close_content_search(&mut self, cx: &mut Context<Self>) {
+        self.content_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.content_busy = false;
+        self.modal = Modal::None;
         cx.notify();
     }
 
@@ -3489,6 +4025,13 @@ impl RootView {
         let entity = cx.entity().clone();
         match id {
             "app.quit" => cx.quit(),
+            // macOS 惯例的 ⌘, ——直开设置窗口，省去「命令面板 → 翻到主题/布局」两步。
+            "settings.open" => self.open_settings(SettingsTab::Layout, cx),
+            "staging.collect" => self.stage_selection(cx),
+            "staging.toggle" => self.toggle_staging(cx),
+            "compare.toggle" => self.toggle_compare(cx),
+            "compare.jump_next" => self.jump_diff(cx, 1),
+            "compare.jump_prev" => self.jump_diff(cx, -1),
             "palette.open" => {
                 // 打开面板时刷新一次：用户可能刚改过配置或丢了新清单 / 扩展。
                 let exts = selected_ext_names(self.panel());
@@ -3505,6 +4048,9 @@ impl RootView {
                 self.search_results.clear();
                 self.palette_index = 0;
                 cx.notify();
+            }
+            "search.content" => {
+                self.open_content_search(cx);
             }
             "server.connect" => {
                 self.open_connect_dialog(cx);
@@ -4481,6 +5027,8 @@ impl RootView {
             return;
         };
         self.usage.clear();
+        self.usage_tree = None;
+        self.usage_root = Some(root.clone());
         self.form_index = 0;
         self.modal = Modal::DiskUsage;
         let this = cx.entity().clone();
@@ -4489,9 +5037,40 @@ impl RootView {
             this.update(cx, |v, cx| {
                 v.usage = usage;
                 cx.notify();
+                // 地图模式要层级，条形图不需要：懒加载一次，切过去才付这份代价。
+                if v.usage_map {
+                    v.refresh_usage_tree(cx);
+                }
             });
         })
         .detach();
+    }
+
+    /// 重建磁盘地图的树（`usage_root` 为根）。
+    fn refresh_usage_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.usage_root.clone() else {
+            return;
+        };
+        let app = self.app();
+        self.usage_tree = None;
+        let this = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            let tree = app.usage_tree(root, USAGE_MAP_DEPTH).await.ok();
+            this.update(cx, |v, cx| {
+                v.usage_tree = tree;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 条形图 ↔ 磁盘地图：同一份统计的两种看法。
+    pub(crate) fn toggle_usage_map(&mut self, cx: &mut Context<Self>) {
+        self.usage_map = !self.usage_map;
+        if self.usage_map && self.usage_tree.is_none() {
+            self.refresh_usage_tree(cx);
+        }
+        cx.notify();
     }
 
     /// 给选中项设置颜色标签（空串表示清除）。
@@ -4602,6 +5181,25 @@ impl RootView {
         };
         let fit = (((h - 2.0 * PAD) / ROW_H).floor().max(0.0)) as usize;
         count.max(fit)
+    }
+
+    /// 把每个标签页的网格 / 画廊**列数**记下来（键盘定位换算单元行要用）。
+    ///
+    /// 列数取决于容器宽度与图标缩放，只有渲染路径知道（`available` 是每窗格宽）；
+    /// 列表 / 列视图恒记 1——它们不用这个换算（前者按行、后者横向分栏）。
+    fn sync_grid_cols(&mut self, available: f32) {
+        let zoom = listing::Zoom(self.ui.icon_scale);
+        for pane in &mut self.panes {
+            for tab in &mut pane.tabs {
+                let cols = match tab.view_mode {
+                    ViewMode::Grid | ViewMode::Gallery => {
+                        zoom.columns_for(tab.view_mode, available)
+                    }
+                    _ => 1,
+                };
+                tab.grid_cols = cols;
+            }
+        }
     }
 
     // ------------------------------------------------------------ 框选（列表视图）
@@ -4946,7 +5544,7 @@ impl RootView {
         }
         let self_drop = d.paths.iter().any(|p| p == &path);
         if is_dir && !self_drop {
-            self.run_transfer(d, path, alt, cx);
+            self.run_transfer(d, pane, path, alt, cx);
             return;
         }
         if d.pane != pane {
@@ -4971,12 +5569,8 @@ impl RootView {
         let Some(dest) = dest else {
             return;
         };
-        let refresh_app = self
-            .panes
-            .get(pane_idx)
-            .and_then(|p| p.tabs.get(p.active))
-            .map(|p| p.app.clone());
-        self.run_transfer(d, dest, alt, cx);
+        let refresh_app = self.pane_app(pane_idx);
+        self.run_transfer(d, pane_idx, dest, alt, cx);
         // 目标窗格可能没开监听：主动刷一次让新文件立刻出现。
         if let Some(app) = refresh_app {
             cx.spawn(async move |_weak, _cx| {
@@ -4986,14 +5580,40 @@ impl RootView {
         }
     }
 
+    /// 某个窗格**当前标签页**的 `AppState`（分栏拖拽要问目标那一头的后端）。
+    fn pane_app(&self, pane: usize) -> Option<AppState> {
+        self.panes
+            .get(pane)
+            .and_then(|p| p.tabs.get(p.active))
+            .map(|t| t.app.clone())
+    }
+
     /// 真正提交复制 / 移动：按住 ⌥ 是移动，否则复制。
-    fn run_transfer(&mut self, d: DragState, dest: PathBuf, alt: bool, cx: &mut Context<Self>) {
-        let Some(app) = self.panel_at(d.pane, d.tab).map(|p| p.app.clone()) else {
+    ///
+    /// 源端取**拖拽来源窗格**的 `AppState`，目标端取**落点窗格**的——分栏时两个窗格
+    /// 可能各连着不同的后端（一个本地一个远程，甚至两条不同会话），端点必须各问各的
+    /// 窗格；照源窗格去猜目标那一头，会把「拖到另一个窗格的远程目录」当成本地路径交给
+    /// `std::fs`（写进本机同名位置，或直接报不存在）。
+    fn run_transfer(
+        &mut self,
+        d: DragState,
+        dest_pane: usize,
+        dest: PathBuf,
+        alt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(src_app) = self.panel_at(d.pane, d.tab).map(|p| p.app.clone()) else {
             return;
         };
+        // 落点窗格一时取不到（正好被关掉）时退回源端：同窗格拖拽这一路本来两端相同。
+        let dest_app = self.pane_app(dest_pane).unwrap_or_else(|| src_app.clone());
+        let src_ep = src_app.endpoint();
+        let dest_ep = dest_app.endpoint();
         let paths = d.paths.clone();
         cx.spawn(async move |_weak, _cx| {
-            let _ = app.transfer(paths, &dest, alt).await;
+            let _ = src_app
+                .transfer_between(paths, src_ep, &dest, dest_ep, alt)
+                .await;
         })
         .detach();
         cx.notify();
@@ -5388,6 +6008,7 @@ impl RootView {
                 })
                 .detach();
             }
+            A::Stage => self.stage_selection(cx),
         }
         cx.notify();
     }
@@ -5564,6 +6185,8 @@ async fn sync_panel(
         p.window_is_grouped = want_grouped;
         cx.notify();
     });
+    // 对比着色跟着导航走：换了一侧目录就重比（内部判根，同目录不重扫）。
+    let _ = this.update(cx, |v, cx| v.refresh_compare_if_stale(cx));
     // 缩略图不在这里派发：这里的窗口最大到 INITIAL_WINDOW(=200) 条，按它派发就是
     // 进一个图片目录瞬间排 200 个解码任务（单张 80ms 级）——四核被占住，界面跟着卡。
     // 派发点在渲染那一帧，只给**看得见**的行排队（见 `file_list` 的 `want_thumbs`）。
@@ -5633,6 +6256,10 @@ impl Render for RootView {
                     row = row.child(sidebar::render(&self.panel().app, &current, false, &entity));
                 }
                 self.ensure_columns(cx);
+                // 键盘定位要把条目位换算成网格 / 画廊的**单元行**，而列数只有在
+                // 这里（拿到容器宽度 `per_pane_w`）才算得出来——渲染前写回 panel，
+                // 定位路径读它（幂等缓存，不触发重绘，同 `list_origin` 那条约定）。
+                self.sync_grid_cols(per_pane_w);
                 for i in 0..visible_panes {
                     row = row.child(render_pane(self, i, &entity, per_pane_w));
                 }
@@ -5642,7 +6269,7 @@ impl Render for RootView {
             // 其中「浏览型」的两个（全局搜索 / 回收站）**保留侧栏**——它们本质上
             // 还是在挑文件，左侧导航得一直在（用户报：进回收站左侧整个没了）。
             // 其余（扩展 / 比较…）是工具页，全宽无妨。
-            Modal::GlobalSearch | Modal::Trash => {
+            Modal::GlobalSearch | Modal::Trash | Modal::ContentSearch => {
                 let in_trash = matches!(self.modal, Modal::Trash);
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 if self.ui.sidebar {
@@ -5669,6 +6296,8 @@ impl Render for RootView {
                 }
                 if in_trash {
                     row.child(self.render_trash(&entity))
+                } else if self.modal == Modal::ContentSearch {
+                    row.child(self.render_content_search(&entity))
                 } else {
                     row.child(self.render_global_search(&entity))
                 }
@@ -5713,16 +6342,30 @@ impl Render for RootView {
             ))
             .child(body);
 
+        // 分栏对比的图例条（只有对比开着时才占一行）。
+        if self.compare {
+            root = root.child(compare_legend(self, &entity));
+        }
+
+        // 暂存区抽屉：展开时贴在中央区下方、状态栏之上（收集 / 投递都在这一条里）。
+        if self.staging_open {
+            root = root.child(crate::staging::render_tray(&app, &entity));
+        }
+
         // 状态栏可关（配置 `ui.status_bar`）。
         if self.ui.status_bar {
             root = root.child(status_bar::render(
-                panel.visible_count,
+                status_bar::Stats {
+                    count: panel.visible_count,
+                    selection_count,
+                    indexed: self.indexed,
+                    can_undo,
+                    can_redo,
+                    staged: self.app().staged_count(),
+                },
                 &panel.path,
                 &panel.query,
-                selection_count,
-                self.indexed,
-                can_undo,
-                can_redo,
+                &entity,
             ));
         }
 
@@ -5833,11 +6476,14 @@ impl Render for RootView {
                     let step = if key == "up" { -1 } else { 1 };
                     let extend = shift;
                     cx.spawn(async move |cx| {
-                        // `move_cursor` 已经移动并选中了新行，这里多拿它返回的
-                        // 行下标把目标滚进可视区（方向键之前没滚动，列表滚远了
+                        // `locate_cursor` 已经移动并选中了新行，这里多拿它返回的
+                        // 定位结果把目标滚进可视区（方向键之前没滚动，列表滚远了
                         // 选中项会跑到视口外看不见）。`Nearest` 只在不可见时才滚。
-                        if let Some(row) = app.move_cursor(step, extend).await {
+                        // 行号按当前视图换算：列表 / 列视图用列表行，网格 / 画廊
+                        // 用条目位 ÷ 列数（它们的 `uniform_list` 按单元行计）。
+                        if let Some(hit) = app.locate_cursor(step, extend).await {
                             this.update(cx, |v, cx| {
+                                let row = located_row(v.panel(), hit);
                                 v.panel_mut()
                                     .scroll
                                     .scroll_to_item(row, gpui_kit::ScrollStrategy::Nearest);
@@ -5871,7 +6517,8 @@ impl Render for RootView {
                         })
                         .detach();
                     } else {
-                        run_type_ahead(app, this, q, gen, cx);
+                        // 退格后重新定位：不跳下一个（`skip_current = false`）。
+                        run_type_ahead(app, this, q, false, gen, cx);
                     }
                 }
                 "escape" => {
@@ -5883,11 +6530,11 @@ impl Render for RootView {
                 }
                 k if plain && k.chars().count() == 1 => {
                     let ch = k.chars().next().unwrap();
-                    // 输入即定位（type-ahead）：只逐字累积前缀缓冲、跳到第一个匹配
-                    // 项并滚进可视区，**不收窄列表**——跟 Finder / 资源管理器一致。
-                    // 不再调用 `apply_filter`：敲字符不再过滤隐藏其它文件。
+                    // 输入即定位（type-ahead）：只逐字累积前缀缓冲、跳到匹配项
+                    // 并滚进可视区，**不收窄列表**——跟 Finder / 资源管理器一致。
+                    // 连按同一个字母（缓冲变成 "aa"/"aaa"）跳到**下一个**匹配项。
                     let this = entity_key.clone();
-                    let (app, q, gen) = entity_key.update(cx, |v, cx| {
+                    let (app, q, skip, gen) = entity_key.update(cx, |v, cx| {
                         // 先取走 `app`（克隆后即释放对 `v` 的借用），再拿
                         // `panel_mut()` 做可变修改，避免借用冲突。
                         let app = v.app();
@@ -5896,9 +6543,10 @@ impl Render for RootView {
                         // 刷新代数：让更早的自动重置定时器失效，避免误清空本次输入。
                         p.type_ahead_gen += 1;
                         cx.notify();
-                        (app, p.query.clone(), p.type_ahead_gen)
+                        let skip = type_ahead_repeats_one_char(&p.query);
+                        (app, p.query.clone(), skip, p.type_ahead_gen)
                     });
-                    run_type_ahead(app, this, q, gen, cx);
+                    run_type_ahead(app, this, q, skip, gen, cx);
                 }
                 _ => {}
             }
@@ -6093,8 +6741,15 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                 ViewMode::Columns => {
                     // 列视图的条目不走主目录模型，取不到「窗口」里那份 app，
                     // 所以把 panel 的 app 传进去（系统图标要走它那条链路）。
-                    columns::render(entity, pane_idx, tab_idx, &panel.columns, &panel.app)
-                        .into_any_element()
+                    columns::render(
+                        entity,
+                        pane_idx,
+                        tab_idx,
+                        &panel.columns,
+                        &panel.app,
+                        panel.diff.as_deref(),
+                    )
+                    .into_any_element()
                 }
                 ViewMode::Grid | ViewMode::Gallery => {
                     // 图标缩放（配置 `ui.icon_scale`）：只作用于网格 / 画廊。
@@ -6402,6 +7057,54 @@ fn handle_modal_key(
             }
             _ => {}
         },
+        Modal::ContentSearch => {
+            let hits_len = entity.update(cx, |v, _cx| v.content_hits().len());
+            match key {
+                "escape" => entity.update(cx, |v, cx| v.close_content_search(cx)),
+                "up" | "arrowup" => entity.update(cx, |v, cx| {
+                    if v.content_index > 0 {
+                        v.content_index -= 1;
+                    }
+                    cx.notify();
+                }),
+                "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                    if hits_len > 0 {
+                        v.content_index = (v.content_index + 1).min(hits_len - 1);
+                    }
+                    cx.notify();
+                }),
+                // 改过查询 / 开关 → Enter 重搜；没改 → Enter 跳到选中那条命中。
+                // 少了 dirty 这层判断，「改完词按回车」会变成「打开上一条旧结果」。
+                "enter" => entity.update(cx, |v, cx| {
+                    if v.content_dirty {
+                        v.run_content_search(cx);
+                    } else {
+                        v.open_content_hit(cx);
+                    }
+                }),
+                k if plain && k.chars().count() == 1 => {
+                    let ch = k.chars().next().unwrap();
+                    entity.update(cx, |v, cx| {
+                        v.content_query.push(ch);
+                        v.content_dirty = true;
+                        v.content_index = 0;
+                        cx.notify();
+                    });
+                }
+                "backspace" => entity.update(cx, |v, cx| {
+                    v.content_query.pop();
+                    v.content_dirty = true;
+                    v.content_index = 0;
+                    cx.notify();
+                }),
+                // ⌥ + 首字母切开关：四个开关各有专属键，不用记顺序。
+                "a" if combo.alt => entity.update(cx, |v, cx| v.toggle_content_opt(0, cx)),
+                "r" if combo.alt => entity.update(cx, |v, cx| v.toggle_content_opt(1, cx)),
+                "w" if combo.alt => entity.update(cx, |v, cx| v.toggle_content_opt(2, cx)),
+                "c" if combo.alt => entity.update(cx, |v, cx| v.toggle_content_opt(3, cx)),
+                _ => {}
+            }
+        }
         Modal::Trash => match key {
             "escape" => close_modal(entity, cx),
             "up" | "arrowup" => entity.update(cx, |v, cx| {
@@ -6542,6 +7245,9 @@ fn handle_modal_key(
                     close_modal(entity, cx);
                 }
             }
+            // M：条形图 ↔ 磁盘地图。地图模式下 ↑↓ / Enter 仍按条形图那一份走
+            // （同一批子项，只是看法不同），所以这里只换视图。
+            "m" => entity.update(cx, |v, cx| v.toggle_usage_map(cx)),
             _ => {}
         },
         Modal::Tags => match key {
@@ -6840,6 +7546,9 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 cx.notify();
             });
         }
+        Some(CommandId::ContentSearch) => {
+            entity.update(cx, |v, cx| v.open_content_search(cx));
+        }
         Some(CommandId::ConnectServer) => {
             entity.update(cx, |v, cx| v.dispatch_action("server.connect", cx));
         }
@@ -6869,6 +7578,24 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::OpenTrash) => {
             entity.update(cx, |v, cx| v.open_trash_panel(cx));
+        }
+        Some(CommandId::StageSelection) => {
+            entity.update(cx, |v, cx| v.stage_selection(cx));
+        }
+        Some(CommandId::ToggleStaging) => {
+            entity.update(cx, |v, cx| v.toggle_staging(cx));
+        }
+        Some(CommandId::ClearStaging) => {
+            entity.update(cx, |v, cx| v.clear_staged(cx));
+        }
+        Some(CommandId::StagedCopyHere) => {
+            entity.update(cx, |v, cx| v.paste_staged(cx, false));
+        }
+        Some(CommandId::StagedMoveHere) => {
+            entity.update(cx, |v, cx| v.paste_staged(cx, true));
+        }
+        Some(CommandId::ToggleCompare) => {
+            entity.update(cx, |v, cx| v.toggle_compare(cx));
         }
         Some(CommandId::NewTab) => {
             entity.update(cx, |v, cx| {
@@ -7294,6 +8021,7 @@ async fn run_command(id: CommandId, app: &AppState) {
         CommandId::Redo => app.redo(),
         // 这几个由面板特殊处理（需要 RootView 状态或异步剪贴板），不会走到这里。
         CommandId::OpenGlobalSearch
+        | CommandId::ContentSearch
         | CommandId::QuickLook
         | CommandId::HashSelection
         | CommandId::CompareSelection
@@ -7336,6 +8064,14 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::ZoomReset
         // 列表分组：同上，走 UI 层（`on_palette_enter` → `cycle_grouping`）。
         | CommandId::GroupingCycle
+        // 暂存区五则：都需要 RootView 状态（抽屉开合 / 通知），走 `on_palette_enter`。
+        | CommandId::StageSelection
+        | CommandId::ToggleStaging
+        | CommandId::ClearStaging
+        | CommandId::StagedCopyHere
+        | CommandId::StagedMoveHere
+        // 对比着色同样要读两侧窗格 + 改面板状态，走 `on_palette_enter`。
+        | CommandId::ToggleCompare
         | CommandId::ConnectServer
         | CommandId::DisconnectServer
         | CommandId::RevealInFileManager
@@ -7541,25 +8277,228 @@ async fn pull_selection(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncA
     });
 }
 
+/// 分栏对比的图例条：统计 + 两种颜色的含义 + 关闭。
+fn compare_legend(view: &RootView, entity: &Entity<RootView>) -> Stateful<Div> {
+    let (lo, ro, diff) = view.compare_stats.unwrap_or((0, 0, 0));
+    let swatch = |tint: Rgba, label: &'static str| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded(px(2.0))
+                    .bg(tint)
+                    .border_1()
+                    .border_color(theme::separator()),
+            )
+            .child(text!(label))
+    };
+    let row = div()
+        .id("compare-legend")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .px(px(10.0))
+        .h(px(22.0))
+        .flex_shrink_0()
+        .bg(theme::container())
+        .border_t_1()
+        .border_color(theme::separator())
+        .text_size(px(11.0))
+        .text_color(theme::muted())
+        .debug_selector(|| "mo-compare-legend".to_string())
+        .child(text!(format!("对比：仅左 {lo} · 仅右 {ro} · 不同 {diff}")))
+        .child(swatch(
+            compare_tint(Some(mo_diff::TreeStatus::LeftOnly)).unwrap_or(theme::accent()),
+            "仅此有",
+        ))
+        .child(swatch(
+            compare_tint(Some(mo_diff::TreeStatus::Different)).unwrap_or(theme::accent()),
+            "内容不同",
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(text!("⌘⇧↓ / ⌘⇧↑ 在差异间跳")),
+        );
+
+    let close = entity.clone();
+    let mut btn = div()
+        .id("compare-close")
+        .px(px(7.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(theme::separator())
+        .text_color(theme::text())
+        .hover(|s| s.bg(theme::hover_bg()))
+        .child(text!("关闭对比"))
+        .debug_selector(|| "mo-compare-close".to_string());
+    btn.interactivity().on_click(move |_, _window, cx| {
+        close.update(cx, |v, cx| v.stop_compare(cx));
+    });
+    row.child(btn.test_support())
+}
+
+/// 一行搜索结果，命中区间单独上色。
+///
+/// 按 **字符** 切（`spans` 是字符下标）：按字节切会把一个汉字切成两半，
+/// 显示出来是乱码。切成独立的 `text!` 段而不是给整行换色，是因为一行里
+/// 可能有多处命中——只染其中几段才叫「高亮」。
+fn highlighted_line(text: &str, spans: &[(usize, usize)], selected: bool) -> Div {
+    let chars: Vec<char> = text.chars().collect();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .text_size(px(12.0));
+    let mut pos = 0usize;
+    for (a, b) in spans {
+        let (a, b) = ((*a).min(chars.len()), (*b).min(chars.len()));
+        if a > pos {
+            row = row.child(text!(chars[pos..a].iter().collect::<String>()));
+        }
+        if b > a {
+            row = row.child(
+                div()
+                    .bg(hit_bg())
+                    .rounded(px(2.0))
+                    .text_color(if selected {
+                        theme::selected_text()
+                    } else {
+                        theme::text()
+                    })
+                    .child(text!(chars[a..b].iter().collect::<String>())),
+            );
+        }
+        pos = pos.max(b);
+    }
+    if pos < chars.len() {
+        row = row.child(text!(chars[pos..].iter().collect::<String>()));
+    }
+    row
+}
+
+/// 命中高亮的底色（半透明黄：不盖掉行本身的选中 / 斑马纹底色）。
+///
+/// 写成函数不是常量：`rgba()` 不是 const fn，常量里调不了。
+fn hit_bg() -> Rgba {
+    rgba(0xf5d4424d)
+}
+
+/// 分栏对比的行底色：仅此有（蓝）/ 内容不同（橙）；**相同不染色**。
+///
+/// 用低透明度的一层而不是实心色：行本来还有斑马纹 / 悬停 / 选中三层底色，
+/// 实心会把它们全盖掉，选中行就看不出选中了。
+pub(crate) fn compare_tint(status: Option<mo_diff::TreeStatus>) -> Option<Rgba> {
+    match status? {
+        mo_diff::TreeStatus::Identical => None,
+        mo_diff::TreeStatus::LeftOnly | mo_diff::TreeStatus::RightOnly => Some(rgba(0x2f6fd033)),
+        mo_diff::TreeStatus::Different => Some(rgba(0xb26a1a3d)),
+    }
+}
+
+/// 把一次树比较的结果拆成**两页各自的**行状态表（按绝对路径查）。
+///
+/// 关键在「只染有变化的那一侧」：仅左有的条目右栏根本没有这一行，染右栏就是
+/// 凭空造一条不存在的记录；两侧都有但内容不同的，那才两侧都染。这正是「双栏
+/// 对比」跟「出一份差异报告」的根本区别——报告是中立的一列，双栏是两侧各自的视角。
+///
+/// 只取**直接子项**：更深层的差异归到它所在的那个子目录上（`compare_trees` 对
+/// 「内部有差异」的目录给的就是目录自己那一条）。
+pub(crate) fn compare_maps(
+    cmp: &mo_diff::TreeComparison,
+    // ⚠️ 写全 `std::path::Path`：`use gpui_kit::*` 里也有个（带泛型的）`Path`，
+    // 裸写会解析到它，报错是「missing generics」而不是「找不到类型」，很误导。
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> (
+    HashMap<PathBuf, mo_diff::TreeStatus>,
+    HashMap<PathBuf, mo_diff::TreeStatus>,
+) {
+    let mut l = HashMap::new();
+    let mut r = HashMap::new();
+    for e in &cmp.entries {
+        if e.rel.components().count() != 1 {
+            continue;
+        }
+        match e.status {
+            mo_diff::TreeStatus::Identical => {}
+            mo_diff::TreeStatus::LeftOnly => {
+                l.insert(left.join(&e.rel), e.status);
+            }
+            mo_diff::TreeStatus::RightOnly => {
+                r.insert(right.join(&e.rel), e.status);
+            }
+            mo_diff::TreeStatus::Different => {
+                l.insert(left.join(&e.rel), e.status);
+                r.insert(right.join(&e.rel), e.status);
+            }
+        }
+    }
+    (l, r)
+}
+
+/// 定位结果 → 当前视图滚动要的行号。
+///
+/// 列表 / 列视图用 `hit.row`（**列表行**：分组开启时含组头行，与它们的
+/// `uniform_list` 同空间）；网格 / 画廊的 `uniform_list` 一行放 `cols` 个单元，
+/// 而 `hit.pos` 是条目位，除列数才是它的行（列数由渲染路径写回 `Panel.grid_cols`）。
+fn located_row(panel: &Panel, hit: mo_app::LocateHit) -> usize {
+    match panel.view_mode {
+        ViewMode::Grid | ViewMode::Gallery => hit.pos / panel.grid_cols.max(1),
+        _ => hit.row,
+    }
+}
+
+/// 定位缓冲是不是「同一个字符的重复」（`"aa"` / `"aaa"`…）。
+///
+/// 用来实现 Finder / 资源管理器的习惯：**连按同一个字母跳到下一个匹配项**。
+/// 只认长度为 2 及以上、且字符全同的缓冲——首字符（`"a"`）仍从第一个匹配项开始，
+/// 输入 `"ab"` 这种正常前缀也不受影响。
+fn type_ahead_repeats_one_char(buf: &str) -> bool {
+    match buf.chars().next() {
+        Some(c) => buf.chars().count() >= 2 && buf.chars().all(|x| x == c),
+        None => false,
+    }
+}
+
 /// 输入即定位（type-ahead）的「定位 + 自动重置」逻辑，字符输入与退格共用。
 ///
 /// 给定当前前缀 `prefix`：
-/// 1. 选中第一个前缀匹配项（`focus_by_prefix` 已做大小写不敏感匹配），并把它
-///    滚进可视区（`Nearest`：本来就看得见就不滚，避免无谓跳动）；
+/// 1. 选中匹配项（`locate_by_prefix` 已做大小写不敏感匹配 + 前缀优先、子序列兜底），
+///    并把它滚进可视区（`Nearest`：本来就看得见就不滚，避免无谓跳动）；
+///    `skip_current` 为真时从**当前焦点之后**找（连按同字母跳下一个）；
 /// 2. 之后若 `TYPE_AHEAD_RESET_MS` 内没有新输入，清空定位缓冲（选择保留——
 ///    定位只是临时跳选，不该因为缓冲过期就把文件取消选中）。
 ///
 /// `gen` 是调用方在更新缓冲时自增的「代数」：每次新输入都会让更早的定时器
 /// 失效，从而避免后一次输入被前一次定时器误清空。
-fn run_type_ahead(app: AppState, this: Entity<RootView>, prefix: String, gen: u64, cx: &mut App) {
+fn run_type_ahead(
+    app: AppState,
+    this: Entity<RootView>,
+    prefix: String,
+    skip_current: bool,
+    gen: u64,
+    cx: &mut App,
+) {
     // 定位与自动重置是两个独立任务，各持一份 `this` 克隆，互不影响。
     let this_reset = this.clone();
     cx.spawn(async move |cx| {
-        if let Some(idx) = app.focus_by_prefix(&prefix).await {
+        if let Some(hit) = app.locate_by_prefix(&prefix, skip_current).await {
             this.update(cx, |v, cx| {
+                let row = located_row(v.panel(), hit);
                 v.panel_mut()
                     .scroll
-                    .scroll_to_item(idx, gpui_kit::ScrollStrategy::Nearest);
+                    .scroll_to_item(row, gpui_kit::ScrollStrategy::Nearest);
                 cx.notify();
             });
             // app 侧选择是唯一事实来源：跳选后回灌 UI 高亮。
@@ -7771,6 +8710,235 @@ impl RootView {
             &format!("🔍 {}", self.search_query),
             body,
             "↑↓ 选择 · Enter 打开 · Esc 关闭",
+        )
+    }
+
+    /// 内容搜索（grep）面板。
+    ///
+    /// 结构照 `render_global_search`：四枚开关 + 一行统计 + 扁平的命中行列表。
+    /// 与那一头最大的区别是**不实时搜**（读字节太贵），只有 Enter 才跑。
+    fn render_content_search(&self, entity: &Entity<RootView>) -> Div {
+        // 四枚开关胶囊：点一下切一个，改了就置 dirty（Enter 变回「搜索」）。
+        let mut opts_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(6.0));
+        for i in 0..4 {
+            let on = self.content_opts.get(i);
+            let btn = div()
+                .id(format!("content-opt-{i}"))
+                .px(px(7.0))
+                .py(px(1.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(if on {
+                    theme::accent()
+                } else {
+                    theme::separator()
+                })
+                .bg(if on {
+                    theme::selected_bg()
+                } else {
+                    theme::surface()
+                })
+                .text_size(px(11.0))
+                .text_color(if on {
+                    theme::selected_text()
+                } else {
+                    theme::muted()
+                })
+                .child(text!(format!(
+                    "{} {}",
+                    ContentOptions::label(i),
+                    ContentOptions::hint(i)
+                )))
+                .debug_selector({
+                    let s = format!("mo-content-opt-{i}");
+                    move || s.clone()
+                });
+            let target = entity.clone();
+            let mut btn = btn;
+            btn.interactivity().on_click(move |_, _window, cx| {
+                target.update(cx, |v, cx| v.toggle_content_opt(i, cx));
+            });
+            opts_row = opts_row.child(btn.test_support());
+        }
+        // 搜索按钮：跑着的时候置灰（点也不会再起一轮）。
+        let go = div()
+            .id("content-go")
+            .px(px(9.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(theme::separator())
+            .text_size(px(11.0))
+            .text_color(if self.content_busy {
+                theme::muted()
+            } else {
+                theme::text()
+            })
+            .child(text!(if self.content_busy {
+                "搜索中…".to_string()
+            } else if self.content_dirty {
+                "搜索".to_string()
+            } else {
+                "重新搜索".to_string()
+            }))
+            .debug_selector(|| "mo-content-go".to_string());
+        let go_target = entity.clone();
+        let mut go = go;
+        go.interactivity().on_click(move |_, _window, cx| {
+            go_target.update(cx, |v, cx| v.run_content_search(cx));
+        });
+        opts_row = opts_row.child(go.test_support());
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(2.0))
+            .child(opts_row)
+            .overflow_y_scrollbar()
+            .debug_selector(|| "mo-content-body".to_string());
+
+        match (&self.content_report, self.content_busy) {
+            // 第一轮的「正在搜索」：还没有任何旧结果可看。
+            (&None, true) => {
+                body = body.child(
+                    div()
+                        .px(px(8.0))
+                        .text_color(theme::muted())
+                        .child(text!("正在搜索…（Esc 可中断）".to_string())),
+                );
+            }
+            (Some(r), _) => {
+                body = body.child(
+                    div()
+                        .px(px(8.0))
+                        .text_size(px(11.0))
+                        .text_color(theme::muted())
+                        .child(text!(format!(
+                            "扫了 {} 个文件 · {} 个文件命中 · {} 处 · 跳过 {} 个二进制{}",
+                            r.scanned,
+                            r.files_matched,
+                            r.hits,
+                            r.skipped_binary,
+                            if r.truncated { " · 已达上限" } else { "" }
+                        ))),
+                );
+                if r.files.is_empty() {
+                    body = body.child(
+                        div()
+                            .px(px(8.0))
+                            .text_color(theme::muted())
+                            .child(text!("没有找到匹配的内容".to_string())),
+                    );
+                }
+                // 扁平命中行：序号即 `content_index`，与 ↑↓ 走的是同一条序列。
+                let hits = self.content_hits();
+                for (row_i, (fi, li)) in hits.iter().enumerate() {
+                    let Some(file) = r.files.get(*fi) else {
+                        continue;
+                    };
+                    let Some(line) = file.lines.get(*li) else {
+                        continue;
+                    };
+                    let selected = row_i == self.content_index;
+                    // 同一文件连续多行只在第一行标文件名，其余留白对齐——
+                    // 每行都重复一次文件名，扫读时反而看不出行在变。
+                    let first_of_file = row_i == 0 || hits[row_i - 1].0 != *fi;
+                    let row = div()
+                        .id(format!("content-row-{row_i}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .bg(if selected {
+                            theme::selected_bg()
+                        } else {
+                            theme::surface()
+                        })
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::text()
+                        })
+                        .child(
+                            div()
+                                .w(px(150.0))
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .text_size(px(11.0))
+                                .text_color(if selected {
+                                    theme::selected_text()
+                                } else {
+                                    theme::muted()
+                                })
+                                .child(text!(if first_of_file {
+                                    file.name.clone()
+                                } else {
+                                    String::new()
+                                })),
+                        )
+                        .child(
+                            div()
+                                .w(px(38.0))
+                                .flex_shrink_0()
+                                .text_size(px(11.0))
+                                .text_color(if selected {
+                                    theme::selected_text()
+                                } else {
+                                    theme::muted()
+                                })
+                                .child(text!(format!("{}", line.line))),
+                        )
+                        .child(highlighted_line(&line.text, &line.spans, selected))
+                        .debug_selector({
+                            let s = format!("mo-content-row-{row_i}");
+                            move || s.clone()
+                        });
+                    let target = entity.clone();
+                    let idx = row_i;
+                    let mut row = row;
+                    row.interactivity().on_click(move |_, _window, cx| {
+                        target.update(cx, |v, cx| {
+                            v.content_index = idx;
+                            v.open_content_hit(cx);
+                        });
+                    });
+                    body = body.child(row.test_support());
+                }
+            }
+            (None, false) => {
+                body = body.child(
+                    div()
+                        .px(px(8.0))
+                        .text_color(theme::muted())
+                        .child(text!("输入要找的内容，回车搜索".to_string())),
+                );
+            }
+        }
+
+        let root = self
+            .content_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        central_view(
+            "内容搜索",
+            &format!("🔍 {} · 范围 {}", self.content_query, root),
+            body,
+            if self.content_dirty {
+                "Enter 搜索 · ↑↓ 选择 · ⌥A/⌥R/⌥W/⌥C 切开关 · Esc 关闭"
+            } else {
+                "Enter 跳到命中 · ↑↓ 选择 · Esc 关闭"
+            },
         )
     }
 
@@ -8565,8 +9733,8 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, filtered_apps, ConnectAuthState, Modal, OperationHandle, RootView,
-        SettingsTab,
+        box_row_range, filtered_apps, located_row, type_ahead_repeats_one_char, ConnectAuthState,
+        Modal, OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -9832,6 +11000,49 @@ mod tests {
         let _ = root;
     }
 
+    /// 定位结果 → 滚动行号：列表 / 列视图用列表行，网格 / 画廊按列数换算条目位。
+    ///
+    /// 这条守的是「网格 / 画廊下方向键与 type-ahead 滚错位置」——两种视图的
+    /// `uniform_list` 计数空间不同（列表按行含组头、网格按单元行），拿错一个
+    /// 目标行就会滚偏（甚至滚到列表外）。
+    #[test]
+    fn located_row_converts_entry_pos_to_cell_row_in_grid_views() {
+        let mut panel = Panel::new(AppState::new());
+        // pos 7 / row 9：故意让两者不等，谁被用了一看便知。
+        let hit = mo_app::LocateHit { pos: 7, row: 9 };
+
+        panel.view_mode = crate::panel::ViewMode::List;
+        assert_eq!(located_row(&panel, hit), 9, "列表用列表行（含组头）");
+        panel.view_mode = crate::panel::ViewMode::Columns;
+        assert_eq!(located_row(&panel, hit), 9, "列视图同样用列表行");
+
+        // 网格 / 画廊：条目位 ÷ 列数（7 / 3 = 2）。
+        panel.view_mode = crate::panel::ViewMode::Grid;
+        panel.grid_cols = 3;
+        assert_eq!(located_row(&panel, hit), 2);
+        panel.view_mode = crate::panel::ViewMode::Gallery;
+        assert_eq!(located_row(&panel, hit), 2, "画廊与网格同为单元行");
+
+        // 单列退化：条目位即单元行；列数非法（0）按 1 列算，不 panic。
+        panel.grid_cols = 1;
+        assert_eq!(located_row(&panel, hit), 7);
+        panel.grid_cols = 0;
+        assert_eq!(located_row(&panel, hit), 7);
+    }
+
+    /// 连按同字母的判据：只有「长度 ≥ 2 且字符全同」才算重复输入。
+    #[test]
+    fn repeat_detection_covers_double_and_triple_press() {
+        assert!(!type_ahead_repeats_one_char(""), "空缓冲不算重复");
+        assert!(
+            !type_ahead_repeats_one_char("a"),
+            "首字符应从头找第一个匹配项"
+        );
+        assert!(type_ahead_repeats_one_char("aa"));
+        assert!(type_ahead_repeats_one_char("aaa"));
+        assert!(!type_ahead_repeats_one_char("ab"), "正常前缀不受影响");
+    }
+
     /// 传输估速：首次快照只建样本（速度 0 不显示），间隔后差分出速度与剩余时间；
     /// 操作不再 Running（暂停 / 结束）时样本清空，恢复 Running 从零重新观测。
     #[test]
@@ -10862,5 +12073,91 @@ mod tests {
         let (head, src) = super::split_preview_for_two_pass(text);
         assert!(src.is_none(), "文本预览没有第二拍");
         assert_eq!(head.text.as_deref(), Some("hello"), "文本要原样留着");
+    }
+
+    /// 双栏对比的着色表：**只染有变化的那一侧**。
+    ///
+    /// 这条守的是双栏对比与「出一份差异报告」的分野——报告是中立的一列，
+    /// 双栏是两侧各自的视角：左栏根本不存在右独有的那一行，染上去就是凭空
+    /// 造记录；两侧都有但内容不同的才两边都染。深层差异不展开，只取直接子项。
+    #[test]
+    fn compare_maps_tint_each_side_from_its_own_view() {
+        let (left, right) = (PathBuf::from("/L"), PathBuf::from("/R"));
+        let cmp = mo_diff::TreeComparison {
+            left: left.clone(),
+            right: right.clone(),
+            entries: vec![
+                mo_diff::TreeEntry {
+                    rel: PathBuf::from("only_left.txt"),
+                    status: mo_diff::TreeStatus::LeftOnly,
+                    is_dir: false,
+                },
+                mo_diff::TreeEntry {
+                    rel: PathBuf::from("only_right.txt"),
+                    status: mo_diff::TreeStatus::RightOnly,
+                    is_dir: false,
+                },
+                mo_diff::TreeEntry {
+                    rel: PathBuf::from("changed.txt"),
+                    status: mo_diff::TreeStatus::Different,
+                    is_dir: false,
+                },
+                // 深层差异：不进着色表（归到它所在的子目录上）。
+                mo_diff::TreeEntry {
+                    rel: PathBuf::from("sub/deep.txt"),
+                    status: mo_diff::TreeStatus::LeftOnly,
+                    is_dir: false,
+                },
+            ],
+            identical_files: 0,
+            identical_dirs: 0,
+            different: 1,
+            left_only: 2,
+            right_only: 1,
+        };
+        let (lm, rm) = super::compare_maps(&cmp, &left, &right);
+
+        assert_eq!(
+            lm.get(&left.join("only_left.txt")),
+            Some(&mo_diff::TreeStatus::LeftOnly)
+        );
+        assert!(
+            !rm.contains_key(&right.join("only_left.txt")),
+            "右栏没有这一行，不能染——染了就是凭空造一条不存在的记录"
+        );
+        assert_eq!(
+            rm.get(&right.join("only_right.txt")),
+            Some(&mo_diff::TreeStatus::RightOnly)
+        );
+        assert!(
+            !lm.contains_key(&left.join("only_right.txt")),
+            "同理，左栏也不该出现右独有的条目"
+        );
+        // 两侧都有但内容不同 → 两边都染。
+        assert_eq!(
+            lm.get(&left.join("changed.txt")),
+            Some(&mo_diff::TreeStatus::Different)
+        );
+        assert_eq!(
+            rm.get(&right.join("changed.txt")),
+            Some(&mo_diff::TreeStatus::Different)
+        );
+        // 深层不上色：着色表只管直接子项。
+        assert_eq!(lm.len(), 2, "左栏只有仅左有 + 内容不同两条");
+        assert_eq!(rm.len(), 2, "右栏只有仅右有 + 内容不同两条");
+        assert!(!lm.contains_key(&left.join("sub/deep.txt")));
+    }
+
+    /// 相同不染色：染了就等于把整屏都涂成「有差异」，差异反而看不见了。
+    #[test]
+    fn compare_tint_leaves_identical_rows_alone() {
+        assert!(super::compare_tint(None).is_none(), "没在对比 → 不染");
+        assert!(
+            super::compare_tint(Some(mo_diff::TreeStatus::Identical)).is_none(),
+            "相同不染：整屏都染就没差异可言了"
+        );
+        assert!(super::compare_tint(Some(mo_diff::TreeStatus::LeftOnly)).is_some());
+        assert!(super::compare_tint(Some(mo_diff::TreeStatus::RightOnly)).is_some());
+        assert!(super::compare_tint(Some(mo_diff::TreeStatus::Different)).is_some());
     }
 }
