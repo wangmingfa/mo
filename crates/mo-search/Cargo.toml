@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mo-core.workspace = true
 mo-fs.workspace = true
+parking_lot.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true

@@ -193,6 +193,9 @@ pub struct AppState {
     /// 子进程——每帧一次的子进程会把 UI 拖死。挂载 / 卸载这种事几秒的延迟无所谓，
     /// 所以按 [`NET_SHARE_TTL`] 缓存（挂载 / 卸载后立刻作废）。
     net_shares: Arc<std::sync::Mutex<(std::time::Instant, Vec<mo_remote::mount::NetworkShare>)>>,
+    /// 网络盘后台刷新的单飞标志：有刷新在途时置位，防每次重绘叠一个子进程。
+    /// 见 [`AppState::network_shares`]。
+    net_shares_refreshing: Arc<AtomicBool>,
     /// 「本机挂了哪些卷宗」的缓存（`mountedVolumeURLs` / 读 `/Volumes`）。
     ///
     /// 与 [`AppState::net_shares`] 同一条纪律：侧边栏每帧都问，而卷宗列表要
@@ -818,6 +821,7 @@ impl AppState {
                 std::time::Instant::now() - NET_SHARE_TTL,
                 Vec::new(),
             ))),
+            net_shares_refreshing: Arc::new(AtomicBool::new(false)),
             volumes_cache: Arc::new(std::sync::Mutex::new((
                 std::time::Instant::now() - VOLUME_TTL,
                 Vec::new(),
@@ -1391,15 +1395,32 @@ impl AppState {
     /// 系统里已经挂好的**网络盘**（SMB / NFS），供侧边栏「网络」区显示。
     ///
     /// 只读（读 `/proc/mounts` 或跑一次 `mount` / `net use`），不发起任何网络操作。
+    ///
+    /// ⚠️ **绝不在这条主线程路径上等查询**：TTL 过期就回缓存的旧值，把真查询丢给
+    /// 后台单飞刷新，刷完置 `dirty` 由刷新泵合并成一次重绘。Windows 上 `net use`
+    /// 一次要 1~3s，旧实现让 hover 重绘撞上过期 TTL 就把 UI 原地卡住几秒（用户报
+    /// 的「常态卡顿」根因）。
     pub fn network_shares(&self) -> Vec<mo_remote::mount::NetworkShare> {
-        let mut slot = self.net_shares.lock().unwrap();
-        if slot.0.elapsed() >= NET_SHARE_TTL {
-            *slot = (
-                std::time::Instant::now(),
-                mo_remote::mount::mounted_shares(),
-            );
+        if self.net_shares.lock().unwrap().0.elapsed() < NET_SHARE_TTL {
+            return self.net_shares.lock().unwrap().1.clone();
+        } // 单飞：有刷新在途就不再叠（侧栏每次重绘都会问）。
+        if self
+            .net_shares_refreshing
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let app = self.clone();
+            self.spawn(async move {
+                let shares = app
+                    .spawn_blocking(mo_remote::mount::mounted_shares)
+                    .await
+                    .unwrap_or_default();
+                *app.net_shares.lock().unwrap() = (std::time::Instant::now(), shares);
+                app.dirty.store(true, Ordering::Relaxed);
+                app.net_shares_refreshing.store(false, Ordering::Relaxed);
+            });
         }
-        slot.1.clone()
+        self.net_shares.lock().unwrap().1.clone()
     }
 
     /// 作废网络盘的缓存（挂载 / 卸载之后立刻生效，不必等 TTL 过期）。
@@ -2883,11 +2904,14 @@ impl AppState {
             // 闭包是 `move` 且要进 blocking 池，判据得在派发前算好。
             let skip_hidden = !app.show_hidden();
             let bus_p = bus.clone();
+            // ⚠️ 锁**不再**横跨整棵遍历：`crawl` 内部每攒满一批才短暂取锁写入。
+            // 旧写法全程握着 `index.lock()` 爬几万条，而 UI 主线程的事件总线循环
+            // 每收到一条 `IndexUpdated` 就同步调 `index_count()`（同一个锁）——
+            // 主目录自举期间界面每隔几秒冻住几秒（用户报的「常态卡顿」）。
             let result = app
                 .spawn_blocking(move || {
-                    let mut idx = index.lock();
                     let out = crawl(
-                        &mut idx,
+                        &index,
                         fs.as_ref(),
                         &root,
                         max_depth,
@@ -2905,7 +2929,7 @@ impl AppState {
                     .map_err(|e| e.to_string());
                     // 爬完（或被中断）都记一下时刻：下次自举就知道这个根不用再爬了。
                     // 被打断时也记，否则每次启动都会重挑这个根、永远刷不完后面那些。
-                    let _ = idx.mark_root(&root, now_secs());
+                    let _ = index.lock().mark_root(&root, now_secs());
                     out
                 })
                 .await;

@@ -105,6 +105,35 @@ impl FileIndex {
         Ok(())
     }
 
+    /// 批量写入（一个事务 + 预编译语句复用）。
+    ///
+    /// 爬取路径专用：逐条 `upsert` 每条都是一个独立事务，几万条目就是几万次提交，
+    /// 既慢、又把索引锁攥在手里更久。批量后墙钟快一个量级，锁也是**拿一批放一次**。
+    pub fn upsert_batch(&mut self, entries: &[crate::CrawledEntry]) -> Result<(), SearchError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO files (path, name, name_lower, size, modified, is_dir)
+                 VALUES (?1, ?2, ?3, 0, 0, ?4)
+                 ON CONFLICT(path) DO UPDATE SET
+                   name=excluded.name, name_lower=excluded.name_lower",
+            )?;
+            for e in entries {
+                stmt.execute(rusqlite::params![
+                    e.path.to_string_lossy(),
+                    e.name,
+                    e.name.to_lowercase(),
+                    e.is_dir as i32,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 删除一条记录（按路径）。返回删掉的行数。
     pub fn remove(&mut self, path: &Path) -> Result<usize, SearchError> {
         let p = path.to_string_lossy().to_string();

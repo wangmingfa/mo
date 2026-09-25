@@ -4985,6 +4985,7 @@ dependencies = [
  "anyhow",
  "mo-core",
  "mo-fs",
+ "parking_lot",
  "regex",
  "rusqlite",
  "thiserror 2.0.20",

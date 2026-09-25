@@ -16,5 +16,5 @@ mod index;
 pub use content::{
     search_content, ContentQuery, ContentReport, FileHit, LineHit, DEFAULT_MAX_FILE_BYTES,
 };
-pub use crawl::crawl;
+pub use crawl::{crawl, CrawledEntry};
 pub use index::{FileIndex, SearchError, SearchHit};
