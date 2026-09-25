@@ -1184,7 +1184,10 @@ fn copying_into_the_current_remote_dir_goes_through_the_backend() {
         app.transfer(vec![PathBuf::from("/remote.txt")], Path::new("/pub"), false)
             .await;
 
-        let written = format!("write_file:{}", Path::new("/pub").join("remote.txt").display());
+        let written = format!(
+            "write_file:{}",
+            Path::new("/pub").join("remote.txt").display()
+        );
         let mut seen = false;
         for _ in 0..200 {
             if log.lock().unwrap().contains(&written) {

@@ -80,10 +80,18 @@ fn jpath(p: &std::path::Path) -> String {
 /// 键串里的主修饰键：macOS 写 `cmd`，别的平台写 `ctrl`。
 /// （键表本身两个写法同义，但 headless 模拟把 `cmd` 解释成 platform 修饰位，
 /// 非 macOS 的事件里那一位永远不亮，只有 `ctrl` 能命中。）
-const PRIMARY: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+const PRIMARY: &str = if cfg!(target_os = "macos") {
+    "cmd"
+} else {
+    "ctrl"
+};
 
 /// 「重命名」的平台默认键：Finder 惯例 Enter、资源管理器惯例 F2（见 keys.rs 的 `default_spec`）。
-const RENAME_KEY: &str = if cfg!(target_os = "macos") { "enter" } else { "f2" };
+const RENAME_KEY: &str = if cfg!(target_os = "macos") {
+    "enter"
+} else {
+    "f2"
+};
 
 /// 文件列表必须吃满中央区的剩余高度——它没有自我撑高的能力。
 #[gpui_kit::test]

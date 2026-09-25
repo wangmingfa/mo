@@ -18,9 +18,8 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{
-    SHCreateItemFromParsingName, IFileOperation, IFileOperationProgressSink, IShellItem,
-    FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE,
-    FOFX_RECYCLEONDELETE,
+    IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
+    FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
 };
 
 use crate::PlatformError;
@@ -28,8 +27,7 @@ use crate::PlatformError;
 /// `CLSID_FileOperation`（Windows SDK 里的固定值，crate 没导就自己钉一份）。
 /// ⚠️ 别和 `IFileOperation` 的接口 IID（`947AAB5F-…`）混了——CoCreateInstance
 /// 要的是 coclass 的 CLSID。
-const CLSID_FILE_OPERATION: GUID =
-    GUID::from_u128(0x3AD05575_8857_4850_9277_11B85BDB8E09);
+const CLSID_FILE_OPERATION: GUID = GUID::from_u128(0x3AD05575_8857_4850_9277_11B85BDB8E09);
 
 /// 在资源管理器里选中 `path`（打开其所在目录并高亮该项）。
 pub fn reveal(path: &Path) -> Result<(), PlatformError> {
@@ -93,7 +91,11 @@ pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
         // 返回 S_OK 但文件被**直接抹掉**（不进回收站）——文档里那句「默认回收」
         // 靠不住，这条是数据安全问题，不许省。
         op.SetOperationFlags(
-            FOFX_RECYCLEONDELETE | FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOFX_EARLYFAILURE,
+            FOFX_RECYCLEONDELETE
+                | FOF_SILENT
+                | FOF_NOCONFIRMATION
+                | FOF_NOERRORUI
+                | FOFX_EARLYFAILURE,
         )
         .map_err(|e| failed("设置回收站选项", path, e))?;
         op.DeleteItem(&item, None::<&IFileOperationProgressSink>)
@@ -123,8 +125,7 @@ pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
 fn find_recycled(full: &Path, original: &Path) -> Result<PathBuf, PlatformError> {
     let roots = recycle_roots(full);
     // 10 分钟富余：机器时钟有小偏差、批量删除各条差几秒，都不该被筛掉。
-    let floor = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(600));
+    let floor = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(600));
     for attempt in 0..8 {
         let fresh_only = attempt < 4;
         for root in &roots {
@@ -232,15 +233,15 @@ fn canonical_full(path: &Path) -> Result<PathBuf, PlatformError> {
 
 fn encode_wide(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    p.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 错误里必须带上**是哪条路径**（用户有多选删除，分不清位置的报错等于没说）。
 fn failed(action: &str, path: &Path, e: windows::core::Error) -> PlatformError {
-    PlatformError::Failed(format!(
-        "{action}失败：{}（{e}）",
-        path.display()
-    ))
+    PlatformError::Failed(format!("{action}失败：{}（{e}）", path.display()))
 }
 
 #[cfg(test)]
@@ -265,8 +266,14 @@ mod tests {
 
         assert!(original_matches(&bytes, Path::new(origin)));
         // NTFS 本来就不区分大小写，比对必须跟着不敏感。
-        assert!(original_matches(&bytes, Path::new("c:\\USERS\\demo\\desktop\\A.TXT")));
-        assert!(!original_matches(&bytes, Path::new("C:\\Users\\demo\\Desktop\\b.txt")));
+        assert!(original_matches(
+            &bytes,
+            Path::new("c:\\USERS\\demo\\desktop\\A.TXT")
+        ));
+        assert!(!original_matches(
+            &bytes,
+            Path::new("C:\\Users\\demo\\Desktop\\b.txt")
+        ));
     }
 
     /// 卷根上挂 `$Recycle.Bin`（回收站每卷一份，不在子目录里）。
