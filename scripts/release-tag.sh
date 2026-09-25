@@ -15,6 +15,13 @@
 #   ./scripts/release-tag.sh 0.1.1-beta.3  # 显式指定 beta 版
 #   ./scripts/release-tag.sh patch --no-push   # 只本地打 tag，稍后自己推
 #   ./scripts/release-tag.sh patch --skip-checks  # 跳过 fmt/clippy/test，快速发布
+#   ./scripts/release-tag.sh --republish       # 重发当前版本号对应的 tag
+#
+# --republish：某次 release 流水线挂了（构建失败 / 产物坏了）时用——把已有的
+# tag 移到当前 HEAD（带上修复后的代码），删掉远端旧 tag 再重推，重新触发一遍
+# 流水线。不改版本号、不产生新提交；远端 tag 删除会把旧 Release 打成草稿，
+# 重跑完由流水线重新发布。要重发**旧版本**（Cargo.toml 已经往前走了）别用
+# 这条，去 Actions 面板对 release.yml 手动 Run workflow、填旧 tag。
 #
 # beta 版即 semver 预发布形态 `x.y.z-beta.N`：tag 形如 v0.1.1-beta.1，
 # GitHub Release 会被流水线标成 Pre-release。要把某个 beta 转正式，显式传
@@ -37,6 +44,7 @@ ROOT="$(pwd)"
 BUMP=""
 NO_PUSH=0
 SKIP_CHECKS=0
+REPUBLISH=0
 
 usage() {
   # 打印文件头的注释块（第 3 行起，到 `set -euo` 前为止）——锚点匹配，
@@ -50,6 +58,7 @@ for arg in "$@"; do
     -h | --help) usage 0 ;;
     --no-push) NO_PUSH=1 ;;
     --skip-checks) SKIP_CHECKS=1 ;;
+    --republish) REPUBLISH=1 ;;
     patch | minor | major | beta) BUMP="$arg" ;;
     *) BUMP="$arg" ;;
   esac
@@ -180,7 +189,23 @@ fi
 
 TAG="v$VERSION"
 
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG 已存在"
+# tag 现状：本地查 refs，远端只在重发时才 ls-remote（正常发布不必多一次网络往返）。
+LOCAL_HAS_TAG=0
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && LOCAL_HAS_TAG=1
+REMOTE_HAS_TAG=0
+
+if [ "$REPUBLISH" -eq 1 ]; then
+  [ -z "$BUMP" ] || die "--republish 不接受版本参数（重发不改版本号）"
+  if git ls-remote --tags "$REMOTE" "refs/tags/$TAG" 2>/dev/null | grep -q .; then
+    REMOTE_HAS_TAG=1
+  fi
+  if [ "$LOCAL_HAS_TAG" -eq 0 ] && [ "$REMOTE_HAS_TAG" -eq 0 ]; then
+    die "--republish：tag $TAG 本地和远端都不存在，没有可重发的（要打新 tag 去掉 --republish 即可）"
+  fi
+  printf '\033[33m! 重发 %s：tag 会移到当前 HEAD（带上修复后的代码），不改版本号\033[0m\n' "$TAG"
+else
+  [ "$LOCAL_HAS_TAG" -eq 0 ] || die "tag $TAG 已存在（要重发它：加 --republish）"
+fi
 
 # ---------------------------------------------------------------- 版本写入
 # 先在**改文件之前**跑门禁：不合格时工作区仍是干净的，不必手动回滚。
@@ -246,6 +271,9 @@ if [ "$VERSION_COMMIT" -eq 1 ]; then
   printf '  提交：chore(release): bump version to %s\n' "$VERSION"
 fi
 printf '  tag：%s（推送后自动触发 GitHub Release 流水线）\n' "$TAG"
+if [ "$REPUBLISH" -eq 1 ]; then
+  printf '  \033[33m重发：删掉已有 tag 重新打；远端旧 tag 删除会把旧 Release 打成草稿\033[0m\n'
+fi
 if [ "$NO_PUSH" -eq 1 ]; then
   printf '  \033[33m--no-push：只本地打 tag，不推送\033[0m\n'
 fi
@@ -266,16 +294,28 @@ if [ "$VERSION_COMMIT" -eq 1 ]; then
   git commit -m "chore(release): bump version to $VERSION"
 fi
 
+if [ "$LOCAL_HAS_TAG" -eq 1 ]; then
+  step "删除本地旧 tag $TAG（重新指到当前 HEAD）"
+  git tag -d "$TAG"
+fi
+
 step "创建 tag $TAG"
 git tag -a "$TAG" -m "Mo $TAG"
 
 if [ "$NO_PUSH" -eq 1 ]; then
-  printf '\n\033[33m本地已就绪，手动推送：\033[0m\n  git push %s %s && git push %s %s\n' \
-    "$REMOTE" "$BRANCH" "$REMOTE" "$TAG"
+  printf '\n\033[33m本地已就绪，手动推送：\033[0m\n'
+  if [ "$REMOTE_HAS_TAG" -eq 1 ]; then
+    printf '  git push %s :refs/tags/%s && \\\n' "$REMOTE" "$TAG"
+  fi
+  printf '  git push %s %s && git push %s %s\n' "$REMOTE" "$BRANCH" "$REMOTE" "$TAG"
   exit 0
 fi
 
 step "推送到 $REMOTE"
+if [ "$REMOTE_HAS_TAG" -eq 1 ]; then
+  step "删除远端旧 tag $TAG（旧 Release 变草稿，流水线重跑后重新发布）"
+  git push "$REMOTE" ":refs/tags/$TAG"
+fi
 git push "$REMOTE" "$BRANCH"
 git push "$REMOTE" "$TAG"
 

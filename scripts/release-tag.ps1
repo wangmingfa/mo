@@ -16,6 +16,13 @@
 #   .\scripts\release-tag.ps1 0.1.1-beta.3    # 显式指定 beta 版
 #   .\scripts\release-tag.ps1 patch -NoPush   # 只本地打 tag，稍后自己推
 #   .\scripts\release-tag.ps1 patch -SkipChecks  # 跳过 fmt/clippy/test，快速发布
+#   .\scripts\release-tag.ps1 -Republish      # 重发当前版本号对应的 tag
+#
+# -Republish：某次 release 流水线挂了（构建失败 / 产物坏了）时用——把已有的
+# tag 移到当前 HEAD（带上修复后的代码），删掉远端旧 tag 再重推，重新触发一遍
+# 流水线。不改版本号、不产生新提交；远端 tag 删除会把旧 Release 打成草稿，
+# 重跑完由流水线重新发布。要重发**旧版本**（Cargo.toml 已经往前走了）别用
+# 这条，去 Actions 面板对 release.yml 手动 Run workflow、填旧 tag。
 #
 # beta 版即 semver 预发布形态 `x.y.z-beta.N`：tag 形如 v0.1.1-beta.1，
 # GitHub Release 会被流水线标成 Pre-release。要把某个 beta 转正式，显式传
@@ -36,7 +43,8 @@ param(
     [Parameter(Position = 0)]
     [string]$Bump = "",
     [switch]$NoPush,
-    [switch]$SkipChecks
+    [switch]$SkipChecks,
+    [switch]$Republish
 )
 
 # 这里刻意不用 $ErrorActionPreference='Stop'：PS 5.1 下它会要了 git/cargo 的
@@ -155,8 +163,26 @@ if ($Bump) {
 
 $Tag = "v$Version"
 
+# tag 现状：本地查 refs，远端只在重发时才 ls-remote（正常发布不必多一次网络往返）。
+$localHasTag = $false
 & git rev-parse -q --verify "refs/tags/$Tag" 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { Die "tag $Tag 已存在" }
+if ($LASTEXITCODE -eq 0) { $localHasTag = $true }
+$remoteHasTag = $false
+
+if ($Republish) {
+    if ($Bump) { Die '-Republish 不接受版本参数（重发不改版本号）' }
+    # tag 不存在时 ls-remote 也是退出码 0、输出为空；非零退出是连不上远端等真错误，
+    # 这时当作「远端没有」处理，让下面「本地远端都没有」的报错给出准确指引。
+    $lsOut = @(& git ls-remote --tags $Remote "refs/tags/$Tag" 2>&1 |
+        ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if ($LASTEXITCODE -eq 0 -and $lsOut.Count -gt 0) { $remoteHasTag = $true }
+    if (-not $localHasTag -and -not $remoteHasTag) {
+        Die "-Republish：tag $Tag 本地和远端都不存在，没有可重发的（要打新 tag 去掉 -Republish 即可）"
+    }
+    Write-Host "! 重发 $Tag：tag 会移到当前 HEAD（带上修复后的代码），不改版本号" -ForegroundColor Yellow
+} elseif ($localHasTag) {
+    Die "tag $Tag 已存在（要重发它：加 -Republish）"
+}
 
 # ---------------------------------------------------------------- 质量门禁
 # 先在**改文件之前**跑门禁：不合格时工作区仍是干净的，不必手动回滚。
@@ -226,6 +252,9 @@ try {
         Write-Host "  提交：chore(release): bump version to $Version"
     }
     Write-Host "  tag：$Tag（推送后自动触发 GitHub Release 流水线）"
+    if ($Republish) {
+        Write-Host '  重发：删掉已有 tag 重新打；远端旧 tag 删除会把旧 Release 打成草稿' -ForegroundColor Yellow
+    }
     if ($NoPush) {
         Write-Host '  -NoPush：只本地打 tag，不推送' -ForegroundColor Yellow
     }
@@ -253,6 +282,12 @@ try {
         $committed = $true   # 版本改动已进提交，回滚不再是「还原文件」的事
     }
 
+    if ($localHasTag) {
+        Step "删除本地旧 tag $Tag（重新指到当前 HEAD）"
+        & git tag -d $Tag
+        if ($LASTEXITCODE -ne 0) { Die "git tag -d 失败" }
+    }
+
     Step "创建 tag $Tag"
     & git tag -a $Tag -m "Mo $Tag"
     if ($LASTEXITCODE -ne 0) { Die "git tag 失败" }
@@ -262,11 +297,19 @@ try {
     if ($NoPush) {
         Write-Host ''
         Write-Host '本地已就绪，手动推送：' -ForegroundColor Yellow
+        if ($remoteHasTag) {
+            Write-Host "  git push $Remote :refs/tags/$Tag"
+        }
         Write-Host "  git push $Remote $Branch; git push $Remote $Tag"
         exit 0
     }
 
     Step "推送到 $Remote"
+    if ($remoteHasTag) {
+        Step "删除远端旧 tag $Tag（旧 Release 变草稿，流水线重跑后重新发布）"
+        & git push $Remote ":refs/tags/$Tag" 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -ne 0) { Die "删除远端旧 tag 失败，手动重试：git push $Remote :refs/tags/$Tag" }
+    }
     & git push $Remote $Branch 2>&1 | ForEach-Object { "$_" }
     if ($LASTEXITCODE -ne 0) { Die "git push 分支失败（tag $Tag 已在本地，修好后手动：git push $Remote $Tag）" }
     & git push $Remote $Tag 2>&1 | ForEach-Object { "$_" }
