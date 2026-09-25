@@ -9616,15 +9616,8 @@ impl RootView {
                 ));
             }
         }
-        if self.trash_entries.is_empty() {
-            body = body.child(
-                div()
-                    .p(px(24.0))
-                    .text_size(px(13.0))
-                    .text_color(theme::muted())
-                    .child(text!("回收站是空的".to_string())),
-            );
-        }
+        // 空态**不**再画「回收站是空的」一行（用户报）：标题「回收站（0 项）」已
+        // 说明状态，且这行字挂在补足行下面，看起来像又一处渲染错位。
         // 表头固定在滚动区上方，不随内容滚动（Finder 列表视图行为）；网格 / 画廊
         // 没有列的概念，不出表头。
         let mut content = div().flex().flex_col().flex_1().min_h_0().min_w_0();
