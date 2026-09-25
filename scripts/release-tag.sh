@@ -9,10 +9,17 @@
 #   ./scripts/release-tag.sh                # 用 Cargo.toml 里现有版本号打 tag
 #   ./scripts/release-tag.sh patch         # 0.1.0 → 0.1.1
 #   ./scripts/release-tag.sh minor         # 0.1.0 → 0.2.0
-#   ./scripts/release-tag.sh major         # 0.1.0 → 1.0.0
+#   ./scripts/release-tag.sh major           # 0.1.0 → 1.0.0
+#   ./scripts/release-tag.sh beta            # 0.1.0 → 0.1.1-beta.1；0.1.1-beta.1 → 0.1.1-beta.2
 #   ./scripts/release-tag.sh 1.2.3         # 显式指定
+#   ./scripts/release-tag.sh 0.1.1-beta.3  # 显式指定 beta 版
 #   ./scripts/release-tag.sh patch --no-push   # 只本地打 tag，稍后自己推
 #   ./scripts/release-tag.sh patch --skip-checks  # 跳过 fmt/clippy/test，快速发布
+#
+# beta 版即 semver 预发布形态 `x.y.z-beta.N`：tag 形如 v0.1.1-beta.1，
+# GitHub Release 会被流水线标成 Pre-release。要把某个 beta 转正式，显式传
+# 对应版本号（如 `0.1.1`）；`patch/minor/major` 永远在数字段上 +1（会先剥掉
+# 现有的 `-beta.N` 再进位，不会原地转正）。
 #
 # 质量门禁与最终确认都是方向键菜单（↑/↓ 移动光标，回车确认，默认选中
 # 第一项）；选「跳过」直接发布，push 后 CI 仍会兜底跑一遍。--skip-checks
@@ -32,7 +39,9 @@ NO_PUSH=0
 SKIP_CHECKS=0
 
 usage() {
-  sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+  # 打印文件头的注释块（第 3 行起，到 `set -euo` 前为止）——锚点匹配，
+  # 免得注释块行长变化后写死的行号把用法说明切掉半截。
+  sed -n '3,/^set -euo/p' "$0" | sed -e '/^set -euo/d' -e 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -41,7 +50,7 @@ for arg in "$@"; do
     -h | --help) usage 0 ;;
     --no-push) NO_PUSH=1 ;;
     --skip-checks) SKIP_CHECKS=1 ;;
-    patch | minor | major) BUMP="$arg" ;;
+    patch | minor | major | beta) BUMP="$arg" ;;
     *) BUMP="$arg" ;;
   esac
 done
@@ -127,10 +136,29 @@ current_version() {
 CURRENT="$(current_version)"
 [ -n "$CURRENT" ] || die "无法从 Cargo.toml 读取 [workspace.package].version"
 
+# 把现有版本号拆成「数字段 + 预发布段」：`0.1.1-beta.2` → BASE=`0.1.1`、
+# PRE=`beta.2`；纯正式版本 PRE 为空。
+CURRENT_BASE="${CURRENT%%-*}"
+CURRENT_PRE=""
+[ "$CURRENT" = "$CURRENT_BASE" ] || CURRENT_PRE="${CURRENT#*-}"
+
 if [ -n "$BUMP" ]; then
   case "$BUMP" in
+    beta)
+      if [[ "$CURRENT_PRE" == beta.* ]]; then
+        # 已经是 beta：只进预发布号（0.1.1-beta.1 → 0.1.1-beta.2）。
+        N="${CURRENT_PRE#beta.}"
+        VERSION="${CURRENT_BASE}-beta.$((N + 1))"
+      else
+        # 从正式版本起 beta：patch 进位后挂 `-beta.1`。
+        IFS='.' read -r MA MI PA <<<"$CURRENT_BASE"
+        VERSION="$MA.$MI.$((PA + 1))-beta.1"
+      fi
+      ;;
     patch | minor | major)
-      IFS='.' read -r MA MI PA <<<"$CURRENT"
+      # 在数字段上进位（先剥掉 `-beta.N`，所以 beta 不会「原地转正」——
+      # 转正请显式传版本号）。
+      IFS='.' read -r MA MI PA <<<"$CURRENT_BASE"
       case "$BUMP" in
         patch) PA=$((PA + 1)) ;;
         minor) MI=$((MI + 1)); PA=0 ;;
@@ -139,10 +167,10 @@ if [ -n "$BUMP" ]; then
       VERSION="$MA.$MI.$PA"
       ;;
     *)
-      if [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      if [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
         VERSION="$BUMP"
       else
-        die "无法识别的版本参数：${BUMP}（可用 patch / minor / major / x.y.z）"
+        die "无法识别的版本参数：${BUMP}（可用 patch / minor / major / beta / x.y.z[-beta.N]）"
       fi
       ;;
   esac
@@ -205,6 +233,9 @@ fi
 # ---------------------------------------------------------------- 确认并推送
 printf '\n\033[1m即将发布\033[0m\n'
 printf '  版本：%s（当前 branch %s）\n' "$TAG" "$BRANCH"
+case "$VERSION" in
+  *-beta.*) printf '  \033[33mbeta 版：GitHub Release 会标为 Pre-release\033[0m\n' ;;
+esac
 if [ "$SKIP_CHECKS" -eq 1 ]; then
   printf '  门禁：\033[33m已跳过\033[0m\n'
 else

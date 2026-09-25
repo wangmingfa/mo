@@ -11,9 +11,16 @@
 #   .\scripts\release-tag.ps1 patch           # 0.1.0 → 0.1.1
 #   .\scripts\release-tag.ps1 minor           # 0.1.0 → 0.2.0
 #   .\scripts\release-tag.ps1 major           # 0.1.0 → 1.0.0
+#   .\scripts\release-tag.ps1 beta            # 0.1.0 → 0.1.1-beta.1；0.1.1-beta.1 → 0.1.1-beta.2
 #   .\scripts\release-tag.ps1 1.2.3           # 显式指定
+#   .\scripts\release-tag.ps1 0.1.1-beta.3    # 显式指定 beta 版
 #   .\scripts\release-tag.ps1 patch -NoPush   # 只本地打 tag，稍后自己推
 #   .\scripts\release-tag.ps1 patch -SkipChecks  # 跳过 fmt/clippy/test，快速发布
+#
+# beta 版即 semver 预发布形态 `x.y.z-beta.N`：tag 形如 v0.1.1-beta.1，
+# GitHub Release 会被流水线标成 Pre-release。要把某个 beta 转正式，显式传
+# 对应版本号（如 `0.1.1`）；`patch/minor/major` 永远在数字段上 +1（会先剥掉
+# 现有的 `-beta.N` 再进位，不会原地转正）。
 #
 # 质量门禁与最终确认都是方向键菜单（↑/↓ 移动光标，回车确认，默认选中
 # 第一项）；选「跳过」直接发布，push 后 CI 仍会兜底跑一遍。
@@ -111,19 +118,36 @@ if ($LASTEXITCODE -ne 0) { Die "读当前分支失败：$Branch" }
 $Current = Get-Version
 
 # ---------------------------------------------------------------- 版本计算
+# 把现有版本号拆成「数字段 + 预发布段」：`0.1.1-beta.2` → base=`0.1.1`、
+# pre=`beta.2`；纯正式版本 pre 为空。
+$CurBase = $Current.Split('-')[0]
+$CurPre = ''
+if ($Current.Contains('-')) { $CurPre = $Current.Substring($CurBase.Length + 1) }
+
 if ($Bump) {
-    if ($Bump -match '^(patch|minor|major)$') {
-        $p = $Current.Split('.') | ForEach-Object { [int]$_ }
+    if ($Bump -match '^(patch|minor|major|beta)$') {
+        $p = $CurBase.Split('.') | ForEach-Object { [int]$_ }
         if ($p.Count -lt 3) { Die "当前版本号不是 x.y.z 形态：$Current" }
         switch ($Bump) {
+            # patch/minor/major 在数字段上进位（先剥掉 `-beta.N`，所以 beta 不会
+            # 「原地转正」——转正请显式传版本号）。
             'patch' { $Version = "$($p[0]).$($p[1]).$($p[2] + 1)" }
             'minor' { $Version = "$($p[0]).$($p[1] + 1).0" }
             'major' { $Version = "$($p[0] + 1).0.0" }
+            'beta' {
+                if ($CurPre -match '^beta\.(\d+)$') {
+                    # 已经是 beta：只进预发布号（0.1.1-beta.1 → 0.1.1-beta.2）。
+                    $Version = "$CurBase-beta.$([int]$Matches[1] + 1)"
+                } else {
+                    # 从正式版本起 beta：patch 进位后挂 `-beta.1`。
+                    $Version = "$($p[0]).$($p[1]).$($p[2] + 1)-beta.1"
+                }
+            }
         }
-    } elseif ($Bump -match '^\d+\.\d+\.\d+$') {
+    } elseif ($Bump -match '^\d+\.\d+\.\d+(-beta\.\d+)?$') {
         $Version = $Bump
     } else {
-        Die "无法识别的版本参数：$Bump（可用 patch / minor / major / x.y.z）"
+        Die "无法识别的版本参数：$Bump（可用 patch / minor / major / beta / x.y.z[-beta.N]）"
     }
 } else {
     $Version = $Current
@@ -189,6 +213,9 @@ try {
     Write-Host ''
     Write-Host '即将发布' -ForegroundColor White
     Write-Host "  版本：$Tag（当前 branch $Branch）"
+    if ($Version -match '-beta\.') {
+        Write-Host '  beta 版：GitHub Release 会标为 Pre-release' -ForegroundColor Yellow
+    }
     if ($SkipChecks) {
         Write-Host '  门禁：已跳过' -ForegroundColor Yellow
     } else {

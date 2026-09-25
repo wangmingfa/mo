@@ -159,3 +159,6 @@ jobs:
           files: |
             artifacts/*
           generate_release_notes: true
+          # 版本号带 `-`（semver 预发布形态，如 v0.1.1-beta.1）→ 标为 Pre-release。
+          # 不赌 action 的 auto 探测语义，这里显式判。
+          prerelease: ${{ contains(env.TAG, '-') }}
