@@ -27,7 +27,7 @@ unsafe_code = "warn"
 all = "deny"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1-beta.1"
 edition = "2021"
 license = "MIT"
 authors = ["Mo Contributors"]
