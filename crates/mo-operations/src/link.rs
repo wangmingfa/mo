@@ -141,7 +141,16 @@ mod tests {
         std::fs::write(&src, b"hello").unwrap();
 
         let sym = dir.join("a-sym.txt");
-        create_link(&src, &sym, LinkKind::Symlink).unwrap();
+        if let Err(e) = create_link(&src, &sym, LinkKind::Symlink) {
+            // Windows 建符号链接要管理员权限或开发者模式（ERROR_PRIVILEGE_NOT_HELD=1314），
+            // 环境不满足时跳过整条用例——这是权限限制，不是实现的锅。
+            #[cfg(windows)]
+            if matches!(&e, MoError::Io(io) if io.raw_os_error() == Some(1314)) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            panic!("建符号链接失败：{e}");
+        }
         assert_eq!(std::fs::read_to_string(&sym).unwrap(), "hello");
 
         let hard = dir.join("a-hard.txt");

@@ -7376,6 +7376,9 @@ fn handle_modal_key(
                     on_trash_open(entity, cx);
                 }
             }
+            // 非 macOS 平台的重命名专属键（资源管理器同款 F2）：那边 Enter 归了
+            // 「打开」，不接 F2 就等于整个面板没有重命名入口。
+            "f2" if !crate::keys::has_command_key() => on_trash_rename_start(entity, cx),
             // 空格 = 快速预览**实际落点**文件（Finder 废纸篓同款 Quick Look）。
             // 预览的是 `trashed`（真在 ~/.Trash / 卷上 .Trashes 的本地文件），
             // 不是已不存在的原路径。

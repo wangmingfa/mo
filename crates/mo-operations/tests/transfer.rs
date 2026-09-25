@@ -59,7 +59,11 @@ impl MemFs {
 
     fn dirs(&self) -> Vec<String> {
         let m = self.inner.lock().unwrap();
-        m.dirs.iter().map(|p| p.display().to_string()).collect()
+        // 远程后端拿路径会把 `\` 规范化成 `/`（见 sftp.rs 的 `remote()`），fake 对齐这个行为。
+        m.dirs
+            .iter()
+            .map(|p| p.display().to_string().replace('\\', "/"))
+            .collect()
     }
 }
 

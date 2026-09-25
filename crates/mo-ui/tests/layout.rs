@@ -71,6 +71,20 @@ fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> 
         .unwrap_or_else(|| panic!("{selector} 没有出现在渲染帧里（debug_selector 未生效？）"))
 }
 
+/// 路径作为 JSON 字符串字面量的正文：Windows 的 `display()` 带 `\`，
+/// 不转义成 `\\` 的话预种的 index.json 根本解析不出来（回收站面板空白）。
+fn jpath(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "\\\\")
+}
+
+/// 键串里的主修饰键：macOS 写 `cmd`，别的平台写 `ctrl`。
+/// （键表本身两个写法同义，但 headless 模拟把 `cmd` 解释成 platform 修饰位，
+/// 非 macOS 的事件里那一位永远不亮，只有 `ctrl` 能命中。）
+const PRIMARY: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+
+/// 「重命名」的平台默认键：Finder 惯例 Enter、资源管理器惯例 F2（见 keys.rs 的 `default_spec`）。
+const RENAME_KEY: &str = if cfg!(target_os = "macos") { "enter" } else { "f2" };
+
 /// 文件列表必须吃满中央区的剩余高度——它没有自我撑高的能力。
 #[gpui_kit::test]
 fn file_list_fills_the_central_area(cx: &mut TestAppContext) {
@@ -1247,7 +1261,7 @@ fn trash_empty_asks_for_confirmation(cx: &mut TestAppContext) {
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            dir.join(name).display()
+            jpath(&dir.join(name))
         ));
     }
     records.push(']');
@@ -1342,8 +1356,8 @@ fn trash_space_previews_and_double_click_opens(cx: &mut TestAppContext) {
         seed.join("index.json"),
         format!(
             r#"[{{"id":"seed-1","original":"/Users/demo/folder","trashed":"{}","is_dir":true,"at":1700000000}},{{"id":"seed-0","original":"/Users/demo/a.txt","trashed":"{}","is_dir":false,"at":1700000000}}]"#,
-            seed.join("seed-1").display(),
-            seed.join("seed-0").join("a.txt").display()
+            jpath(&seed.join("seed-1")),
+            jpath(&seed.join("seed-0").join("a.txt"))
         ),
     )
     .unwrap();
@@ -1535,7 +1549,7 @@ fn trash_panel_supports_multi_select(cx: &mut TestAppContext) {
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            dir.join(&name).display()
+            jpath(&dir.join(&name))
         ));
     }
     records.push(']');
@@ -1603,8 +1617,8 @@ fn trash_panel_supports_multi_select(cx: &mut TestAppContext) {
     redraw(&mut vcx);
     assert_eq!(sel(&mut vcx, &window), vec![1]);
 
-    // ⌘A：全选。
-    cx.simulate_keystrokes(window.into(), "cmd-a");
+    // ⌘A / Ctrl+A：全选。
+    cx.simulate_keystrokes(window.into(), &format!("{PRIMARY}-a"));
     redraw(&mut vcx);
     assert_eq!(sel(&mut vcx, &window), vec![0, 1, 2]);
     // 视觉回归：三行都得画上选中底色。
@@ -1665,8 +1679,8 @@ fn trash_multi_select_restore_acts_on_the_selection(cx: &mut TestAppContext) {
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            seed.display(),
-            dir.join(&name).display()
+            jpath(&seed),
+            jpath(&dir.join(&name))
         ));
     }
     records.push(']');
@@ -1744,8 +1758,8 @@ fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppCont
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            seed.display(),
-            dir.join(&name).display()
+            jpath(&seed),
+            jpath(&dir.join(&name))
         ));
     }
     records.push(']');
@@ -1793,16 +1807,16 @@ fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppCont
         "有选中时应出现还原按钮"
     );
 
-    // ③ macOS Enter = 重命名：弹卡并预填游标行的当前名（原路径的文件名）。
+    // ③ 重命名默认键（Finder=Enter / 资源管理器=F2）：弹卡并预填游标行的当前名。
     assert_eq!(
         names(&mut vcx, &window),
         vec!["demo-f2.txt", "demo-f1.txt", "demo-f0.txt"]
     );
-    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), RENAME_KEY);
     redraw(&mut vcx);
     assert!(
         vcx.debug_bounds("mo-dialog-card").is_some(),
-        "Enter 应弹重命名卡"
+        "{RENAME_KEY} 应弹重命名卡"
     );
     // Esc 回面板，多选保持。
     cx.simulate_keystrokes(window.into(), "escape");
@@ -1811,7 +1825,7 @@ fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppCont
     assert_eq!(sel(&mut vcx, &window), vec![0]);
 
     // ④ 再进重命名卡：清空预填 → 输入新名 → Enter 提交。
-    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), RENAME_KEY);
     redraw(&mut vcx);
     cx.simulate_keystrokes(
         window.into(),
@@ -1854,7 +1868,7 @@ fn trash_header_and_blank_click_clears_selection(cx: &mut TestAppContext) {
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"/Users/demo/{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            dir.join(name).display()
+            jpath(&dir.join(name))
         ));
     }
     records.push(']');
@@ -1919,8 +1933,8 @@ fn trash_view_switch_really_switches(cx: &mut TestAppContext) {
         }
         records.push_str(&format!(
             r#"{{"id":"{id}","original":"{}/demo-{name}","trashed":"{}","is_dir":false,"at":1700000000}}"#,
-            seed.display(),
-            dir.join(&name).display()
+            jpath(&seed),
+            jpath(&dir.join(&name))
         ));
     }
     records.push(']');
