@@ -9400,17 +9400,6 @@ impl RootView {
                     }
                 });
             });
-        // prepaint 回写内容区高度，下一帧才能把斑马纹补满一屏（首帧先按实际
-        // 行数渲染；高度变了才 notify，不会造成重绘循环）。
-        let entity_h = entity.clone();
-        body = body.on_prepaint(move |bounds, _window, cx| {
-            let h = f32::from(bounds.size.height);
-            entity_h.update(cx, |v, cx| {
-                if v.set_trash_body_h(h) {
-                    cx.notify();
-                }
-            });
-        });
 
         // 系统图标链路与文件列表**同一条**（`AppState::file_icon` 纯查表 + 后台泵
         // 补齐）。类型图标按扩展名向系统要（`iconForFileType:`）——回收站条目的
@@ -9642,7 +9631,30 @@ impl RootView {
         if !grid_mode {
             content = content.child(list_view::header_row("trash", &cols));
         }
-        content = content.child(body);
+        // prepaint 回写内容区高度，下一帧才能把斑马纹补满一屏（首帧先按实际
+        // 行数渲染；高度变了才 notify，不会造成重绘循环）。
+        // ⚠️ 量的是**视口**（这一层包裹），不能把 on_prepaint 挂在 `overflow_y_scrollbar`
+        // 的 body 上：那个调用会把 body 重构进「叠加滚动条」包装，挂在它上面的监听
+        // 实际量到的是**内容层**高度——补足行让它一帧比一帧高，下一帧又按这个高度
+        // 补更多行，正反馈滚出几百行空白（用户报，Windows 实测 300 帧涨到 622 行）。
+        // 与文件列表的 `list_origin` 同一套规矩：量视口，不量内容。
+        let entity_h = entity.clone();
+        let viewport = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .on_prepaint(move |bounds, _window, cx| {
+                let h = f32::from(bounds.size.height);
+                entity_h.update(cx, |v, cx| {
+                    if v.set_trash_body_h(h) {
+                        cx.notify();
+                    }
+                });
+            })
+            .child(body);
+        content = content.child(viewport);
 
         // 「还原」按钮：只在**有选中**时出现（没有可还的就不占地方）。
         // Enter 不再还原——macOS 上它是重命名、Win/Linux 上是打开（平台惯例），

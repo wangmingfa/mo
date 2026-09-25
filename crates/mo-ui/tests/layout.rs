@@ -1243,6 +1243,44 @@ fn trash_zebra_stripes_fill_the_viewport(cx: &mut TestAppContext) {
     );
 }
 
+/// 回归（用户报，Windows 构建）：空回收站里斑马纹补足行**自己喂自己**——
+/// `overflow_y_scrollbar()` 把原 div 重构成滚动条叠加层，`on_prepaint` 量到的是
+/// **内容层**高度（随行数增长）而不是视口高度。补足行让内容变高 → 下一帧量到
+/// 更高 → 补更多行，无限正反馈：0 条目也能滚出几千行空白。
+/// 这里连续渲染多帧，断言补足行总数有界（铺满一屏即可，不该随帧数增长）。
+#[gpui_kit::test]
+fn trash_filler_rows_do_not_grow_every_frame(cx: &mut TestAppContext) {
+    let seed = std::env::temp_dir().join(format!("mo-layout-trash-filler-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seed);
+    let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::inject_trash_for_tests(root, Vec::new());
+        })
+        .expect("注入空回收站失败");
+    // 跑多帧：正反馈每帧把行数往上推一档，帧数足够多必然暴露。
+    for _ in 0..300 {
+        vcx.update(|window, cx| window.render_frame(cx));
+    }
+
+    let mut count = 0usize;
+    loop {
+        let sel: &'static str = Box::leak(format!("mo-trash-ph-{count}").into_boxed_str());
+        if vcx.debug_bounds(sel).is_some() {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    // 700px 窗口的回收站视口装得下 ~26 行 24px；给足余量也不该超过 40。
+    assert!(
+        count > 0 && count <= 40,
+        "补足行有 {count} 条：内容高度回写把补足数喂成了无限增长（空白行可无限下滚）"
+    );
+}
+
 /// 清空回收站必须**先弹确认卡**（面板标题栏「清空回收站」按钮）：Esc / 取消 /
 /// 点遮罩回面板、条目原样；确认（Enter 或红色按钮）才真正执行并回到面板。
 ///
