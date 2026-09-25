@@ -712,8 +712,9 @@ struct Source {
 impl AppState {
     /// 回收站账本目录：用户主目录下的 `.mo-trash`。
     ///
-    /// ⚠️ 只存 `index.json` 账本，**不存文件**——macOS 生产模式下被删文件由系统
-    /// 送进废纸篓（`~/.Trash` / 卷宗 `.Trashes`），账本里记的是实际落点。
+    /// ⚠️ 只存 `index.json` 账本，**不存文件**——生产模式下（macOS / Windows）
+    /// 被删文件由系统送进废纸篓（macOS `~/.Trash` / 卷宗 `.Trashes`；Windows
+    /// 各卷 `$Recycle.Bin` 的 `$R...`），账本里记的是实际落点。
     /// 旧版本的 `<uuid>/<原名>` 隔离条目依然可还原 / 清理（见 `Trash` 的
     /// 隔离 / 系统双模式）。
     fn default_trash_root() -> PathBuf {
@@ -722,7 +723,7 @@ impl AppState {
             .join(".mo-trash")
     }
 
-    /// 生产构造：回收站走**系统废纸篓 + Mo 账本**（macOS）。
+    /// 生产构造：回收站走**系统废纸篓 + Mo 账本**（macOS / Windows）。
     pub fn new() -> Self {
         Self::build(
             Self::default_trash_root(),
@@ -764,7 +765,7 @@ impl AppState {
 
     /// 以指定回收站、会话表与暂存区构造（各构造器共用）。
     ///
-    /// `system_trash`：macOS 生产模式下为 `true`——删除经
+    /// `system_trash`：生产模式（macOS / Windows）下为 `true`——删除经
     /// `mo_platform::recycle_one` 送进系统废纸篓，Mo 只拿回落点记账。测试一律
     /// 传 `false`（隔离模式），绝不能把测试文件删进真实废纸篓。
     fn build(
@@ -780,7 +781,7 @@ impl AppState {
                 None
             }
         };
-        let trash = if system_trash && cfg!(target_os = "macos") {
+        let trash = if system_trash && mo_platform::supports_trash() {
             Arc::new(
                 Trash::with_mover(
                     trash_root,

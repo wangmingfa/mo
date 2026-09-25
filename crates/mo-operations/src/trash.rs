@@ -4,7 +4,8 @@
 //! * **隔离模式**（默认 / 测试）：被回收项放进 `<root>/<uuid>/<原名>`，按 uuid
 //!   隔离，避免同名冲突；`root` 里既有数据也有 `index.json`。
 //! * **系统模式**（注入搬移器）：由平台把文件送进**系统**废纸篓（macOS 上是
-//!   `trashItemAtURL`，落点在 `~/.Trash` 或卷宗 `.Trashes/<uid>`），Mo 只拿回落点
+//!   `trashItemAtURL`，落点在 `~/.Trash` 或卷宗 `.Trashes/<uid>`；Windows 上是
+//!   `IFileOperation`，落点是各卷 `$Recycle.Bin\<SID>\$R<名>`），Mo 只拿回落点
 //!   记账。`root` 里只有 `index.json`，账本悬空（用户清倒废纸篓）时还原会报
 //!   「文件已不在」。
 //! * 索引（`<root>/index.json`）持久化 `TrashEntry`，进程重启后仍能还原 / 清空。
@@ -157,6 +158,9 @@ impl Trash {
             }
         }
         move_path(&entry.trashed, &entry.original)?;
+        // Windows 系统条目：本体已被搬走，配对的 `$I` 元数据要跟着清，
+        // 不然资源管理器回收站留幽灵条目。
+        drop_recycle_pair(&entry.trashed);
         // 清理 uuid 隔离目录（可能残留空父）。仅限隔离条目。
         if self.is_isolated(&entry.trashed) {
             if let Some(id_dir) = entry.trashed.parent() {
@@ -211,6 +215,7 @@ impl Trash {
             } else {
                 let _ = std::fs::remove_file(&entry.trashed);
             }
+            drop_recycle_pair(&entry.trashed);
         }
         self.remove_entry(&entry.id)
     }
@@ -223,8 +228,10 @@ impl Trash {
                 let _ = std::fs::remove_dir_all(self.root.join(&e.id));
             } else if e.trashed.is_dir() {
                 let _ = std::fs::remove_dir_all(&e.trashed);
+                drop_recycle_pair(&e.trashed);
             } else {
                 let _ = std::fs::remove_file(&e.trashed);
+                drop_recycle_pair(&e.trashed);
             }
         }
         self.entries.lock().clear();
@@ -258,7 +265,13 @@ impl Trash {
         if name == old_name {
             return Ok(entry.clone());
         }
-        let new_trashed = entry.trashed.with_file_name(name);
+        // Windows 系统条目落盘是 `$R<名>`（配 `$I<名>` 元数据），用户只见 `<名>`：
+        // 落盘名要补回前缀，配对元数据跟着改名。
+        let prefix = trashed_prefix(&old_name);
+        if !prefix.is_empty() && name == old_name.strip_prefix(prefix).unwrap_or(&old_name) {
+            return Ok(entry.clone());
+        }
+        let new_trashed = entry.trashed.with_file_name(format!("{prefix}{name}"));
         if new_trashed.exists() {
             return Err(TrashError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -266,6 +279,15 @@ impl Trash {
             )));
         }
         std::fs::rename(&entry.trashed, &new_trashed)?;
+        #[cfg(target_os = "windows")]
+        if !prefix.is_empty() {
+            if let Some(old_tail) = old_name.strip_prefix("$R") {
+                let _ = std::fs::rename(
+                    entry.trashed.with_file_name(format!("$I{old_tail}")),
+                    entry.trashed.with_file_name(format!("$I{name}")),
+                );
+            }
+        }
         let mut updated = entry.clone();
         updated.trashed = new_trashed;
         if let Some(dir) = updated.original.parent() {
@@ -292,6 +314,44 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Windows 系统回收站条目的落盘名前缀（`$R<名>`，配对 `$I<名>` 元数据）。
+/// 其它平台、以及系统废纸篓里的普通名字，都是空串。
+#[cfg(target_os = "windows")]
+fn trashed_prefix(trashed_name: &str) -> &'static str {
+    if trashed_name.starts_with("$R") {
+        "$R"
+    } else {
+        ""
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trashed_prefix(_trashed_name: &str) -> &'static str {
+    ""
+}
+
+/// Windows 系统回收站条目**配对**的元数据文件路径（抹掉/搬走本体后 `$I` 会变幽灵）；
+/// 其它平台恒 `None`。
+#[cfg(target_os = "windows")]
+fn recycle_pair(trashed: &Path) -> Option<PathBuf> {
+    let name = trashed.file_name()?.to_string_lossy().into_owned();
+    let tail = name.strip_prefix("$R")?;
+    Some(trashed.with_file_name(format!("$I{tail}")))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn recycle_pair(_trashed: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// 本体没了之后把配对的 `$I` 也删掉——不然资源管理器回收站留幽灵条目
+/// （还原必失败的那种）。非 Windows 是空操作。
+fn drop_recycle_pair(trashed: &Path) {
+    if let Some(pair) = recycle_pair(trashed) {
+        let _ = std::fs::remove_file(pair);
+    }
 }
 
 fn load_index(root: &Path) -> Result<Vec<TrashEntry>> {

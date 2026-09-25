@@ -36,13 +36,14 @@ pub enum PlatformError {
 
 /// 这个平台支持「把文件送进**系统**回收站」吗。
 pub fn supports_trash() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 把 `path` 送进系统回收站，返回它在废纸篓里的**实际落点**。
 ///
 /// 落点是上层记账的依据（Mo 的回收站账本要靠它还原 / 永久删除）；系统负责
-/// 处理重名改名与外接卷宗的就地 `.Trashes`。
+/// 处理重名改名与外接卷宗的就地 `.Trashes`（Windows 上是各卷的
+/// `$Recycle.Bin`，落点是配对的 `$R...` 文件）。
 ///
 /// 返回 `Err(PlatformError::Unsupported)` 时上层应当退回自己的回收站实现
 /// （`mo_operations` 那套目录），不要静默吞掉。
@@ -51,7 +52,11 @@ pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
     {
         macos::recycle_one(path)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::recycle_one(path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
         Err(PlatformError::Unsupported("回收站"))
@@ -333,10 +338,10 @@ mod tests {
                 eject(Path::new("/tmp")),
                 Err(PlatformError::Unsupported(_))
             ));
-            assert!(!supports_trash());
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
+            assert!(!supports_trash());
             assert!(matches!(
                 reveal(Path::new("/tmp")),
                 Err(PlatformError::Unsupported(_))
@@ -355,7 +360,7 @@ mod tests {
         let here_is_macos = cfg!(target_os = "macos");
         let here_is_windows = cfg!(target_os = "windows");
         assert_eq!(supports_reveal(), here_is_macos || here_is_windows);
-        assert_eq!(supports_trash(), here_is_macos);
+        assert_eq!(supports_trash(), here_is_macos || here_is_windows);
         assert_eq!(supports_volumes(), here_is_macos);
         assert_eq!(supports_file_icons(), here_is_macos);
         if here_is_macos {
@@ -369,13 +374,14 @@ mod tests {
 
     /// 真把它送进**系统**废纸篓：原处必须消失。
     ///
-    /// ⚠️ 这条走的是真实 AppKit——之所以敢放进单测，是因为回收站那条路用的是
-    /// `NSFileManager`（同步、不要求主线程）。`reveal` / `eject` 不行：它们
-    /// `dispatch_sync` 回主队列，而测试进程的主线程并不 drain 主队列，会直接挂死
-    /// （见 `devlog/macos-platform.md` §9）。
+    /// ⚠️ 这条走的是真实系统 API——之所以敢放进单测，是因为回收站那条路是
+    /// **同步、不要求主线程**的（macOS 用 `NSFileManager`；Windows 用
+    /// `IFileOperation`，COM 在测试线程里自己初始化）。`reveal` / `eject` 不行：
+    /// 它们 `dispatch_sync` 回主队列，而测试进程的主线程并不 drain 主队列，
+    /// 会直接挂死（见 `devlog/macos-platform.md` §9）。
     ///
     /// 副作用是把一个临时文件丢进用户自己的废纸篓，可接受。
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn recycling_takes_the_file_out_of_place() {
         let dir = std::env::temp_dir().join("mo-platform-recycle-test");
@@ -391,6 +397,18 @@ mod tests {
         );
         // 记账的另一半：落点文件可以直接抹掉（永久删除语义）。
         std::fs::remove_file(&trashed).expect("落点应当可删");
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 的回收条目是 `$R 本体 + $I 元数据` 一对：只抹本体会在
+            // 资源管理器回收站留幽灵条目，配对元数据必须一起清掉。
+            let name = trashed
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(tail) = name.strip_prefix("$R") {
+                let _ = std::fs::remove_file(trashed.with_file_name(format!("$I{tail}")));
+            }
+        }
 
         // 第二次必须**报错**（而不是静默「成功」）——用户会以为又删了一份。
         let err = recycle_one(&victim).expect_err("同一个文件第二次应当失败");
