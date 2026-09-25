@@ -26,7 +26,9 @@
 //! 地址里没写密码时用 `-N`（不询问，走 `nsmb.conf` / 钥匙串里的那份）。
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 use crate::{RemoteError, RemoteUrl};
 
@@ -299,6 +301,7 @@ fn mount_nfs(url: &RemoteUrl, point: &Path) -> Result<PathBuf, RemoteError> {
 // ---- 解析（纯函数，方便单测钉住各种输出格式）----
 
 /// macOS 的 `mount` 输出：`<fs> on <path> (<type>, <opts>)`。
+#[cfg(any(test, target_os = "macos"))]
 fn shares_from_macos_mount(output: &str) -> Vec<NetworkShare> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -454,6 +457,7 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// 跑一条命令，并把 `stdin_text`（SMB 密码）从管道喂进去。
+#[cfg(target_os = "macos")]
 fn spawn_with_stdin(
     program: &str,
     args: &[String],

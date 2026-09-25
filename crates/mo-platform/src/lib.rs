@@ -16,6 +16,7 @@
 //! 容量统计都只认系统那份。用 `trashItemAtURL:resultingItemURL:` 让系统搬、Mo
 //! 拿回落点记账才是正解（探针结论见 `devlog/trash-unify.md`）。
 
+#[cfg(target_os = "macos")]
 mod macos;
 
 use std::path::{Path, PathBuf};

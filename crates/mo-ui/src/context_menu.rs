@@ -669,6 +669,7 @@ mod tests {
     }
 
     /// 同上，但当前页在**远程**（用来验证本机专属动作被裁掉）。
+    #[cfg(target_os = "macos")]
     fn remote_menu(target: Option<&str>, is_dir: bool, selected: usize) -> ContextMenu {
         ContextMenu {
             remote: true,
