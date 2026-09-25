@@ -39,20 +39,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          # runner 一律钉具体版本、不用 *-latest：latest 别名会随镜像更新漂移
+          # （2026-09 起 ubuntu-latest=26.04、windows-latest=Server 2025、
+          # macos-latest=macOS 15 且很快跳 26），发布产物不该跟着漂。
+          # macOS 14 已弃用、13 已下线，macos-15 是当前能钉的最低版本；
+          # 最低可运行系统由 MACOSX_DEPLOYMENT_TARGET + Info.plist 决定（见下）。
+          - os: macos-15
             target: aarch64-apple-darwin
             format: app
-          - os: macos-latest
+          - os: macos-15
             target: x86_64-apple-darwin
             format: app
-          - os: ubuntu-latest
+          # Linux 钉 24.04：glibc 2.39，产物可跑 Ubuntu 24.04+ / Debian 13+ /
+          # Fedora 40+。22.04 镜像已进入弃用期，不做发布基线。
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             format: bin
-          - os: windows-latest
+          # Windows 钉 Server 2022（仍在支持期且工具链更久经考验）；Rust 的
+          # windows-msvc 目标本身兼容 Windows 10+，产物兼容性不受镜像影响。
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             format: bin
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      # 不显式设的话，macOS 链接器把「构建机系统版本」写成二进制的最低版本，
+      # 产物反而更挑系统。11.0 与 assets/macos/Info.plist 的
+      # LSMinimumSystemVersion 保持一致（改一处请同步改另一处）。
+      # 非 macOS 平台忽略此变量。
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
 
     steps:
       - uses: actions/checkout@v4
@@ -136,7 +152,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: 下载全部平台产物
