@@ -3271,31 +3271,18 @@ impl RootView {
         for (i, name) in names.iter().enumerate() {
             let selected = i == self.theme_index;
             let on_click_theme = name.clone();
-            let mut row = div()
-                .id(format!("theme-row-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .rounded(px(4.0))
-                .bg(if selected {
-                    crate::theme::selected_bg()
-                } else {
-                    crate::theme::surface()
-                })
-                .text_color(if selected {
-                    crate::theme::selected_text()
-                } else {
-                    crate::theme::text()
-                })
-                .child(text!(crate::theme::label(name)));
-            // 自定义主题额外显示配置里的 key，方便对着 config.json 改。
-            if crate::theme::label(name) != *name {
-                row = row.child(text!(format!("（{name}）")));
+            let title = if crate::theme::label(name) != *name {
+                // 自定义主题额外带上配置里的 key，方便对着 config.json 改。
+                format!("{}（{}）", crate::theme::label(name), name)
+            } else {
+                crate::theme::label(name)
+            };
+            let mut row = picker_row(&format!("theme-row-{i}"), selected, &title);
+            if !selected {
+                row = row.hover(|s| s.bg(theme::hover_bg()));
             }
             if *name == self.theme_name {
-                row = row.child(text!("· 当前".to_string()));
+                row = row.child(tag_pill("当前", selected));
             }
             let ent = entity.clone();
             row.interactivity().on_click(move |_ev, _window, cx| {
@@ -4540,10 +4527,11 @@ impl RootView {
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .gap(px(8.0))
-                .px(px(6.0))
-                .h(px(22.0))
-                .rounded(px(3.0))
+                .gap(px(10.0))
+                .px(px(10.0))
+                .h(px(30.0))
+                .rounded(px(8.0))
+                .text_size(px(13.0))
                 .bg(if capturing {
                     theme::selected_bg()
                 } else if selected {
@@ -4556,21 +4544,18 @@ impl RootView {
                 } else {
                     theme::text()
                 })
-                .child(text!(b.label.to_string()))
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(if capturing {
-                            theme::selected_text()
-                        } else {
-                            theme::muted()
-                        })
-                        .child(text!(if capturing {
-                            "按下新键位…"
-                        } else {
-                            &combo
-                        })),
-                );
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(text!(b.label.to_string())),
+                )
+                .child(if capturing {
+                    tag_pill("按下新键位…", true)
+                } else {
+                    tag_pill(&combo, false)
+                });
             list = list.child(row);
         }
         let mut reset_row = div()
@@ -4604,16 +4589,13 @@ impl RootView {
             ("显示侧边栏".to_string(), on(self.ui.sidebar).to_string()),
             ("显示状态栏".to_string(), on(self.ui.status_bar).to_string()),
             ("列表斑马纹".to_string(), on(self.ui.zebra).to_string()),
-            (
-                "新标签页默认视图".to_string(),
-                format!("{mode}（Enter 切换）"),
-            ),
+            ("新标签页默认视图".to_string(), mode.to_string()),
             // 图标缩放的三个入口（网格 / 画廊生效）。值那一列直接显示当前倍率，
             // 这样「按了没反应」一眼能看出是到了档位边界还是根本没生效。
             // f32 的 Display 会砍掉多余的 0（1.0 → "1"、1.25 → "1.25"）。
             (
                 "放大图标（网格 / 画廊）".to_string(),
-                format!("当前 {}×", self.ui.icon_scale),
+                format!("{}×", self.ui.icon_scale),
             ),
             ("缩小图标（网格 / 画廊）".to_string(), String::new()),
             ("图标大小还原 1×".to_string(), String::new()),
@@ -4838,36 +4820,13 @@ impl RootView {
         let mut body = div().flex().flex_col().gap(px(2.0));
         for (i, (label, value)) in self.layout_rows().into_iter().enumerate() {
             let selected = i == self.layout_index;
-            let mut row = div()
-                .id(format!("layout-row-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .rounded(px(4.0))
-                .bg(if selected {
-                    theme::selected_bg()
-                } else {
-                    theme::surface()
-                })
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                })
-                .child(text!(label))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(if selected {
-                            theme::selected_text()
-                        } else {
-                            theme::muted()
-                        })
-                        .child(text!(value)),
-                );
+            let mut row = picker_row(&format!("layout-row-{i}"), selected, &label);
+            if !selected {
+                row = row.hover(|s| s.bg(theme::hover_bg()));
+            }
+            if !value.is_empty() {
+                row = row.child(tag_pill(&value, selected));
+            }
             let ent = entity.clone();
             row.interactivity().on_click(move |_ev, _window, cx| {
                 ent.update(cx, |v, cx| v.layout_activate(i, cx));
@@ -4884,7 +4843,7 @@ impl RootView {
     /// 外壳（标题栏 / 提示行 / Esc 与点遮罩语义）由 [`dialog_overlay`] 统一提供。
     /// 正文统一限高滚动：卡片不再随标签页内容多少改变高度，翻页不跳。
     fn render_settings(&self, entity: &Entity<RootView>) -> impl IntoElement {
-        let mut rail = div().flex().flex_col().gap(px(2.0)).w(px(76.0));
+        let mut rail = div().flex().flex_col().gap(px(4.0)).w(px(92.0)).pt(px(2.0));
         for (i, tab) in SettingsTab::ALL.iter().enumerate() {
             let active = *tab == self.settings_tab;
             let ent = entity.clone();
@@ -4893,11 +4852,12 @@ impl RootView {
                 .flex()
                 .flex_row()
                 .items_center()
-                .px(px(8.0))
-                .h(px(26.0))
-                .rounded(px(4.0))
+                .px(px(10.0))
+                .h(px(30.0))
+                .rounded(px(8.0))
+                .text_size(px(13.0))
                 .bg(if active {
-                    theme::hover_bg()
+                    theme::container()
                 } else {
                     theme::surface()
                 })
@@ -4932,9 +4892,11 @@ impl RootView {
         let body = div()
             .flex()
             .flex_row()
+            .items_stretch()
             .gap(px(12.0))
             .min_h_0()
             .child(rail)
+            .child(div().flex_none().w(px(1.0)).bg(theme::separator()))
             .child(
                 div()
                     .flex()
@@ -4956,7 +4918,14 @@ impl RootView {
                 "↑↓ 选择 · Enter 捕获 · Delete 解绑 · R 复位 · ←→ 换页 · Esc 关闭"
             }
         };
-        dialog_overlay(entity, "设置", self.settings_tab.label(), body, hint)
+        dialog_overlay_sized(
+            entity,
+            "设置",
+            self.settings_tab.label(),
+            body,
+            hint,
+            px(620.0),
+        )
     }
 
     // ------------------------------------------------------------ 列视图
@@ -8959,48 +8928,37 @@ impl RootView {
         }
         let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
         let idx = self.palette_index;
-        let mut body = div()
+        let mut body = div().flex().flex_col();
+        body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤命令…"));
+        let mut rows = div()
             .flex()
             .flex_col()
             .gap(px(2.0))
             .overflow_y_scrollbar()
-            .h(px(360.0));
+            .h(px(340.0));
         for (i, id) in list.iter().enumerate() {
             let def = commands_in(&self.user_commands, &self.workflows)
                 .into_iter()
                 .find(|c| c.id == *id)
                 .unwrap();
             let selected = i == idx;
-            let row = div()
-                .id(format!("cmd-row-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .bg(if selected {
-                    theme::selected_bg()
-                } else {
-                    theme::surface()
-                })
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                })
-                .child(text!(def.category.to_string()))
-                .child(text!(def.title.to_string()));
-            body = body.child(row);
+            // 分类放右侧胶囊：左缘是对齐的命令名，扫读时不必先跳过一串分类词。
+            rows = rows.child(
+                picker_row(&format!("cmd-row-{i}"), selected, &def.title)
+                    .child(tag_pill(&def.category, selected)),
+            );
         }
         if list.is_empty() {
-            body = body.child(text!("无匹配命令".to_string()));
+            rows = rows.child(dialog_empty_row("无匹配命令"));
         }
-        dialog_overlay(
+        body = body.child(rows);
+        dialog_overlay_sized(
             entity,
             "命令面板",
-            &format!("🔍 {}", self.cmd_query),
+            "",
             body,
             "↑↓ 选择 · Enter 执行 · Esc 关闭（⌘⇧P 打开）",
+            px(600.0),
         )
         .into_any_element()
     }
@@ -9012,33 +8970,17 @@ impl RootView {
     fn render_app_picker(&self, entity: &Entity<RootView>, picker: &AppPicker) -> AnyElement {
         let list = filtered_apps(&self.cmd_query, &picker.apps);
         let idx = self.palette_index;
-        let mut body = div()
+        let mut body = div().flex().flex_col();
+        body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤应用…"));
+        let mut rows = div()
             .flex()
             .flex_col()
             .gap(px(2.0))
             .overflow_y_scrollbar()
-            .h(px(360.0));
+            .h(px(340.0));
         for (i, a) in list.iter().enumerate() {
             let selected = i == idx;
-            let row = div()
-                .id(format!("app-row-{i}"))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .bg(if selected {
-                    theme::selected_bg()
-                } else {
-                    theme::surface()
-                })
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                })
-                .child(text!(a.name.clone()));
-            body = body.child(row);
+            rows = rows.child(picker_row(&format!("app-row-{i}"), selected, &a.name));
         }
         if list.is_empty() {
             // 列表还没加载完（异步扫目录）与「真的没有」要分开说，否则看着像坏了。
@@ -9047,14 +8989,16 @@ impl RootView {
             } else {
                 "无匹配应用"
             };
-            body = body.child(text!(msg.to_string()));
+            rows = rows.child(dialog_empty_row(msg));
         }
-        dialog_overlay(
+        body = body.child(rows);
+        dialog_overlay_sized(
             entity,
             "打开方式",
-            &format!("🔍 {}", self.cmd_query),
+            "",
             body,
             "↑↓ 选择 · Enter 打开 · Esc 取消",
+            px(600.0),
         )
         .into_any_element()
     }
@@ -10043,12 +9987,28 @@ pub(crate) fn dialog_overlay(
     body: impl IntoElement,
     hint: &str,
 ) -> impl IntoElement {
+    dialog_overlay_sized(entity, title, input, body, hint, px(480.0))
+}
+
+/// [`dialog_overlay`] 的定宽版：命令面板 / 设置这类「列表 + 标签页」的浮层
+/// 需要比 480px 更宽的卡片，窄卡片会把行里的标题与右侧胶囊挤成两行。
+pub(crate) fn dialog_overlay_sized(
+    entity: &Entity<RootView>,
+    title: &str,
+    input: &str,
+    body: impl IntoElement,
+    hint: &str,
+    width: gpui_kit::Pixels,
+) -> impl IntoElement {
     let mut card = div()
         .id("dialog-card")
-        .w(px(480.0))
+        .w(width)
         .flex()
         .flex_col()
         .rounded(px(DIALOG_RADIUS))
+        .border_1()
+        // 深色底上阴影几乎不可见，靠一圈描边把卡片与遮罩分开。
+        .border_color(theme::separator())
         .bg(theme::surface())
         .text_color(theme::text())
         .shadow_lg();
@@ -10118,6 +10078,115 @@ pub(crate) fn dialog_overlay(
         .debug_selector(|| "mo-dialog-overlay".to_string())
         .on_click(move |_, _window, cx| dismiss_modal(&backdrop, cx))
         .child(card)
+}
+
+/// 小圆角胶囊：设置行的「当前值」与命令面板的「分类」右侧徽章共用一套视觉。
+///
+/// 选中行（实心强调色底）上换反色（底=正文白、字=强调蓝）——胶囊若仍是
+/// `hover_bg` 会整块融进蓝底，值就看不见了。
+fn tag_pill(label: &str, selected: bool) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(18.0))
+        .px(px(7.0))
+        .rounded(px(5.0))
+        .bg(if selected {
+            theme::selected_text()
+        } else {
+            theme::hover_bg()
+        })
+        .text_size(px(11.0))
+        .text_color(if selected {
+            theme::selected_bg()
+        } else {
+            theme::muted()
+        })
+        .child(text!(label.to_string()))
+}
+
+/// 对话框里的整行可选项（设置三页的行、命令面板的行同一副骨架）：
+/// 固定行高 + 圆角，选中=实心强调底，正文左标题。右侧内容调用方 `.child()` 追加。
+/// 不带 hover——可点的行（设置）自己按 `!selected` 条件加，纯键盘的面板行加了是误导。
+fn picker_row(id: &str, selected: bool, title: &str) -> Stateful<Div> {
+    div()
+        .id(id.to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(10.0))
+        .h(px(34.0))
+        .rounded(px(8.0))
+        .text_size(px(13.0))
+        .bg(if selected {
+            theme::selected_bg()
+        } else {
+            theme::surface()
+        })
+        .text_color(if selected {
+            theme::selected_text()
+        } else {
+            theme::text()
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(text!(title.to_string())),
+        )
+}
+
+/// 面板 / 选择器顶部的搜索行：放大镜图标 + 当前过滤词（空则给占位提示）。
+///
+/// 不用 emoji（🔍）：Windows 上 emoji 走系统彩色字体，字号、基线、配色都不跟主题。
+/// 真正的输入仍走全局键位路径（这里只是回显）。
+fn dialog_search_row(query: &str, placeholder: &str) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(10.0))
+        .h(px(34.0))
+        .mb(px(8.0))
+        .rounded(px(8.0))
+        .bg(theme::container())
+        .child(crate::icons::icon(
+            crate::icons::SEARCH,
+            14.0,
+            theme::muted(),
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.5))
+                .text_color(if query.is_empty() {
+                    theme::muted()
+                } else {
+                    theme::text()
+                })
+                .child(text!(if query.is_empty() {
+                    placeholder.to_string()
+                } else {
+                    query.to_string()
+                })),
+        )
+}
+
+/// 面板空态：居中一行灰字（此前是贴边的裸文本，看着像渲染坏了）。
+fn dialog_empty_row(msg: &str) -> Div {
+    div()
+        .flex()
+        .justify_center()
+        .py(px(28.0))
+        .text_size(px(12.0))
+        .text_color(theme::muted())
+        .child(text!(msg.to_string()))
 }
 
 /// 关闭当前对话框，收尾与该模态的 **Esc 保持一致**。

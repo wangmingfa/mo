@@ -99,6 +99,10 @@ pub const PLUS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 /// 「从列表里移除」，而这里真正的语义是「把这条连接关掉」。
 pub const POWER: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>"##;
 
+/// 放大镜：命令面板 / 应用选择器的搜索行（替代此前正文里的 🔍 emoji，
+/// emoji 在 Windows 上字距与配色都不受主题控制）。
+pub const SEARCH: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>"##;
+
 // ---- 远程协议图标（与上面同源风格：24×24、描边 2、单色描边）----
 //
 // 一个协议一个形状，靠**结构**区分而不是颜色（列表里是单色的）。认不出的协议
