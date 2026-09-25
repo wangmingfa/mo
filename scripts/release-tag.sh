@@ -302,7 +302,9 @@ if [ "$VERSION" != "$CURRENT" ]; then
   NEEDS_RESTORE=1
   step "写入版本号 $CURRENT → $VERSION"
   # 只改 [workspace.package] 段里的 version：匹配到该段的第一个 version 行。
-  perl -0pi -e "s/(\[workspace\.package\]\n(?:.*\n)*?version = \")[^\"]*(\")/\${1}$VERSION\${2}/" Cargo.toml
+  # \r?\n 兼容 CRLF 工作区文件（Windows 上 checkout 出来常常是 CRLF，写死 \n
+  # 会整条不匹配，替换静默落空）。
+  perl -0pi -e "s/(\[workspace\.package\]\r?\n(?:.*\n)*?version = \")[^\"]*(\")/\${1}$VERSION\${2}/" Cargo.toml
   [ "$(current_version)" = "$VERSION" ] || die "版本号写入失败，请检查 Cargo.toml 的 [workspace.package] 段"
   # 刷新 Cargo.lock 里 mo-* 的版本记录，保证 CI 用 --locked 也能过。
   cargo metadata --format-version 1 >/dev/null
