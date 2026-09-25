@@ -91,7 +91,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # GPUI 在 Linux 上需要 X11 / Wayland / 音频等系统库。
+      # GPUI 在 Linux 上需要 X11 / Wayland / 音频 / 字体等系统库。
+      # fontconfig / freetype：cosmic-text 链路（yeslogic-fontconfig-sys、
+      # freetype-sys）构建期用 pkg-config 找 .pc，缺一个就整 job 挂。
       - name: 安装 Linux 系统依赖
         if: runner.os == 'Linux'
         run: |
@@ -100,7 +102,8 @@ jobs:
             pkg-config libssl-dev \
             libx11-dev libxcb1-dev libxrandr-dev libxi-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libasound2-dev libudev-dev libvulkan1
+            libwayland-dev libasound2-dev libudev-dev libvulkan1 \
+            libfontconfig-dev libfreetype-dev
 
       - name: 构建 release 二进制
         # --locked：依赖版本由已入库的 Cargo.lock 锁定，产物可复现。
