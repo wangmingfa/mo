@@ -7,6 +7,7 @@
 #
 # 用法：
 #   ./scripts/release-tag.sh                # 用 Cargo.toml 里现有版本号打 tag
+#                                           #（tag 已存在时弹交互菜单：发新版本 / 重发 / 取消）
 #   ./scripts/release-tag.sh patch         # 0.1.0 → 0.1.1
 #   ./scripts/release-tag.sh minor         # 0.1.0 → 0.2.0
 #   ./scripts/release-tag.sh major           # 0.1.0 → 1.0.0
@@ -16,6 +17,10 @@
 #   ./scripts/release-tag.sh patch --no-push   # 只本地打 tag，稍后自己推
 #   ./scripts/release-tag.sh patch --skip-checks  # 跳过 fmt/clippy/test，快速发布
 #   ./scripts/release-tag.sh --republish       # 重发当前版本号对应的 tag
+#
+# 交互式：不带版本参数运行、且当前版本号对应的 tag 已存在（本地或远端）时，
+# 会弹菜单让你选——「发布新版本（再选 patch/minor/major/beta）」「重新发布该
+# tag」「取消」。显式传了版本参数则该场景直接报错，不兜圈子。
 #
 # --republish：某次 release 流水线挂了（构建失败 / 产物坏了）时用——把已有的
 # tag 移到当前 HEAD（带上修复后的代码），删掉远端旧 tag 再重推，重新触发一遍
@@ -151,30 +156,35 @@ CURRENT_BASE="${CURRENT%%-*}"
 CURRENT_PRE=""
 [ "$CURRENT" = "$CURRENT_BASE" ] || CURRENT_PRE="${CURRENT#*-}"
 
-if [ -n "$BUMP" ]; then
-  case "$BUMP" in
+# 进位规则（结果写入全局 VERSION）：patch/minor/major 在数字段上进位（先剥掉
+# `-beta.N`，所以 beta 不会「原地转正」——转正请显式传版本号）；beta 已经是
+# beta 时只进预发布号（0.1.1-beta.1 → 0.1.1-beta.2），否则 patch 进位挂 `-beta.1`。
+bump_version() {
+  case "$1" in
     beta)
       if [[ "$CURRENT_PRE" == beta.* ]]; then
-        # 已经是 beta：只进预发布号（0.1.1-beta.1 → 0.1.1-beta.2）。
         N="${CURRENT_PRE#beta.}"
         VERSION="${CURRENT_BASE}-beta.$((N + 1))"
       else
-        # 从正式版本起 beta：patch 进位后挂 `-beta.1`。
         IFS='.' read -r MA MI PA <<<"$CURRENT_BASE"
         VERSION="$MA.$MI.$((PA + 1))-beta.1"
       fi
       ;;
     patch | minor | major)
-      # 在数字段上进位（先剥掉 `-beta.N`，所以 beta 不会「原地转正」——
-      # 转正请显式传版本号）。
       IFS='.' read -r MA MI PA <<<"$CURRENT_BASE"
-      case "$BUMP" in
+      case "$1" in
         patch) PA=$((PA + 1)) ;;
         minor) MI=$((MI + 1)); PA=0 ;;
         major) MA=$((MA + 1)); MI=0; PA=0 ;;
       esac
       VERSION="$MA.$MI.$PA"
       ;;
+  esac
+}
+
+if [ -n "$BUMP" ]; then
+  case "$BUMP" in
+    beta | patch | minor | major) bump_version "$BUMP" ;;
     *)
       if [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
         VERSION="$BUMP"
@@ -189,22 +199,69 @@ fi
 
 TAG="v$VERSION"
 
-# tag 现状：本地查 refs，远端只在重发时才 ls-remote（正常发布不必多一次网络往返）。
+# tag 现状：本地查 refs；远端只在本地查不到时才 ls-remote（少一次网络往返）。
+tag_in_remote() { git ls-remote --tags "$REMOTE" "refs/tags/$1" 2>/dev/null | grep -q .; }
+
 LOCAL_HAS_TAG=0
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && LOCAL_HAS_TAG=1
 REMOTE_HAS_TAG=0
 
 if [ "$REPUBLISH" -eq 1 ]; then
   [ -z "$BUMP" ] || die "--republish 不接受版本参数（重发不改版本号）"
-  if git ls-remote --tags "$REMOTE" "refs/tags/$TAG" 2>/dev/null | grep -q .; then
-    REMOTE_HAS_TAG=1
-  fi
+  tag_in_remote "$TAG" && REMOTE_HAS_TAG=1
   if [ "$LOCAL_HAS_TAG" -eq 0 ] && [ "$REMOTE_HAS_TAG" -eq 0 ]; then
     die "--republish：tag $TAG 本地和远端都不存在，没有可重发的（要打新 tag 去掉 --republish 即可）"
   fi
   printf '\033[33m! 重发 %s：tag 会移到当前 HEAD（带上修复后的代码），不改版本号\033[0m\n' "$TAG"
 else
-  [ "$LOCAL_HAS_TAG" -eq 0 ] || die "tag $TAG 已存在（要重发它：加 --republish）"
+  # tag 已存在时：不带版本参数 → 交互菜单（发新版本 / 重发 / 取消）；带了版本
+  # 参数说明是显式进位，不必再兜圈子，直接报错让用户明确意图。
+  TAG_EXISTS=$LOCAL_HAS_TAG
+  if [ "$TAG_EXISTS" -eq 0 ] && tag_in_remote "$TAG"; then
+    TAG_EXISTS=1
+    REMOTE_HAS_TAG=1
+  fi
+  if [ "$TAG_EXISTS" -eq 1 ]; then
+    if [ -n "$BUMP" ]; then
+      die "tag $TAG 已存在（进位后的版本也发布过）；去掉版本参数重跑可走交互菜单，或 --republish 重发当前版本"
+    fi
+    menu "tag ${TAG} 已存在，怎么做？" \
+      "发布新版本（选进位方式）" \
+      "重新发布 ${TAG}（tag 移到当前 HEAD，重新触发流水线）" \
+      "取消"
+    case "$MENU_INDEX" in
+      0)
+        IFS='.' read -r MA MI PA <<<"$CURRENT_BASE"
+        NEXT_BETA="$(bump_version beta; printf '%s' "$VERSION")"
+        menu "选新版本号（当前 ${CURRENT}）" \
+          "patch → $MA.$MI.$((PA + 1))" \
+          "minor → $MA.$((MI + 1)).0" \
+          "major → $((MA + 1)).0.0" \
+          "beta  → $NEXT_BETA" \
+          "取消"
+        case "$MENU_INDEX" in
+          0) bump_version patch ;;
+          1) bump_version minor ;;
+          2) bump_version major ;;
+          3) bump_version beta ;;
+          *) die "已取消" ;;
+        esac
+        TAG="v$VERSION"
+        LOCAL_HAS_TAG=0
+        git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && LOCAL_HAS_TAG=1
+        REMOTE_HAS_TAG=0
+        tag_in_remote "$TAG" && REMOTE_HAS_TAG=1
+        if [ "$LOCAL_HAS_TAG" -eq 1 ] || [ "$REMOTE_HAS_TAG" -eq 1 ]; then
+          die "tag $TAG 也已存在，换一种进位，或直接 --republish 重发它"
+        fi
+        ;;
+      1)
+        REPUBLISH=1
+        printf '\033[33m! 重发 %s：tag 会移到当前 HEAD（带上修复后的代码），不改版本号\033[0m\n' "$TAG"
+        ;;
+      *) die "已取消" ;;
+    esac
+  fi
 fi
 
 # ---------------------------------------------------------------- 版本写入

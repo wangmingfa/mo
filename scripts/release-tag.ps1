@@ -8,6 +8,7 @@
 #
 # 用法：
 #   .\scripts\release-tag.ps1                 # 用 Cargo.toml 里现有版本号打 tag
+#                                             #（tag 已存在时弹交互菜单：发新版本 / 重发 / 取消）
 #   .\scripts\release-tag.ps1 patch           # 0.1.0 → 0.1.1
 #   .\scripts\release-tag.ps1 minor           # 0.1.0 → 0.2.0
 #   .\scripts\release-tag.ps1 major           # 0.1.0 → 1.0.0
@@ -17,6 +18,10 @@
 #   .\scripts\release-tag.ps1 patch -NoPush   # 只本地打 tag，稍后自己推
 #   .\scripts\release-tag.ps1 patch -SkipChecks  # 跳过 fmt/clippy/test，快速发布
 #   .\scripts\release-tag.ps1 -Republish      # 重发当前版本号对应的 tag
+#
+# 交互式：不带版本参数运行、且当前版本号对应的 tag 已存在（本地或远端）时，
+# 会弹菜单让你选——「发布新版本（再选 patch/minor/major/beta）」「重新发布该
+# tag」「取消」。显式传了版本参数则该场景直接报错，不兜圈子。
 #
 # -Republish：某次 release 流水线挂了（构建失败 / 产物坏了）时用——把已有的
 # tag 移到当前 HEAD（带上修复后的代码），删掉远端旧 tag 再重推，重新触发一遍
@@ -132,26 +137,41 @@ $CurBase = $Current.Split('-')[0]
 $CurPre = ''
 if ($Current.Contains('-')) { $CurPre = $Current.Substring($CurBase.Length + 1) }
 
+# 进位规则（与 bash 版 bump_version 对等）：patch/minor/major 在数字段上进位
+# （先剥掉 `-beta.N`，所以 beta 不会「原地转正」——转正请显式传版本号）；
+# beta 已经是 beta 时只进预发布号，否则 patch 进位后挂 `-beta.1`。
+function Get-BumpedVersion([string]$Kind) {
+    $p = $CurBase.Split('.') | ForEach-Object { [int]$_ }
+    if ($p.Count -lt 3) { Die "当前版本号不是 x.y.z 形态：$Current" }
+    switch ($Kind) {
+        'patch' { return "$($p[0]).$($p[1]).$($p[2] + 1)" }
+        'minor' { return "$($p[0]).$($p[1] + 1).0" }
+        'major' { return "$($p[0] + 1).0.0" }
+        'beta' {
+            if ($CurPre -match '^beta\.(\d+)$') {
+                return "$CurBase-beta.$([int]$Matches[1] + 1)"
+            }
+            return "$($p[0]).$($p[1]).$($p[2] + 1)-beta.1"
+        }
+    }
+}
+
+function Test-TagLocal([string]$T) {
+    & git rev-parse -q --verify "refs/tags/$T" 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-TagRemote([string]$T) {
+    # tag 不存在时 ls-remote 也是退出码 0、输出为空；非零退出是连不上远端等真错误，
+    # 这时当作「远端没有」处理，让后续报错给出准确指引。
+    $out = @(& git ls-remote --tags $Remote "refs/tags/$T" 2>&1 |
+        ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    return ($LASTEXITCODE -eq 0 -and $out.Count -gt 0)
+}
+
 if ($Bump) {
     if ($Bump -match '^(patch|minor|major|beta)$') {
-        $p = $CurBase.Split('.') | ForEach-Object { [int]$_ }
-        if ($p.Count -lt 3) { Die "当前版本号不是 x.y.z 形态：$Current" }
-        switch ($Bump) {
-            # patch/minor/major 在数字段上进位（先剥掉 `-beta.N`，所以 beta 不会
-            # 「原地转正」——转正请显式传版本号）。
-            'patch' { $Version = "$($p[0]).$($p[1]).$($p[2] + 1)" }
-            'minor' { $Version = "$($p[0]).$($p[1] + 1).0" }
-            'major' { $Version = "$($p[0] + 1).0.0" }
-            'beta' {
-                if ($CurPre -match '^beta\.(\d+)$') {
-                    # 已经是 beta：只进预发布号（0.1.1-beta.1 → 0.1.1-beta.2）。
-                    $Version = "$CurBase-beta.$([int]$Matches[1] + 1)"
-                } else {
-                    # 从正式版本起 beta：patch 进位后挂 `-beta.1`。
-                    $Version = "$($p[0]).$($p[1]).$($p[2] + 1)-beta.1"
-                }
-            }
-        }
+        $Version = Get-BumpedVersion $Bump
     } elseif ($Bump -match '^\d+\.\d+\.\d+(-beta\.\d+)?$') {
         $Version = $Bump
     } else {
@@ -163,25 +183,50 @@ if ($Bump) {
 
 $Tag = "v$Version"
 
-# tag 现状：本地查 refs，远端只在重发时才 ls-remote（正常发布不必多一次网络往返）。
-$localHasTag = $false
-& git rev-parse -q --verify "refs/tags/$Tag" 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { $localHasTag = $true }
+# tag 现状：本地查 refs，远端只在本地查不到 / 重发时才 ls-remote（少弹网络往返）。
+$localHasTag = Test-TagLocal $Tag
 $remoteHasTag = $false
 
 if ($Republish) {
     if ($Bump) { Die '-Republish 不接受版本参数（重发不改版本号）' }
-    # tag 不存在时 ls-remote 也是退出码 0、输出为空；非零退出是连不上远端等真错误，
-    # 这时当作「远端没有」处理，让下面「本地远端都没有」的报错给出准确指引。
-    $lsOut = @(& git ls-remote --tags $Remote "refs/tags/$Tag" 2>&1 |
-        ForEach-Object { "$_".Trim() } | Where-Object { $_ })
-    if ($LASTEXITCODE -eq 0 -and $lsOut.Count -gt 0) { $remoteHasTag = $true }
+    $remoteHasTag = Test-TagRemote $Tag
     if (-not $localHasTag -and -not $remoteHasTag) {
         Die "-Republish：tag $Tag 本地和远端都不存在，没有可重发的（要打新 tag 去掉 -Republish 即可）"
     }
     Write-Host "! 重发 $Tag：tag 会移到当前 HEAD（带上修复后的代码），不改版本号" -ForegroundColor Yellow
-} elseif ($localHasTag) {
-    Die "tag $Tag 已存在（要重发它：加 -Republish）"
+} else {
+    # tag 已存在时：不带版本参数 → 交互菜单（发新版本 / 重发 / 取消）；带了版本
+    # 参数说明是显式进位，不必再兜圈子，直接报错让用户明确意图。
+    $tagExists = $localHasTag
+    if (-not $tagExists) {
+        $remoteHasTag = Test-TagRemote $Tag
+        if ($remoteHasTag) { $tagExists = $true }
+    }
+    if ($tagExists) {
+        if ($Bump) {
+            Die "tag $Tag 已存在（进位后的版本也发布过）；去掉版本参数重跑可走交互菜单，或 -Republish 重发当前版本"
+        }
+        $idx = Menu "tag $Tag 已存在，怎么做？" `
+            @('发布新版本（选进位方式）', "重新发布 $Tag（tag 移到当前 HEAD，重新触发流水线）", '取消')
+        if ($idx -eq 2) { Die '已取消' }
+        if ($idx -eq 1) {
+            $Republish = $true
+            Write-Host "! 重发 $Tag：tag 会移到当前 HEAD（带上修复后的代码），不改版本号" -ForegroundColor Yellow
+        } else {
+            $kinds = @('patch', 'minor', 'major', 'beta')
+            $items = @($kinds | ForEach-Object { "$_ → $(Get-BumpedVersion $_)" }) + '取消'
+            $j = Menu "选新版本号（当前 $Current）" $items
+            if ($j -ge $kinds.Count) { Die '已取消' }
+            $Version = Get-BumpedVersion $kinds[$j]
+            $Tag = "v$Version"
+            $localHasTag = Test-TagLocal $Tag
+            $remoteHasTag = $false
+            if (-not $localHasTag) { $remoteHasTag = Test-TagRemote $Tag }
+            if ($localHasTag -or $remoteHasTag) {
+                Die "tag $Tag 也已存在，换一种进位，或直接 -Republish 重发它"
+            }
+        }
+    }
 }
 
 # ---------------------------------------------------------------- 质量门禁
