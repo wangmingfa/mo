@@ -669,7 +669,7 @@ mod tests {
     }
 
     /// 同上，但当前页在**远程**（用来验证本机专属动作被裁掉）。
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn remote_menu(target: Option<&str>, is_dir: bool, selected: usize) -> ContextMenu {
         ContextMenu {
             remote: true,
@@ -720,22 +720,22 @@ mod tests {
         );
     }
 
-    /// 远端页（FTP / SFTP / WebDAV）上**不**出现「在访达中显示」：
+    /// 远端页（FTP / SFTP / WebDAV）上**不**出现「在访达 / 资源管理器中显示」：
     /// 远程条目在本机磁盘上根本不存在，给了就是点了没反应——与「目录判据只问列表
     /// 模型」同一条纪律。
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn remote_page_hides_host_only_actions() {
         let host = actions(&menu(Some("/tmp/a.txt"), false, 1));
         assert!(
             host.contains(&MenuAction::RevealInFileManager),
-            "本机页应当能「在访达中显示」"
+            "本机页应当能「在系统文件管理器中显示」"
         );
 
         let remote = actions(&remote_menu(Some("/pub/a.txt"), false, 1));
         assert!(
             !remote.contains(&MenuAction::RevealInFileManager),
-            "远程条目没法在访达里显示"
+            "远程条目没法在本机文件管理器里显示"
         );
         // 裁剪只针对这一条：常规动作（复制到剪贴板 / 移到废纸篓）照旧。
         assert!(remote.contains(&MenuAction::Copy));
@@ -744,7 +744,7 @@ mod tests {
 
     /// 平台没实现时（这里是不支持的那几个）「在访达中显示」压根不该进菜单——
     /// 列出来点了只会报「不支持」。
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn unsupported_platform_hides_host_only_actions() {
         let a = actions(&menu(Some("/tmp/a.txt"), false, 1));

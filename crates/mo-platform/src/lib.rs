@@ -18,6 +18,8 @@
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use std::path::{Path, PathBuf};
 
@@ -58,16 +60,18 @@ pub fn recycle_one(path: &Path) -> Result<PathBuf, PlatformError> {
 
 /// 这个平台支持「在系统文件管理器里定位一个文件」吗。
 pub fn supports_reveal() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 「在系统文件管理器中显示」在这个平台上的**叫法**。
 ///
-/// 菜单上写「在文件管理器中显示」在 macOS 上是错的——那里叫访达。UI 层拿这个
-/// 名字当菜单标签，别自己按平台写死。
+/// 菜单上写「在文件管理器中显示」在 macOS 上是错的——那里叫访达；Windows 上
+/// 也叫资源管理器。UI 层拿这个名字当菜单标签，别自己按平台写死。
 pub fn reveal_label() -> &'static str {
     if cfg!(target_os = "macos") {
         "在访达中显示"
+    } else if cfg!(target_os = "windows") {
+        "在资源管理器中显示"
     } else {
         "在文件管理器中显示"
     }
@@ -79,7 +83,11 @@ pub fn reveal(path: &Path) -> Result<(), PlatformError> {
     {
         macos::reveal(path)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::reveal(path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
         Err(PlatformError::Unsupported("在文件管理器中显示"))
@@ -314,19 +322,25 @@ mod tests {
     use super::*;
 
     /// 不支持的平台必须给 `Unsupported`，别让上层把「没实现」当成「做成了」。
+    ///
+    /// ⚠️ 这里**不能**在 Windows 上真调 `reveal`——它会拉起资源管理器窗口，
+    /// 测试不该有这种副作用；那条路径由 `supports_reveal()` 断言覆盖。
     #[test]
     fn unsupported_platforms_say_so() {
         #[cfg(not(target_os = "macos"))]
         {
             assert!(matches!(
-                reveal(Path::new("/tmp")),
-                Err(PlatformError::Unsupported(_))
-            ));
-            assert!(matches!(
                 eject(Path::new("/tmp")),
                 Err(PlatformError::Unsupported(_))
             ));
             assert!(!supports_trash());
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(matches!(
+                reveal(Path::new("/tmp")),
+                Err(PlatformError::Unsupported(_))
+            ));
         }
         #[cfg(target_os = "macos")]
         {
@@ -339,12 +353,15 @@ mod tests {
     #[test]
     fn reveal_label_matches_the_platform() {
         let here_is_macos = cfg!(target_os = "macos");
-        assert_eq!(supports_reveal(), here_is_macos);
+        let here_is_windows = cfg!(target_os = "windows");
+        assert_eq!(supports_reveal(), here_is_macos || here_is_windows);
         assert_eq!(supports_trash(), here_is_macos);
         assert_eq!(supports_volumes(), here_is_macos);
         assert_eq!(supports_file_icons(), here_is_macos);
         if here_is_macos {
             assert_eq!(reveal_label(), "在访达中显示");
+        } else if here_is_windows {
+            assert_eq!(reveal_label(), "在资源管理器中显示");
         } else {
             assert_eq!(reveal_label(), "在文件管理器中显示");
         }
