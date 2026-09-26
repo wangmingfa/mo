@@ -37,22 +37,46 @@ pub const fn has_command_key() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// `+` 与 `=`、`_` 与 `-` 在键盘上是**同一个物理键**（Shift 切印刷变体）。
+/// Shift 在符号键上只是**印刷变体**：`+` 与 `=` 是同一个物理键，`>` 与 `.` 也是。
 ///
 /// 归一时折回基本键名、**连同 Shift 位一起归掉**：默认键位写 `cmd+=`（无 Shift），
 /// 用户按「⌘+」报的却是 Shift+=（key == `+`）——Shift 位若保留，两个组合永远差一位、
 /// 永远打不中。返回 `(key, shift)`，调用方用它替换原 key 与 shift 位。
-fn fold_typographic_shift(key: &str, _shift: bool) -> (String, bool) {
-    match key {
-        // `+` 与 `=`、`_` 与 `-` 各是**同一个物理键**（Shift 切印刷变体）。
-        // 折回基本键名时把 Shift 位一并丢掉：默认键位写 `cmd+=`（无 Shift），
-        // 而用户按「⌘+」报的是 Shift+=（key == "+"）——Shift 位若保留，
-        // 两个组合永远差一位、永远打不中。这四个字符没有别的绑定用，
-        // Shift 不参与区分没有副作用。
-        "+" | "=" => ("=".to_string(), false),
-        "_" | "-" => ("-".to_string(), false),
-        _ => (key.to_string(), _shift),
+///
+/// 表里两端都算：写 `cmd+.` 与写 `cmd+shift+.` 指的是同一个键位上的同一个动作，
+/// 因为「按下时 Shift 有没有亮」在 gpui 的三个来源上根本不一致（见下面的警告）。
+/// 字母键不进这张表——`cmd+z`（撤销）与 `cmd+shift+z`（重做）必须分得开。
+///
+/// ⚠️ 数字（`!` `@` `#` …）故意不进这张表：`cmd+1`~`cmd+4` 是视图模式，把 `!` 折成
+/// `1` 会让 Ctrl+Shift+1 顺手切视图模式——白送的宽容，代价是误触。
+///
+/// ⚠️ 在 Windows 上这一折不是「宽容」而是**必需**：gpui 的 Windows 后端
+/// （`gpui-pre-windows` 的 `keyboard.rs::get_keystroke_key`）遇到 Shift + OEM 符号键时，
+/// 把 `key` 直接换成 Shift 后的字符（`.` → `>`）**并把 Shift 位清零**。于是
+/// `cmd+shift+.` 这类键位在这里差两位：key 多了、shift 没了，永远打不中。
+/// 2026-09-26 实测：Ctrl+Shift+. 切隐藏文件在 Windows 上按了没反应，
+/// 而同一个窗口里 Ctrl+Shift+P（字母键）是好的。
+fn fold_typographic_shift(key: &str, shift: bool) -> (String, bool) {
+    /// `(Shift 后的样子, 基本键名)`——US 键盘布局。
+    const SYMBOL_PAIRS: [(&str, &str); 11] = [
+        ("+", "="),
+        ("_", "-"),
+        ("{", "["),
+        ("}", "]"),
+        ("<", ","),
+        (">", "."),
+        (":", ";"),
+        ("\"", "'"),
+        ("?", "/"),
+        ("|", "\\"),
+        ("~", "`"),
+    ];
+    for (shifted, base) in SYMBOL_PAIRS {
+        if key == shifted || key == base {
+            return (base.to_string(), false);
+        }
     }
+    (key.to_string(), shift)
 }
 
 impl KeyCombo {
@@ -80,16 +104,27 @@ impl KeyCombo {
         self.cmd || self.ctrl || self.alt
     }
 
-    /// 匹配一次按键：四个修饰位都必须严格相等。
+    /// 比对用的形式：把 Shift 的印刷变体折回物理键位（见 [`fold_typographic_shift`]）。
+    fn canonical(&self) -> (String, bool) {
+        fold_typographic_shift(&self.key, self.shift)
+    }
+
+    /// 是否命中同一次按键。
+    ///
+    /// 修饰位里 `cmd` / `ctrl` / `alt` 严格相等，主键走 [`Self::canonical`]：
     ///
     /// 严格相等而不是「包含」：否则 `cmd+shift+z`（重做）会把 `cmd+z`（撤销）
-    /// 也判中，两个动作抢同一次按键。
+    /// 也判中，两个动作抢同一次按键。而符号键的 Shift 位**不能**严格比——
+    /// 同一个物理键在三个来源上写成三种样子（配置 `cmd+shift+.`、macOS 按键
+    /// `.`+Shift、Windows 按键 `>`+无 Shift），只有一起折掉才都命中。
+    ///
+    /// 注意这里**不**改 `self`：`format()` / `spec()` 要按用户写下的原样显示，
+    /// 提示文案里丢了 Shift 就成了「按 Ctrl+.」这种按不出来的指令。
     pub fn matches(&self, other: &KeyCombo) -> bool {
         self.cmd == other.cmd
             && self.ctrl == other.ctrl
             && self.alt == other.alt
-            && self.shift == other.shift
-            && self.key == other.key
+            && self.canonical() == other.canonical()
     }
 
     /// 解析 `cmd+shift+p` 形式的键串；大小写与顺序都不敏感。
@@ -139,11 +174,9 @@ impl KeyCombo {
                 _ => out.key = normalize(&p),
             }
         }
-        // `+` 与 `=` 是同一个键位（见 [`fold_typographic_shift`]）：配置里写
-        // `cmd+shift+=` / `cmd++` 都折到 `cmd+=`，别让同一个物理按键有两种写法。
-        let (key, shift) = fold_typographic_shift(&out.key, out.shift);
-        out.key = key;
-        out.shift = shift;
+        // 符号的印刷变体（`cmd++` ≡ `cmd+=`）留到 `matches` 里再折：这里若就地折掉，
+        // 用户写下的 Shift 位就丢了，键位编辑器与提示文案会显示成「Ctrl+=」，
+        // 而按下的是 Ctrl+Shift+=。
         // 主键必须是认识的键名：否则「不是键」这种手打错的值会被当成一个
         // 永远按不出来的键，动作直接失联——这里返回 None 让调用方退回默认。
         (!out.key.is_empty() && known_key(&out.key)).then_some(out)
@@ -606,6 +639,17 @@ pub fn hint(id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 把**没有动作 id** 的字面键串（`⌥A`、`⌘⇧↓`）按当前平台渲染。
+///
+/// 有 id 的一律走 [`hint`]：那样提示跟着键表走，用户改键后提示不会说谎。这里留给
+/// 那些只在某个对话框内部生效、没进键表的裸键；解析不出来就原样返回，宁可显示成
+/// 旧文案也不要显示成空。
+pub fn key_hint(spec: &str) -> String {
+    KeyCombo::parse(spec)
+        .map(|c| c.format())
+        .unwrap_or_else(|| spec.to_string())
+}
+
 /// 当前键表：`(键组, 动作 id)`，按平台主修饰键分两段查询。
 #[derive(Default)]
 pub struct Keymap {
@@ -771,8 +815,62 @@ mod tests {
         assert_eq!(typed, plus_binding, "「⌘+」应与 `cmd+=` 折到同一键组");
         assert_eq!(map.lookup(&typed), Some("view.zoom_in"));
 
-        // 配置里另一种自然写法 `cmd+shift+=` 也折到同一条。
-        assert_eq!(ks("cmd+shift+="), plus_binding);
+        // 配置里另一种自然写法 `cmd+shift+=` 也命中同一条绑定。结构体本身保留
+        // 用户写下的 Shift 位（键位编辑器要按原样显示），折只发生在比对时。
+        let shift_equals = ks("cmd+shift+=");
+        assert_eq!(shift_equals.key, "=");
+        assert!(shift_equals.shift, "解析不该就地丢掉用户写的 Shift");
+        assert!(
+            shift_equals.matches(&plus_binding),
+            "两种写法该命中同一个动作"
+        );
+        assert_eq!(map.lookup(&shift_equals), Some("view.zoom_in"));
+    }
+
+    /// 回归：符号键的快捷键在 **Windows** 上按得出来。
+    ///
+    /// gpui 的 Windows 后端会把 Shift + OEM 符号键报成「Shift 后的字符 + Shift 位清零」
+    /// （`.` → `>`、`[` → `{`），与配置里写的 `cmd+shift+.` 差两位；折拢之前
+    /// `view.hidden`（Ctrl+Shift+.）与切标签页的 `Ctrl+Shift+[` / `]` 在 Windows 上
+    /// 全是死键——2026-09-26 实测按下无反应，而同窗口的 Ctrl+Shift+P（字母）正常。
+    #[test]
+    fn windows_shifted_symbol_events_hit_symbol_bindings() {
+        let map = Keymap::build(&HashMap::new());
+        // 造一次 Windows 形状的按键：主键是 Shift 后的字符、Shift 位已被后端吃掉。
+        let pressed = |key: &str| {
+            KeyCombo::from_keystroke(&Keystroke {
+                key: key.into(),
+                modifiers: gpui_kit::Modifiers {
+                    platform: has_command_key(),
+                    control: !has_command_key(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        assert_eq!(map.lookup(&pressed(">")), Some("view.hidden"));
+        assert_eq!(map.lookup(&pressed("{")), Some("tab.prev"));
+        assert_eq!(map.lookup(&pressed("}")), Some("tab.next"));
+        // macOS 形状（同一个键、Shift 位还在）当然也要命中同一条。
+        let macish = KeyCombo {
+            key: ".".into(),
+            shift: true,
+            cmd: true,
+            ctrl: false,
+            alt: false,
+        };
+        assert_eq!(map.lookup(&macish), Some("view.hidden"));
+        // 字母键的 Shift 位后端不会吃掉，Ctrl+Shift+P 仍然是命令面板、不会落到 ⌘P 上。
+        let mut ctrl_shift_p = pressed("p");
+        ctrl_shift_p.shift = true;
+        assert_eq!(map.lookup(&ctrl_shift_p), Some("palette.open"));
+    }
+
+    /// 提示文案按用户写下的键串显示，不能被比对用的折拢带跑。
+    #[test]
+    fn spec_keeps_the_written_shift() {
+        assert_eq!(ks("cmd+shift+.").spec(), "cmd+shift+.");
+        assert_eq!(ks("cmd+shift+[").spec(), "cmd+shift+[");
     }
 
     /// `cmd+,`（macOS「偏好设置」惯例）能解析、能查表，且不打到别的动作上。
@@ -1021,5 +1119,52 @@ mod tests {
             assert_eq!(hint("list.open"), "Enter");
             assert_eq!(hint("list.rename"), "F2");
         }
+    }
+
+    /// 文案里引用到的动作 id 必须都能出提示。
+    ///
+    /// `hint` 对未知 id 返回空串（右键菜单宁可少一行提示），但拼进文案就是
+    /// 「复制选中（）」——空括号比没有提示更难看，而写错一个字母正是这种后果。
+    #[test]
+    fn ids_used_in_prose_have_hints() {
+        for id in [
+            "file.properties",
+            "clipboard.copy",
+            "clipboard.cut",
+            "clipboard.paste",
+            "clipboard.copy_path",
+            "tab.new",
+            "tab.close",
+            "pane.split",
+            "edit.undo",
+            "edit.redo",
+            "palette.open",
+            "staging.collect",
+            "select.all",
+            "compare.jump_next",
+            "compare.jump_prev",
+        ] {
+            assert!(!hint(id).is_empty(), "{id} 出不了提示：文案里会留空括号");
+        }
+    }
+
+    /// 没进键表的裸键串也要按平台渲染（内容搜索那四个 ⌥ 开关）。
+    #[test]
+    fn key_hint_renders_bare_specs_per_platform() {
+        if has_command_key() {
+            assert_eq!(key_hint("⌥A"), "⌥A");
+            assert_eq!(key_hint("⌘⇧P"), "⌘⇧P");
+        } else {
+            assert_eq!(key_hint("⌥A"), "Alt+A");
+            assert_eq!(key_hint("⌘⇧P"), "Ctrl+Shift+P");
+            // 主修饰键在 Windows 上是 Ctrl，顺序也按 Windows 惯例排。
+            assert_eq!(key_hint("⌥⌘C"), "Ctrl+Alt+C");
+        }
+        assert_eq!(key_hint("Esc"), "Esc", "裸键名不带修饰，两边都原样");
+        assert_eq!(
+            key_hint("这不是一个键"),
+            "这不是一个键",
+            "解析不出来要原样返回，不能变空"
+        );
     }
 }
