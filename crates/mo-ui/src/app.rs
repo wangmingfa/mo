@@ -2726,10 +2726,13 @@ impl RootView {
             );
         }
 
-        for (label, id, state) in [
+        for (idx, (label, id, state)) in [
             ("用户名", "mo-connect-user", auth.user.as_ref()),
             ("密码", "mo-connect-pass", auth.pass.as_ref()),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             body = body.child(
                 div()
                     .flex()
@@ -2738,11 +2741,13 @@ impl RootView {
                     .gap(px(8.0))
                     .child(
                         // `text!` 没有定宽方法，要定宽就包一层。
+                        // 显式 id：两个标签共享宏调用点哈希 → a11y NodeId 会撞
+                        // （见 list_view::header_row 注释）。
                         div()
                             .w(px(48.0))
                             .text_size(px(12.0))
                             .text_color(theme::muted())
-                            .child(text!(label.to_string())),
+                            .child(text!(id = format!("auth-label-{idx}"), label.to_string())),
                     )
                     .child(self.auth_field(id, state)),
             );
@@ -4120,11 +4125,11 @@ impl RootView {
                         .text_size(px(12.0))
                         .truncate()
                         // 第一份是「建议保留」，标出来免得用户删错。
-                        .child(text!(format!(
-                            "{} {}",
-                            if j == 0 { "◆" } else { "  " },
-                            p.display()
-                        ))),
+                        // 显式 id：同组多条路径共享 `text!` 调用点哈希（a11y NodeId 会撞）。
+                        .child(text!(
+                            id = format!("dedup-path-{i}-{j}"),
+                            format!("{} {}", if j == 0 { "◆" } else { "  " }, p.display())
+                        )),
                 );
             }
             let ent = entity.clone();
@@ -8727,10 +8732,15 @@ fn highlighted_line(text: &str, spans: &[(usize, usize)], selected: bool) -> Div
         .overflow_hidden()
         .text_size(px(12.0));
     let mut pos = 0usize;
-    for (a, b) in spans {
+    // 显式 id：`text!` 默认按宏调用点生成元素 id，一行里多处命中会把同一调用点
+    // 画好几遍 → a11y NodeId 撞车（见 list_view::header_row 注释）。
+    for (k, (a, b)) in spans.iter().enumerate() {
         let (a, b) = ((*a).min(chars.len()), (*b).min(chars.len()));
         if a > pos {
-            row = row.child(text!(chars[pos..a].iter().collect::<String>()));
+            row = row.child(text!(
+                id = format!("hl-{k}-gap"),
+                chars[pos..a].iter().collect::<String>()
+            ));
         }
         if b > a {
             row = row.child(
@@ -8742,13 +8752,19 @@ fn highlighted_line(text: &str, spans: &[(usize, usize)], selected: bool) -> Div
                     } else {
                         theme::text()
                     })
-                    .child(text!(chars[a..b].iter().collect::<String>())),
+                    .child(text!(
+                        id = format!("hl-{k}-hit"),
+                        chars[a..b].iter().collect::<String>()
+                    )),
             );
         }
         pos = pos.max(b);
     }
     if pos < chars.len() {
-        row = row.child(text!(chars[pos..].iter().collect::<String>()));
+        row = row.child(text!(
+            id = "hl-tail",
+            chars[pos..].iter().collect::<String>()
+        ));
     }
     row
 }
@@ -9516,7 +9532,7 @@ impl RootView {
                 } else {
                     theme::muted()
                 };
-                for c in cols.iter().skip(1) {
+                for (ci, c) in cols.iter().skip(1).enumerate() {
                     let t = match c.key {
                         "date" => date.clone(),
                         "size" => size_text.clone(),
@@ -9530,7 +9546,9 @@ impl RootView {
                             .flex_shrink_0()
                             .min_w_0()
                             .text_color(fg2)
-                            .child(text!(t)),
+                            // 显式 id：`text!` 的默认 id 是宏调用点哈希，同一行
+                            // 三列共享它 → a11y NodeId 撞车（见 list_view::header_row 注释）。
+                            .child(text!(id = format!("trash-meta-{i}-{ci}"), t)),
                     );
                 }
                 row.interactivity()
@@ -10910,12 +10928,16 @@ mod tests {
             .expect("没找到卡片那张四角圆角的底色 quad");
         let r = card_quad.corner_radii.top_left.as_f32();
 
-        // 标题栏：与卡片同左 / 同顶 / 同宽，但更矮（卡片本身是全高，已被上面的
-        // 条件排除），并且只有它这一层的顶部需要跟随圆角。
+        // 标题栏：卡片有 1px 边框，标题栏贴在边框**内侧**——与卡片同缩 1 逻辑
+        // px、宽度少 2px，但明显更矮（卡片全高已被上一条排除）。
+        // 位置认脸，圆角留给下面的断言。
+        let inset = scale; // 1 逻辑 px 边框 = scale 物理 px
         let header = quads
             .iter()
             .find(|q| {
-                same_left_top_width(q)
+                near(q.bounds.origin.x.as_f32(), card_x + inset)
+                    && near(q.bounds.origin.y.as_f32(), card_y + inset)
+                    && near(q.bounds.size.width.as_f32(), card_w - 2.0 * inset)
                     && q.bounds.size.height.as_f32() < card_quad.bounds.size.height.as_f32() - 1.0
             })
             .expect("没找到对话框标题栏那一层的 quad");

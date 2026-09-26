@@ -77,7 +77,7 @@ pub(crate) fn header_row(id_prefix: &str, cols: &[Column]) -> Div {
         .text_size(px(11.0))
         .text_color(theme::muted())
         .debug_selector(|| format!("mo-{id_prefix}-header"));
-    for c in cols {
+    for (i, c) in cols.iter().enumerate() {
         let mut cell = div().flex().flex_row().items_center().h_full().min_w_0();
         cell = if c.width > 0.0 {
             cell.w(px(c.width)).flex_shrink_0()
@@ -89,7 +89,13 @@ pub(crate) fn header_row(id_prefix: &str, cols: &[Column]) -> Div {
         } else {
             cell
         };
-        row = row.child(cell.child(text!(c.label.to_string())));
+        // `text!` 的元素 id 取自**宏调用点**的哈希：不给显式 id 的话整行所有列
+        // 共享同一条 a11y 路径 → 相同 NodeId → 辅助功能激活时 debug 构建直接
+        // panic（gpui 的 Duplicate a11y node id 断言，实测踩到）。
+        row = row.child(cell.child(text!(
+            id = format!("{id_prefix}-header-{i}"),
+            c.label.to_string()
+        )));
     }
     row
 }
