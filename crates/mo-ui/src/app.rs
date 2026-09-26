@@ -5059,6 +5059,10 @@ impl RootView {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        // 改名框只编辑**本体名**：Windows 的快捷方式在框里显示 `Atlas` 而不是
+        // `Atlas.lnk`（资源管理器把后缀划在可编辑区之外），提交时由
+        // `commit_properties` 补回去。
+        let name = mo_core::display_name(&name).to_string();
         let (size, mode) = match std::fs::metadata(&target) {
             Ok(m) => {
                 #[cfg(unix)]
@@ -10507,8 +10511,10 @@ fn commit_properties(entity: &Entity<RootView>, cx: &mut App) {
         .unwrap_or_default();
     let this = entity.clone();
     cx.spawn(async move |cx| {
-        if !p.name.is_empty() && p.name != old_name {
-            let to = p.path.with_file_name(&p.name);
+        // 编辑框里是「显示名」，落盘名要还原被藏起来的那截后缀（见 `name_after_edit`）。
+        let new_real = mo_core::name_after_edit(&p.name, &old_name);
+        if !p.name.is_empty() && new_real != old_name {
+            let to = p.path.with_file_name(&new_real);
             if let Err(e) = app.rename_many(vec![(p.path.clone(), to)]).await {
                 this.update(cx, |v, cx| {
                     v.notice(format!("重命名失败：{e}"), None, cx);
@@ -10516,7 +10522,7 @@ fn commit_properties(entity: &Entity<RootView>, cx: &mut App) {
             }
         }
         // 权限按修改后的位应用（路径可能已变，但权限属于同一个 inode）。
-        let target = p.path.with_file_name(&p.name);
+        let target = p.path.with_file_name(&new_real);
         if let Err(e) = app.set_permissions(target, p.mode).await {
             tracing::warn!("权限修改失败：{e}");
         }

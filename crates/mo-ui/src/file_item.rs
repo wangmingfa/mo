@@ -300,6 +300,9 @@ fn kind_by_ext(name: &str) -> String {
         "app" => "应用程序",
         "dmg" => "磁盘映像",
         "pkg" => "安装包",
+        // Windows 快捷方式：资源管理器也叫它「快捷方式」，而不是「LNK 文件」——
+        // 列表里的名字已经藏起 `.lnk` 后缀了，种类再提一遍后缀就对不上。
+        "lnk" => "快捷方式",
         // 兜底：有扩展名 → 「EXT 文件」，无扩展名 → 「文档」
         "" => "文档",
         other => return format!("{} 文件", other.to_uppercase()),
@@ -327,7 +330,7 @@ mod tests {
     // 注意：这里**不能**写 `use super::*`——`file_item` 顶部的 `use gpui_kit::*`
     // 会把 gpui 的 `test` 属性宏一起带进来，遮蔽内置的 `#[test]`
     // （表现是 "recursion limit reached while expanding `#[test]`"）。
-    use super::view;
+    use super::{kind_label, trash_kind_label, view};
     use crate::list_columns::{ColId, ColumnLayout};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -368,6 +371,18 @@ mod tests {
             permissions: Permissions::default(),
         });
         entry
+    }
+
+    /// 快捷方式的「种类」：名字列已经藏起 `.lnk` 了，种类再写「LNK 文件」就对不上
+    /// 资源管理器（那边两列分别是 `Atlas` 与「快捷方式」）。
+    #[test]
+    fn shortcut_kind_says_shortcut_not_the_suffix() {
+        assert_eq!(kind_label(&entry_named("Atlas.lnk")), "快捷方式");
+        assert_eq!(kind_label(&entry_named("Atlas.LNK")), "快捷方式");
+        // 回收站条目那份走同一张表（没有 `Entry` 可包）。
+        assert_eq!(trash_kind_label(false, "Atlas.lnk"), "快捷方式");
+        // 普通类型不受影响。
+        assert_eq!(kind_label(&entry_named("notes.txt")), "文本文档");
     }
 
     /// 大小列必须固定在「种类」列左侧、种类列贴行右缘，各列间距一致（gap 8）。
