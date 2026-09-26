@@ -4046,13 +4046,22 @@ pub const TAG_COLORS: [(&str, &str); 7] = [
 
 /// 客户端剪贴板：记住一批路径以及「剪切（移动）」还是「复制」。
 ///
-/// 与系统剪贴板无关：这里只在同一应用内传递文件引用，
-/// 粘贴时才真正落到操作队列（见 [`AppState::paste_clipboard`]）。
-#[derive(Debug, Clone)]
+/// 与系统剪贴板的关系是**双向**的：Mo 里复制/剪切时会把这批路径写进系统剪贴板
+/// （Windows 上是 `CF_HDROP`），别的应用复制过文件后 Mo 也会采纳系统剪贴板里那批
+/// （[`AppState::adopt_system_clipboard`]）。
+///
+/// 没有 `Debug`：[`Endpoint`] 里揣着一条会话的文件系统，打不出来也不必打。
+#[derive(Clone)]
 pub struct Clipboard {
     pub paths: Vec<PathBuf>,
     /// true = 剪切（粘贴后移动），false = 复制。
     pub cut: bool,
+    /// 这批路径**在哪一端**——粘贴时读它们的那一头。
+    ///
+    /// 不能在粘贴时拿「当前浏览的那一端」顶替：复制之后换目录、切标签页、
+    /// 甚至从资源管理器复制一批本机路径再粘进正在浏览的 FTP 会话，源都在**别的**
+    /// 那一端。系统剪贴板带来的那批一定在本地盘上（Shell 只会放本机路径）。
+    pub src: Endpoint,
 }
 
 /// 磁盘用量的一行结果（某个子树的汇总）。
@@ -4457,7 +4466,12 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        *self.clipboard.lock().await = Some(Clipboard { paths, cut: false });
+        let src = self.endpoint();
+        *self.clipboard.lock().await = Some(Clipboard {
+            paths,
+            cut: false,
+            src,
+        });
     }
 
     /// 把当前选择**剪切**进内部剪贴板（`cut = true`）。
@@ -4466,7 +4480,35 @@ impl AppState {
         if paths.is_empty() {
             return;
         }
-        *self.clipboard.lock().await = Some(Clipboard { paths, cut: true });
+        let src = self.endpoint();
+        *self.clipboard.lock().await = Some(Clipboard {
+            paths,
+            cut: true,
+            src,
+        });
+    }
+
+    /// 采纳**系统**剪贴板里的文件（资源管理器 / 访达里复制、剪切的那批），返回有没有采纳。
+    ///
+    /// 只在两边**不是同一批**时覆盖内部剪贴板：Mo 自己复制时也会往系统剪贴板写同一条
+    /// 路径，那种情况下内部记的 `cut` 才是权威（我们自己知道刚才是剪切还是复制，
+    /// 而 macOS 上根本读不出这一位），外部那份只是同一条信息的副本。
+    ///
+    /// `src` 恒为 [`Endpoint::Local`]：Shell 剪贴板里的文件路径只可能是本机路径。
+    pub async fn adopt_system_clipboard(&self, paths: Vec<PathBuf>, cut: bool) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let mut clip = self.clipboard.lock().await;
+        if clip.as_ref().is_some_and(|c| c.paths == paths) {
+            return false;
+        }
+        *clip = Some(Clipboard {
+            paths,
+            cut,
+            src: Endpoint::Local,
+        });
+        true
     }
 
     /// 粘贴：`dest` 为空时粘贴到当前目录。
@@ -4479,29 +4521,14 @@ impl AppState {
             Some(d) => d,
             None => return Vec::new(),
         };
-        let ids = if clip.cut {
-            // 逐个源项移动到目标目录下的同名位置，并记入历史 / 撤销栈，
-            // 这样「剪切 → 粘贴」也能被 ⌘Z 撤销（与 UI 里的移动走同一路径）。
-            let mut ids = Vec::new();
-            for src in &clip.paths {
-                let name = src
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let to = dest.join(name);
-                let id = self.ops.lock().await.next_id();
-                let op: SharedOperation = MoveOperation::new(id, src.clone(), to.clone());
-                ids.push(self.submit_operation(op).await);
-                self.record_history("移动", vec![src.clone()], Some(dest.clone()));
-                self.push_reversible(Reversible::Move {
-                    from: src.clone(),
-                    to: to.clone(),
-                });
-            }
-            ids
-        } else {
-            self.copy_selection(&dest).await
-        };
+        // 粘的是**剪贴板里那批**，与「此刻选中的那批」无关：复制后换了目录、
+        // 或者只点了一行，拿 selection 就会粘出错的东西（甚至粘出 0 项）。
+        // 源端点同样取自剪贴板（见 [`Clipboard::src`]），目标才是当前浏览的那一端。
+        // 剪切走 `transfer_between` 的本地分支：历史与可逆项照记，⌘Z 仍然撤销得动。
+        let here = self.endpoint();
+        let ids = self
+            .transfer_between(clip.paths, clip.src, &dest, here, clip.cut)
+            .await;
         // 剪切是一次性消耗品：粘贴后清空，避免二次粘贴重复执行。
         if clip.cut {
             *self.clipboard.lock().await = None;

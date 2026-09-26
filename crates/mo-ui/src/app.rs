@@ -51,6 +51,30 @@ pub(crate) const USAGE_MAP_DEPTH: usize = 3;
 /// 写上去也是被裁掉半截的乱码。
 pub(crate) const USAGE_MAP_LABEL_AREA: f32 = 0.006;
 
+/// 系统剪贴板里那批**文件**（资源管理器 / 访达里复制或剪切的那一批）。
+///
+/// 路径由 gpui 报：两个平台的后端都会把剪贴板里的文件读成
+/// `ClipboardEntry::ExternalPaths`。gpui 报不出来的是「剪切还是复制」——那一位
+/// Shell 记在另一个剪贴板格式里，由平台层补（Windows 读 `Preferred DropEffect`，
+/// 别处读不出，一律按复制答）。
+///
+/// 粘文本（地址栏、同步目标）时这里返回 `None`，别把一条路径都没有的剪贴板
+/// 当成「要粘一批空文件」。
+fn system_file_clipboard(cx: &App) -> Option<(Vec<PathBuf>, bool)> {
+    let paths = cx
+        .read_from_clipboard()?
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(files) => Some(files.paths().to_vec()),
+            _ => None,
+        })?;
+    if paths.is_empty() {
+        return None;
+    }
+    Some((paths, mo_platform::clipboard_files_are_cut()))
+}
+
 /// 传输速度采样的上一次观测（按操作 ID 记账）。
 ///
 /// 进度面板每 ≈150ms 拿一次快照，两次快照的 `done` 差分即是瞬时速度；
@@ -4377,7 +4401,13 @@ impl RootView {
             "clipboard.paste" => {
                 let app = self.app();
                 let dest = self.panel().path.clone();
+                // 先采纳系统剪贴板里的文件（资源管理器复制的那批），再粘：两步必须
+                // 在同一个任务里连着做，分开 spawn 就成了赛跑，粘的可能是上一批。
+                let ext = system_file_clipboard(cx);
                 cx.spawn(async move |_weak, _cx| {
+                    if let Some((paths, cut)) = ext {
+                        app.adopt_system_clipboard(paths, cut).await;
+                    }
                     let _ = app.paste_clipboard(dest).await;
                 })
                 .detach();
@@ -6103,7 +6133,11 @@ impl RootView {
             A::Paste => {
                 let dest = self.panel().path.clone();
                 let app = self.app();
+                let ext = system_file_clipboard(cx);
                 cx.spawn(async move |_weak, _cx| {
+                    if let Some((paths, cut)) = ext {
+                        app.adopt_system_clipboard(paths, cut).await;
+                    }
                     let _ = app.paste_clipboard(dest).await;
                 })
                 .detach();
@@ -8294,7 +8328,11 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::PasteClipboard) => {
             let dest = entity.update(cx, |v, _cx| v.panel().path.clone());
+            let ext = system_file_clipboard(cx);
             cx.spawn(async move |_cx| {
+                if let Some((paths, cut)) = ext {
+                    app.adopt_system_clipboard(paths, cut).await;
+                }
                 let _ = app.paste_clipboard(dest).await;
             })
             .detach();

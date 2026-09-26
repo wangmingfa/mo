@@ -36,7 +36,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     HDEVINFO, PNP_VETO_TYPE, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
     SP_DEVINFO_DATA,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -49,10 +49,14 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+};
 use windows::Win32::System::Ioctl::{
     GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_EJECT_MEDIA, IOCTL_STORAGE_GET_DEVICE_NUMBER,
     STORAGE_DEVICE_NUMBER,
 };
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{
     IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
@@ -1080,6 +1084,57 @@ fn opaque_rgba_over_white(bgra: &[u8]) -> Vec<u8> {
         o[3] = 255;
     }
     out
+}
+
+// ---- 文件剪贴板：读 Shell 记的「这批文件是剪切来的吗」 ----
+
+/// `Preferred DropEffect` 的正文里 `DROPEFFECT_MOVE` 那一位（0x1=复制、0x2=移动、
+/// 0x4=建快捷方式）。资源管理器自己就是靠这一位决定 Ctrl+V 是搬走还是留一份。
+const DROP_EFFECT_MOVE: u32 = 0x2;
+
+/// 打开系统剪贴板的守卫（`OpenClipboard` / `CloseClipboard` 必须成对——漏一口，
+/// 整个桌面的应用都读不到剪贴板，而且症状看起来像「别的程序粘不出来」）。
+struct ClipboardGuard;
+
+impl ClipboardGuard {
+    /// 抢不到就返回 `None`（别的进程正开着剪贴板）。**不重试**：为一个元信息把线程
+    /// 挂进重试循环不值得，调用方按默认语义答即可。
+    fn open() -> Option<Self> {
+        unsafe { OpenClipboard(None).ok() }.map(|_| Self)
+    }
+}
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
+/// 系统剪贴板当前那批文件是**剪切**来的吗。
+///
+/// 契约（为什么 macOS 那边直接答 `false`）写在 `lib.rs::clipboard_files_are_cut`。
+pub fn clipboard_files_are_cut() -> bool {
+    let Some(_clip) = ClipboardGuard::open() else {
+        return false;
+    };
+    let name = wide_str("Preferred DropEffect");
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
+    if format == 0 {
+        return false;
+    }
+    let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
+        // 没有这个格式：不是资源管理器那类「剪切/复制」放上来的。
+        return false;
+    };
+    let global = HGLOBAL(handle.0);
+    let ptr = unsafe { GlobalLock(global) };
+    if ptr.is_null() {
+        return false;
+    }
+    // 这份全局内存的正文就是一个 DWORD。
+    let effect = unsafe { (ptr as *const u32).read_unaligned() };
+    let _ = unsafe { GlobalUnlock(global) };
+    effect & DROP_EFFECT_MOVE != 0
 }
 
 fn encode_wide(p: &Path) -> Vec<u16> {

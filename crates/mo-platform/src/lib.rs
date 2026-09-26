@@ -1,4 +1,5 @@
-//! mo-platform：桌面平台的**原生集成**（回收站、在文件管理器里显示、推出卷宗）。
+//! mo-platform：桌面平台的**原生集成**（回收站、在文件管理器里显示、推出卷宗、
+//! 文件剪贴板上的元信息）。
 //!
 //! 这些东西每个平台做法都不一样，而且都不是「纯逻辑」——它们要调系统的
 //! AppKit / GVfs / Shell32。单独一个 crate 的好处：
@@ -260,6 +261,29 @@ pub fn pdf_page_raster(path: &Path, max_edge: u32) -> Option<IconRaster> {
     {
         let _ = (path, max_edge);
         None
+    }
+}
+
+// -------------------------------------------------------------- 文件剪贴板
+
+/// 系统剪贴板里那批文件是**剪切**来的（粘完就该从原处搬走）还是复制来的。
+///
+/// 读文件路径本身不用这里管：gpui 的 `read_from_clipboard` 在 macOS / Windows 上
+/// 都会把系统剪贴板里的文件报成 `ClipboardEntry::ExternalPaths`。它报不了的是
+/// 「剪切还是复制」——那是 Shell 记在另一个剪贴板格式（`Preferred DropEffect`）
+/// 里的元信息，gpui 没有透出。
+///
+/// 只有 Windows 有可靠判据。macOS 上 Finder 的「剪切粘贴」走的是一条私有
+/// pasteboard 标记，公开可读的类型里没有这一位，所以那边一律答**复制**：
+/// 猜错的代价是「以为在复制，结果把用户的文件搬走了」，宁可多留一份原文件。
+pub fn clipboard_files_are_cut() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::clipboard_files_are_cut()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
 }
 

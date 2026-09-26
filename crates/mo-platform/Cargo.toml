@@ -29,6 +29,8 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 # PDF 首页渲染单独用 0.62（别名 `windows_pdf`）：`Windows.Data.Pdf` 的异步入口要的是
