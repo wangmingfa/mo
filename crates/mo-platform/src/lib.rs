@@ -312,6 +312,30 @@ pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), Platform
     }
 }
 
+// -------------------------------------------------------------- 键盘布局
+
+/// 字符 `ch` 在**当前键盘布局**上的基本键（它所在物理键未加 Shift 打出的那个字符）。
+///
+/// 用来把「Shift 切出来的符号」折回它自己的物理键位：同一张 Shift 变体表（US 布局那套
+/// `+`=`=`、`?`=`/`……）在别的布局上是错的——德语布局上 `:` 才是 `.` 的 Shift 变体，
+/// 而 `?` 与 `/` 在两个完全不同的键上。折错了就是**动作串键**：用户按下的键触发另一个
+/// 功能，默认键位反倒按不出来。
+///
+/// 只有 Windows 问得出（`VkKeyScanExW` + `MapVirtualKeyExW`，见 `windows::unshifted_key`）。
+/// macOS 拿不到虚拟键码——gpui 的 `Keystroke` 只给字符，所以那边答 `None`，调用方继续用
+/// 自己的 US 表（已知缺口，见 devlog 的 §15）。
+pub fn unshifted_key(ch: char) -> Option<char> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::unshifted_key(ch)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ch;
+        None
+    }
+}
+
 /// 一张图标位图的**原始像素**：RGBA8、**预乘 alpha**。
 ///
 /// 它是「系统图标」这条链路上主线程与后台之间的交接物：主线程负责取回它，

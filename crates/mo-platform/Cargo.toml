@@ -24,6 +24,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # 键盘布局查询（`VkKeyScanExW` / `MapVirtualKeyExW`）：折符号键的 Shift 变体要问当前布局。
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Com",
     "Win32_Security",
     "Win32_Storage_FileSystem",

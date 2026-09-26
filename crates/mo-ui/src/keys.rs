@@ -47,36 +47,90 @@ pub const fn has_command_key() -> bool {
 /// 因为「按下时 Shift 有没有亮」在 gpui 的三个来源上根本不一致（见下面的警告）。
 /// 字母键不进这张表——`cmd+z`（撤销）与 `cmd+shift+z`（重做）必须分得开。
 ///
-/// ⚠️ 数字（`!` `@` `#` …）故意不进这张表：`cmd+1`~`cmd+4` 是视图模式，把 `!` 折成
-/// `1` 会让 Ctrl+Shift+1 顺手切视图模式——白送的宽容，代价是误触。
-///
 /// ⚠️ 在 Windows 上这一折不是「宽容」而是**必需**：gpui 的 Windows 后端
 /// （`gpui-pre-windows` 的 `keyboard.rs::get_keystroke_key`）遇到 Shift + OEM 符号键时，
 /// 把 `key` 直接换成 Shift 后的字符（`.` → `>`）**并把 Shift 位清零**。于是
 /// `cmd+shift+.` 这类键位在这里差两位：key 多了、shift 没了，永远打不中。
 /// 2026-09-26 实测：Ctrl+Shift+. 切隐藏文件在 Windows 上按了没反应，
 /// 而同一个窗口里 Ctrl+Shift+P（字母键）是好的。
+///
+/// ⚠️ 「哪个符号是哪个键的 Shift 变体」是**键盘布局**的事，不是常理：`SYMBOL_PAIRS`
+/// 那张表只描述 US 布局。所以 Windows 上先**问当前布局**（[`mo_platform::unshifted_key`]，
+/// 实测德语布局上 `:` 才是 `.` 的变体、`?` 与 `/` 在两个不相干的键上），问不到才退到表。
+/// macOS 问不了——gpui 的 `Keystroke` 只给字符、不给虚拟键码，于是那边仍按 US 表折
+/// （已知缺口，非 US 布局的 mac 用户会串键；见 devlog §15 的这条尾巴）。
 fn fold_typographic_shift(key: &str, shift: bool) -> (String, bool) {
-    /// `(Shift 后的样子, 基本键名)`——US 键盘布局。
-    const SYMBOL_PAIRS: [(&str, &str); 11] = [
-        ("+", "="),
-        ("_", "-"),
-        ("{", "["),
-        ("}", "]"),
-        ("<", ","),
-        (">", "."),
-        (":", ";"),
-        ("\"", "'"),
-        ("?", "/"),
-        ("|", "\\"),
-        ("~", "`"),
-    ];
-    for (shifted, base) in SYMBOL_PAIRS {
-        if key == shifted || key == base {
-            return (base.to_string(), false);
-        }
+    // 单测里布局查询退化成「都问不到」→ 只走 US 表：开发机装什么键盘布局不该决定
+    // 断言的红绿（与钉 `MO_CONFIG_DIR` 同一类测试卫生）。布局相关的行为由 `fold_with`
+    // 那组测试用**假布局**覆盖，不碰机器。
+    #[cfg(test)]
+    let layout: fn(char) -> Option<char> = |_| None;
+    #[cfg(not(test))]
+    let layout: fn(char) -> Option<char> = mo_platform::unshifted_key;
+    fold_with(key, shift, layout)
+}
+
+/// [`fold_typographic_shift`] 的纯逻辑部分。
+///
+/// `layout` 问「这个符号字符在当前键盘布局上落在哪个键（未加 Shift 的样子）」；
+/// 它答 `None`（不是 Windows、或这个字符在本布局上要 AltGr / 根本打不出）才退
+/// [`us_base`] 那张 US 表。
+///
+/// 只折**符号键**，且折出来的基本键也必须是符号键：`!` 的基本键是数字 `1`，而
+/// `cmd+1`~`cmd+4` 是视图模式——折过去等于白送一次误触。字母同理：某个布局会把 `*`
+/// 放在 Shift+某字母键上，绝不能把符号折进字母里——`cmd+z`（撤销）与
+/// `cmd+shift+z`（重做）必须分得开。
+fn fold_with(key: &str, shift: bool, layout: impl Fn(char) -> Option<char>) -> (String, bool) {
+    let mut chars = key.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return (key.to_string(), shift);
+    };
+    if !is_symbol_char(ch) {
+        return (key.to_string(), shift);
     }
-    (key.to_string(), shift)
+    // ⚠️ `layout` **答了**就不再查表，哪怕答的是数字或字母：德语布局上 `"` 是 Shift+`2`，
+    // 这时表里那条 `"`→`'` 是错的，拿它兜底就把两个不相干的键又并到一起了。
+    let Some(base) = layout(ch)
+        .or_else(|| us_base(ch))
+        .filter(|b| is_symbol_char(*b))
+    else {
+        return (key.to_string(), shift);
+    };
+    (base.to_string(), false)
+}
+
+/// 可以参与「同一个物理键」折拢的字符：ASCII 标点。
+///
+/// 数字与字母都不是（见 [`fold_with`] 的理由）；非 ASCII（`ß`、`¥`、中日韩标点）也不问，
+/// 那些键位 Mo 的默认键表里根本没有，折了只会串到别的动作上。
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_punctuation()
+}
+
+/// `(Shift 后的样子, 基本键名)`——US 键盘布局（ANSI）。布局问不到时的兜底表。
+const SYMBOL_PAIRS: [(char, char); 11] = [
+    ('+', '='),
+    ('_', '-'),
+    ('{', '['),
+    ('}', ']'),
+    ('<', ','),
+    ('>', '.'),
+    (':', ';'),
+    ('"', '\''),
+    ('?', '/'),
+    ('|', '\\'),
+    ('~', '`'),
+];
+
+/// US 表的两端都查：写 `cmd+.` 与写 `cmd+shift+.` 得折成同一个键组。
+///
+/// 表里**没有**数字的 Shift 变体（`!` `@` `#` …），那是 [`fold_with`] 里「基本键也得是
+/// 符号」那条规则自己挡掉的（视图模式占着 `cmd+1`~`cmd+4`），不靠表去记。
+fn us_base(ch: char) -> Option<char> {
+    SYMBOL_PAIRS
+        .iter()
+        .find(|(shifted, base)| *shifted == ch || *base == ch)
+        .map(|(_, base)| *base)
 }
 
 impl KeyCombo {
@@ -864,6 +918,55 @@ mod tests {
         let mut ctrl_shift_p = pressed("p");
         ctrl_shift_p.shift = true;
         assert_eq!(map.lookup(&ctrl_shift_p), Some("palette.open"));
+    }
+
+    /// 折拢的纯逻辑跟着**布局**走：布局答什么就按什么折，答不到才退 US 表。
+    ///
+    /// 上面两组测试用的是「单测里不查真布局」那条退化（`fold_typographic_shift` 的
+    /// `#[cfg(test)]` 分支），钉的是 US 表的行为；这里直接喂**假布局**，钉的是
+    /// 非 US 布局上该发生的事——开发机插什么键盘布局不该决定断言的红绿。
+    #[test]
+    fn fold_follows_the_layout_when_it_answers() {
+        // 德语布局的实测值见 mo-platform 的 `unshifted_key_follows_the_german_layout`。
+        let de = |c: char| match c {
+            ':' => Some('.'),
+            '>' => Some('<'),
+            '<' => Some('<'),
+            '+' => Some('+'),
+            '"' => Some('2'),
+            _ => None,
+        };
+        // 德语上「`.` 那个键加了 Shift」打出 `:`，所以默认键位 `cmd+.` 要靠这一折才按得出。
+        assert_eq!(fold_with(":", false, de), (".".to_string(), false));
+        assert_eq!(fold_with(">", false, de), ("<".to_string(), false));
+        // US 表说 `+` 是 Shift+`=`、`"` 是 Shift+`'`——德语上两条都错，布局答了就不再退表，
+        // 哪怕答的是数字（`"` = Shift+`2`）：不折，也比折到别的键上强。
+        assert_eq!(fold_with("+", false, de), ("+".to_string(), false));
+        assert_eq!(fold_with("\"", false, de), ("\"".to_string(), false));
+        // 布局答不到的（这里没给 `}`）才退 US 表。
+        assert_eq!(fold_with("}", false, de), ("]".to_string(), false));
+    }
+
+    /// 三类绝对不折：数字、字母、多位键名——Shift 位必须原样留着。
+    #[test]
+    fn fold_leaves_digits_letters_and_named_keys_alone() {
+        // 只有兜底表可用（等价于「本机问不出」：macOS 就是这一路）。
+        let none = |_| None;
+        // `!` 的基本键是 `1`，而 `cmd+1`~`cmd+4` 是视图模式——折过去就是白送一次误触。
+        assert_eq!(fold_with("!", true, none), ("!".to_string(), true));
+        assert_eq!(fold_with("1", true, none), ("1".to_string(), true));
+        // `cmd+z`（撤销）与 `cmd+shift+z`（重做）必须分得开。
+        assert_eq!(fold_with("z", true, none), ("z".to_string(), true));
+        assert_eq!(
+            fold_with("escape", true, none),
+            ("escape".to_string(), true),
+            "多位键名根本不进这套折拢"
+        );
+        assert_eq!(
+            fold_with("ß", false, none),
+            ("ß".to_string(), false),
+            "非 ASCII 的键位不问也不折"
+        );
     }
 
     /// 提示文案按用户写下的键串显示，不能被比对用的折拢带跑。

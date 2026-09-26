@@ -62,6 +62,9 @@ use windows::Win32::System::Ioctl::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyboardLayout, MapVirtualKeyExW, VkKeyScanExW, MAPVK_VK_TO_CHAR,
+};
 use windows::Win32::UI::Shell::{
     IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
     SHDefExtractIconW, SHGetFileInfoW, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION,
@@ -1260,9 +1263,93 @@ fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+// ---- 键盘布局：问「这个字符在本布局上是哪个键未加 Shift 的样子」 ----
+
+/// 字符 `ch` 在**当前键盘布局**上的基本键（也就是它所在物理键未加 Shift 打出的字符）。
+///
+/// 给 `mo_ui::keys` 折 Shift 的印刷变体用（见那边的 `fold_typographic_shift`）：默认键位
+/// 按 US 布局写（`cmd+=`、`cmd+.`），而符号键的「Shift 后是什么字符」是**布局的事**——
+/// 德语布局上 `:` 才是 `.` 的 Shift 变体，`?` 与 `/` 根本在两个不同的键上。照一张 US 表
+/// 折所有布局，就会把德语用户按下的 `:` 折成分号、把 `?` 折到 `/` 上：动作串到别处，
+/// 而默认键位反而按不出来。
+///
+/// 问的是当前**线程**的布局（`GetKeyboardLayout(0)`），所以用户中途换布局 / 切输入法
+/// 立刻跟着变；这一步**不缓存**，缓存就会在换布局后继续拿旧表折键（一次系统调用换一次
+/// 正确，划算）。
+///
+/// 答 `None`（= 问不出，调用方退回自己的表）：本布局打不出这个字符；要 AltGr / Ctrl
+/// 参与才出得来（那是同一个键的**第三种**字符，不是 Shift 的印刷变体）；或者是死键
+/// （`¨` `'` 那类按下去等下一个键的键位）。
+pub fn unshifted_key(ch: char) -> Option<char> {
+    let Ok(code) = u16::try_from(ch) else {
+        return None;
+    };
+    unsafe {
+        let hkl = GetKeyboardLayout(0);
+        let scan = VkKeyScanExW(code, hkl);
+        if scan < 0 {
+            return None;
+        }
+        let vk = (scan & 0xFF) as u32;
+        // 高字节是修饰位：0x1=Shift、0x2=Ctrl、0x4=Alt（合起来 0x6 就是 AltGr）。
+        // 只接受「不用 Shift」与「只用 Shift」两种，别的都不是印刷变体。
+        if !matches!((scan >> 8) & 0xFF, 0 | 1) {
+            return None;
+        }
+        let mapped = MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, hkl);
+        // bit15 置位表示这是死键；低 15 位才是字符。0 表示这个键在本布局上没有字符。
+        if mapped == 0 || mapped & 0x8000 != 0 {
+            return None;
+        }
+        char::from_u32(mapped & 0x7FFF)
+    }
+}
+
 /// 错误里必须带上**是哪条路径**（用户有多选删除，分不清位置的报错等于没说）。
 fn failed(action: &str, path: &Path, e: windows::core::Error) -> PlatformError {
     PlatformError::Failed(format!("{action}失败：{}（{e}）", path.display()))
+}
+
+/// 测试用：把**当前线程**的键盘布局临时换成指定 KLID， Drop 时换回原来那个。
+///
+/// `ActivateKeyboardLayout` 默认只作用于调用线程，而 [`unshifted_key`] 问的正是
+/// `GetKeyboardLayout(0)`（本线程的布局）——所以同一个测试里激活、同一个线程里问，
+/// 不会串到并行的其它用例，也不碰用户的输入法。
+#[cfg(test)]
+struct ActiveLayout {
+    previous: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+}
+
+#[cfg(test)]
+impl ActiveLayout {
+    /// 这台机器上没有这个布局（返回 `None`，调用方跳过该断言）。
+    fn new(klid: &str) -> Option<Self> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW,
+            ACTIVATE_KEYBOARD_LAYOUT_FLAGS,
+        };
+        let wide = wide_str(klid);
+        // 先**装载**（0x10 = KLF_REPLACELANG，不激活），这样下一步能先把本线程原来的
+        // 布局记下来，Drop 时才还得回去。
+        let hkl = unsafe {
+            LoadKeyboardLayoutW(PCWSTR(wide.as_ptr()), ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0x10))
+        }
+        .ok()?;
+        let previous = unsafe { GetKeyboardLayout(0) };
+        // 激活：flags 为 0 表示只给**调用线程**，不动系统默认，也不影响并行的其它用例。
+        unsafe { ActivateKeyboardLayout(hkl, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0)) }.ok()?;
+        Some(Self { previous })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveLayout {
+    fn drop(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            ActivateKeyboardLayout, ACTIVATE_KEYBOARD_LAYOUT_FLAGS,
+        };
+        let _ = unsafe { ActivateKeyboardLayout(self.previous, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0)) };
+    }
 }
 
 #[cfg(test)]
@@ -1331,6 +1418,112 @@ mod tests {
             vec!["D:\\a.txt", "D:\\中文 与 空格.txt"],
             "每条路径各自 NUL 结尾、顺序不变"
         );
+    }
+
+    /// 问的是**当前布局**，不是硬编码：德语（00000407）上符号键的配对与 US 完全不同。
+    ///
+    /// 这些断言就是 `mo_ui::keys::fold_typographic_shift` 不能只按 US 表折的理由：
+    /// US 表里 `:`→`;`、`?`→`/` 两条在德语布局上会把用户按下的键**串到别的动作**上。
+    /// 期望值取自 2026-09-26 在本机的实测（同一套 `VkKeyScanExW` + `MapVirtualKeyExW`，
+    /// 见 `.tmp/vk.ps1`），不是照文档想当然。
+    #[test]
+    fn unshifted_key_follows_the_german_layout() {
+        let Some(_de) = ActiveLayout::new("00000407") else {
+            eprintln!("这台机器装不上德语键盘布局（kbdgr），跳过布局相关断言");
+            return;
+        };
+        // 德语：`.` 这个键未加 Shift 打出 `.`，加了打出 `:`。
+        assert_eq!(unshifted_key(':'), Some('.'));
+        // `<` 在德语上是**独立键**，`>` 才是它的 Shift 变体（US 表说的是 `>`→`.`）。
+        assert_eq!(unshifted_key('>'), Some('<'));
+        assert_eq!(unshifted_key('<'), Some('<'));
+        // `+` 自己就是基本键（US 表把它当成 Shift+`=`，德语上那样折会把两个键并成一个）。
+        assert_eq!(unshifted_key('+'), Some('+'));
+        // AltGr 出来的字符不是「同一个键的 Shift 变体」，不答。
+        assert_eq!(unshifted_key('{'), None);
+        assert_eq!(unshifted_key('@'), None);
+        // 布局答了就不再退表：德语上 `"` 是 Shift+`2`（数字），不是 Shift+`'`。
+        assert_eq!(unshifted_key('"'), Some('2'));
+        // 德语上 `?` 这个键未加 Shift 打出 `ß`。答出的是**非 ASCII** 的 `ß` 而不是 `/`
+        // （US 表给的答案），调用方因此不折这一对——`?` 与 `/` 在德语上是两个键。
+        assert_eq!(unshifted_key('?'), Some('ß'));
+    }
+
+    /// US 布局（00000409，每台 Windows 都带 kbdus）：与 `SYMBOL_PAIRS` 那张表逐条对得上。
+    ///
+    /// 显式**激活**布局再问，而不是靠本机默认键盘——CI 镜像上装的是什么布局不由我们
+    /// 决定，默认布局上的断言就是「在别人机器上随机红」。
+    #[test]
+    fn unshifted_key_answers_the_us_layout() {
+        let Some(_us) = ActiveLayout::new("00000409") else {
+            eprintln!("这台机器装不上 US 键盘布局（kbdus），跳过");
+            return;
+        };
+        for (shifted, base) in [
+            ('+', '='),
+            ('_', '-'),
+            ('{', '['),
+            ('}', ']'),
+            ('<', ','),
+            ('>', '.'),
+            (':', ';'),
+            ('"', '\''),
+            ('?', '/'),
+            ('|', '\\'),
+            ('~', '`'),
+        ] {
+            assert_eq!(
+                unshifted_key(shifted),
+                Some(base),
+                "`{shifted}` 是 Shift+`{base}`"
+            );
+            // 基本键这一端也答自己（`cmd+.` 与 `cmd+shift+.` 要折到同一个键组）。
+            assert_eq!(unshifted_key(base), Some(base));
+        }
+        // 数字的 Shift 变体照样答出数字：是不是该折由调用方判（视图模式占着 `cmd+1`）。
+        assert_eq!(unshifted_key('!'), Some('1'));
+        assert_eq!(unshifted_key('@'), Some('2'));
+    }
+
+    /// gpui 的 Windows 后端**不**经过我们的 `VkKeyScanExW`，它自己调 `ToUnicode`
+    /// （只看当前线程的布局）算出字符，再交给我们折。这条测试把两端接在一起：
+    /// 同一个德语线程上，`ToUnicode(102 键 + Shift)` 交出 `>`，而 `unshifted_key('>')`
+    /// 必须答回 `<`——两边各错一步，键位就绑到别的动作上了。
+    ///
+    /// 调用形状照抄 gpui（`state[VK_SHIFT]=0x80`、buffer 8 个 u16、flags 0x5），
+    /// 不是我觉得该怎么调。
+    #[test]
+    fn to_unicode_and_unshifted_key_agree_on_the_same_layout() {
+        fn shifted_char(vk: u32, scan: u32) -> Option<char> {
+            use windows::Win32::UI::Input::KeyboardAndMouse::ToUnicode;
+            let mut state = [0u8; 256];
+            state[0x10] = 0x80; // VK_SHIFT
+            let mut buffer = [0u16; 8];
+            let len = unsafe { ToUnicode(vk, scan, Some(&state), &mut buffer, 0x5) };
+            if len < 1 {
+                return None;
+            }
+            char::from_u32(buffer[0] as u32)
+        }
+
+        // VK_OEM_102（102 键）的扫描码，US 与德语都是 0x56。
+        const LT102: u32 = 0xE2;
+        const SCAN_LT102: u32 = 0x56;
+
+        let Some(_de) = ActiveLayout::new("00000407") else {
+            eprintln!("这台机器装不上德语键盘布局（kbdgr），跳过");
+            return;
+        };
+        assert_eq!(shifted_char(LT102, SCAN_LT102), Some('>'));
+        assert_eq!(unshifted_key('>'), Some('<'));
+        drop(_de);
+
+        let Some(_us) = ActiveLayout::new("00000409") else {
+            eprintln!("这台机器装不上 US 键盘布局（kbdus），跳过");
+            return;
+        };
+        assert_eq!(shifted_char(LT102, SCAN_LT102), Some('|'));
+        assert_eq!(unshifted_key('|'), Some('\\'));
     }
 
     /// 卷根上挂 `$Recycle.Bin`（回收站每卷一份，不在子目录里）。
