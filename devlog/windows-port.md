@@ -193,13 +193,23 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **测试怎么钉**：headless 里「下一帧」是测试自己调的，`render_frame` 两次就能让旧代码看起来是对的（既有的 `trash_zebra_stripes_fill_the_viewport` 就是这个形状）。所以新测试 `trash_zebra_fill_requests_its_own_second_frame` 断言的不是布局，是**首帧有没有替自己排队**：先把队列排空（`simulate_next_frame` 会顺手把文件列表那条唤醒吃掉），进回收站画一帧，再数 next-frame 回调数——必须 ≥1。反向验证做过：把那一行注释掉，测试红；放回去，绿（空回收站、0 条目，补足行铺到 y>550）。
 * **仍未验**：锁屏状态下拍不到图，所以「肉眼看不到那 7 毫秒」这条只有日志，没有截图。
 
+## 24. 从资源管理器拖进 Mo：`on_drop::<ExternalPaths>` 三处落点
+
+* **做到哪一步**：这一轮只做**进来**（OS → Mo）——目录行、窗格空白处、侧栏快捷访问、侧栏回收站四个落点，拖上去有 hover 高亮。应用内的拖动早就通了；**出去**（Mo → 资源管理器）还断着，卡在 Windows 没有 `DoDragDrop`，见文末待办。
+* **gpui 已经把活干了一半**：`gpui-pre` 的 Windows 后端实现了 `IDropTarget`（`CF_HDROP`），拖进窗口就翻译成三件事——`Entered{position, paths}` 挂一个 `active_drag`（值就是 `Arc<ExternalPaths>`）并合成一次左键 `MouseMove`；`Pending` 继续合成 move；`Submit{position}` 合成一次左键 `MouseUp`。所以 UI 侧只要 `on_drop::<ExternalPaths>` + `drag_over::<ExternalPaths>`（hover 上色），从「事件进窗口」到「文件落盘」这条链在 headless 测试里也是真的。
+* **⚠️ 坑一：不能用 `can_drop` 做「非目录拒绝」**。gpui 在判定可行性**之前**就把 `cx.active_drag.take()` 掉了（`div.rs` 的 MouseUp 分支：命中、TypeId 对得上就先取走）。用 `can_drop` 返回 false 来拒，事件会被**吞掉且不再冒泡**，窗格空白处那层永远收不到。正确写法是**只在接得住的元素上注册 `on_drop`**——目录行注册，普通文件行一个监听都不挂，让事件自然冒泡到窗格容器。
+* **⚠️ 坑二：外部拖进来只能复制，做不了移动**。`Submit` 合成 MouseUp 时把修饰键写成 `Modifiers::default()`，Alt / Shift 全丢，应用内那套「按住 Alt 就是移动」的判断在外部拖放里根本没有输入。所以 `submit_os_drop` 恒传 `move_ = false`。这不是偷懒：判不准时偏向复制，猜成移动会把用户的文件**搬走**。
+* **⚠️ 坑三：测试里导航会被启动流程盖掉**。`tab_loop` 启动时异步「按需打开 Home」，它比 `navigate_for_tests` 慢到：面板一度停在临时目录、`list_count` 也对，随后 Home 落地把窗口快照整个换掉（`window.len()` 归 0，`mo-file-row-0` 消失）。修法是**先等 Home 那次打开落地、再导航**，并且断言用「行数精确相等」（`panel_window_ready_for_tests(rows)`）而不是「≥1 行」——后者会被 Home 的内容蒙过去。另：`AppState::opening_path()` 在读取完成时发布成 `None`，不能当导航判据，新加了 `panel_path_for_tests`（读面板自己的 `path`）。
+* **验证**：`crates/mo-ui/tests/os_drop.rs` 三个 headless 用例各投一次真的 `FileDropEvent`（`Entered` + `Submit`，经 `to_platform_input()` 走 `dispatch_event`）——拖到目录行 → 文件出现在那个子目录且**源文件留着**；拖到窗格空白 → 进当前目录；拖到回收站 → 源文件消失。反向对照三处：把对应注册点注释掉，三条测试各自红。
+* **侧栏快捷访问没进测试**（代码里挂了监听，但没有用例）：`quick_locations` 用的是真 `dirs`，`isolate_user_dirs_for_tests` 只钉配置和缓存两个目录，钉不住 Desktop/Documents。在开发机上跑这个用例等于往用户的真实桌面写文件。**这条缺口是已知的，不是漏测。**
+
 ## 待办（还没做，别当成已完成）
 
 * 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
 * **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
 * **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
-* **拖放**（应用内、以及与资源管理器之间）还没动，是 §19/§20 之后自然的一段：`DROPFILES` 那套字节形状已经现成。
+* **拖放只通了「进来」**（§24）。**出去**（Mo → 资源管理器 / 别的软件）在 Windows 上要自己写 OLE：`DoDragDrop` + 一个 `IDataObject`（`CF_HDROP` 的字节形状 §20 已经现成，`DROPFILES` 头 20 字节那套直接复用），再加 `IDropSource` 泵鼠标和 `DROPEFFECT`。gpui 的 Windows 后端只有 `IDropTarget`，没有 `start_external_drag`；macOS 侧 `beginDraggingSessionWithItems` 也还没接。
 * §21 的缓存隔离只收了 mo-ui / mo-platform 这条路；mo-app / mo-operations 的十余个集成测试仍在写真实 `search.sqlite`。
 * 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
 * 测试留下的临时回收站 `mo-trash-<pid>-<seq>` 在 TEMP 里没人删（§21 那个 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积）。

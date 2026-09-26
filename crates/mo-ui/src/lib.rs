@@ -232,6 +232,14 @@ pub fn inject_content_search_for_tests(view: &mut RootView) {
     view.modal = app::Modal::ContentSearch;
 }
 
+/// 测试专用：当前标签页**已经显示出来**的目录（导航是否生效的判据）。
+///
+/// 别用 `AppState::opening_path()` 代替：那条在读取完成时会被发布成 `None`。
+#[doc(hidden)]
+pub fn panel_path_for_tests(view: &RootView) -> Option<std::path::PathBuf> {
+    view.panel_at(0, 0).and_then(|p| p.path.clone())
+}
+
 /// 测试专用：当前标签页的窗口快照是否已同步到 `rows` 行（导航等待用）。
 #[doc(hidden)]
 pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {

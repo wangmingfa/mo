@@ -5887,6 +5887,123 @@ impl RootView {
         cx.notify();
     }
 
+    // ------------------------------------------------------ 从系统拖入（外部拖放）
+
+    /// 提交一次「从资源管理器 / 访达拖进来」的复制。
+    ///
+    /// 和内部拖拽（[`Self::run_transfer`]）有两条差别，都必须写在这里：
+    /// * **源端恒为本地**：平台递进来的就是本机路径（Windows 走 CF_HDROP、macOS 走
+    ///   file URL），目标端要问落点那一头自己连着谁——分栏一边本地一边 FTP 时，这一
+    ///   路是「上传」。
+    /// * **只能复制，不能移动**：gpui 把 `FileDropEvent::Submit` 翻成 MouseUp 时把修饰
+    ///   键清成 `Modifiers::default()`（gpui `window.rs` 的 FileDrop 分支），拿不到
+    ///   Alt / Shift，所以 `move_` 恒为 `false`。想让外部拖放变成移动，得等平台层把
+    ///   按键状态透传进来（Windows 的 `IDropTarget::Drop` 里有 `keyState`，还没用）。
+    fn submit_os_drop(
+        &mut self,
+        app: AppState,
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        dest_ep: mo_app::Endpoint,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // 「把目录拖进它自己 / 它的子目录」在资源管理器里也是直接拒绝的：交到底层
+        // 只会得到一条看不懂的拷贝错误，这里先挡掉。
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| p != &dest && !dest.starts_with(p))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |_weak, _cx| {
+            let _ = app
+                .transfer_between(paths, mo_app::Endpoint::Local, &dest, dest_ep, false)
+                .await;
+            if refresh {
+                // 目标窗格可能没开监听：拖进来的文件不会自己冒出来，主动刷一次。
+                let _ = app.refresh().await;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 外部拖放落在某个**目录行**上：复制进那个目录。
+    ///
+    /// 只给目录行注册（非目录行根本没有 drop 监听）——gpui 在派发 drop 前会先把
+    /// `active_drag` 取走，用 `can_drop` 拒绝并不能把事件让给外层元素，只会把它
+    /// 吞掉（gpui `elements/div.rs` 的 drop 派发）。所以「能不能接」这件事必须由
+    /// **有没有注册监听**来表达。
+    pub(crate) fn drop_os_paths_on_entry(
+        &mut self,
+        paths: Vec<PathBuf>,
+        pane: usize,
+        dest: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(app) = self.pane_app(pane) else {
+            return;
+        };
+        // 落点窗格连着谁，目标端就是谁（远程目录 = 上传）。
+        let dest_ep = app.endpoint();
+        self.submit_os_drop(app, paths, dest, dest_ep, false, cx);
+    }
+
+    /// 外部拖放落在窗格空白处：复制进该窗格当前显示的目录。
+    pub(crate) fn drop_os_paths_on_pane(
+        &mut self,
+        paths: Vec<PathBuf>,
+        pane: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dest) = self
+            .panes
+            .get(pane)
+            .and_then(|p| p.tabs.get(p.active))
+            .and_then(|t| t.path.clone())
+        else {
+            return;
+        };
+        self.drop_os_paths_on_entry(paths, pane, dest, cx);
+    }
+
+    /// 外部拖放落在侧栏「快捷访问」的某个位置上。
+    ///
+    /// 快捷位置全是**本地**目录（`AppState::quick_locations` 用 `dirs` 解析），所以
+    /// 目标端写死 `Endpoint::Local`：当前窗格连着 FTP 时也不能把本机路径交给远程后端。
+    /// 刷新走那条窗格——用户可能正看着这个目录。
+    pub(crate) fn drop_os_paths_on_location(
+        &mut self,
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app();
+        self.submit_os_drop(app, paths, dest, mo_app::Endpoint::Local, true, cx);
+    }
+
+    /// 外部拖放落在侧栏「回收站」上：送进回收站（外部拖放没有「移动」语义，
+    /// 但回收站本来就是「移走」，这里按用户点这一行的意图办）。
+    pub(crate) fn drop_os_paths_on_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        let count = paths.len();
+        cx.spawn(async move |_weak, cx| {
+            app.trash_paths(paths).await;
+            this.update(cx, |v, cx| {
+                // 正开着回收站面板就当场看得见。
+                if matches!(v.modal, Modal::Trash) {
+                    v.trash_entries = v.app().trash_list();
+                }
+                v.notice(format!("已把 {count} 项移入回收站"), None, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     // ------------------------------------------------------------ 右键菜单
 
     /// 打开右键菜单。
@@ -7083,6 +7200,15 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
         .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
             let alt = ev.modifiers.alt;
             drop_entity.update(cx, |v, cx| v.drop_on_pane(pane_idx, alt, cx));
+        });
+
+    // 从系统拖文件进来落在窗格空白处 = 复制进这一窗格当前显示的目录。
+    // 目录行自己有监听（更靠内先吃到事件），这里接的是「没对上任何目录」的那部分。
+    let os_drop_entity = entity.clone();
+    col.interactivity()
+        .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+            let paths = paths.paths().to_vec();
+            os_drop_entity.update(cx, |v, cx| v.drop_os_paths_on_pane(paths, pane_idx, cx));
         });
 
     // 空白处右键：弹「目录级」菜单（新建 / 粘贴 / 刷新 / 全选…）。

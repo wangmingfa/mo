@@ -546,6 +546,27 @@ pub fn render(
                         });
                     });
 
+                // 从系统（资源管理器 / 访达）拖文件进来：**只有目录行接得住**。
+                // 这里不能改用 `can_drop` 来做「非目录拒绝」——gpui 在判定可行性
+                // 之前就把 `cx.active_drag` 取走了（`elements/div.rs` 的 drop 派发），
+                // 拒绝等于吞掉事件，外层窗格的兜底监听再也收不到。所以非目录行
+                // 干脆不注册监听，让事件自然冒泡。
+                if is_dir {
+                    let entity_os = entity.clone();
+                    let os_dest = entry.path.clone();
+                    row = row.drag_over::<ExternalPaths>(|style, _, _window, _cx| {
+                        style.bg(crate::theme::hover_bg())
+                    });
+                    row.interactivity()
+                        .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+                            let paths = paths.paths().to_vec();
+                            let dest = os_dest.clone();
+                            entity_os.update(cx, |v, cx| {
+                                v.drop_os_paths_on_entry(paths, pane, dest, cx);
+                            });
+                        });
+                }
+
                 // 右键：对着这一行弹上下文菜单。必须 `stop_propagation`，
                 // 否则事件继续冒泡到窗格容器，菜单会被随即替换成「空白处」版本。
                 let entity_ctx = entity.clone();

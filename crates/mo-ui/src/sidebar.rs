@@ -84,6 +84,17 @@ pub fn render(
 
         // imperative API：`Div` 只实现 `InteractiveElement`，点击回调走这里。
         // on_click 要求 `Fn`（可多次调用），闭包内只克隆、不消耗捕获值。
+        let entity_os = entity.clone();
+        let os_dest = path.clone();
+        item = item.drag_over::<ExternalPaths>(|style, _, _window, _cx| {
+            style.bg(crate::theme::hover_bg())
+        });
+        item.interactivity()
+            .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+                let paths = paths.paths().to_vec();
+                let dest = os_dest.clone();
+                entity_os.update(cx, |v, cx| v.drop_os_paths_on_location(paths, dest, cx));
+            });
         item.interactivity().on_click(move |_, _window, cx| {
             let app = app_click.clone();
             let target = path.clone();
@@ -145,6 +156,16 @@ pub fn render(
     } else {
         trash_item = trash_item.hover(|s| s.bg(crate::theme::hover_bg()));
     }
+    // 把文件拖到这一行 = 送回收站（和资源管理器里拖到回收站图标同语义）。
+    let entity_os_trash = entity.clone();
+    trash_item = trash_item
+        .drag_over::<ExternalPaths>(|style, _, _window, _cx| style.bg(crate::theme::hover_bg()));
+    trash_item
+        .interactivity()
+        .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+            let paths = paths.paths().to_vec();
+            entity_os_trash.update(cx, |v, cx| v.drop_os_paths_on_trash(paths, cx));
+        });
     trash_item.interactivity().on_click(move |_, _window, cx| {
         entity_trash.update(cx, |v, cx| v.open_trash_panel(cx));
     });
