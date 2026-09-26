@@ -4832,7 +4832,7 @@ dependencies = [
 
 [[package]]
 name = "mo-app"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4860,7 +4860,7 @@ dependencies = [
 
 [[package]]
 name = "mo-bench"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "criterion",
  "image",
@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "mo-cache"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "dirs 5.0.1",
  "mo-core",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "mo-config"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4893,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "mo-core"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -4903,11 +4903,11 @@ dependencies = [
 
 [[package]]
 name = "mo-diff"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 
 [[package]]
 name = "mo-fs"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "async-trait",
  "mo-core",
@@ -4919,7 +4919,7 @@ dependencies = [
 
 [[package]]
 name = "mo-operations"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "async-trait",
  "flate2",
@@ -4941,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "mo-platform"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "dispatch",
  "libc",
@@ -4952,7 +4952,7 @@ dependencies = [
 
 [[package]]
 name = "mo-preview"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "mo-core",
@@ -4961,7 +4961,7 @@ dependencies = [
 
 [[package]]
 name = "mo-remote"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "mo-search"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "mo-core",
@@ -4994,7 +4994,7 @@ dependencies = [
 
 [[package]]
 name = "mo-thumbnails"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "dirs 5.0.1",
  "image",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "mo-ui"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "chrono",
  "embed-resource",
