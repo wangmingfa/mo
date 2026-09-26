@@ -1,6 +1,6 @@
 # Windows 移植的坑
 
-日期：2026-09-25 ~ 09-26。涉及：gpui-pre 0.3.6、`windows` 0.58 / 0.62（别名）、Win32 Shell / SetupAPI / CfgMgr / GDI、`IFileOperation`、WinRT `Windows.Data.Pdf`。
+日期：2026-09-25 ~ 09-26。涉及：gpui-pre 0.3.6、`windows` 0.58 / 0.62（别名）、Win32 Shell / SetupAPI / CfgMgr / GDI / 剪贴板 / 键盘布局、`IFileOperation`、WinRT `Windows.Data.Pdf`。
 
 Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**。平台层的对外形状（`PlatformError`、`IconRaster`、`Volume`）两端共用，上层因此一行没为 Windows 改过判断——除了一处例外，见 §6。
 
@@ -122,6 +122,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **修法**：`fold_typographic_shift`（`crates/mo-ui/src/keys.rs:59`）扩成完整一对表（`{[`、`}<`、`>.`、`:;`、`"'`、`?/`、`|\`、`~\`` 加上原有的 `+=`、`_-`），**表两头都算**、折回基本键并把 Shift 位归掉。折只发生在比对用的 `canonical()`（`:108`）里，`matches()`（`:123`）比它——`parse` 不再就地折，否则用户写的 `cmd+shift+.` 显示成「Ctrl+.」，提示文案就成了按不出来的指令。
 * **为什么数字不进表**：`cmd+1`~`cmd+4` 是视图模式，把 `!` 折成 `1` 等于让 `Ctrl+Shift+1` 顺手切视图——白送的宽容，代价是误触。字母键同理不进表（`cmd+z` 撤销 / `cmd+shift+z` 重做必须分得开）。
 * **回归测试**：`windows_shifted_symbol_events_hit_symbol_bindings` 直接造 Windows 形状的按键事件（key 是 `>` / `{` / `}`、Shift 位已被后端吃掉）查表，不靠真键盘。
+* **尾巴**：这一节的表只描述 **US 布局**，非 US 键盘上会串键——修法见 §22。
 
 ## 16. 测试把用户机器上的真实配置写了
 
@@ -143,10 +144,52 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **修法**：一张表两处用——`known_folder_labels()`（`crates/mo-app/src/lib.rs:710`，`OnceLock` 包住 `dirs::*_dir()`）既喂侧栏快捷访问，也喂 `folder_label()`（`crates/mo-ui/src/path_label.rs:32`）；标签页、面包屑、列视图、侧栏都改走它，比较时 Windows 忽略大小写（`same_dir`，`:52`，顺带吃掉尾部 `\`）。
 * **为什么不用 `SHGetDisplayNameOfW`**：那是**逐段**问 Shell 要名字，面包屑每帧都要重算，等于每帧一次跨模块调用；而且它给的是本地化 + 用户改过的名字，跟侧栏那张表又会分叉。显示名与真实名分离这条（`mo_core::display_name`）本来就是同一个哲学：只改画法，路径一个字符都不动。
 
+## 19. 系统剪贴板「进来」：gpui 早就报了，Mo 一直没读
+
+* **现象**：资源管理器里 Ctrl+C 一批文件，回 Mo 粘贴毫无反应。Mo 的文件剪贴板是**纯进程内部**的那份（`Clipboard` 只在应用里传路径），而 gpui 的 `read_from_clipboard` 在 macOS / Windows 上都会把系统剪贴板里的文件报成 `ClipboardEntry::ExternalPaths`——这一支 Mo 从来没看。
+* **剪切还是复制，gpui 报不出来**：那一位 Shell 记在 `Preferred DropEffect` 这个剪贴板格式里，gpui 没透出。Windows 侧平台层补一手读（`clipboard_files_are_cut`）；**macOS 一律答复制**——Finder 的剪切是一条私有 pasteboard 标记，公开可读的类型里没有这一位。判不准时为什么必须偏向复制：猜成剪切会把用户的文件**搬走**，猜反了只是多留一份。
+* **顺带挖出两个老错**（`crates/mo-app` 的粘贴路径）：
+    * 复制分支调的是 `copy_selection`（当前**选区**），于是「复制 → 换目录 → 粘贴」粘的是新目录里选中的东西，选区一空就粘出 0 项。两支现在都按剪贴板那批走 `transfer_between`。
+    * 源端点取的是「当前浏览的那一端」：从资源管理器复制的本机路径、粘进正在浏览的 FTP 会话，会去服务器上找一个不存在的文件。源端点改记在剪贴板里（`Clipboard::src`）。
+* **验证**：真机跑通「资源管理器复制 → Mo 粘贴」「资源管理器剪切 → Mo 粘贴（原处文件搬走）」，以及反向的 Mo→Mo。
+
+## 20. 系统剪贴板「出去」：gpui 的后端对 `ExternalPaths` 是 `=> {}`
+
+* **现象**：§19 让 Mo 能粘别人复制的，反向仍是断的——Mo 里 Ctrl+C 之后去别的程序粘贴，什么都出不来。原因写在 gpui 里：`write_to_clipboard` 遇到 `ClipboardEntry::ExternalPaths` 直接丢弃，两个平台的后端都写着 `=> {}`。
+* **修法**：Windows 侧自己写原生那套。`GlobalAlloc(GMEM_MOVEABLE)` 一块，按 `DROPFILES` 摆 20 字节头（`pFiles=20`、`pt=(0,0)`、`fNC=0`、`fWide=1`），后接 UTF-16 路径表、每条各自 NUL 结尾、整表再空一项收尾；`SetClipboardData(CF_HDROP=15)`。同时写 `Preferred DropEffect`（复制 `0x1` / 剪切 `0x2`），否则对方程序把剪切当复制，粘完原文件还留着。
+* **字节必须钉死**：头部偏一格、或结尾少一个 NUL，Mo 自己一切正常，只有别的应用读不出（资源管理器直接灰掉「粘贴」）。`dropfiles_bytes` 的测试按字节断言，不按「能读回来」断言。
+* **两处内存所有权**（都写在注释里，这类错编译不了也测不出）：`SetClipboardData` 成功之后 HGLOBAL 归系统，再 `GlobalFree` 是双重释放；反过来它**失败**时必须释放，不然每次复制漏一块。`OpenClipboard` / `CloseClipboard` 用 Drop guard 配对，中间任何 `?` 早退都不会漏下锁——剪贴板被进程独占住，别的程序会连粘都粘不了。
+* **上层不许报错**：`supports_file_clipboard()` 为假（macOS 没做）或写入失败时，应用内粘贴照走自己那份剪贴板，UI 不能因此说「复制失败」。
+
+## 21. 缓存隔离补漏：`MO_CACHE_DIR` 只认了一半
+
+* **现象**：`isolate_config_for_tests()`（§16 那个 helper）只挡了 `MO_CONFIG_DIR`，缓存那半是漏的。`AppState::new()` 一开就接上 `<缓存>/mo/search.sqlite`，测试爬过的每个临时目录都被写进**开发者机器上的真索引**——回头按搜索键找文件，会搜出一批早已被删掉的 `mo-layout-trash-*` 之类的脏根。缩略图 / 预览图 / `metadata.sqlite` 同理，每个会渲染图片的用例都在往真实缓存落文件。
+* **修法**：`mo_cache::cache_dir()`、`mo_thumbnails` 的 thumb / preview 两个根都认 `MO_CACHE_DIR`（和 `AppState::index_path` 同一条理由，之前只有它认）；helper 改名 `isolate_user_dirs_for_tests()`，一次钉两个目录——**名字只说 config 会让后来人以为隔离已经做全了**。
+* **验证方式**：不看日志看 mtime。跑 `cargo test -p mo-ui`（33/33）前后 `%LOCALAPPDATA%\mo\search.sqlite` 与 `metadata.sqlite` 都没动，临时目录里多出 `mo-test-cache-<pid>`。
+* ⚠️ **没修完**：mo-app / mo-operations 的集成测试（`hidden_files`、`large_dir`、`navigation`、`staging`、`sync`、`watcher_refresh` 等十余个）各自 `set_var` 之外不钉缓存，仍在写真实 `search.sqlite`。它们的 app 构造各写各的，要一起收口得先给 mo-app 补一个同款 helper。
+
+## 22. §15 那张折表只认 US 布局：改成问当前键盘布局
+
+* **为什么要改**：「哪个符号是哪个键的 Shift 变体」是**键盘布局**的事，不是常理。2026-09-26 用 `VkKeyScanExW` 实测两种布局的配对（`.tmp/vk.ps1`，同一套 API）：US 上 `+` 是 Shift+`=`、`?` 是 Shift+`/`；德语上 `+` 自己就是一个键、`:` 才是 `.` 的 Shift 变体、`"` 是 Shift+`2`、`{` 要 AltGr+`7`、而 `?` 那个键未加 Shift 打出的是 `ß`。照 US 表在德语上折，等于把用户按下的键绑到另一个动作上，默认键位反倒按不出来。
+* **修法**：`mo_platform::unshifted_key(ch)`——`VkKeyScanExW` 查出这个字符要按哪个虚拟键、什么 Shift 态（只认「无 Shift」与「Shift」两种，AltGr / Ctrl / Alt 出来的一律不答），再用 `MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR)` 取该键**未加 Shift** 的字符；死键（bit15）与非 ASCII 结果都不答。`fold_typographic_shift` 先问布局、问不到才退 US 表。
+* **两条不明显的规则**：
+    * 布局**答了就不再退表**，哪怕答的是数字或字母（德语上 `"`→`2`）：表里那条 `"`→`'` 在这一列是错的，拿它兜底就把两个不相干的键又并到一起。
+    * 「基本键也得是符号键」这条规则从「表里不记数字」改成了真判据（`is_symbol_char`），因为布局会给回数字（`!`→`1`）——视图模式占着 `cmd+1`~`cmd+4`，不判就白送一次误触。
+* **macOS 仍是 US 表**：gpui 的 `Keystroke` 只给字符、不给虚拟键码，那边问不出布局。`unshifted_key` 在非 Windows 直接答 `None`，调用方退表——已知缺口，不是漏判。
+* **单测不碰真布局**：`fold_typographic_shift` 在 `#[cfg(test)]` 下把查询退化成 `None`（开发机插什么键盘不该决定断言红绿，与 §16/§21 同一类卫生）；非 US 的行为由 `fold_with` 那组测试喂**假布局**覆盖。`mo-platform` 侧按 KLID 显式 `ActivateKeyboardLayout` 后实测 US 与德语两列答案，装不上布局的机器跳过并 `eprintln!`。
+* **实机验证撞到的两件事**（记下来，免得下一个人重踩）：
+    * gpui 算字符走 `ToUnicode(vk, lParam 高字节的扫描码, state)`，它只看**当前线程**的布局。而 `SetForegroundWindow` 一激活窗口，Windows 就把该线程的布局打回这个窗口登记的输入语言（本机是 `0x0804` 中文）；`WM_INPUTLANGCHANGEREQUEST` 想切德语（`00000407`）也不落地——不在用户「输入语言列表」里的布局，Shell 不给切。所以**没能让 Mo 的线程真变成德语键盘**，GUI 上的德语端到端这一轮没验成。
+    * 于是改成验**同一条 API 链**：`to_unicode_and_unshifted_key_agree_on_the_same_layout` 在进程内激活德语后，照抄 gpui 的调用形状（`state[VK_SHIFT]=0x80`、8 个 u16 的缓冲、flags `0x5`），`ToUnicode(VK_OEM_102, 0x56, Shift)` 交出 `>`，`unshifted_key('>')` 答回 `<`；同一个键在 US 上交出 `|`、折成 `\`。真实德语用户的 Mo 线程从进程起来就是德语，走的是这一条。
+    * GUI 侧只验了**不回归**：US 线程上 `Ctrl+Shift+.` → Mo 收到 `>` → 折成 `.` → 隐藏文件照常切换（第二轮再按一次收回）。
+
 ## 待办（还没做，别当成已完成）
 
-* 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14~§18 是当轮写的。
+* 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
-* §15 的折表只按 **US 布局**折符号；法语/德语键盘上 `?`、`:` 这些不在同一个物理键，键位提示与匹配可能会分叉——真收到反馈再考虑读键盘布局表。
-* Linux 侧没有 §15 的实测（gpui 的 Linux 后端怎么报 Shift + 符号还没验），只保证单测在三个平台都跑得过。
+* **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
+* **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
+* **拖放**（应用内、以及与资源管理器之间）还没动，是 §19/§20 之后自然的一段：`DROPFILES` 那套字节形状已经现成。
+* §21 的缓存隔离只收了 mo-ui / mo-platform 这条路；mo-app / mo-operations 的十余个集成测试仍在写真实 `search.sqlite`。
+* 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
+* 测试留下的临时回收站 `mo-trash-<pid>-<seq>` 在 TEMP 里没人删（§21 那个 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积）。
 
