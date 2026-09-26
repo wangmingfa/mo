@@ -135,7 +135,7 @@ pub fn icon_key(path: &Path, is_dir: bool, slot_pt: f32) -> IconKey {
     if !is_dir {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext = ext.to_lowercase();
-            if !ext.is_empty() && !is_package_ext(&ext) {
+            if !ext.is_empty() && !is_package_ext(&ext) && !is_per_file_ext(&ext) {
                 return IconKey::Type(format!(".{ext}"), px);
             }
         }
@@ -164,6 +164,27 @@ fn is_package_ext(ext: &str) -> bool {
             | "saver"
             | "scptd"
     )
+}
+
+/// 这些后缀在系统里是**每个条目自带图标**的，也必须按路径问（只在 Windows 上有意义）。
+///
+/// 实测（32px，逐张比对像素指纹）：`.lnk` 的**类型**图标是一张通用白纸，而桌面上三个
+/// 快捷方式各自拿到 atlas 的 `.ico` / PotPlayer / VS Code 的图标；`.exe` 同理
+/// （`notepad.exe`、`cmd.exe` 各自一张，只有没内嵌图标的 `ping.exe` 才等于类型图）。
+/// 误按类型共享的后果是看得见的：整个目录的快捷方式共用**第一个被问到**的那张图，
+/// 看起来像串图。`.url` 与 `.lnk` 同为快捷方式、`.scr` 本质是换了后缀的 `.exe`，
+/// 按同一条规律一起收进来（这两条没实测，机器上没有样本）。
+///
+/// macOS 上这些后缀不成问题：快捷方式是 `.app` 包（上面那张表）或 Finder alias
+/// （`.alias` 的类型图标本来就是通用的那张箭头纸），所以这张表只在 Windows 生效。
+#[cfg(target_os = "windows")]
+fn is_per_file_ext(ext: &str) -> bool {
+    matches!(ext, "lnk" | "url" | "exe" | "scr")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_per_file_ext(_ext: &str) -> bool {
+    false
 }
 
 /// 图标缓存 + 待取队列。
@@ -511,6 +532,34 @@ mod tests {
         assert_eq!(
             icon_key(Path::new("/tmp/LICENSE"), false, SLOT_SMALL),
             IconKey::Path(PathBuf::from("/tmp/LICENSE"), ICON_PX_SMALL)
+        );
+    }
+
+    /// Windows 的快捷方式与可执行文件**每个条目一张图**，绝不能按扩展名共享。
+    ///
+    /// 这一条是从用户报告来的：桌面上十几个 `.lnk` 全显示成同一张通用白纸。类型键
+    /// 问的是 `SHGFI_USEFILEATTRIBUTES`（压根不看这个文件），拿到的就是 `.lnk` 这个
+    /// **类型**的图标——第一个被问到的那张顶掉了全部。
+    #[test]
+    fn shortcuts_and_executables_never_share_a_type_key() {
+        for p in [
+            "D:\\Users\\me\\Desktop\\Atlas.lnk",
+            "D:\\Users\\me\\Desktop\\Visual Studio Code.lnk",
+            "C:\\Windows\\System32\\notepad.exe",
+        ] {
+            let path = Path::new(p);
+            assert_eq!(
+                icon_key(path, false, SLOT_SMALL),
+                IconKey::Path(path.to_path_buf(), ICON_PX_SMALL),
+                "{p} 该按路径问"
+            );
+        }
+        // 非 Windows 上这些后缀没有「自带图标」这回事，共享照旧（别为了不存在
+        // 的场景把 macOS 的缓存命中率打下去）。
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            icon_key(Path::new("/tmp/a.lnk"), false, SLOT_SMALL),
+            IconKey::Type(".lnk".to_string(), ICON_PX_SMALL)
         );
     }
 
