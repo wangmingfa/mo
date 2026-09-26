@@ -3188,7 +3188,7 @@ impl RootView {
             // 显示「载入预览…」），降采样在后台跑。以前是「先 await 降采样、再换内容」，
             // 于是按方向键后窗口里还挂着**上一张**的图，直到新图就绪才跳变。
             if let Ok(pv) = app.preview(&p) {
-                show_preview_twopass(&app, &this, pv, cx);
+                show_preview_twopass(&app, &this, pv, &p, cx);
             }
         })
         .detach();
@@ -7366,7 +7366,7 @@ fn handle_modal_key(
                     let app = entity.update(cx, |v, _cx| v.app());
                     let this = entity.clone();
                     cx.spawn(async move |cx| match app.preview(&path) {
-                        Ok(pv) => show_preview_twopass(&app, &this, pv, cx),
+                        Ok(pv) => show_preview_twopass(&app, &this, pv, &path, cx),
                         Err(e) => {
                             this.update(cx, |v, cx| {
                                 v.modal = Modal::Info(format!("无法预览 {}：{e}", path.display()));
@@ -8332,7 +8332,7 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
                             v.search_results.clear();
                             cx.notify();
                         });
-                        show_preview_twopass(&app, &this, pv, cx);
+                        show_preview_twopass(&app, &this, pv, &h.path, cx);
                     }
                     Err(e) => {
                         this.update(cx, |v, cx| {
@@ -8462,7 +8462,7 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
         return;
     };
     match app.preview(&p) {
-        Ok(pv) => show_preview_twopass(app, this, pv, cx),
+        Ok(pv) => show_preview_twopass(app, this, pv, &p, cx),
         Err(e) => {
             this.update(cx, |v, cx| {
                 v.modal = Modal::Info(format!("无法预览 {p:?}：{e}"));
@@ -8472,32 +8472,6 @@ async fn open_quick_look(app: &AppState, this: &Entity<RootView>, cx: &mut Async
     }
 }
 
-/// 换预览内容：**窗口立刻切到新内容**，图片的降采样副本随后到。
-///
-/// 三个入口共用它：按空格（`open_quick_look`）、方向键翻页（`preview_step`）、
-/// 搜索面板里回车预览。
-///
-/// ⚠️ 图片必须分两拍——先把 `image` 清掉，让 [`crate::preview::PreviewWindow`] 画
-/// 「载入预览…」，副本生成好再 [`RootView::set_preview_image`] 换上。写成「先 await
-/// 降采样、再换内容」会有两个后果：
-///
-/// * 首次打开时窗口要等副本生成完才出现（按空格后像没反应）；
-/// * **翻页时窗口里一直挂着上一张的图**，直到新图就绪才跳变——按方向键看到的是旧图，
-///   体感就是「切换有延迟」。
-///
-/// 预览本身不解码（`Preview.image` 只是路径），真正的解码在 UI 加载图片时发生。一张
-/// 7680×4320 的 JPEG 全解码约 130MB RGBA，既慢又白占一张大纹理，所以这里先在 blocking
-/// 池按长边上限生成一份副本并缓存（见 `mo_thumbnails::preview_scaled`）；之后同一张图
-/// 直接命中磁盘，不再解码。降采样失败一律回退到原图路径——它是优化，不是预览能否
-/// 打开的必要条件。
-///
-/// 快速连按时只有最后一张能贴上：`preview_seq` 代际校验在
-/// [`RootView::set_preview_image`]。
-/// 把一份预览拆成「可以立刻显示的那一半」与「还要后台补的图片源路径」。
-///
-/// ⚠️ 图片预览**必须**在这里把 `image` 摘掉：留着它，窗口就会继续显示**上一张**的图
-/// （本轮修的体验问题），永远走不到占位分支。摘出来的路径拿去后台降采样，回来再由
-/// [`crate::preview::PreviewWindow::set_image`] 补上。非图片预览一次给全，第二拍为空。
 /// 两段式预览的「第二段要补什么」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreviewSecond {
@@ -8516,17 +8490,59 @@ impl PreviewSecond {
     }
 }
 
-fn split_preview_for_two_pass(mut pv: Preview) -> (Preview, Option<PreviewSecond>) {
+/// 把一份预览拆成「可以立刻显示的那一半」与「还要后台补的那一半」。
+///
+/// ⚠️ 图片预览**必须**在这里把 `image` 摘掉：留着它，窗口就会继续显示**上一张**的图
+/// （本轮修的体验问题），永远走不到占位分支。摘出来的路径拿去后台降采样，回来再由
+/// [`crate::preview::PreviewWindow::set_image`] 补上。
+///
+/// PDF 要补的是**首页渲染**，输入只能是文件本身（`path`）——`Preview.image` 对 PDF
+/// 恒为 `None`（mo-preview 只认类型不碰平台），所以这一支不能从 `pv` 里 take。
+/// 文本 / 目录 / 二进制一次给全，第二拍为空。
+fn split_preview_for_two_pass(
+    mut pv: Preview,
+    path: &std::path::Path,
+) -> (Preview, Option<PreviewSecond>) {
     let src = match pv.kind {
         PreviewKind::Image => pv.image.take().map(PreviewSecond::Image),
-        PreviewKind::Pdf => pv.image.take().map(PreviewSecond::Pdf),
+        // PDF 的 `image` 恒为 `None`（mo-preview 只认类型、不渲染），源路径得由调用方
+        // 给。从 `pv.image` 里 take 的话第二拍永远是空，首页渲染根本不会启动——窗口
+        // 上一直挂着「正在渲染首页…」。
+        PreviewKind::Pdf => Some(PreviewSecond::Pdf(path.to_path_buf())),
         _ => None,
     };
     (pv, src)
 }
 
-fn show_preview_twopass(app: &AppState, this: &Entity<RootView>, pv: Preview, cx: &mut AsyncApp) {
-    let (head, src) = split_preview_for_two_pass(pv);
+/// 换预览内容：**窗口立刻切到新内容**，要后台补的那一半随后到。
+///
+/// 三个入口共用它：按空格（`open_quick_look`）、方向键翻页（`preview_step`）、
+/// 搜索面板里回车预览。`path` 是被预览的那个文件，PDF 拿它去渲染首页。
+///
+/// ⚠️ 必须分两拍——先 [`split_preview_for_two_pass`] 出来的那一半立刻上屏（占位文案
+/// 由此画出），补的那一半在 blocking 池生成好再 [`RootView::set_preview_image`] 换上。
+/// 写成「先 await 降采样、再换内容」会有两个后果：
+///
+/// * 首次打开时窗口要等副本生成完才出现（按空格后像没反应）；
+/// * **翻页时窗口里一直挂着上一张的图**，直到新图就绪才跳变——按方向键看到的是旧图，
+///   体感就是「切换有延迟」。
+///
+/// 预览本身不解码（`Preview.image` 只是路径），真正的解码在 UI 加载图片时发生。一张
+/// 7680×4320 的 JPEG 全解码约 130MB RGBA，既慢又白占一张大纹理，所以先在 blocking 池
+/// 按长边上限生成一份副本并缓存（见 `mo_thumbnails::preview_scaled`）；之后同一张图
+/// 直接命中磁盘，不再解码。降采样失败一律回退到原图路径——它是优化，不是预览能否
+/// 打开的必要条件。
+///
+/// 快速连按时只有最后一张能贴上：`preview_seq` 代际校验在
+/// [`RootView::set_preview_image`]。
+fn show_preview_twopass(
+    app: &AppState,
+    this: &Entity<RootView>,
+    pv: Preview,
+    path: &std::path::Path,
+    cx: &mut AsyncApp,
+) {
+    let (head, src) = split_preview_for_two_pass(pv, path);
     // 立刻换内容（窗口已开着就复用，没开就现在开）——这一步不等任何 IO。
     let seq = this.update(cx, |v, cx| {
         v.show_preview(head, cx);
@@ -12891,14 +12907,18 @@ mod tests {
         );
     }
 
-    /// 图片预览在换上降采样副本之前，**必须先摘掉 `image`**。
+    /// 图片与 PDF 各有自己的第二拍，其它类型一次给全。
     ///
-    /// 不摘的后果正是本轮修的体验问题：翻页时窗口里还挂着上一张的图，用户按了方向键
-    /// 看到的还是旧图、隔一拍才跳变。摘掉之后 `PreviewWindow` 才会走到占位分支画
-    /// 「载入预览…」。非图片预览一次给全，第二拍必须为空——否则会白跑一次降采样
-    /// （图片之外的类型没有可降采样的东西）。
+    /// 图片那一拍守的是本轮修的体验问题：不摘掉 `image`，翻页时窗口里还挂着上一张的
+    /// 图，用户按了方向键看到的还是旧图、隔一拍才跳变；摘掉之后 `PreviewWindow` 才会
+    /// 走到占位分支画「载入预览…」。
+    ///
+    /// PDF 那一拍守的是「渲染到底有没有被启动」：`Preview.image` 对 PDF 恒为 `None`
+    /// （mo-preview 只认类型不碰平台），第二拍的输入只能取自调用方给的路径——早先写成
+    /// 从 `pv.image` 里 take，于是渲染**从来没有**被叫起过，窗口永远停在
+    /// 「正在渲染首页…」。
     #[test]
-    fn only_images_are_split_into_two_passes() {
+    fn two_pass_split_hands_over_image_and_pdf_jobs() {
         let photo = std::path::Path::new("/tmp/mo/photo.jpg");
 
         let image = mo_preview::Preview {
@@ -12908,7 +12928,7 @@ mod tests {
             image: Some(photo.to_path_buf()),
             size: 1024,
         };
-        let (head, src) = super::split_preview_for_two_pass(image);
+        let (head, src) = super::split_preview_for_two_pass(image, photo);
         assert!(
             matches!(&src, Some(super::PreviewSecond::Image(p)) if p == photo),
             "图片的源路径要交给第二拍去降采样：{src:?}"
@@ -12927,6 +12947,26 @@ mod tests {
             "标题照旧：占位期间标题不该闪成空白"
         );
 
+        let doc = std::path::Path::new("/tmp/mo/report.pdf");
+        let pdf = mo_preview::Preview {
+            kind: mo_preview::PreviewKind::Pdf,
+            title: "report.pdf".to_string(),
+            text: Some("PDF 文档\n\n（正在渲染首页…）".to_string()),
+            // mo-preview 对 PDF 就是给的 None：只认类型、不渲染。
+            image: None,
+            size: 2048,
+        };
+        let (head, src) = super::split_preview_for_two_pass(pdf, doc);
+        assert!(
+            matches!(&src, Some(super::PreviewSecond::Pdf(p)) if p == doc),
+            "PDF 的第二拍输入只能是文件本身，否则首页渲染根本不会启动：{src:?}"
+        );
+        assert!(head.image.is_none(), "PDF 第一拍没有图可画");
+        assert!(
+            head.text.is_some(),
+            "占位文案要留着——渲染没回来之前窗口里总得有句话"
+        );
+
         let text = mo_preview::Preview {
             kind: mo_preview::PreviewKind::Text,
             title: "notes.txt".to_string(),
@@ -12934,7 +12974,8 @@ mod tests {
             image: None,
             size: 5,
         };
-        let (head, src) = super::split_preview_for_two_pass(text);
+        let (head, src) =
+            super::split_preview_for_two_pass(text, std::path::Path::new("/tmp/mo/notes.txt"));
         assert!(src.is_none(), "文本预览没有第二拍");
         assert_eq!(head.text.as_deref(), Some("hello"), "文本要原样留着");
     }

@@ -1,7 +1,8 @@
 #![allow(unsafe_code)]
 //! Windows 原生集成：「在资源管理器中显示」+ 系统回收站（`IFileOperation`）
 //! + 卷宗列表与推出（`GetLogicalDrives` / `CM_Request_Device_Eject`）
-//! + 系统图标（`SHGetFileInfoW` / `SHDefExtractIconW` → `HICON` → 像素）。
+//! + 系统图标（`SHGetFileInfoW` / `SHDefExtractIconW` → `HICON` → 像素）
+//! + PDF 首页渲染（WinRT `Windows.Data.Pdf`）。
 //!
 //! 回收站这条链路与 macOS 的契约完全一致：**系统搬文件、Mo 拿回落点记账**。
 //! 但 Windows 的 `IFileOperation` 没有 macOS
@@ -20,7 +21,11 @@
 //! [`premultiplied_from_backdrops`]）——交出去的仍是**预乘** RGBA，与 macOS 那份
 //! 同一契约。
 //!
-//! ⚠️ unsafe 仅限本文件的 shell / COM / 设备管理 / GDI FFI 调用（与 `mo_app::shell` 同一约定）。
+//! PDF 这条走系统自带的 WinRT `Windows.Data.Pdf`（Windows 10 起就在机器上，不必随
+//! 二进制带一个 pdfium.dll）。渲染输出是 BGRA8 预乘、页面底色透明，所以要换通道并
+//! 铺一层白纸（见 [`opaque_rgba_over_white`]）——交出去的还是与 macOS 同一份契约。
+//!
+//! ⚠️ unsafe 仅限本文件的 shell / COM / 设备管理 / GDI / WinRT 初始化 FFI 调用（与 `mo_app::shell` 同一约定）。
 
 use std::path::{Path, PathBuf};
 
@@ -899,6 +904,184 @@ fn canonical_full(path: &Path) -> Result<PathBuf, PlatformError> {
     Ok(canon)
 }
 
+// ---- PDF：首页渲染（WinRT `Windows.Data.Pdf`）----
+
+// 这一段用的是 0.62 那份 `windows`（别名 `windows_pdf`，理由见 Cargo.toml）：
+// WinRT 的 `*Async` 在 0.62 里生成的是「返回 `IAsyncOperation` 的同步函数」，而
+// `IAsyncOperation::join()` 就是**阻塞等完**——不需要 tokio、不需要手写完成回调，
+// 正好合 blocking 池的胃口。
+use windows_pdf::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
+use windows_pdf::Graphics::Imaging::{
+    BitmapAlphaMode, BitmapBufferAccessMode, BitmapDecoder, BitmapPixelFormat,
+};
+use windows_pdf::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+use windows_pdf::Win32::System::WinRT::IMemoryBufferByteAccess;
+// `IMemoryBufferReference::cast()` 挂在这个 trait 上，不进作用域就调不到。
+use windows_pdf::core::Interface;
+
+/// 把当前线程接进 WinRT 运行时（`Windows.Data.Pdf` 是 WinRT 类，没初始化调不动）。
+///
+/// 只**加**不**减**：`RoInitialize` 幂等（同一线程第二次返回 `S_FALSE`，计数不再涨），
+/// 而这里分不清「这次是我加的还是别人早加过」——乱配 `RoUninitialize` 会把别人的
+/// 计数打穿。blocking 池的线程活得跟进程一样久，留一层计数没有代价。
+///
+/// ⚠️ 必须是**多线程套间**（MTA）。STA 线程上 `join()` 等完成回调会互等成死锁：
+/// 回调要排进本线程的消息泵，而本线程正卡在 `join()` 上。所以这里不能沿用
+/// [`ComGuard`]（那是 STA）。
+fn ensure_winrt() {
+    use windows_pdf::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+    // 返回 `Err` 只可能是这台机器的 WinRT 不可用，或线程已是 STA（RPC_E_CHANGED_MODE，
+    // 此时运行时其实已经就绪，照常往下调用即可）——两种都不值得单独处理。
+    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+}
+
+/// 渲染 PDF 第一页。失败一律 `None`（打不开 / 不是 PDF / 有密码 / 零页 / 尺寸不对）。
+pub fn pdf_page_raster(path: &Path, max_edge: u32) -> Option<IconRaster> {
+    if max_edge == 0 {
+        return None;
+    }
+    // 整个文件先读进内存再喂流：WinRT 那边拿路径开文件要走 `StorageFile`，对
+    // 长路径 / UNC / 云占位文件的脾气与 `std::fs` 不一致，而预览的 PDF 本来就得
+    // 整份解析。渲染只花几十毫秒，读盘那点时间在总账里不是主角。
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    ensure_winrt();
+    render_first_page(&bytes, max_edge)
+}
+
+/// `bytes` 是一份 PDF 正文，长边缩到 `max_edge` 以内渲染第一页（不放大）。
+///
+/// 全程 `Option`：WinRT 那边每个调用都带 `Result`，但上层（`AppState::preview_pdf_page`）
+/// 只问「这张图出得来吗」， HRESULT 到了那里也得丢掉，所以中间不养一条错误链。
+fn render_first_page(bytes: &[u8], max_edge: u32) -> Option<IconRaster> {
+    let src = InMemoryRandomAccessStream::new().ok()?;
+    let writer = DataWriter::CreateDataWriter(&src).ok()?;
+    writer.WriteBytes(bytes).ok()?;
+    writer.StoreAsync().ok()?.join().ok()?;
+    src.Seek(0).ok()?;
+
+    let doc = PdfDocument::LoadFromStreamAsync(&src).ok()?.join().ok()?;
+    // 页码 0-based（CoreGraphics 那边是 1-based，别混）。加密文档到 `LoadFromStream`
+    // 就已经报错了，走不到这里。
+    let page = doc.GetPage(0).ok()?;
+    // `Size` 已按页面旋转调整过（`Dimensions().MediaBox()` 是未旋转的纸面框，
+    // 横竖页拿去算缩放会把长宽边弄反）。
+    let size = page.Size().ok()?;
+    let (pw, ph) = (f64::from(size.Width), f64::from(size.Height));
+    if !pw.is_finite() || !ph.is_finite() || pw <= 0.0 || ph <= 0.0 {
+        return None;
+    }
+    let scale = (f64::from(max_edge) / pw.max(ph)).min(1.0);
+    let w = (pw * scale).round().max(1.0) as u32;
+    let h = (ph * scale).round().max(1.0) as u32;
+
+    let out = InMemoryRandomAccessStream::new().ok()?;
+    let opts = PdfPageRenderOptions::new().ok()?;
+    // 宽高都按同一比例给：WinRT 只在两者之间保持**源**宽高比，给准了就不带形变。
+    opts.SetDestinationWidth(w).ok()?;
+    opts.SetDestinationHeight(h).ok()?;
+    // 系统开了高对比度时不照做——深色模式反色出来的「白纸黑字」在预览窗里是张底片。
+    opts.SetIsIgnoringHighContrast(true).ok()?;
+    page.RenderWithOptionsToStreamAsync(&out, &opts)
+        .ok()?
+        .join()
+        .ok()?;
+
+    // 流里那张图过一道解码才拿到像素（见 [`decode_bgra`]），尺寸以解码结果为准。
+    let (w, h, bgra) = decode_bgra(&out)?;
+    Some(IconRaster {
+        width: w,
+        height: h,
+        rgba: opaque_rgba_over_white(&bgra),
+    })
+}
+
+/// 把渲染产物还原成 BGRA8（预乘）像素。
+///
+/// ⚠️ `RenderWithOptionsToStreamAsync` 交进流里的**不是裸像素**，而是按
+/// `PdfPageRenderOptions.BitmapEncoderId` 编好的一张图（默认 PNG；早年 Windows 10 才
+/// 给裸 BGRA8）。所以这里拿系统自带的 `BitmapDecoder` 过一道，再问 `SoftwareBitmap`
+/// 要内存缓冲——顺手把像素格式钉成 `Bgra8` + 预乘，免得碰上不带 alpha 的格式。
+fn decode_bgra(stream: &InMemoryRandomAccessStream) -> Option<(u32, u32, Vec<u8>)> {
+    stream.Seek(0).ok()?;
+    let decoder = BitmapDecoder::CreateAsync(stream).ok()?.join().ok()?;
+    let bitmap = decoder
+        .GetSoftwareBitmapConvertedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied)
+        .ok()?
+        .join()
+        .ok()?;
+    let (w, h) = (bitmap.PixelWidth().ok()?, bitmap.PixelHeight().ok()?);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (w, h) = (w as usize, h as usize);
+    let buffer = bitmap.LockBuffer(BitmapBufferAccessMode::Read).ok()?;
+    let plane = buffer.GetPlaneDescription(0).ok()?;
+    // `GetBuffer` 给的指针归这块内存缓冲引用管：拷完之前 `reference` 必须在作用域里
+    // 活着（它 drop 时运行时才会把这块缓冲解掉），所以拷贝就写在这儿，不外传。
+    let reference = buffer.CreateReference().ok()?;
+    let access: IMemoryBufferByteAccess = reference.cast().ok()?;
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut capacity: u32 = 0;
+    // SAFETY: 两个出参写进上面的局部变量；`plane` 描述的正是这块缓冲。
+    unsafe {
+        access.GetBuffer(&mut ptr, &mut capacity).ok()?;
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    // 行距（stride）通常比 `w * 4` 大（按字对齐），而 [`IconRaster`] 要的是紧挨着的行。
+    let (start, stride) = (
+        plane.StartIndex.max(0) as usize,
+        plane.Stride.max(0) as usize,
+    );
+    let row_bytes = w.checked_mul(4)?;
+    if stride < row_bytes {
+        return None;
+    }
+    let need = start.checked_add(stride.checked_mul(h - 1)?.checked_add(row_bytes)?)?;
+    if (capacity as usize) < need {
+        return None;
+    }
+    let mut out = vec![0u8; w.checked_mul(h)?.checked_mul(4)?];
+    // SAFETY: 上面按 `need ≤ capacity` 逐行核过区间，读的都是这块缓冲内部。
+    unsafe {
+        let src = std::slice::from_raw_parts(ptr.add(start), capacity as usize - start);
+        for y in 0..h {
+            let from = y * stride;
+            let to = y * row_bytes;
+            out[to..to + row_bytes].copy_from_slice(&src[from..from + row_bytes]);
+        }
+    }
+    Some((w as u32, h as u32, out))
+}
+
+/// WinRT 的 BGRA8 预乘 → 上层的 RGBA8 预乘**且已铺白纸**。
+///
+/// 两件事：
+///
+/// * **换通道**：WinRT 交的是 `B, G, R, A`，[`IconRaster`] 约定 `R, G, B, A`。
+/// * **合成到白底**：PDF 页面本身是**透明**的（只画文字笔画），WinRT 如实给出带
+///   alpha 的一张图。直接编码 PNG 就是一张黑纸（透明像素在图里看着是黑的），所以
+///   按 macOS 那份的做法铺一层白：预乘值合成到白是 `c + (255 − a)`，合成完处处
+///   不透明，alpha 拉满。
+fn opaque_rgba_over_white(bgra: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bgra.len()];
+    let (src, _) = bgra.as_chunks::<4>();
+    let (dst, _) = out.as_chunks_mut::<4>();
+    for (px, o) in src.iter().zip(dst) {
+        let a = px[3] as i32;
+        let paper = 255 - a;
+        o[0] = (px[2] as i32 + paper).clamp(0, 255) as u8; // R
+        o[1] = (px[1] as i32 + paper).clamp(0, 255) as u8; // G
+        o[2] = (px[0] as i32 + paper).clamp(0, 255) as u8; // B
+        o[3] = 255;
+    }
+    out
+}
+
 fn encode_wide(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     p.as_os_str()
@@ -1087,5 +1270,173 @@ mod tests {
                 "映射盘跑进本机卷宗列表了：{v:?}"
             );
         }
+    }
+
+    /// 黑、白、半透明三种像素：换通道 + 铺白底一步做完。
+    ///
+    /// 输入按 WinRT 的 `B, G, R, A`（预乘）给，所以这里也顺手验一遍换序没写反——
+    /// 写反了「纯蓝方块」会渲染成红色，肉眼在真机上一定能看出来，但不如一条断言便宜。
+    #[test]
+    fn bgra_becomes_rgba_on_paper() {
+        // 不透明的纯蓝。
+        assert_eq!(opaque_rgba_over_white(&[255, 0, 0, 255]), [0, 0, 255, 255]);
+        // 不透明的纯红：R 与 B 换位。
+        assert_eq!(opaque_rgba_over_white(&[0, 0, 255, 255]), [255, 0, 0, 255]);
+        // 全透明（PDF 的纸面）→ 白纸。
+        assert_eq!(opaque_rgba_over_white(&[0, 0, 0, 0]), [255, 255, 255, 255]);
+        // 五成透明的纯蓝（预乘值 B=128）：合成到白 = `c + (255 − a)`。
+        assert_eq!(
+            opaque_rgba_over_white(&[128, 0, 0, 128]),
+            [127, 127, 255, 255]
+        );
+        // 多个像素各算各的。
+        assert_eq!(
+            opaque_rgba_over_white(&[0, 0, 255, 255, 0, 0, 0, 0]),
+            [255, 0, 0, 255, 255, 255, 255, 255]
+        );
+    }
+
+    /// 手搓一份**最小可解析**的 PDF：一页 `w×h` 点，内容流原样塞进去。
+    ///
+    /// 不引依赖、不下载样本就能给渲染层验货。xref 的字节偏移按拼装过程现算——算错的
+    /// 偏移会让解析器走「修复」路径，能不能救回来全看运气，索性一次算准。
+    fn minimal_pdf(w: u32, h: u32, content: &str) -> Vec<u8> {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Contents 4 0 R >>"),
+            format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objs.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// 真的渲染一张 PDF 首页：尺寸、底色、方块颜色与位置都要对得上。
+    ///
+    /// ⚠️ 这条会起 WinRT（`RoInitialize` + `Windows.Data.Pdf` + `BitmapDecoder`），跑在
+    /// 测试的子线程上——特意**不**在单线程套间里等完成回调，正是为了确认「blocking 池
+    /// 里能自己等完」这件事。
+    #[test]
+    fn renders_the_first_page_of_a_real_pdf() {
+        // 100×200 点的一页，左下角 60×60 的纯蓝方块。
+        let pdf = minimal_pdf(100, 200, "0 0 1 rg\n20 20 60 60 re\nf\n");
+        let path = std::env::temp_dir().join(format!("mo-pdf-{}.pdf", std::process::id()));
+        std::fs::write(&path, &pdf).expect("临时 PDF 写得出去");
+
+        let r = pdf_page_raster(&path, 1024).expect("渲染不出首页：WinRT 这条路没通");
+        // `PdfPage::Size` 给的是 **96 DPI** 的像素数：100×200 点 = 133.33×266.67 px。
+        // 页面本来就比 max_edge 小 → 不放大，但也绝不缩小。
+        assert!(
+            (r.width as i64 - 133).abs() <= 2 && (r.height as i64 - 267).abs() <= 2,
+            "尺寸该是 96 DPI 下的原样，拿到的是 {:?}",
+            (r.width, r.height)
+        );
+        let px = r.rgba.as_chunks::<4>().0;
+        assert_eq!(
+            px.len(),
+            r.width as usize * r.height as usize,
+            "像素数与尺寸对得上"
+        );
+        assert!(px.iter().all(|p| p[3] == 255), "铺过白纸的图必须处处不透明");
+        assert!(
+            px.iter().all(|p| !(p[0] > 200 && p[2] < 60)),
+            "一个红像素都没有——有就说明通道换序写反了，蓝方块画成了红的"
+        );
+        let paper = px
+            .iter()
+            .filter(|p| p[0] > 250 && p[1] > 250 && p[2] > 250)
+            .count();
+        assert!(paper > 20_000, "方块外都得是白纸面，实际 {paper}");
+
+        // 方块：60×60 点 = 80×80 px，落在位图的左下（PDF 的 y 轴向上）。
+        let box_of = |p: &&[u8; 4]| p[2] > 200 && p[0] < 60;
+        let idx = px
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| box_of(p))
+            .map(|(i, _)| i);
+        let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0usize, usize::MAX, 0usize);
+        let mut blue = 0;
+        for i in idx {
+            let (x, y) = (i % r.width as usize, i / r.width as usize);
+            (x0, x1) = (x0.min(x), x1.max(x));
+            (y0, y1) = (y0.min(y), y1.max(y));
+            blue += 1;
+        }
+        assert!(blue > 5_000, "80×80 的方块该有 ~6400 个像素，实际 {blue}");
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        assert!(
+            (70..=90).contains(&bw) && (70..=90).contains(&bh),
+            "方块外框该是个 ~80×80 的正方形，实际 {bw}×{bh}"
+        );
+        assert!(
+            x0 < r.width as usize / 3 && y0 > r.height as usize / 3,
+            "方块在左下方：左上角 ({x0},{y0})，画布 {}×{}",
+            r.width,
+            r.height
+        );
+
+        // 缩到长边 50：等比 25×50，方块跟着缩成 ~15×15。
+        let small = pdf_page_raster(&path, 50).expect("缩放这条也走得通");
+        assert_eq!((small.width, small.height), (25, 50), "长边贴住 max_edge");
+        let blue_small = small
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[2] > 200 && p[0] < 60)
+            .count();
+        assert!(blue_small > 100, "缩完仍有方块，实际 {blue_small}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 喂进去的不是 PDF（或压根是空文件）→ 安静地 `None`，不许 panic。
+    ///
+    /// 用户随手把扩展名改成 `.pdf` 的非 PDF 文件是常态，第二拍拿 `None` 退回占位文案。
+    #[test]
+    fn junk_input_is_not_a_pdf() {
+        let dir = std::env::temp_dir().join(format!("mo-pdf-junk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录建得出来");
+        let not_pdf = dir.join("liar.pdf");
+        std::fs::write(&not_pdf, b"just some text, definitely not a PDF").expect("写得动");
+        assert!(
+            pdf_page_raster(&not_pdf, 512).is_none(),
+            "内容不是 PDF 渲染不出来"
+        );
+        assert!(
+            pdf_page_raster(Path::new(&dir), 512).is_none(),
+            "目录不是文件"
+        );
+        assert!(
+            pdf_page_raster(&dir.join("missing.pdf"), 512).is_none(),
+            "不存在的路径"
+        );
+        assert!(
+            pdf_page_raster(&not_pdf, 0).is_none(),
+            "max_edge 为 0 没意义，直接不给渲染"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

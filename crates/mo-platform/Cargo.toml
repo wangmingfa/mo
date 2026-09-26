@@ -31,6 +31,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Ioctl",
     "Win32_Devices_DeviceAndDriverInstallation",
 ] }
+# PDF 首页渲染单独用 0.62（别名 `windows_pdf`）：`Windows.Data.Pdf` 的异步入口要的是
+# 0.62 附带 `windows-future` 才有的 `IAsyncOperation::join()`（同步等完，不需要执行器），
+# 而上面那套 Shell / SetupAPI / GDI 调用全按 0.58 的签名验过并上线了——为了一个功能
+# 把整个模块重签不划算。两个版本同时链进来，类型互不相干，各自只在自己的小模块里出现。
+[target.'cfg(target_os = "windows")'.dependencies.windows_pdf]
+package = "windows"
+version = "0.62"
+features = ["Data_Pdf", "Storage_Streams", "Graphics_Imaging", "Win32_System_WinRT"]
 
 [lints]
 workspace = true

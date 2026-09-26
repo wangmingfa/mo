@@ -3040,7 +3040,13 @@ impl AppState {
     ///
     /// 与缩略图 / 预览降采样分开：这是「渲染出来的」，清掉随时能重来，但尺寸与
     /// 用途都不一样，混在一个目录里不利于整体清理。
+    ///
+    /// 认 `MO_CACHE_DIR`（与 [`AppState::index_path`] 同一条理由）：测试要能把渲染产物
+    /// 钉进临时目录，别往开发者机器上的真实缓存里写。
     fn pdf_preview_root() -> PathBuf {
+        if let Ok(dir) = std::env::var("MO_CACHE_DIR") {
+            return PathBuf::from(dir).join("pdf-preview");
+        }
         dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("mo")
