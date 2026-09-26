@@ -540,27 +540,26 @@ mod tests {
     /// 这一条是从用户报告来的：桌面上十几个 `.lnk` 全显示成同一张通用白纸。类型键
     /// 问的是 `SHGFI_USEFILEATTRIBUTES`（压根不看这个文件），拿到的就是 `.lnk` 这个
     /// **类型**的图标——第一个被问到的那张顶掉了全部。
+    ///
+    /// ⚠️ 断言必须**按平台分叉**：`is_per_file_ext` 只在 Windows 生效，macOS 上这些
+    /// 后缀照旧按类型共享。整条都按 Windows 的形状断言，CI（macos-latest）就红在
+    /// 这里（2026-09-26 实测：Rust CI 从 d677f24 起连挂，本地 Windows 全绿看不出来）。
     #[test]
     fn shortcuts_and_executables_never_share_a_type_key() {
-        for p in [
-            "D:\\Users\\me\\Desktop\\Atlas.lnk",
-            "D:\\Users\\me\\Desktop\\Visual Studio Code.lnk",
-            "C:\\Windows\\System32\\notepad.exe",
+        for (p, type_key) in [
+            ("D:\\Users\\me\\Desktop\\Atlas.lnk", ".lnk"),
+            ("D:\\Users\\me\\Desktop\\Visual Studio Code.lnk", ".lnk"),
+            ("C:\\Windows\\System32\\notepad.exe", ".exe"),
         ] {
             let path = Path::new(p);
-            assert_eq!(
-                icon_key(path, false, SLOT_SMALL),
-                IconKey::Path(path.to_path_buf(), ICON_PX_SMALL),
-                "{p} 该按路径问"
-            );
+            let want = if cfg!(target_os = "windows") {
+                IconKey::Path(path.to_path_buf(), ICON_PX_SMALL)
+            } else {
+                // 非 Windows：没有「自带图标」这回事，共享照旧。
+                IconKey::Type(type_key.to_string(), ICON_PX_SMALL)
+            };
+            assert_eq!(icon_key(path, false, SLOT_SMALL), want, "{p}");
         }
-        // 非 Windows 上这些后缀没有「自带图标」这回事，共享照旧（别为了不存在
-        // 的场景把 macOS 的缓存命中率打下去）。
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(
-            icon_key(Path::new("/tmp/a.lnk"), false, SLOT_SMALL),
-            IconKey::Type(".lnk".to_string(), ICON_PX_SMALL)
-        );
     }
 
     /// 槽位 → 档位：小槽位要 40px、大槽位要 128px，**没有中间态**。
