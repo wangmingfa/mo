@@ -75,6 +75,33 @@ fn system_file_clipboard(cx: &App) -> Option<(Vec<PathBuf>, bool)> {
     Some((paths, mo_platform::clipboard_files_are_cut()))
 }
 
+/// 把刚复制／剪切的那批文件也写进**系统**剪贴板，让别的应用粘得出来。
+///
+/// 为什么不走 gpui：它写 `ClipboardEntry::ExternalPaths` 是**静默丢弃**的（两个
+/// 平台的后端都明写着 `=> {}`），所以这一手得平台层自己做——目前只有 Windows
+/// 实现了（`mo_platform::write_file_clipboard`）。
+///
+/// 只在「这批路径在本地盘上」时做：远程会话里的路径是**服务器上**的路径，写进本机
+/// 剪贴板等于给别的应用一个它自己打不开的文件。
+async fn publish_files_to_system_clipboard(app: &AppState, paths: Vec<PathBuf>, cut: bool) {
+    if paths.is_empty()
+        || !mo_platform::supports_file_clipboard()
+        || !matches!(app.endpoint(), mo_app::Endpoint::Local)
+    {
+        return;
+    }
+    match app
+        .spawn_blocking(move || mo_platform::write_file_clipboard(&paths, cut))
+        .await
+    {
+        // 失败只记一条日志：Mo 自己的粘贴读的是内部那份剪贴板，系统剪贴板被别的
+        // 程序占着不该让用户的「复制」变成报错。
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("写系统剪贴板失败：{e}"),
+        Err(e) => tracing::warn!("写系统剪贴板这一手没排上：{e}"),
+    }
+}
+
 /// 传输速度采样的上一次观测（按操作 ID 记账）。
 ///
 /// 进度面板每 ≈150ms 拿一次快照，两次快照的 `done` 差分即是瞬时速度；
@@ -4387,14 +4414,16 @@ impl RootView {
             "clipboard.copy" => {
                 let app = self.app();
                 cx.spawn(async move |_weak, _cx| {
-                    app.copy_selection_to_clipboard().await;
+                    let paths = app.copy_selection_to_clipboard().await;
+                    publish_files_to_system_clipboard(&app, paths, false).await;
                 })
                 .detach();
             }
             "clipboard.cut" => {
                 let app = self.app();
                 cx.spawn(async move |_weak, _cx| {
-                    app.cut_selection_to_clipboard().await;
+                    let paths = app.cut_selection_to_clipboard().await;
+                    publish_files_to_system_clipboard(&app, paths, true).await;
                 })
                 .detach();
             }
@@ -6119,14 +6148,16 @@ impl RootView {
             A::Copy => {
                 let app = self.app();
                 cx.spawn(async move |_weak, _cx| {
-                    app.copy_selection_to_clipboard().await;
+                    let paths = app.copy_selection_to_clipboard().await;
+                    publish_files_to_system_clipboard(&app, paths, false).await;
                 })
                 .detach();
             }
             A::Cut => {
                 let app = self.app();
                 cx.spawn(async move |_weak, _cx| {
-                    app.cut_selection_to_clipboard().await;
+                    let paths = app.cut_selection_to_clipboard().await;
+                    publish_files_to_system_clipboard(&app, paths, true).await;
                 })
                 .detach();
             }
@@ -8312,11 +8343,12 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
             let cut = matches!(id, Some(CommandId::CutClipboard));
             let this = entity.clone();
             cx.spawn(async move |cx| {
-                if cut {
-                    app.cut_selection_to_clipboard().await;
+                let paths = if cut {
+                    app.cut_selection_to_clipboard().await
                 } else {
-                    app.copy_selection_to_clipboard().await;
-                }
+                    app.copy_selection_to_clipboard().await
+                };
+                publish_files_to_system_clipboard(&app, paths, cut).await;
                 this.update(cx, |v, cx| {
                     v.modal = Modal::None;
                     v.cmd_query.clear();

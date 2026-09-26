@@ -4046,9 +4046,9 @@ pub const TAG_COLORS: [(&str, &str); 7] = [
 
 /// 客户端剪贴板：记住一批路径以及「剪切（移动）」还是「复制」。
 ///
-/// 与系统剪贴板的关系是**双向**的：Mo 里复制/剪切时会把这批路径写进系统剪贴板
-/// （Windows 上是 `CF_HDROP`），别的应用复制过文件后 Mo 也会采纳系统剪贴板里那批
-/// （[`AppState::adopt_system_clipboard`]）。
+/// 与系统剪贴板的关系是**双向**的：Mo 里复制/剪切时会把这批路径同步一份进系统
+/// 剪贴板（Windows 上写 `CF_HDROP`，那一步在 `mo-ui`），别的应用复制过文件后 Mo
+/// 也会采纳系统剪贴板里那批（[`AppState::adopt_system_clipboard`]）。
 ///
 /// 没有 `Debug`：[`Endpoint`] 里揣着一条会话的文件系统，打不出来也不必打。
 #[derive(Clone)]
@@ -4460,32 +4460,32 @@ fn terminal_plans(dir: &Path) -> Vec<(String, Vec<String>)> {
 impl AppState {
     // ------------------------------------------------------------ 客户端剪贴板
 
-    /// 把当前选择复制进内部剪贴板（`cut = false`）。
-    pub async fn copy_selection_to_clipboard(&self) {
-        let paths = self.selection_paths().await;
-        if paths.is_empty() {
-            return;
-        }
-        let src = self.endpoint();
-        *self.clipboard.lock().await = Some(Clipboard {
-            paths,
-            cut: false,
-            src,
-        });
+    /// 把当前选择复制进内部剪贴板（`cut = false`），返回进剪贴板的那批路径。
+    ///
+    /// 返回值是给 UI 的：往**系统**剪贴板同步那一份是平台集成，归 `mo-ui` 那一层
+    /// 管（与「读系统剪贴板」在同一处），这里只管自己这一份。选区为空时返回空，
+    /// 什么也不写。
+    pub async fn copy_selection_to_clipboard(&self) -> Vec<PathBuf> {
+        self.clip_selection(false).await
     }
 
-    /// 把当前选择**剪切**进内部剪贴板（`cut = true`）。
-    pub async fn cut_selection_to_clipboard(&self) {
+    /// 把当前选择**剪切**进内部剪贴板（`cut = true`）。见 [`Self::copy_selection_to_clipboard`]。
+    pub async fn cut_selection_to_clipboard(&self) -> Vec<PathBuf> {
+        self.clip_selection(true).await
+    }
+
+    /// 复制与剪切是同一条路，只差 `cut` 那一位。
+    async fn clip_selection(&self, cut: bool) -> Vec<PathBuf> {
         let paths = self.selection_paths().await;
         if paths.is_empty() {
-            return;
+            return Vec::new();
         }
-        let src = self.endpoint();
         *self.clipboard.lock().await = Some(Clipboard {
-            paths,
-            cut: true,
-            src,
+            paths: paths.clone(),
+            cut,
+            src: self.endpoint(),
         });
+        paths
     }
 
     /// 采纳**系统**剪贴板里的文件（资源管理器 / 访达里复制、剪切的那批），返回有没有采纳。

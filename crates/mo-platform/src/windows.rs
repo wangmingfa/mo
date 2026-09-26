@@ -2,7 +2,8 @@
 //! Windows 原生集成：「在资源管理器中显示」+ 系统回收站（`IFileOperation`）
 //! + 卷宗列表与推出（`GetLogicalDrives` / `CM_Request_Device_Eject`）
 //! + 系统图标（`SHGetFileInfoW` / `SHDefExtractIconW` → `HICON` → 像素）
-//! + PDF 首页渲染（WinRT `Windows.Data.Pdf`）。
+//! + PDF 首页渲染（WinRT `Windows.Data.Pdf`）
+//! + 文件剪贴板（写 `CF_HDROP`、读 `Preferred DropEffect`）。
 //!
 //! 回收站这条链路与 macOS 的契约完全一致：**系统搬文件、Mo 拿回落点记账**。
 //! 但 Windows 的 `IFileOperation` 没有 macOS
@@ -36,7 +37,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     HDEVINFO, PNP_VETO_TYPE, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
     SP_DEVINFO_DATA,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HGLOBAL};
+// `GlobalFree` 在 windows 0.58 里挂在 `Foundation` 而不是 `Memory` 下（同族的
+// `GlobalAlloc` / `GlobalLock` 却在 `Memory`），按 crate 的模块走而不是按头文件走。
+use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -50,13 +53,14 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    SetClipboardData,
 };
 use windows::Win32::System::Ioctl::{
     GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_EJECT_MEDIA, IOCTL_STORAGE_GET_DEVICE_NUMBER,
     STORAGE_DEVICE_NUMBER,
 };
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{
     IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
@@ -1086,19 +1090,34 @@ fn opaque_rgba_over_white(bgra: &[u8]) -> Vec<u8> {
     out
 }
 
-// ---- 文件剪贴板：读 Shell 记的「这批文件是剪切来的吗」 ----
+// ---- 文件剪贴板：写 `CF_HDROP`，读 Shell 记的「这批文件是剪切来的吗」 ----
 
-/// `Preferred DropEffect` 的正文里 `DROPEFFECT_MOVE` 那一位（0x1=复制、0x2=移动、
-/// 0x4=建快捷方式）。资源管理器自己就是靠这一位决定 Ctrl+V 是搬走还是留一份。
+/// 标准剪贴板格式 `CF_HDROP`（**固定号 15**，全桌面的应用都认它）。
+///
+/// 与上面那个 CLSID 同理：`windows` 0.58 把它放在 `Win32::System::Ole` 里，为了
+/// 一个常量把整个 Ole 模块链进来不值，而它是协议常量、不会变。
+const CF_HDROP: u32 = 15;
+
+/// `Preferred DropEffect` 的正文位（0x1=复制、0x2=移动、0x4=建快捷方式）。
+/// 资源管理器自己就是靠这一位决定 Ctrl+V 是搬走还是留一份。
+const DROP_EFFECT_COPY: u32 = 0x1;
 const DROP_EFFECT_MOVE: u32 = 0x2;
+
+/// `DROPFILES` 的头部长度，也就是紧跟其后的那份「双 NUL 结尾 UTF-16 路径表」的
+/// 起始偏移：`pFiles: u32` + `pt: POINT`(2×i32) + `fNC: BOOL` + `fWide: BOOL`。
+///
+/// 这里**不按 crate 的结构体来摆**：`windows` 各版本对 `DROPFILES` 是否带
+/// `files: [u16; 1]` 尾字段口径不一，而自己铺字节就没有这个问题——头部就是
+/// 上面那 20 字节，路径表紧跟其后。
+const DROPFILES_HEADER: u32 = 20;
 
 /// 打开系统剪贴板的守卫（`OpenClipboard` / `CloseClipboard` 必须成对——漏一口，
 /// 整个桌面的应用都读不到剪贴板，而且症状看起来像「别的程序粘不出来」）。
 struct ClipboardGuard;
 
 impl ClipboardGuard {
-    /// 抢不到就返回 `None`（别的进程正开着剪贴板）。**不重试**：为一个元信息把线程
-    /// 挂进重试循环不值得，调用方按默认语义答即可。
+    /// 抢不到就是错误（别的进程正开着剪贴板）。**不重试**：为一个剪贴板操作把线程
+    /// 挂进重试循环不值得，调用方要么报错、要么按默认语义答。
     fn open() -> Option<Self> {
         unsafe { OpenClipboard(None).ok() }.map(|_| Self)
     }
@@ -1117,11 +1136,9 @@ pub fn clipboard_files_are_cut() -> bool {
     let Some(_clip) = ClipboardGuard::open() else {
         return false;
     };
-    let name = wide_str("Preferred DropEffect");
-    let format = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
-    if format == 0 {
+    let Some(format) = register_drop_effect_format() else {
         return false;
-    }
+    };
     let Ok(handle) = (unsafe { GetClipboardData(format) }) else {
         // 没有这个格式：不是资源管理器那类「剪切/复制」放上来的。
         return false;
@@ -1135,6 +1152,99 @@ pub fn clipboard_files_are_cut() -> bool {
     let effect = unsafe { (ptr as *const u32).read_unaligned() };
     let _ = unsafe { GlobalUnlock(global) };
     effect & DROP_EFFECT_MOVE != 0
+}
+
+/// 把一批本机文件写进系统剪贴板（`CF_HDROP` + `Preferred DropEffect`）。
+///
+/// ⚠️ 这条**不进单元测试**：它会把开发者机器上真实的剪贴板覆盖掉（与 `reveal`
+/// 拉起资源管理器、`eject` 把用户的盘停掉是同一条红线）。字节布局由
+/// `dropfiles_bytes` 的单测钉住，真发出去那一步走真机验证。
+pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), PlatformError> {
+    if paths.is_empty() {
+        return Err(PlatformError::Failed("没有要写进剪贴板的文件".to_string()));
+    }
+    let body = dropfiles_bytes(paths);
+    let Some(_clip) = ClipboardGuard::open() else {
+        return Err(PlatformError::Failed(
+            "打不开系统剪贴板（多半是别的程序正占着它）".to_string(),
+        ));
+    };
+    unsafe { EmptyClipboard() }
+        .map_err(|e| PlatformError::Failed(format!("清空系统剪贴板失败：{e}")))?;
+    set_clipboard_bytes(&body, CF_HDROP)?;
+    // 这一位决定别的应用粘出去的是「复制」还是「剪切」；注册不上就只写文件本体，
+    // 对方按复制处理——那是可接受的降级，不该让整个复制动作失败。
+    if let Some(format) = register_drop_effect_format() {
+        let effect = if cut {
+            DROP_EFFECT_MOVE
+        } else {
+            DROP_EFFECT_COPY
+        };
+        let _ = set_clipboard_bytes(&effect.to_ne_bytes(), format);
+    }
+    Ok(())
+}
+
+/// 组一份 `DROPFILES`：20 字节头 + 每条路径（UTF-16、各自 NUL 结尾）+ 一个额外 NUL。
+fn dropfiles_bytes(paths: &[PathBuf]) -> Vec<u8> {
+    let mut units: Vec<u16> = Vec::new();
+    for p in paths {
+        units.extend(encode_wide(p).iter().copied());
+    }
+    units.push(0);
+    let mut out = Vec::with_capacity(DROPFILES_HEADER as usize + units.len() * 2);
+    out.extend_from_slice(&DROPFILES_HEADER.to_ne_bytes());
+    // pt（屏幕坐标，粘贴时不参考）、fNC（不在非客户区）、fWide（下面是 UTF-16）。
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&1u32.to_ne_bytes());
+    // 路径表按原样铺字节：Windows 只有小端。
+    let raw = unsafe {
+        std::slice::from_raw_parts(
+            units.as_ptr() as *const u8,
+            units.len() * std::mem::size_of::<u16>(),
+        )
+    };
+    out.extend_from_slice(raw);
+    out
+}
+
+/// `Preferred DropEffect` 这个自定义格式号（注册不上返回 `None`）。
+fn register_drop_effect_format() -> Option<u32> {
+    let name = wide_str("Preferred DropEffect");
+    match unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) } {
+        0 => None,
+        format => Some(format),
+    }
+}
+
+/// 以某个剪贴板格式交出一段字节。
+///
+/// ⚠️ `SetClipboardData` 成功后那块全局内存就**归系统**了（直到下一次
+/// `EmptyClipboard`），所以成功分支绝不能 `GlobalFree`；失败分支反过来还是我们的，
+/// 不释放就是每失败一次漏一次。
+fn set_clipboard_bytes(bytes: &[u8], format: u32) -> Result<(), PlatformError> {
+    unsafe {
+        let global = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+            .map_err(|e| PlatformError::Failed(format!("分配剪贴板内存失败：{e}")))?;
+        let ptr = GlobalLock(global);
+        if ptr.is_null() {
+            let _ = GlobalUnlock(global);
+            let _ = GlobalFree(global);
+            return Err(PlatformError::Failed(format!(
+                "锁定剪贴板内存失败：{}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        let _ = GlobalUnlock(global);
+        match SetClipboardData(format, HANDLE(global.0)) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = GlobalFree(global);
+                Err(PlatformError::Failed(format!("写入剪贴板失败：{e}")))
+            }
+        }
+    }
 }
 
 fn encode_wide(p: &Path) -> Vec<u16> {
@@ -1185,6 +1295,42 @@ mod tests {
             &bytes,
             Path::new("C:\\Users\\demo\\Desktop\\b.txt")
         ));
+    }
+
+    /// `DROPFILES` 的正文怎么摆：20 字节头 + 双 NUL 收尾的 UTF-16 路径表。
+    ///
+    /// 头部偏一格、或者结尾少一个 NUL，别的应用从剪贴板里就**读不出文件**
+    /// （资源管理器会直接灰掉「粘贴」）——这种错在 Mo 自己身上完全看不出来，
+    /// 所以钉死字节。
+    #[test]
+    fn dropfiles_bytes_lays_out_the_header_and_the_wide_list() {
+        let bytes = dropfiles_bytes(&[
+            PathBuf::from("D:\\a.txt"),
+            PathBuf::from("D:\\中文 与 空格.txt"),
+        ]);
+        assert_eq!(&bytes[0..4], &DROPFILES_HEADER.to_ne_bytes(), "pFiles");
+        assert_eq!(&bytes[4..16], &[0u8; 12], "pt 与 fNC 都是 0");
+        assert_eq!(
+            &bytes[16..20],
+            &1u32.to_ne_bytes(),
+            "fWide=1：路径表按 UTF-16 摆"
+        );
+
+        let tail = &bytes[DROPFILES_HEADER as usize..];
+        let units: Vec<u16> = tail
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert!(units.ends_with(&[0, 0]), "路径表必须再空一项收尾");
+        let text = String::from_utf16(&units[..units.len() - 2]).expect("写进去的就是 UTF-16");
+        let list: Vec<&str> = text.split('\0').collect();
+        assert_eq!(
+            list,
+            vec!["D:\\a.txt", "D:\\中文 与 空格.txt"],
+            "每条路径各自 NUL 结尾、顺序不变"
+        );
     }
 
     /// 卷根上挂 `$Recycle.Bin`（回收站每卷一份，不在子目录里）。
