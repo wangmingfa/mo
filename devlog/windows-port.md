@@ -182,6 +182,17 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
     * 于是改成验**同一条 API 链**：`to_unicode_and_unshifted_key_agree_on_the_same_layout` 在进程内激活德语后，照抄 gpui 的调用形状（`state[VK_SHIFT]=0x80`、8 个 u16 的缓冲、flags `0x5`），`ToUnicode(VK_OEM_102, 0x56, Shift)` 交出 `>`，`unshifted_key('>')` 答回 `<`；同一个键在 US 上交出 `|`、折成 `\`。真实德语用户的 Mo 线程从进程起来就是德语，走的是这一条。
     * GUI 侧只验了**不回归**：US 线程上 `Ctrl+Shift+.` → Mo 收到 `>` → 折成 `.` → 隐藏文件照常切换（第二轮再按一次收回）。
 
+## 23. paint 阶段的 `cx.notify()` 不叫醒帧循环：首次进回收站空白一秒
+
+* **用户报**：首次进入回收站先是一片空白，几百毫秒到 1 秒后才冒出斑马纹；要求「一进来就有，不管有没有文件」。
+* **机制**：斑马纹补足行的条数要靠 `on_prepaint` 量回来的内容区高度（§见回收站面板那段注释），所以**首帧没有补足行是设计使然**。坏在第二帧永远等不到：prepaint 里 `set_trash_body_h` 写完高度后 `cx.notify()`，gpui 只把视图**标脏**，不会去 `schedule_frame` / 唤醒平台帧循环——进程没有下一个事件就没有下一帧。于是「高度已经拿到了，但没人重画」，条纹只能等条目到货、图标扫描回来或用户动一下鼠标。
+* **日志证据**（`RUST_LOG` + 锁屏下用 `SendMessageTimeout` 投递点击，见 `.tmp/postclick.ps1`）：
+    * 修之前：`render body_h=0 fill=0` → `prepaint h=607 changed=true` → **之后再没有 render**，直到别的事件进来。
+    * 修之后：`render body_h=0 fill=0`（.112）→ `prepaint h=607 changed=true`（.121）→ `render body_h=607 fill=24`（**.129，7 毫秒后**），中间没有任何外部事件。
+* **修法**：`window.request_animation_frame()` —— gpui 自己给动画元素用的那条唤醒（内部 `on_next_frame` → `schedule_frame` + `invalidator.wake_platform`，回调里再 notify 一次当前视图）。只在高度**变了**时调，第二帧起高度恒定，不会自续成满帧重绘。文件列表的 `list_origin` 是同一个模式、同一个缺口（首次进目录的补足斑马纹也靠边等事件），一并加上。
+* **测试怎么钉**：headless 里「下一帧」是测试自己调的，`render_frame` 两次就能让旧代码看起来是对的（既有的 `trash_zebra_stripes_fill_the_viewport` 就是这个形状）。所以新测试 `trash_zebra_fill_requests_its_own_second_frame` 断言的不是布局，是**首帧有没有替自己排队**：先把队列排空（`simulate_next_frame` 会顺手把文件列表那条唤醒吃掉），进回收站画一帧，再数 next-frame 回调数——必须 ≥1。反向验证做过：把那一行注释掉，测试红；放回去，绿（空回收站、0 条目，补足行铺到 y>550）。
+* **仍未验**：锁屏状态下拍不到图，所以「肉眼看不到那 7 毫秒」这条只有日志，没有截图。
+
 ## 待办（还没做，别当成已完成）
 
 * 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
