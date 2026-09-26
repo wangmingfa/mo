@@ -47,23 +47,32 @@ fn init_tracing() {
         .init();
 }
 
-/// 测试专用：把配置目录钉到进程唯一的临时目录。
+/// 测试专用：把**配置目录**与**缓存目录**都钉到进程唯一的临时目录。
 ///
-/// ⚠️ 凡是会建 `AppState` / `RootView` 的测试都要在开头调一次：视图模式、
-/// 侧边栏开关这些布局偏好会改变渲染结构，不隔离就会读到**开发者机器上的真实
-/// 配置**，于是同一份代码在别人机器上跑测试结论不同（表现是断言莫名失败）。
+/// ⚠️ 凡是会建 `AppState` / `RootView` 的测试都要在开头调一次，两件事各挡一类污染：
+///
+/// * 配置：视图模式、侧边栏开关这些布局偏好会改变渲染结构，不隔离就会读到**开发者
+///   机器上的真实 config.json**，于是同一份代码在别人机器上跑测试结论不同（表现是
+///   断言莫名失败）。
+/// * 缓存：`AppState::new()` 一开就接上全局索引（`<缓存>/mo/search.sqlite`），浏览
+///   过的目录会被爬进去。不隔离等于每跑一次测试就往开发机上那份**真索引**里堆一批
+///   临时目录的脏根——用户回头按搜索键找文件名，会搜到早已被删掉的测试目录。
 #[doc(hidden)]
-pub fn isolate_config_for_tests() -> std::path::PathBuf {
+pub fn isolate_user_dirs_for_tests() -> std::path::PathBuf {
     use std::path::PathBuf;
     use std::sync::OnceLock;
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        let p = std::env::temp_dir().join(format!("mo-test-config-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&p);
-        p
+    static DIRS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    let (config, cache) = DIRS.get_or_init(|| {
+        let pid = std::process::id();
+        let config = std::env::temp_dir().join(format!("mo-test-config-{pid}"));
+        let cache = std::env::temp_dir().join(format!("mo-test-cache-{pid}"));
+        let _ = std::fs::create_dir_all(&config);
+        let _ = std::fs::create_dir_all(&cache);
+        (config, cache)
     });
-    std::env::set_var("MO_CONFIG_DIR", dir);
-    dir.clone()
+    std::env::set_var("MO_CONFIG_DIR", config);
+    std::env::set_var("MO_CACHE_DIR", cache);
+    config.clone()
 }
 
 /// 测试专用：向**当前标签页**注入假的操作快照（传输小块 / 浮层的数据源）。

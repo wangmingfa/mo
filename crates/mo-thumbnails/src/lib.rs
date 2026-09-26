@@ -326,22 +326,27 @@ pub fn unpremultiply_rgba(rgba: &mut [u8]) {
     }
 }
 
-/// 默认缩略图缓存目录：`dirs::cache_dir()/mo/thumbs`。
+/// 默认缩略图缓存目录：`<用户缓存目录>/mo/thumbs`（认 `MO_CACHE_DIR`）。
 fn default_thumb_root() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("mo")
-        .join("thumbs")
+    mo_cache_dir().join("thumbs")
 }
 
-/// 默认预览图缓存目录：`dirs::cache_dir()/mo/preview`。
+/// 默认预览图缓存目录：`<用户缓存目录>/mo/preview`（认 `MO_CACHE_DIR`）。
 ///
 /// 与缩略图分开存放：两者尺寸差 20 倍，混在一个目录里不利于整体清理。
 fn default_preview_root() -> PathBuf {
+    mo_cache_dir().join("preview")
+}
+
+/// Mo 的缓存根。`MO_CACHE_DIR` 一认到底：测试里凡是会渲染图片的用例都不该往
+/// 开发者机器的真实缓存里写文件（与全局索引、元数据缓存同一条理由）。
+fn mo_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MO_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("mo")
-        .join("preview")
 }
 
 /// 为**快速预览**准备一张降采样副本，落在 `root` 下；返回 `Some` 时应加载

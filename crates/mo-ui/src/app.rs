@@ -10784,7 +10784,7 @@ mod tests {
     /// （集成测试不受影响，见 `file_item.rs` 的同类注释）。
     #[test]
     fn address_edit_prefills_and_selects_the_whole_path() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         // 框架的 `InputState` 依赖 gpui-component 的 Theme 全局
         // （生产环境由 `run()` 里的 `gpui_kit::init` 注册），测试里补上。
@@ -10823,7 +10823,7 @@ mod tests {
     /// Esc 与失焦都要退出编辑态（面包屑才回得来）。
     #[test]
     fn address_edit_ends_on_escape_and_blur() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -10861,7 +10861,7 @@ mod tests {
     /// 布局把文件列表压小——这条测试同时守住这两点。
     #[test]
     fn context_menu_renders_at_the_pointer_without_disturbing_layout() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -10917,7 +10917,7 @@ mod tests {
     /// 它们原先会顶掉整个浏览区，与「连接到服务器」是同一类缺陷。
     #[test]
     fn dialogs_are_full_viewport_overlays() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11012,7 +11012,7 @@ mod tests {
     /// `corner_radii`，足够直接断言绘制输出。
     #[test]
     fn dialog_header_carries_the_card_corner_radius() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11092,7 +11092,7 @@ mod tests {
     /// 短对话框与长视图不再共用同一张 640px 固定宽卡片。
     #[test]
     fn central_views_take_over_the_browsing_area() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11150,7 +11150,7 @@ mod tests {
     /// 就把键吃掉了，根本到不了本视图的监听器。
     #[test]
     fn cmd_a_in_the_connect_dialog_selects_the_field_not_the_file_list() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11208,7 +11208,7 @@ mod tests {
     /// 绘制分支的开关；同时断言 `value()` 仍是明文，否则拿去登录必然失败。
     #[test]
     fn connect_auth_masks_the_password() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11274,7 +11274,7 @@ mod tests {
     /// 「连接到服务器」对话框会列出记住过的服务器，每行可点（一键重连）。
     #[test]
     fn connect_dialog_lists_remembered_servers() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11318,7 +11318,7 @@ mod tests {
     /// 翻成深色，比色值就是随机闪断。
     #[test]
     fn remembered_servers_list_has_a_frame_and_zebra_rows() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11509,7 +11509,7 @@ mod tests {
     /// 「使用说明」默认折叠，点一下展开各协议写法（再点一下收起）。
     #[test]
     fn connect_help_starts_collapsed_and_toggles() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11561,7 +11561,7 @@ mod tests {
     /// 太粗暴。
     #[test]
     fn connect_auth_escape_returns_to_the_address_dialog() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11608,7 +11608,7 @@ mod tests {
     /// 也照样响应菜单快捷键，一刀切地吞会让模态一开连标签页都建不了。
     #[test]
     fn browser_shortcuts_are_swallowed_while_a_dialog_is_open() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11654,7 +11654,7 @@ mod tests {
     /// 贴着右下角打开时，菜单必须被钳回视口内（否则会被窗口边缘切掉）。
     #[test]
     fn context_menu_is_clamped_inside_the_viewport() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11721,7 +11721,7 @@ mod tests {
                 .expect("鼠标底下没有菜单项 hover 底色的 quad（项没渲染？还是没 hover 上？）")
         }
 
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11826,7 +11826,7 @@ mod tests {
     /// 条目菜单比空白菜单长（多了打开 / 重命名 / 废纸篓…），且 Esc 能关掉。
     #[test]
     fn entry_menu_has_more_items_and_escape_closes_it() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11875,7 +11875,7 @@ mod tests {
     /// Esc 还原（不写配置——配置是用户文件，测试绝不落盘）。
     #[test]
     fn theme_picker_previews_and_restores() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -11929,7 +11929,7 @@ mod tests {
     /// 各自落到对应标签页；← → 循环换页；带着未提交的主题预览翻页要还原预览。
     #[test]
     fn settings_window_unifies_the_three_pickers() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -12033,7 +12033,7 @@ mod tests {
     /// 操作不再 Running（暂停 / 结束）时样本清空，恢复 Running 从零重新观测。
     #[test]
     fn op_speeds_averages_progress_deltas() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -12117,7 +12117,7 @@ mod tests {
     /// `platform` 给的是 Win 键，Ctrl 在 `control` 里。
     #[test]
     fn global_chords_route_through_keymap() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -12168,7 +12168,7 @@ mod tests {
     /// 「配置 → 键表」这一环由 `keys.rs` 的单测覆盖，这里只测「键表 → 行为」。
     #[test]
     fn keymap_drives_lookup_and_dispatch() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -12225,7 +12225,7 @@ mod tests {
     /// 仍活着（`open_local` 不断开），可这个标签看的已经是本地目录了。
     #[test]
     fn tab_badge_shows_only_while_browsing_a_remote() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         // 独占会话表：库测试并行跑，共享进程级注册表会互相看见对方装的假服务器。
         let app = AppState::with_sessions(
             std::env::temp_dir().join("mo-ui-badge-trash"),
@@ -12272,7 +12272,7 @@ mod tests {
             crate::panel::ViewMode::Gallery,
         ] {
             let tag = format!("{mode:?}");
-            crate::isolate_config_for_tests();
+            crate::isolate_user_dirs_for_tests();
             let mut cx = TestAppContext::single();
             cx.update(gpui_kit::init);
             let app = AppState::new();
@@ -12405,7 +12405,7 @@ mod tests {
     /// 每列一次全量读 + 排序，几秒就把内存和主线程拖死。
     #[test]
     fn switching_directory_rebuilds_column_stack_instead_of_appending() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let state = AppState::new();
@@ -12449,7 +12449,7 @@ mod tests {
     /// 根列已经对得上当前目录时，不该每帧重新读一次盘。
     #[test]
     fn matching_root_column_is_not_reloaded() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let state = AppState::new();
@@ -12476,7 +12476,7 @@ mod tests {
     /// 替换。否则点击那 100–300ms 里会先闪掉几列，滚动位置也跟着跳。
     #[test]
     fn drilling_down_keeps_old_columns_until_loaded() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let state = AppState::new();
@@ -12517,7 +12517,7 @@ mod tests {
     /// `falls_back_to_root_path`），这里只钉几何（固定高度 = 不折行）。
     #[test]
     fn column_headers_are_single_line_regardless_of_path_depth() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let state = AppState::new();
@@ -12565,7 +12565,7 @@ mod tests {
     /// 也没法一步点到想去的那个（回归现场是用户拿 Finder 截图来对）。
     #[test]
     fn view_mode_buttons_are_tiled_with_exactly_one_active() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         // 切视图会重画中央区（可能派生补窗 / 缩略图任务），开一次官方豁免。
         cx.dispatcher.allow_parking();
@@ -12824,7 +12824,7 @@ mod tests {
     /// 左右 12 / 上下 10（用户反馈上下各收 2px）。
     #[test]
     fn file_list_rows_are_inset_from_the_edges() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -12861,7 +12861,7 @@ mod tests {
     /// （斑马纹占位生效），且这一帧里确实没有数据行（整片都是占位）。
     #[test]
     fn unfilled_rows_are_empty_zebra_placeholders() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         // 占位来自「快照还没回来」，渲染闭包会派生一次补窗任务（`ensure_window`）；
         // 真 IO 与 gpui 的确定性调度器混搭天生会偶发误报，开一次官方豁免（同
@@ -12962,7 +12962,7 @@ mod tests {
     /// 网格视图缺格时画的是**同尺寸的空骨架格**（不是 `…`）。
     #[test]
     fn unfilled_grid_cells_match_cell_geometry() {
-        crate::isolate_config_for_tests();
+        crate::isolate_user_dirs_for_tests();
         let mut cx = TestAppContext::single();
         cx.dispatcher.allow_parking();
         cx.update(gpui_kit::init);

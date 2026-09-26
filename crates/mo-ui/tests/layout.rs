@@ -40,9 +40,9 @@ fn open_app_with_trash(
     trash_root: std::path::PathBuf,
     cx: &mut TestAppContext,
 ) -> (VisualTestContext, WindowHandle<RootView>) {
-    // 钉住配置目录到临时路径：否则视图模式 / 侧边栏开关这些布局偏好会读到人家的
-    // 真实 config.json，同一份代码在不同机器上渲染结构不同。
-    mo_ui::isolate_config_for_tests();
+    // 钉住配置与缓存目录：前者不隔离会读到人家的真实 config.json（视图模式 / 侧边栏
+    // 开关会改变渲染结构），后者不隔离会把这些测试爬过的目录写进真实 `search.sqlite`。
+    mo_ui::isolate_user_dirs_for_tests();
     // ⚠️ `AppState::new()` 会经 `spawn_blocking` 异步读真实的 Home 目录，读完由 tokio
     // 的 worker 线程唤醒 GPUI 任务。gpui 的 TestScheduler 默认把「外部线程唤醒本地
     // 任务」判成 `not deterministic`，并在测试收尾（`end_test`）时 panic——高负载 /

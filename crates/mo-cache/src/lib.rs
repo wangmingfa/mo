@@ -177,7 +177,14 @@ fn row_to_metadata_offset(row: &rusqlite::Row) -> Result<FileMetadata, MoError> 
 }
 
 /// Mo 的缓存根目录（`<用户缓存目录>/mo`）。
+///
+/// 认 `MO_CACHE_DIR`（与全局索引 `search.sqlite` 同一条理由，见 `AppState::index_path`）：
+/// 测试要能把整份缓存钉进临时目录。不认的话每个 `AppState::new()` 都会打开并**写**开发
+/// 机上真实的 `metadata.sqlite`——跑一次测试套件就往真缓存里塞一批临时文件的元数据。
 pub fn cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MO_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("mo")
