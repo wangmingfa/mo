@@ -284,7 +284,12 @@ fn local_tree(tag: &str) -> PathBuf {
 /// 传一份独占的表 = 测试隔离；两个 `AppState` 传同一个 `Arc` = 两个标签页共享同一批
 /// 连接——后者正是「关标签页不断开」的验证方式。
 fn tab(sessions: &Arc<SessionRegistry>) -> AppState {
-    let trash = std::env::temp_dir().join(format!("mo-trash-{}", std::process::id()));
+    // 回收站目录按「进程 + 序号」命名：只带 pid 的话，同一个测试二进制里的所有
+    // `AppState` 会共用一个回收站——本地删除的用例刚把文件塞进去，远程删除的用例
+    // 断言 `trash_list().is_empty()` 就挂了（并行下顺序不定，偶发失败）。
+    static TRASH_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = TRASH_SEQ.fetch_add(1, Ordering::SeqCst);
+    let trash = std::env::temp_dir().join(format!("mo-trash-{}-{seq}", std::process::id()));
     AppState::with_sessions(trash, sessions.clone())
 }
 
