@@ -105,10 +105,48 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 
 * **CI 现状**（`.github/workflows/ci.yml`）：job 只在 macOS 上，Windows 代码由**本地 `cargo check/test` + release 构建**把关。所以上面这些坑没有一个能被 CI 兜住，全靠像素断言。
 * **锁屏时无法截图验证**：`CopyFromScreen` 在屏幕锁定下只会拍到锁屏画面。这轮的验收全部改成**程序级**：手写一份 xref 偏移正确的最小 1 页 PDF 喂真 WinRT，逐像素断言（96 DPI 尺寸、蓝方块的 bbox 与大小、通道换序 → 红通道必须为 0、白纸占比、`max_edge` 缩放档）。见 `crates/mo-platform/src/windows.rs` 的 `renders_the_first_page_of_a_real_pdf`，与 `crates/mo-app/tests/pdf_preview.rs`（渲染产物落 `<cache>/pdf-preview`、缓存命中、mtime 失效）。
+* **屏幕没锁的时候有比像素更硬的手段**：UIA 直接把窗口里每个节点的 `Name` + `BoundingRectangle` 全打出来（`FindAll(Descendants, TrueCondition)`），文案对不对、某一行在不在列表里、要点哪个坐标，一次拿全；图标糊不糊再配 `CopyFromScreen` 裁格子逐块 MD5。这台机器 1920x1080 @100%，截图坐标与 `SetCursorPos` 一比一。⚠️ 锁屏状态**每轮现测**，别沿用上一轮的结论——把「你去解锁一下」当成事实，等于让用户替 agent 验证。
 * **测试隔离**：`MO_CACHE_DIR` 是进程级变量，同二进制内多线程并行必须**串行化**（`ENV_LOCK`）。`pdf_preview_root` 这轮也补上了认它（`crates/mo-app/src/lib.rs:3046`）——和 `index_path` 同一条理由：不认的话新增测试会往开发者机器的真实缓存里写。
+
+## 14. 隐藏文件：点开头是 Mac 的习惯，Windows 得看属性位
+
+* **现象**：`desktop.ini`、`ntuser.dat`、`AppData` 在 Mo 里全是可见的——它们不以 `.` 开头，而 `is_hidden_name` 只认这一条。macOS 上同一件事由 `st_flags & UF_HIDDEN` 兜住（`chflags hidden` 的文件不靠改名）。
+* **修法**：`is_hidden_with_metadata`（`crates/mo-fs/src/lib.rs:192`）按平台补一条属性判据，Windows 侧 `hidden_by_attributes`（`:222`）取 `FILE_ATTRIBUTE_HIDDEN (0x2) | FILE_ATTRIBUTE_SYSTEM (0x4)`——用 `std::os::windows::fs::MetadataExt::file_attributes()`，不为这个再引一个 `windows` crate 依赖。
+* **为什么 SYSTEM 也算**：`desktop.ini`（0x26）、`ntuser.dat`（0x2022）都是 Hidden|System，资源管理器也不显示；只看 HIDDEN 位就会漏掉这一批。反过来 **Archive（0x20）不算隐藏**——桌面上那些 `.lnk` 全是 0x20，把它们当隐藏等于把用户的快捷方式藏了。
+* **⚠️ 这一折让 Mo 与资源管理器不再逐条一致**：点开头但不是隐藏属性的文件（`.ssh`、`.cargo`）Windows 上仍按隐藏处理，这是刻意的跨平台约定，不是漏判；写进 `is_hidden_name` 的文档注释里，免得下一个人「顺手修好」。见 `crates/mo-fs/src/local.rs` 的 `windows_tests`（用 `attrib +h/+s` 造真属性，逐条钉死 0x26/0x12/0x4 判隐、0x20/0x10 不判隐）。
+
+## 15. Shift + 符号键在 Windows 上永远打不中
+
+* **现象**：`Ctrl+Shift+.`（显示/隐藏隐藏文件）按了没反应，同一个窗口里 `Ctrl+Shift+P` 好使。同一段代码，一个字母键、一个符号键——差的就是符号。
+* **根因**：gpui 的 Windows 后端在 `keyboard.rs::get_keystroke_key` 里遇到 Shift + OEM 符号键时，把 `key` 换成 Shift 后的字符（`.` → `>`）**并且把 Shift 位清零**（`need_to_convert_to_shifted_key` 那张表覆盖 `VK_OEM_*` 和 `VK_0..9`）。配置里写的 `cmd+shift+.` 于是**差两位**：主键多了、Shift 没了，严格比较永远不命中。macOS 后端不改写字符也不清 Shift，所以同一份键表在 Mac 上一直是对的。
+* **修法**：`fold_typographic_shift`（`crates/mo-ui/src/keys.rs:59`）扩成完整一对表（`{[`、`}<`、`>.`、`:;`、`"'`、`?/`、`|\`、`~\`` 加上原有的 `+=`、`_-`），**表两头都算**、折回基本键并把 Shift 位归掉。折只发生在比对用的 `canonical()`（`:108`）里，`matches()`（`:123`）比它——`parse` 不再就地折，否则用户写的 `cmd+shift+.` 显示成「Ctrl+.」，提示文案就成了按不出来的指令。
+* **为什么数字不进表**：`cmd+1`~`cmd+4` 是视图模式，把 `!` 折成 `1` 等于让 `Ctrl+Shift+1` 顺手切视图——白送的宽容，代价是误触。字母键同理不进表（`cmd+z` 撤销 / `cmd+shift+z` 重做必须分得开）。
+* **回归测试**：`windows_shifted_symbol_events_hit_symbol_bindings` 直接造 Windows 形状的按键事件（key 是 `>` / `{` / `}`、Shift 位已被后端吃掉）查表，不靠真键盘。
+
+## 16. 测试把用户机器上的真实配置写了
+
+* **现象**：跑完 `cargo test --workspace`，开发者自己的「显示隐藏文件」被悄悄关掉，重启 Mo 才发现。
+* **根因**：`crates/mo-app/tests/hidden_files.rs` 里两个测试都按「读真实配置 → 切开关 → 测完恢复」写，而它们跑在**同一个进程、默认多线程并行**。B 构造 `AppState` 时盘上正被 A 写成 `false`，B 记下的「原始值」就是 `false`，收尾把 `false` 留给了用户——恢复动作本身是竞态读出来的，等于没恢复。
+* **修法**：与 §13 同一条纪律：`MO_CONFIG_DIR` 钉到临时目录 + 按测试名分目录 + `ENV_LOCK` 全程互斥（该文件 `use_temp_config`）。钉住之后「恢复原值」这段直接删掉——临时目录里没有需要保护的用户状态。
+* **纪律**：任何**落盘**的状态（配置、缓存、索引）在测试里都必须先钉目录。判据是「这个 setter 会不会写 `~` 下的东西」，不是「这个测试看起来无副作用」。
+
+## 17. 文案里写死的 ⌘：绑定是对的，提示是假的
+
+* **现象**：Windows 上状态栏写着「⌘⇧P 命令」、命令面板写着「复制选中（⌘C）」——这台机器上根本没有 ⌘ 键。
+* **根因不是键位**：`keys.rs` 早就把 `cmd` 与 `ctrl` 折成同一个位（非 macOS 看 `modifiers.control`，因为 gpui 的 Windows 后端把 `platform` 映射成真的 Win 键），所以快捷键按得出来；漂掉的是**第二份抄件**——31 处手写 `⌘` 字符串散在 `app.rs` / `status_bar.rs` / `staging.rs` 的文案里。抄的那份一定会漂。
+* **修法**：文案一律现推。有 id 的走 `hint(id)`（`crates/mo-ui/src/keys.rs:633`，从键表拿当前生效的键组再 `format()`，用户改过键也跟着变）；没有 id 的裸键串走 `key_hint(spec)`（`:647`，解析不了就原样返回，绝不让一处文案变成空串）。`KeyCombo::format()` 在非 macOS 写 `Ctrl+Shift+P`，在 macOS 写 `⌘⇧P`。
+* **测试**：`ids_used_in_prose_have_hints` 钉住文案里用到的每个 id 都能查出非空提示（拼错 id 以前是静默少一段文案）；`key_hint_renders_bare_specs_per_platform` 钉住 `⌥A` → `Alt+A`、`⌘⇧P` → `Ctrl+Shift+P`。
+
+## 18. 已知文件夹：Windows 上该叫「桌面」，不是 `Desktop`
+
+* **现象**：侧栏写「桌面」、标签页与面包屑写 `Desktop`，同一个文件夹两个名字；而且盘符在别处时（这台机器桌面在 `D:\Users\…\Desktop`）按 `C:\Users\…` 拼出来的路径根本对不上。
+* **修法**：一张表两处用——`known_folder_labels()`（`crates/mo-app/src/lib.rs:710`，`OnceLock` 包住 `dirs::*_dir()`）既喂侧栏快捷访问，也喂 `folder_label()`（`crates/mo-ui/src/path_label.rs:32`）；标签页、面包屑、列视图、侧栏都改走它，比较时 Windows 忽略大小写（`same_dir`，`:52`，顺带吃掉尾部 `\`）。
+* **为什么不用 `SHGetDisplayNameOfW`**：那是**逐段**问 Shell 要名字，面包屑每帧都要重算，等于每帧一次跨模块调用；而且它给的是本地化 + 用户改过的名字，跟侧栏那张表又会分叉。显示名与真实名分离这条（`mo_core::display_name`）本来就是同一个哲学：只改画法，路径一个字符都不动。
 
 ## 待办（还没做，别当成已完成）
 
-* 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；后续轮次请当轮就写。
+* 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14~§18 是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
-* 锁屏导致的「无法截图验收」还没找替代路子（需要一条能验证真实观感的手段：图标糊不糊、推出按钮点位）。
+* §15 的折表只按 **US 布局**折符号；法语/德语键盘上 `?`、`:` 这些不在同一个物理键，键位提示与匹配可能会分叉——真收到反馈再考虑读键盘布局表。
+* Linux 侧没有 §15 的实测（gpui 的 Linux 后端怎么报 Shift + 符号还没验），只保证单测在三个平台都跑得过。
+
