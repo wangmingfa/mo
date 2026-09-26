@@ -439,16 +439,29 @@ fn users_uid() -> Option<u32> {
 
 // ---- 进程小工具 ----
 
+/// Windows：本程序是 GUI 子系统进程（自己没有控制台），spawn `net.exe` 这类
+/// 控制台子程序时系统会为它**新建一个控制台窗口**——侧边栏每次刷新网络盘就闪
+/// 一下黑框。`CREATE_NO_WINDOW` 让它不分配窗口；输出本来就走管道，不受影响。
+#[cfg(target_os = "windows")]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_cmd: &mut Command) {}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
 /// 跑一条命令并拿回 stdout；非零退出时把 stderr 一起并进错误里（用户要看原因）。
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("{program} 起不来：{e}"))?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    hide_console(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("{program} 起不来：{e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {

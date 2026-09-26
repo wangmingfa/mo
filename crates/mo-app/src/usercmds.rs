@@ -180,6 +180,13 @@ pub fn run(shell_line: &str, cwd: Option<&Path>) -> Result<CommandOutput, String
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
+    // GUI 子系统进程拉起 cmd.exe 这类控制台子程序时，默认为它新建控制台窗口
+    // （一闪而过的黑框）；输出走管道，不需要那个窗口。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let out = cmd.output().map_err(|e| format!("启动失败：{e}"))?;
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&out.stdout));
