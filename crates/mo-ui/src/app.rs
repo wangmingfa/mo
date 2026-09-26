@@ -598,7 +598,7 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         },
         CmdDef {
             id: CommandId::Properties,
-            title: "属性与权限…（⌘I）".to_string(),
+            title: format!("属性与权限…（{}）", crate::keys::hint("file.properties")),
             category: "工具".to_string(),
         },
         CmdDef {
@@ -628,32 +628,32 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         },
         CmdDef {
             id: CommandId::CopyClipboard,
-            title: "复制选中（⌘C）".to_string(),
+            title: format!("复制选中（{}）", crate::keys::hint("clipboard.copy")),
             category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::CutClipboard,
-            title: "剪切选中（⌘X）".to_string(),
+            title: format!("剪切选中（{}）", crate::keys::hint("clipboard.cut")),
             category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::PasteClipboard,
-            title: "粘贴到当前目录（⌘V）".to_string(),
+            title: format!("粘贴到当前目录（{}）", crate::keys::hint("clipboard.paste")),
             category: "操作".to_string(),
         },
         CmdDef {
             id: CommandId::NewTab,
-            title: "新建标签页（⌘T）".to_string(),
+            title: format!("新建标签页（{}）", crate::keys::hint("tab.new")),
             category: "窗口".to_string(),
         },
         CmdDef {
             id: CommandId::CloseTab,
-            title: "关闭标签页（⌘W）".to_string(),
+            title: format!("关闭标签页（{}）", crate::keys::hint("tab.close")),
             category: "窗口".to_string(),
         },
         CmdDef {
             id: CommandId::ToggleSplit,
-            title: "双栏分栏开 / 关（⌘⇧D）".to_string(),
+            title: format!("双栏分栏开 / 关（{}）", crate::keys::hint("pane.split")),
             category: "窗口".to_string(),
         },
         CmdDef {
@@ -1354,7 +1354,14 @@ impl RootView {
             return;
         }
         if !self.split || self.panes.len() < 2 {
-            self.notice("分栏对比需要两个窗格：先按 ⌘⇧D 分栏".to_string(), None, cx);
+            self.notice(
+                format!(
+                    "分栏对比需要两个窗格：先按 {} 分栏",
+                    crate::keys::hint("pane.split")
+                ),
+                None,
+                cx,
+            );
             return;
         }
         let left = self
@@ -3645,7 +3652,8 @@ impl RootView {
         if !dst.is_dir() {
             self.modal = Modal::Info(format!(
                 "剪贴板里的路径不是存在的目录（或是文件）：{first}\n\n\
-                 提示：先在目标目录里按 ⌥C「拷贝路径」，再回来点这里。"
+                 提示：先在目标目录里按 {}「拷贝路径」，再回来点这里。",
+                crate::keys::hint("clipboard.copy_path")
             ));
             cx.notify();
             return;
@@ -3840,7 +3848,10 @@ impl RootView {
         );
         let target_text = match paired.as_ref() {
             Some((_, dst)) => format!("目标：{}", dst.display()),
-            None => "目标：未配对（在目标目录按 ⌥⌘C 拷贝路径，再点下面的「设为目标」）".to_string(),
+            None => format!(
+                "目标：未配对（在目标目录按 {} 拷贝路径，再点下面的「设为目标」）",
+                crate::keys::hint("clipboard.copy_path")
+            ),
         };
         body = body.child(
             div()
@@ -3995,7 +4006,10 @@ impl RootView {
             "文件夹同步",
             "",
             body,
-            "计划只读、执行才动手 · 多余文件一律进回收站（⌘Z 可撤销）",
+            &format!(
+                "计划只读、执行才动手 · 多余文件一律进回收站（{} 可撤销）",
+                crate::keys::hint("edit.undo")
+            ),
         )
     }
 
@@ -4167,7 +4181,10 @@ impl RootView {
             "重复文件",
             "",
             body,
-            "删副本＝移入回收站（⌘Z 可撤销）· ◆ 为建议保留 · Esc 关闭",
+            &format!(
+                "删副本＝移入回收站（{} 可撤销）· ◆ 为建议保留 · Esc 关闭",
+                crate::keys::hint("edit.undo")
+            ),
         )
     }
 
@@ -8634,8 +8651,10 @@ async fn run_compare(app: &AppState, this: &Entity<RootView>, cx: &mut AsyncApp)
     if paths.len() != 2 {
         this.update(cx, |v, cx| {
             v.modal = Modal::Info(format!(
-                "比较需要恰好选中 2 个条目，当前选中 {} 个。\n\n提示：按住 Shift 或 ⌘A 选择后，在命令面板（⌘⇧P）执行「比较选中的两项」。",
-                paths.len()
+                "比较需要恰好选中 2 个条目，当前选中 {n} 个。\n\n提示：按住 Shift 或 {all} 选择后，在命令面板（{palette}）执行「比较选中的两项」。",
+                n = paths.len(),
+                all = crate::keys::hint("select.all"),
+                palette = crate::keys::hint("palette.open"),
             ));
             cx.notify();
         });
@@ -8712,12 +8731,11 @@ fn compare_legend(view: &RootView, entity: &Entity<RootView>) -> Stateful<Div> {
             compare_tint(Some(mo_diff::TreeStatus::Different)).unwrap_or(theme::accent()),
             "内容不同",
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(text!("⌘⇧↓ / ⌘⇧↑ 在差异间跳")),
-        );
+        .child(div().flex_1().min_w_0().child(text!(format!(
+            "{} / {} 在差异间跳",
+            crate::keys::hint("compare.jump_next"),
+            crate::keys::hint("compare.jump_prev")
+        ))));
 
     let close = entity.clone();
     let mut btn = div()
@@ -8993,7 +9011,10 @@ impl RootView {
             "命令面板",
             "",
             body,
-            "↑↓ 选择 · Enter 执行 · Esc 关闭（⌘⇧P 打开）",
+            &format!(
+                "↑↓ 选择 · Enter 执行 · Esc 关闭（{} 打开）",
+                crate::keys::hint("palette.open")
+            ),
             px(600.0),
         )
         .into_any_element()
@@ -9307,15 +9328,25 @@ impl RootView {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        // 这四个是内容搜索对话框内部的裸键（没进键表、没有动作 id），所以走
+        // `key_hint` 而不是 `hint`。
+        let alt_toggles = format!(
+            "{}/{}/{}/{}",
+            crate::keys::key_hint("⌥A"),
+            crate::keys::key_hint("⌥R"),
+            crate::keys::key_hint("⌥W"),
+            crate::keys::key_hint("⌥C"),
+        );
+        let footer = if self.content_dirty {
+            format!("Enter 搜索 · ↑↓ 选择 · {alt_toggles} 切开关 · Esc 关闭")
+        } else {
+            "Enter 跳到命中 · ↑↓ 选择 · Esc 关闭".to_string()
+        };
         central_view(
             "内容搜索",
             &format!("🔍 {} · 范围 {}", self.content_query, root),
             body,
-            if self.content_dirty {
-                "Enter 搜索 · ↑↓ 选择 · ⌥A/⌥R/⌥W/⌥C 切开关 · Esc 关闭"
-            } else {
-                "Enter 跳到命中 · ↑↓ 选择 · Esc 关闭"
-            },
+            &footer,
         )
     }
 

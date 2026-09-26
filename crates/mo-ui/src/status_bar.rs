@@ -49,12 +49,15 @@ pub fn render(
 
     let mut right = format!("已索引 {indexed}");
     if can_undo || can_redo {
-        right.push_str(" · ⌘Z 撤销");
+        right.push_str(&format!(" · {} 撤销", crate::keys::hint("edit.undo")));
         if can_redo {
-            right.push_str(" · ⇧⌘Z 重做");
+            right.push_str(&format!(" · {} 重做", crate::keys::hint("edit.redo")));
         }
     }
-    right.push_str(" · ⌘⇧P 命令 · Space 预览");
+    right.push_str(&format!(
+        " · {} 命令 · Space 预览",
+        crate::keys::hint("palette.open")
+    ));
 
     // 暂存区入口：点了开合底部抽屉。
     let toggle = entity.clone();

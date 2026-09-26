@@ -86,7 +86,10 @@ pub fn render_tray(app: &AppState, entity: &Entity<RootView>) -> impl IntoElemen
                 .py(px(10.0))
                 .text_size(px(11.0))
                 .text_color(theme::muted())
-                .child(text!("还没有收集任何文件 —— 选中文件后按 ⌘⇧S 收集到这里")),
+                .child(text!(format!(
+                    "还没有收集任何文件 —— 选中文件后按 {} 收集到这里",
+                    crate::keys::hint("staging.collect")
+                ))),
         );
         return panel;
     }
