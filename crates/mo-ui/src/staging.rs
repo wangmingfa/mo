@@ -162,7 +162,13 @@ fn staging_row(e: &StagedEntry, ix: usize, entity: &Entity<RootView>) -> Statefu
             theme::muted(),
         ))
         // 文件名优先占空间，来源目录是次要信息（窄窗口下先被挤掉）。
-        .child(div().flex_1().min_w_0().truncate().child(text!(name)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(text!(mo_core::display_name(&name).to_string())),
+        )
         .child(
             div()
                 .max_w(px(220.0))

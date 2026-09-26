@@ -200,7 +200,12 @@ fn column_box(
             )
             .into_any_element(),
         });
-        line = line.child(div().flex_1().truncate().child(text!(e.name.clone())));
+        line = line.child(
+            div()
+                .flex_1()
+                .truncate()
+                .child(text!(mo_core::display_name(&e.name).to_string())),
+        );
         body = body.child(line);
     }
     if data.entries.len() > MAX_PER_COLUMN {

@@ -300,7 +300,7 @@ fn cell(
                 .truncate()
                 // 测试用（release no-op）：断言名称相对 cell 居中。
                 .debug_selector(move || format!("mo-grid-name-{global_idx}"))
-                .child(text!(entry.name.clone())),
+                .child(text!(entry.display_name().to_string())),
         )
         .child(
             div()

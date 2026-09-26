@@ -131,6 +131,34 @@ impl Entry {
             Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff")
         )
     }
+
+    /// 给用户看的名字（见 [`display_name`]）。
+    pub fn display_name(&self) -> &str {
+        display_name(&self.name)
+    }
+}
+
+/// 给用户看的名字：Windows 上快捷方式不露 `.lnk`。
+///
+/// 资源管理器把 `.lnk` 当作「这是一条链接」的记号、而不是文件类型后缀，从不显示
+/// 它——一屏幕 `Atlas.lnk / PotPlayer.lnk / …` 读起来全是噪音。**只管渲染**：真实
+/// 名字（`Entry::name` / `path`）一个字都不动，改名、删除、打开、搜索走的都是原名，
+/// 所以这里剥掉的后缀不会让用户以为文件叫那个名字。
+///
+/// 只有 Windows 有这回事：macOS 的快捷方式是 `.app` 包或 Finder alias（`.alias`
+/// 后缀在访达里同样是隐藏的，但 Mo 里那类条目按包/目录走，不在这条判据里）。
+pub fn display_name(name: &str) -> &str {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some((stem, ext)) = name.rsplit_once('.') {
+            if !stem.is_empty() && ext.eq_ignore_ascii_case("lnk") {
+                return stem;
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = name;
+    name
 }
 
 /// 取文件名后缀的小写形式（不含点）。
@@ -151,4 +179,29 @@ pub struct LightEntry {
     pub name: String,
     pub kind: EntryKind,
     pub path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_name;
+
+    /// 快捷方式的后缀只在 Windows 上藏起来。
+    #[test]
+    fn shortcut_suffix_is_hidden_only_on_windows() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(display_name("Atlas.lnk"), "Atlas");
+            assert_eq!(
+                display_name("迅雷.LNK"),
+                "迅雷",
+                "大小写与非 ASCII 名字都要认"
+            );
+            assert_eq!(display_name(".lnk"), ".lnk", "本体名字为空就不算快捷方式");
+            assert_eq!(display_name("notes.txt"), "notes.txt", "普通文件不动");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(display_name("Atlas.lnk"), "Atlas.lnk");
+        }
+    }
 }

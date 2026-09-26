@@ -178,7 +178,7 @@ pub fn view(
             } else {
                 crate::theme::text()
             })
-            .child(text!(entry.name.clone())),
+            .child(text!(entry.display_name().to_string())),
     );
 
     // 修改日期：后台加载未就绪时留空，加载失败显示 —。

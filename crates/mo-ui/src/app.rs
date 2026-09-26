@@ -9064,7 +9064,7 @@ impl RootView {
                 } else {
                     theme::text()
                 })
-                .child(text!(hit.name.clone()))
+                .child(text!(mo_core::display_name(&hit.name).to_string()))
                 .child(text!(format!("{}", hit.path.display())));
             body = body.child(row);
         }
@@ -9254,7 +9254,7 @@ impl RootView {
                                     theme::muted()
                                 })
                                 .child(text!(if first_of_file {
-                                    file.name.clone()
+                                    mo_core::display_name(&file.name).to_string()
                                 } else {
                                     String::new()
                                 })),
@@ -9487,7 +9487,7 @@ impl RootView {
                         .max_w_full()
                         .truncate()
                         .text_color(fg)
-                        .child(text!(name.clone())),
+                        .child(text!(mo_core::display_name(&name).to_string())),
                 );
                 cell.interactivity()
                     .on_mouse_down(MouseButton::Left, swallow_trash_press);
@@ -9526,7 +9526,7 @@ impl RootView {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(fg)
-                                .child(text!(name.clone())),
+                                .child(text!(mo_core::display_name(&name).to_string())),
                         ),
                 );
                 // 三个右对齐固定列：删除时间 / 大小 / 种类——宽度与表头同源

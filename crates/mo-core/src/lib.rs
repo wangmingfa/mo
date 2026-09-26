@@ -26,7 +26,7 @@ mod tests;
 pub use bitmap::Bitmap;
 pub use command::FileCommand;
 pub use directory::{Directory, DirectoryError, DirectoryId};
-pub use entry::{Entry, EntryKind, LightEntry, MetadataState, ThumbnailState};
+pub use entry::{display_name, Entry, EntryKind, LightEntry, MetadataState, ThumbnailState};
 pub use error::MoError;
 pub use event::{AppEvent, EventBus};
 pub use file_id::FileId;
