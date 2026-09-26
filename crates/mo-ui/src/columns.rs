@@ -103,7 +103,7 @@ fn column_box(
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(text!(crate::path_label::last_segment(&data.path))),
+                    .child(text!(crate::path_label::folder_label(&data.path))),
             )
             .debug_selector(move || format!("mo-col-head-{pane}-{tab}-{index}")),
     );

@@ -263,10 +263,7 @@ impl Panel {
                     trimmed
                 }
             }
-            Some(p) => p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| p.to_string_lossy().to_string()),
+            Some(p) => crate::path_label::folder_label(p),
             None => "新标签页".to_string(),
         }
     }

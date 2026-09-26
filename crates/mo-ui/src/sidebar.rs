@@ -517,7 +517,7 @@ pub fn render(
         );
     }
     for (ix, path) in bookmarks.into_iter().enumerate() {
-        let label = crate::path_label::last_segment(&path);
+        let label = crate::path_label::folder_label(&path);
         let is_active = current.as_deref() == Some(path.as_path());
         let app_click = app.clone();
         let app_del = app.clone();

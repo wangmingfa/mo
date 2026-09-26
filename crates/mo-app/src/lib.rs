@@ -698,6 +698,35 @@ pub fn session_registry() -> Arc<SessionRegistry> {
     REG.get_or_init(|| Arc::new(SessionRegistry::new())).clone()
 }
 
+/// 已知文件夹的「路径 → 中文名」表（只列真实存在的那些，顺序即侧边栏顺序）。
+///
+/// 一张表三处用：侧边栏快捷访问、面包屑、标签页标题。分开写会漂——Windows 上
+/// `dirs::desktop_dir()` 给的是 `D:\Users\x\Desktop`，侧栏写「桌面」而地址栏照抄
+/// 目录名就成了「桌面 › … › Desktop」，同一条路径两个名字。
+///
+/// 名字取的是 Mo 自己的中文标签，不是资源管理器的本地化名：后者要走
+/// `SHGetDisplayNameOfW` 且每个分段一次 shell 调用，而面包屑每帧重算，不划算。
+/// 已知文件夹之外的那几级（`Users`、用户名）两边本来就一致。
+pub fn known_folder_labels() -> &'static [(PathBuf, &'static str)] {
+    static TABLE: std::sync::OnceLock<Vec<(PathBuf, &'static str)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut v: Vec<(PathBuf, &'static str)> = Vec::new();
+        for (label, dir) in [
+            ("主目录", dirs::home_dir()),
+            ("桌面", dirs::desktop_dir()),
+            ("文档", dirs::document_dir()),
+            ("下载", dirs::download_dir()),
+            ("图片", dirs::picture_dir()),
+            ("影片", dirs::video_dir()),
+        ] {
+            if let Some(p) = dir {
+                v.push((p, label));
+            }
+        }
+        v
+    })
+}
+
 /// 本标签页在看哪一边。
 ///
 /// 会话本身不在这里（见 [`SessionRegistry`]），这里只剩「看的是哪一条」。
@@ -3465,27 +3494,14 @@ impl AppState {
     }
 
     /// 侧边栏快捷访问位置（存在才列出）。
+    ///
+    /// 标签与顺序都来自 [`known_folder_labels`]——面包屑和标签页标题用的是同一张表，
+    /// 否则会出现「侧栏写桌面、地址栏写 Desktop」这种自相矛盾的显示。
     pub fn quick_locations(&self) -> Vec<(String, PathBuf)> {
-        let mut out = Vec::new();
-        if let Some(p) = dirs::home_dir() {
-            out.push(("主目录".to_string(), p));
-        }
-        if let Some(p) = dirs::desktop_dir() {
-            out.push(("桌面".to_string(), p));
-        }
-        if let Some(p) = dirs::document_dir() {
-            out.push(("文档".to_string(), p));
-        }
-        if let Some(p) = dirs::download_dir() {
-            out.push(("下载".to_string(), p));
-        }
-        if let Some(p) = dirs::picture_dir() {
-            out.push(("图片".to_string(), p));
-        }
-        if let Some(p) = dirs::video_dir() {
-            out.push(("影片".to_string(), p));
-        }
-        out
+        known_folder_labels()
+            .iter()
+            .map(|(path, label)| (label.to_string(), path.clone()))
+            .collect()
     }
 
     /// 删除选中（无选中则删除聚焦项）：本地条目移入回收站，远程条目删在服务端。

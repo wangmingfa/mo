@@ -513,9 +513,10 @@ fn segments(path: &Path) -> Vec<(String, PathBuf)> {
                 prefix.push("/");
                 out.push(("Mac".to_string(), prefix.clone()));
             }
-            c => {
+            _ => {
                 prefix.push(comp);
-                let label = c.as_os_str().to_string_lossy().to_string();
+                // 已知文件夹那几级显示中文名（「桌面」而不是 `Desktop`），其余照抄目录名。
+                let label = crate::path_label::folder_label(&prefix);
                 out.push((label, prefix.clone()));
             }
         }
