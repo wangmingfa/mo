@@ -1281,6 +1281,58 @@ fn trash_filler_rows_do_not_grow_every_frame(cx: &mut TestAppContext) {
     );
 }
 
+/// 回归（用户报）：**首次**进入回收站先是一片空白，几百毫秒~1 秒后才冒出斑马纹。
+///
+/// 补足行要靠 prepaint 量到的内容区高度，所以「首帧还没有补足行」是设计使然；
+/// 真正的判据是**首帧有没有替自己排下一帧**。gpui 里 paint/prepaint 阶段调
+/// `cx.notify()` 只把视图标脏，**不会叫醒平台的帧循环**——没有下一个外部事件
+/// （条目到货、图标扫描回来、鼠标动一下）就永远没有第二帧，空白就一直挂着。
+/// `Window::request_animation_frame()` 才是那道唤醒：往 next-frame 队列放一个
+/// notify 回调，并 `schedule_frame` + `wake_platform`。
+///
+/// 测试就把这条队列当 observable：**先清空队列**（把文件列表首帧自己那条唤醒
+/// 排掉），再进回收站画一帧，队列里必须留下 ≥1 条回调——少了它 = 唤醒丢了。
+#[gpui_kit::test]
+fn trash_zebra_fill_requests_its_own_second_frame(cx: &mut TestAppContext) {
+    let seed = std::env::temp_dir().join(format!(
+        "mo-layout-trash-first-frame-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&seed);
+    let (mut vcx, _window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
+    // 排掉进回收站之前就挂在队列里的唤醒，让下面的计数只反映这一次面板首帧。
+    vcx.update(|window, cx| window.simulate_next_frame(cx));
+    // **空**回收站也必须有斑马纹（用户要求「不管有没有文件」）。
+    vcx.update(|window, cx| window.click("sidebar-trash", cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let queued = vcx.update(|window, cx| window.simulate_next_frame(cx));
+    assert!(
+        queued > 0,
+        "进入回收站的首帧没有为自己请求下一帧：prepaint 回写高度后的 notify 落不了地，斑马纹要等外部事件才出现"
+    );
+
+    // 那一帧真的把补足行画出来了，并且铺到视口底部。
+    vcx.update(|window, cx| window.render_frame(cx));
+    let ph0 = bounds(&mut vcx, "mo-trash-ph-0");
+    assert_eq!(f32::from(ph0.size.height), 24.0);
+    let mut last_bottom = f32::from(ph0.origin.y) + f32::from(ph0.size.height);
+    let mut i = 1;
+    loop {
+        let sel: &'static str = Box::leak(format!("mo-trash-ph-{i}").into_boxed_str());
+        let Some(b) = vcx.debug_bounds(sel) else {
+            break;
+        };
+        last_bottom = f32::from(b.origin.y) + f32::from(b.size.height);
+        i += 1;
+    }
+    assert!(
+        last_bottom > 550.0,
+        "自请求的第二帧仍然只铺到 y={last_bottom}，没到视口底部"
+    );
+}
+
 /// 清空回收站必须**先弹确认卡**（面板标题栏「清空回收站」按钮）：Esc / 取消 /
 /// 点遮罩回面板、条目原样；确认（Enter 或红色按钮）才真正执行并回到面板。
 ///

@@ -9714,6 +9714,13 @@ impl RootView {
         // 实际量到的是**内容层**高度——补足行让它一帧比一帧高，下一帧又按这个高度
         // 补更多行，正反馈滚出几百行空白（用户报，Windows 实测 300 帧涨到 622 行）。
         // 与文件列表的 `list_origin` 同一套规矩：量视口，不量内容。
+        // ⚠️ notify 之外还要 `request_animation_frame()`：paint/prepaint 阶段的
+        // notify 只把视图标脏，**不会叫醒平台的帧循环**——没有下一个外部事件就
+        // 永远没有下一帧，于是「首次进回收站先一片空白，等图标扫描 / 条目到货
+        // 才出斑马纹」（用户报，几百毫秒~1 秒）。`request_animation_frame` 是
+        // gpui 给动画元素用的官方唤醒（`schedule_frame` + `wake_platform`），
+        // 回调里再 notify 一次本视图 → 下一帧就带上真实高度。只在高度**变了**
+        // 时唤醒，第二帧起高度恒定，不会自续成满帧重绘。
         let entity_h = entity.clone();
         let viewport = div()
             .flex()
@@ -9721,13 +9728,18 @@ impl RootView {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .on_prepaint(move |bounds, _window, cx| {
+            .on_prepaint(move |bounds, window, cx| {
                 let h = f32::from(bounds.size.height);
-                entity_h.update(cx, |v, cx| {
-                    if v.set_trash_body_h(h) {
+                let changed = entity_h.update(cx, |v, cx| {
+                    let changed = v.set_trash_body_h(h);
+                    if changed {
                         cx.notify();
                     }
+                    changed
                 });
+                if changed {
+                    window.request_animation_frame();
+                }
             })
             .child(body);
         content = content.child(viewport);

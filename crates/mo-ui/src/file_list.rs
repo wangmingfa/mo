@@ -663,16 +663,24 @@ pub fn render(
                 .flex_col()
                 .flex_1()
                 .min_w_0()
-                .on_prepaint(move |bounds, _window, cx| {
+                .on_prepaint(move |bounds, window, cx| {
                     let (x, y) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
                     let h = f32::from(bounds.size.height);
-                    entity_origin.update(cx, |v, cx| {
+                    let changed = entity_origin.update(cx, |v, cx| {
                         // 高度变化才 notify：首帧拿到真实高度后下一帧才能把
                         // 斑马纹补满一屏；此后每帧相等，不会造成重绘循环。
-                        if v.set_list_origin(pane, tab, x, y, h) {
+                        let changed = v.set_list_origin(pane, tab, x, y, h);
+                        if changed {
                             cx.notify();
                         }
+                        changed
                     });
+                    // 同回收站面板那条：paint 阶段的 notify 只标脏，不唤醒帧循环。
+                    // 少了这一句，首次进入目录的补足斑马纹要等到下一个外部事件
+                    // （异步条目到货 / 鼠标移动）才补上。
+                    if changed {
+                        window.request_animation_frame();
+                    }
                 })
                 .child(list)
                 .child(Scrollbar::vertical(scroll)),
