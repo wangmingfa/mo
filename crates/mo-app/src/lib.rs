@@ -1568,15 +1568,17 @@ impl AppState {
     /// → 置 `dirty`（由刷新泵合并成一次重绘）。
     ///
     /// ⚠️ **一拍只花 `ICON_BUDGET_MS`**：取图标那一段（`iconForFile:` → 重绘 → 拷像素）
-    /// 跑在 `on_main_thread` 里，也就是 `dispatch_sync` 回主队列——活是**主线程**干的。
-    /// 换 BGRA（原本 PNG 编码占整段 70%）已经在 [`AppState::extract_icons`] 里挪去
-    /// 后台，但剩下这段仍是主线程时间：一拍抓 40 张就等于让它连着忙 40×单价。所以
-    /// 按配额一条条取，剩下的留在队列里等下一拍。
+    /// 在 macOS 上跑在 `on_main_thread` 里，也就是 `dispatch_sync` 回主队列——活是
+    /// **主线程**干的。换 BGRA（原本 PNG 编码占整段 70%）已经在
+    /// [`AppState::extract_icons`] 里挪去后台，但剩下这段仍是主线程时间：一拍抓 40 张
+    /// 就等于让它连着忙 40×单价。所以按配额一条条取，剩下的留在队列里等下一拍。
+    /// （Windows 上这段就在当前线程，不占主线程，但同一份配额照收——一帧里几十次
+    /// shell 查询一样会把泵线程占满，让后面的目录等太久。）
     ///
     /// 两处刻意的保守处理：
     /// * `stopped`（关标签页 / 切会话）就收工，别为已经不在看的目录白解码；
-    /// * [`mo_platform::appkit_usable`] 为假时整轮跳过——测试进程的主队列没人
-    ///   drain，`dispatch_sync` 回去就是挂死（且没有 panic，最难查的那种）。
+    /// * [`mo_platform::icon_source_usable`] 为假时整轮跳过——macOS 上测试进程的主
+    ///   队列没人 drain，`dispatch_sync` 回去就是挂死（且没有 panic，最难查的那种）。
     pub fn spawn_icon_pump(&self) {
         let app = self.clone();
         self.spawn(async move {
@@ -1585,7 +1587,7 @@ impl AppState {
                 if app.stopped() {
                     return;
                 }
-                if !mo_platform::appkit_usable() {
+                if !mo_platform::icon_source_usable() {
                     continue;
                 }
                 if app.icon_cache.lock().unwrap().is_idle() {

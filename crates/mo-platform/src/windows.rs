@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 //! Windows 原生集成：「在资源管理器中显示」+ 系统回收站（`IFileOperation`）
-//! + 卷宗列表与推出（`GetLogicalDrives` / `CM_Request_Device_Eject`）。
+//! + 卷宗列表与推出（`GetLogicalDrives` / `CM_Request_Device_Eject`）
+//! + 系统图标（`SHGetFileInfoW` / `SHDefExtractIconW` → `HICON` → 像素）。
 //!
 //! 回收站这条链路与 macOS 的契约完全一致：**系统搬文件、Mo 拿回落点记账**。
 //! 但 Windows 的 `IFileOperation` 没有 macOS
@@ -14,7 +15,12 @@
 //! `CM_Request_Device_Eject`——与任务栏「安全删除硬件」同一动作，而不是自己
 //! `net use /delete`（那只对网络映射盘有意义）。
 //!
-//! ⚠️ unsafe 仅限本文件的 shell / COM / 设备管理 FFI 调用（与 `mo_app::shell` 同一约定）。
+//! 图标这条链路是「问 shell 图标资源在哪 → 按目标尺寸抽一张 → 画进 GDI 位图取
+//! 像素」。GDI 的 DC 不带 alpha，所以画黑、白两遍反解 alpha（见
+//! [`premultiplied_from_backdrops`]）——交出去的仍是**预乘** RGBA，与 macOS 那份
+//! 同一契约。
+//!
+//! ⚠️ unsafe 仅限本文件的 shell / COM / 设备管理 / GDI FFI 调用（与 `mo_app::shell` 同一约定）。
 
 use std::path::{Path, PathBuf};
 
@@ -26,9 +32,13 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVINFO_DATA,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, FILE_SHARE_MODE,
-    OPEN_EXISTING,
+    CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_SHARE_MODE, OPEN_EXISTING,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -41,10 +51,13 @@ use windows::Win32::System::Ioctl::{
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::UI::Shell::{
     IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
-    FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+    SHDefExtractIconW, SHGetFileInfoW, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION,
+    FOF_NOERRORUI, FOF_SILENT, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_ICONLOCATION,
+    SHGFI_USEFILEATTRIBUTES,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON};
 
-use crate::{PlatformError, Volume};
+use crate::{IconRaster, PlatformError, Volume};
 
 /// `CLSID_FileOperation`（Windows SDK 里的固定值，crate 没导就自己钉一份）。
 /// ⚠️ 别和 `IFileOperation` 的接口 IID（`947AAB5F-…`）混了——CoCreateInstance
@@ -633,6 +646,245 @@ fn utf16_to_string(units: &[u16]) -> String {
     String::from_utf16_lossy(&units[..end])
 }
 
+// ---- 系统图标：向 shell 要一张真图标 ----
+
+/// `FILE_ATTRIBUTE_*`：`SHGetFileInfoW` 按它决定「这一条按哪类文件给图标」。
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+/// 取 `path` 在系统里的图标，重绘到 `px` 见方后交出**预乘** RGBA 像素。
+///
+/// 契约与 macOS 那份完全一致（像素交出去、PNG 编码归调用方）。差别是这边**不挑
+/// 线程**：`SHGetFileInfoW` 不是 UI 框架，在 blocking 池里直接问就行，不需要像
+/// AppKit 那样 `dispatch_sync` 回主队列。
+pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
+    icon_raster(path, px, FILE_ATTRIBUTE_NORMAL, false)
+}
+
+/// 取一个**扩展名**在系统里的图标（不碰磁盘，见 [`icon_raster`] 的 `name_only`）。
+///
+/// 给「文件本体已不在、扩展名还在」的条目用——回收站的原路径是典型：拿不存在的
+/// 路径去问只会得到一张通用白纸图标，还会把整个类型的共享缓存污染掉。
+pub fn ext_icon_raster(ext: &str, px: u32) -> Option<IconRaster> {
+    let ext = ext.trim_start_matches('.');
+    if ext.is_empty() {
+        return None;
+    }
+    // 名字随便起，shell 只看后缀（`SHGFI_USEFILEATTRIBUTES` 下它压根不去碰磁盘）。
+    let name = format!("mo.{ext}");
+    icon_raster(Path::new(&name), px, FILE_ATTRIBUTE_NORMAL, true)
+}
+
+/// 取**通用文件夹**图标。走 shell 的类型解析而不是某个具体目录：不碰任何真实路径，
+/// 也就不会因为「那个目录不存在 / 没权限」而拿不到占位图。
+pub fn folder_icon_raster(px: u32) -> Option<IconRaster> {
+    icon_raster(Path::new("mo"), px, FILE_ATTRIBUTE_DIRECTORY, true)
+}
+
+/// 两段式问图标，为的是**别拿到糊的**：
+///
+/// 1. `SHGFI_ICONLOCATION` 先问出「这个图标躺在哪个文件的第几个资源上」，再拿
+///    `SHDefExtractIconW(.., px)` 按**目标尺寸**要一张真图——shell 手上有 256px 的
+///    真彩图标，只有走这条路才拿得到；
+/// 2. 这条路没成（类型没注册 `DefaultIcon` 一类）才退回 `SHGFI_ICON`，那是 shell
+///    直接给的 32px 小图标，放大到 96px 的画廊槽位会糊——但糊的胜过没有。
+///
+/// ⚠️ 两条路给的 `HICON` 都是「调用者负责销毁」，漏一次就是每屏几十张的泄漏。
+fn icon_raster(target: &Path, px: u32, attrs: u32, name_only: bool) -> Option<IconRaster> {
+    let _com = ComGuard::init();
+    let wide = encode_wide(target);
+    let attrs = FILE_FLAGS_AND_ATTRIBUTES(attrs);
+    // 「只看名字」要多给一位 `SHGFI_USEFILEATTRIBUTES`（否则 shell 会去碰磁盘）。
+    let by_name = if name_only {
+        SHGFI_USEFILEATTRIBUTES
+    } else {
+        SHGFI_FLAGS(0)
+    };
+    let hicon = located_icon(&wide, attrs, by_name | SHGFI_ICONLOCATION, px)
+        .or_else(|| shell_icon(&wide, attrs, by_name | SHGFI_ICON))?;
+    let raster = unsafe { hicon_to_raster(hicon, px) };
+    unsafe {
+        let _ = DestroyIcon(hicon);
+    }
+    raster
+}
+
+/// 第一段：问出图标资源（文件 + 索引），再按 `px` 要一张真图。
+fn located_icon(
+    target_wide: &[u16],
+    attrs: FILE_FLAGS_AND_ATTRIBUTES,
+    flags: SHGFI_FLAGS,
+    px: u32,
+) -> Option<HICON> {
+    let mut info = SHFILEINFOW::default();
+    let asked = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(target_wide.as_ptr()),
+            attrs,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            flags,
+        )
+    };
+    if asked == 0 {
+        return None;
+    }
+    // `szDisplayName` 这个字段在 SDK 里与 `szPath` 是同一个 union——给了
+    // `SHGFI_ICONLOCATION` 时它就是那个装着图标的文件路径。
+    let src = utf16_to_string(&info.szDisplayName);
+    if src.is_empty() {
+        return None;
+    }
+    let src_wide = wide_str(&src);
+    let mut hicon = HICON::default();
+    // 256px 是 shell 图标的天花板，再大只会白要一张上采样图。
+    let hr = unsafe {
+        SHDefExtractIconW(
+            PCWSTR(src_wide.as_ptr()),
+            info.iIcon,
+            0,
+            Some(&mut hicon),
+            None,
+            px.clamp(1, 256),
+        )
+    };
+    (hr.is_ok() && !hicon.is_invalid()).then_some(hicon)
+}
+
+/// 第二段：shell 直接给的图标句柄（系统大图标尺寸，一般 32px）。
+fn shell_icon(
+    target_wide: &[u16],
+    attrs: FILE_FLAGS_AND_ATTRIBUTES,
+    flags: SHGFI_FLAGS,
+) -> Option<HICON> {
+    let mut info = SHFILEINFOW::default();
+    let asked = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(target_wide.as_ptr()),
+            attrs,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            flags,
+        )
+    };
+    if asked != 0 && !info.hIcon.is_invalid() {
+        Some(info.hIcon)
+    } else {
+        None
+    }
+}
+
+/// 把一张 `HICON` 画进 32 位位图，交出 `px` 见方的**预乘** RGBA。
+///
+/// ⚠️ GDI 的设备上下文**没有 alpha 通道**（画进去的第 4 字节恒 0），直接读回来等于
+/// 把图标的透明信息全丢了——半透明边缘会变成一圈黑边。所以画**两遍**：一遍黑底、
+/// 一遍白底，从两张的差里解出 alpha（推导见 [`premultiplied_from_backdrops`]）。
+///
+/// 缩放交给 `DrawIconEx`：图标原生尺寸（256 / 48 / 32）与槽位要的 `px` 几乎不会
+/// 正好对上，而 GDI 至少会做半色调。
+unsafe fn hicon_to_raster(hicon: HICON, px: u32) -> Option<IconRaster> {
+    let side = px.max(1) as usize;
+    let len = side * side * 4;
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: side as i32,
+            // 负高 = 自上而下的行序：读出来的字节序和 RGBA 缓冲同向，不用翻行。
+            biHeight: -(side as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return None;
+    }
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let Ok(bmp) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+        let _ = DeleteDC(dc);
+        return None;
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(dc);
+        return None;
+    }
+    let old = SelectObject(dc, bmp);
+
+    // 底色 `fill` 铺满，再把图标画上去，取一份 BGRA 快照。
+    let on_backdrop = |fill: u8| -> Option<Vec<u8>> {
+        unsafe { std::ptr::write_bytes(bits as *mut u8, fill, len) };
+        unsafe {
+            DrawIconEx(
+                dc,
+                0,
+                0,
+                hicon,
+                side as i32,
+                side as i32,
+                0,
+                None,
+                DI_NORMAL,
+            )
+            .ok()?
+        };
+        let mut buf = vec![0u8; len];
+        unsafe { std::ptr::copy_nonoverlapping(bits as *const u8, buf.as_mut_ptr(), len) };
+        Some(buf)
+    };
+    // 两遍都包在一层闭包里：中途失败也要先走到下面的收尾（DC 与位图必须还）。
+    let taken = (|| {
+        let black = on_backdrop(0x00)?;
+        let white = on_backdrop(0xFF)?;
+        Some((black, white))
+    })();
+
+    // 收尾：不管两遍画了几遍，DC 与位图都得还回去。
+    SelectObject(dc, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(dc);
+
+    let (black, white) = taken?;
+    Some(IconRaster {
+        width: side as u32,
+        height: side as u32,
+        rgba: premultiplied_from_backdrops(&black, &white),
+    })
+}
+
+/// 由「黑底那一张」与「白底那一张」解出**预乘** RGBA（BGRA → RGBA 的换序也在这做）。
+///
+/// `source-over` 叠在不透明底色 `B` 上：`out = a·C + (1−a)·B`。
+///
+/// * `B = 0`（黑）：`black = a·C` —— 这一份**本身就是预乘值**，直接当要交的 RGB；
+/// * `B = 255`（白）：`white = a·C + 255·(1−a) = black + 255 − 255a`
+///   → `a = (black + 255 − white) / 255`。
+///
+/// 三条通道各算一份 alpha 再取平均：同一个像素本该只有一个 alpha，取平均把量化
+/// 误差摊薄（单通道算会在半透明边缘留噪点）。
+///
+/// 顺带一提：这套推导**不要求 `DrawIconEx` 真按 alpha 混合**——它要是只认图标的
+/// 1 位掩码，透明处两张分别还是 0 与 255，解出来的 alpha 照样是 0，只是边缘没了
+/// 抗锯齿。
+fn premultiplied_from_backdrops(black: &[u8], white: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; black.len()];
+    for i in (0..black.len()).step_by(4) {
+        // 32 位 BI_RGB 在内存里是小端 BGRA；第 4 字节是 GDI 写的垃圾，不看。
+        let sum = (black[i] as i32 - white[i] as i32)
+            + (black[i + 1] as i32 - white[i + 1] as i32)
+            + (black[i + 2] as i32 - white[i + 2] as i32);
+        let alpha = (255 + sum / 3).clamp(0, 255) as u8;
+        out[i] = black[i + 2]; // R
+        out[i + 1] = black[i + 1]; // G
+        out[i + 2] = black[i]; // B
+        out[i + 3] = alpha;
+    }
+    out
+}
+
 /// `\\?\` 前缀形态归一成普通绝对路径：`$I` 里记的是普通形态，带前缀比对不上。
 fn canonical_full(path: &Path) -> Result<PathBuf, PlatformError> {
     let canon = std::fs::canonicalize(path)
@@ -734,6 +986,85 @@ mod tests {
         assert!(!is_ejectable(DRIVE_RAMDISK));
         assert!(is_ejectable(DRIVE_REMOVABLE));
         assert!(is_ejectable(DRIVE_CDROM));
+    }
+
+    /// 黑底 / 白底两张图解预乘 RGBA：`a = (black + 255 − white) / 255`，RGB 直接取黑底。
+    ///
+    /// 输入按 32 位 BI_RGB 的内存序（B, G, R, 垃圾）给，所以断言里也能顺手验一遍
+    /// BGRA → RGBA 的换序没写反。
+    #[test]
+    fn backdrops_solve_back_the_alpha() {
+        // 一个不透明的纯红像素：两张图一样。
+        let black = [0u8, 0, 255, 0];
+        let white = [0u8, 0, 255, 0];
+        assert_eq!(
+            premultiplied_from_backdrops(&black, &white),
+            [255, 0, 0, 255]
+        );
+
+        // 全透明：黑底还是黑、白底被刷成白。
+        let black = [0u8, 0, 0, 0];
+        let white = [255u8, 255, 255, 0];
+        assert_eq!(premultiplied_from_backdrops(&black, &white), [0, 0, 0, 0]);
+
+        // 五成透明的纯红：`a·C` = (128,0,0)，白底那份 = `a·C + 255(1−a)` ≈ (255,127,127)。
+        let black = [0u8, 0, 128, 0];
+        let white = [127u8, 127, 255, 0];
+        let got = premultiplied_from_backdrops(&black, &white);
+        assert_eq!(&got[..3], [128, 0, 0], "交出去的必须是**预乘**值");
+        assert!(
+            (got[3] as i32 - 128).abs() <= 1,
+            "alpha 该解回 ~128，实际 {}",
+            got[3]
+        );
+
+        // 多个像素各算各的，互不串味。
+        let black = [0u8, 0, 255, 0, 0, 255, 0, 0];
+        let white = [0u8, 0, 255, 0, 0, 255, 0, 0];
+        assert_eq!(
+            premultiplied_from_backdrops(&black, &white),
+            [255, 0, 0, 255, 0, 255, 0, 255]
+        );
+    }
+
+    /// 真的向 shell 要一张图标：尺寸、缓冲长度、以及「确实画出了东西」都要对。
+    ///
+    /// 这条会开 GDI 对象、查注册表的图标关联——都是无副作用的读操作，且**不要求
+    /// 界面在跑**（`GetIconInfo` 那一套不需要窗口），所以在 CI / 本地都能跑。
+    #[test]
+    fn asks_the_shell_for_real_icons() {
+        for (what, got) in [
+            ("文件夹", folder_icon_raster(32)),
+            ("扩展名 txt", ext_icon_raster("txt", 32)),
+            ("扩展名 .pdf（带点也要能吃）", ext_icon_raster(".pdf", 32)),
+            (
+                "真实文件",
+                file_icon_raster(&std::env::current_exe().unwrap(), 32),
+            ),
+        ] {
+            let r = got.unwrap_or_else(|| panic!("{what}：shell 没给图标"));
+            assert_eq!((r.width, r.height), (32, 32), "{what}");
+            assert_eq!(r.rgba.len(), 32 * 32 * 4, "{what}");
+            let (pixels, tail) = r.rgba.as_chunks::<4>();
+            assert!(tail.is_empty(), "{what}：缓冲长度不是 4 的整数倍");
+            let opaque = pixels.iter().filter(|p| p[3] > 200).count();
+            let see_through = pixels.iter().filter(|p| p[3] < 50).count();
+            assert!(opaque > 32, "{what}：画出了 {} 个不透明像素", opaque);
+            // 图标是**带透明边**的：一张四角不透明的方图说明 alpha 那一步解错了。
+            assert!(see_through > 0, "{what}：一个透明像素都没有，alpha 解错了");
+            // 预乘不变式：`RGB ≤ A`（`a·C` 不可能大于 `a`）。
+            for p in pixels {
+                assert!(
+                    p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3],
+                    "{what}：不是预乘值（{:?} > a={}）",
+                    &p[..3],
+                    p[3]
+                );
+            }
+        }
+        // 空扩展名 = 「没这个名字可问」，与「问了没问到」是两回事。
+        assert!(ext_icon_raster("", 32).is_none());
+        assert!(ext_icon_raster(".", 32).is_none());
     }
 
     /// 列盘在测试环境里也必须跑得动（渲染线程每 5 秒调一次，不能 panic、不能空转）。

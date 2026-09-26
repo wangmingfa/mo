@@ -148,7 +148,7 @@ pub fn supports_volumes() -> bool {
 
 /// 这个平台能不能给「一个具体文件」画出**系统**图标（访达里那种真实图标）。
 pub fn supports_file_icons() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 取 `path` 在**系统**里的图标，返回一块**重绘到 `px` 见方**的 RGBA 像素。
@@ -176,7 +176,11 @@ pub fn file_icon_raster(path: &Path, px: u32) -> Option<IconRaster> {
     {
         macos::file_icon_raster(path, px)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::file_icon_raster(path, px)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (path, px);
         None
@@ -194,7 +198,11 @@ pub fn ext_icon_raster(ext: &str, px: u32) -> Option<IconRaster> {
     {
         macos::ext_icon_raster(ext, px)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::ext_icon_raster(ext, px)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (ext, px);
         None
@@ -214,7 +222,11 @@ pub fn folder_icon_raster(px: u32) -> Option<IconRaster> {
     {
         macos::folder_icon_raster(px)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::folder_icon_raster(px)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = px;
         None
@@ -310,6 +322,27 @@ pub fn appkit_usable() -> bool {
     }
 }
 
+/// 现在**能不能安全地问系统要图标**（图标泵的闸门）。
+///
+/// 两个平台对「安全」的要求根本不是一回事，所以这条不能直接写成
+/// [`appkit_usable`]：
+///
+/// * **macOS**：取图标是 AppKit 的 `iconForFile:`，必须落在主线程 / 主队列上，
+///   而泵跑在 blocking 池里——它靠 `dispatch_sync` 回主队列。测试进程的主队列
+///   没人 drain，动了就是**无 panic 的挂死**，所以那边等价于 [`appkit_usable`]。
+/// * **Windows**：`SHGetFileInfoW` / `SHDefExtractIconW` 不是 UI 框架，不挑线程，
+///   在当前线程直接问就行（COM 由调用自己按线程初始化）。于是这边只看平台支不支持。
+pub fn icon_source_usable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        appkit_usable()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        supports_file_icons()
+    }
+}
+
 /// 已挂载的**本机**卷宗：外接磁盘、光驱、DMG、Time Machine 盘……
 ///
 /// **网络盘不在里面**——它们归侧边栏的「网络」区（`mo_remote::mount::mounted_shares`），
@@ -383,7 +416,14 @@ mod tests {
         assert_eq!(supports_reveal(), here_is_macos || here_is_windows);
         assert_eq!(supports_trash(), here_is_macos || here_is_windows);
         assert_eq!(supports_volumes(), here_is_macos || here_is_windows);
-        assert_eq!(supports_file_icons(), here_is_macos);
+        assert_eq!(supports_file_icons(), here_is_macos || here_is_windows);
+        // 图标泵的闸门：macOS 上还要看主队列（测试进程里必为假，否则 `dispatch_sync`
+        // 挂死），Windows 上 shell 查询不挑线程、平台支持即可用。
+        if here_is_macos {
+            assert!(!icon_source_usable(), "测试进程没标记主循环，必须保守跳过");
+        } else {
+            assert_eq!(icon_source_usable(), supports_file_icons());
+        }
         if here_is_macos {
             assert_eq!(reveal_label(), "在访达中显示");
         } else if here_is_windows {

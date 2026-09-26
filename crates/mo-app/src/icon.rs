@@ -917,4 +917,27 @@ mod tests {
         c.insert(&p, &key, bm());
         assert_eq!(c.cached_paths(), 1, "整清后应能正常落库");
     }
+
+    /// 平台层的契约与这里的还原**对得上**：真向 shell 要一张图标，走完
+    /// [`icon_bitmap`]（预乘还原 + RGBA→BGRA）仍是一张合法的直通位图。
+    ///
+    /// 只在 Windows 上跑真平台调用：macOS 那条必须主线程，测试进程里动它就是挂
+    /// （见 `mo_platform::appkit_usable`），那边由 `devlog/icon-bitmap-pipeline.md`
+    /// 的实测覆盖。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_real_shell_icon_survives_the_unpremultiply_glue() {
+        let mut raster = mo_platform::folder_icon_raster(32).expect("shell 该给得出文件夹图标");
+        let bm = icon_bitmap(&mut raster).expect("32×32 该能成图");
+        assert_eq!((bm.width(), bm.height()), (32, 32));
+        let (pixels, tail) = bm.bgra().as_chunks::<4>();
+        assert!(tail.is_empty() && pixels.len() == 32 * 32);
+        assert!(pixels.iter().any(|p| p[3] == 255), "总得有不透明像素");
+        assert!(pixels.iter().any(|p| p[3] == 0), "图标外圈该是全透明");
+        // 「预乘值 ≤ alpha」这条契约要是被破坏，还原完就会出现 alpha=0 却带颜色的
+        // 怪像素（那种像素在屏幕上就是四角发黑的方片）。
+        for p in pixels.iter().filter(|p| p[3] == 0) {
+            assert_eq!(&p[..3], [0, 0, 0], "alpha=0 的像素不该带颜色：{p:?}");
+        }
+    }
 }

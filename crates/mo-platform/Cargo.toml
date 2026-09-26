@@ -15,12 +15,15 @@ dispatch = "0.2"
 # 卷宗列表要读 `f_fstypename`（区分本地盘与网络盘）。
 libc.workspace = true
 
-# Windows：Win32 Shell（回收站 IFileOperation / 在资源管理器中显示）、Storage+Ioctl+
-# DeviceAndDriverInstallation（卷宗枚举与「安全删除硬件」式的推出）。
+# Windows：Win32 Shell（回收站 IFileOperation / 在资源管理器中显示 / 系统图标）、
+# Storage+Ioctl+DeviceAndDriverInstallation（卷宗枚举与「安全删除硬件」式的推出）、
+# Graphics_Gdi+WindowsAndMessaging（把 HICON 画进位图取像素）。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_Security",
     "Win32_Storage_FileSystem",
