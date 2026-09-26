@@ -395,12 +395,13 @@ pub fn render(
         ))));
     }
 
-    // 位置区：本机**已挂载的卷宗**（外接磁盘 / DMG / Time Machine 盘）。
+    // 位置区：本机**已挂载的卷宗**（外接磁盘 / DMG / Time Machine 盘 / U 盘）。
     //
     // 与「网络」区的区别：网络盘是操作系统按 SMB / NFS 挂的、文件系统类型是网络型，
-    // 这里列的是**本地**卷宗（`apfs` / `hfs` 之类，由 `mo_platform::volumes` 用
-    // `statfs` 的 `f_fstypename` 过滤掉网络型）。点它是 `open_local`，行尾「推出」
-    // 走 `eject_volume`（先问平台、再退回 umount）。
+    // 这里列的是**本地**卷宗（macOS 按 `statfs` 的 `f_fstypename` 过滤、Windows 按
+    // `GetDriveTypeW` 把映射盘剔掉，都在 `mo_platform::volumes` 里办妥）。点它是
+    // `open_local`，行尾「推出」走 `eject_volume`（先问平台、推不动的网络盘再退回
+    // 系统的卸载命令）。
     let volumes = app.volumes();
     if !volumes.is_empty() {
         panel = panel.child(
@@ -482,7 +483,10 @@ pub fn render(
                 cx.spawn(async move |cx| {
                     if let Err(e) = app_eject.eject_volume(eject_target).await {
                         entity_eject.update(cx, |v, cx| {
-                            v.notice(format!("推出失败：{e}"), None, cx);
+                            // 原样显示：`eject_volume` 交回来的已经是一句完整的话
+                            // （平台的否决理由形如「推出失败：E:\（被 xxx 占用）」），
+                            // 这里再加前缀就成了「推出失败：推出失败：…」。
+                            v.notice(e.to_string(), None, cx);
                         });
                     }
                     entity_eject.update(cx, |_, cx| cx.notify());

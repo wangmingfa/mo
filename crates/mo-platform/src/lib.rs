@@ -101,13 +101,21 @@ pub fn reveal(path: &Path) -> Result<(), PlatformError> {
 
 /// 推出 / 卸载一个卷宗（外接盘、网络盘）。
 ///
-/// 路径是**挂载点**（`/Volumes/share`、`/mnt/usb`…），不是卷宗设备文件。
+/// 路径是**挂载点**（`/Volumes/share`、`E:\`…），不是卷宗设备文件。
+///
+/// ⚠️ 网络盘一律 [`PlatformError::Unsupported`]（macOS 交给上层 `umount`、
+/// Windows 交给 `net use /delete`——那里那才是正解），只有**本机**卷宗才走
+/// 系统的推出流程。
 pub fn eject(path: &Path) -> Result<(), PlatformError> {
     #[cfg(target_os = "macos")]
     {
         macos::eject(path)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::eject(path)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
         Err(PlatformError::Unsupported("推出卷宗"))
@@ -117,7 +125,8 @@ pub fn eject(path: &Path) -> Result<(), PlatformError> {
 /// 一块**已挂载的卷宗**（访达侧边栏「位置」里那种）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Volume {
-    /// 展示名（macOS 就是 `/Volumes` 下的目录名）。
+    /// 展示名（macOS 是 `/Volumes` 下的目录名；Windows 与资源管理器同形
+    /// `卷标 (C:)`，没起名给个类型称呼）。
     pub name: String,
     /// 挂载点（`open` 它就是进这块盘）。
     pub path: PathBuf,
@@ -128,13 +137,13 @@ pub struct Volume {
     /// 决定要不要在行尾摆那个按钮；对一个推不动的盘摆按钮，点下去只会得到一句
     /// 「推出失败」。
     ///
-    /// 判据拿不到时（非 macOS / 不在主线程）保守给 `false`。
+    /// 判据拿不到时（没有卷宗枚举实现的平台）保守给 `false`。
     pub ejectable: bool,
 }
 
 /// 本平台能不能列出卷宗（侧边栏「位置」区据此决定要不要摆出来）。
 pub fn supports_volumes() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 这个平台能不能给「一个具体文件」画出**系统**图标（访达里那种真实图标）。
@@ -304,11 +313,13 @@ pub fn appkit_usable() -> bool {
 /// 已挂载的**本机**卷宗：外接磁盘、光驱、DMG、Time Machine 盘……
 ///
 /// **网络盘不在里面**——它们归侧边栏的「网络」区（`mo_remote::mount::mounted_shares`），
-/// 两边都列同一个盘只会让用户困惑。判据是文件系统类型（`statfs`），不是路径形状。
+/// 两边都列同一个盘只会让用户困惑。判据是文件系统类型（macOS `statfs`）/
+/// 驱动器类型（Windows `GetDriveTypeW`），不是路径形状。
 ///
 /// 每块盘还带一个 [`Volume::ejectable`]（能不能推出），UI 据此决定要不要画推出
 /// 按钮——内置硬盘推不动，不该给。macOS 上这步要读卷宗属性（Foundation），
-/// 所以本函数应当在主线程调用；非 macOS 一律 `false`。
+/// 所以本函数应当在主线程调用；Windows 上 `GetDriveTypeW` 是纯查表，但
+/// `GetVolumeInformationW` 在空光驱上会等设备就绪——所以那边干脆不查光盘卷标。
 ///
 /// 没实现的平台返回空。
 pub fn volumes() -> Vec<Volume> {
@@ -316,7 +327,11 @@ pub fn volumes() -> Vec<Volume> {
     {
         macos::volumes()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::volumes()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Vec::new()
     }
@@ -330,6 +345,10 @@ mod tests {
     ///
     /// ⚠️ 这里**不能**在 Windows 上真调 `reveal`——它会拉起资源管理器窗口，
     /// 测试不该有这种副作用；那条路径由 `supports_reveal()` 断言覆盖。
+    ///
+    /// `eject` 同理不能真调：对一块**真实存在**的盘发 `CM_Request_Device_Eject`
+    /// 会把用户的 U 盘停掉。所以下面只喂**不是盘符**的路径——Windows 的实现对此
+    /// 也给 `Unsupported`（让上层退回它自己的 `net use /delete`），正好是想要的语义。
     #[test]
     fn unsupported_platforms_say_so() {
         #[cfg(not(target_os = "macos"))]
@@ -346,6 +365,8 @@ mod tests {
                 reveal(Path::new("/tmp")),
                 Err(PlatformError::Unsupported(_))
             ));
+            assert!(!supports_volumes());
+            assert!(volumes().is_empty());
         }
         #[cfg(target_os = "macos")]
         {
@@ -361,7 +382,7 @@ mod tests {
         let here_is_windows = cfg!(target_os = "windows");
         assert_eq!(supports_reveal(), here_is_macos || here_is_windows);
         assert_eq!(supports_trash(), here_is_macos || here_is_windows);
-        assert_eq!(supports_volumes(), here_is_macos);
+        assert_eq!(supports_volumes(), here_is_macos || here_is_windows);
         assert_eq!(supports_file_icons(), here_is_macos);
         if here_is_macos {
             assert_eq!(reveal_label(), "在访达中显示");

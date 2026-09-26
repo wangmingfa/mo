@@ -1457,12 +1457,14 @@ impl AppState {
     /// 本机已挂载的**卷宗**（侧边栏「位置」区）：外接磁盘、DMG、Time Machine 盘……
     ///
     /// 只读，不发起任何网络操作。网络盘不在这里（归「网络」区，由
-    /// [`AppState::network_shares`] 负责）。按 [`VOLUME_TTL`] 缓存，因为列表要
-    /// `statfs` 逐个查（`mo_platform::volumes` 内已把网络文件系统过滤掉）、还要
-    /// 逐块问一次卷宗属性（能否推出）。
+    /// [`AppState::network_shares`] 负责）。按 [`VOLUME_TTL`] 缓存，因为列表要逐个
+    /// 问文件系统类型 / 驱动器类型（`mo_platform::volumes` 内已把网络盘过滤掉）、
+    /// 还要判能不能推出。
     ///
     /// 每块盘带 [`mo_platform::Volume::ejectable`]：侧栏据此决定给不给推出按钮。
-    /// ⚠️ 这步走 AppKit，必须在主线程读——所以缓存键里也含它，别在后台线程预填。
+    /// ⚠️ macOS 上这步走 AppKit，必须在主线程读——所以缓存键里也含它，别在后台
+    /// 线程预填。Windows 上同样是主线程调用（`GetVolumeInformationW` 在空光驱上会
+    /// 等设备就绪，所以那边对光盘干脆不查卷标，见 `mo_platform::windows::volumes`）。
     pub fn volumes(&self) -> Vec<mo_platform::Volume> {
         let mut slot = self.volumes_cache.lock().unwrap();
         if slot.0.elapsed() >= VOLUME_TTL {
@@ -1479,8 +1481,15 @@ impl AppState {
     /// 推出一块本机卷宗（侧边栏「位置」区那个「推出」）。
     ///
     /// 与 [`AppState::unmount_share`] 同一条纪律：先问平台（macOS 走 AppKit 的
-    /// `unmountAndEjectDeviceAtURL:`，它会接管「还有窗口在用」这类情况），平台没实现
-    /// 或没做成再退回命令行 `umount`（兜底）。推出后不论成败都作废缓存让列表刷新。
+    /// `unmountAndEjectDeviceAtURL:`，Windows 走 `CM_Request_Device_Eject`），平台
+    /// **没实现这条路**（`Unsupported`：网络映射盘、非盘符挂载点）再退回命令行
+    /// `umount` / `net use /delete`——对那两类那才是正解。推出后不论成败都作废缓存
+    /// 让列表刷新。
+    ///
+    /// ⚠️ Windows 上平台**试了但被系统否决**（`Failed`，「还有程序开着它的文件」）
+    /// 时直接把理由交给用户，不再兜底：对本地卷宗跑 `net use /delete` 不但没用，
+    /// 还会把系统给的真实理由换成一句「系统错误 67」。macOS 保持原样——那边
+    /// AppKit 推不动时 `umount` 有时推得动（DMG 一类），那条兜底留着有用。
     pub async fn eject_volume(&self, path: PathBuf) -> Result<(), MoError> {
         let native = {
             let p = path.clone();
@@ -1488,12 +1497,14 @@ impl AppState {
         };
         let r = match native {
             Ok(Ok(())) => Ok(()),
+            #[cfg(target_os = "windows")]
+            Ok(Err(mo_platform::PlatformError::Failed(why))) => Err(MoError::Other(why)),
             _ => {
                 let p = path.clone();
                 self.spawn_blocking(move || mo_remote::mount::unmount(&p))
                     .await
-                    .map_err(|e| MoError::Other(format!("卸载任务失败：{e}")))?
-                    .map_err(|e| MoError::Other(e.to_string()))
+                    .map_err(|e| MoError::Other(format!("推出失败：{e}")))?
+                    .map_err(|e| MoError::Other(format!("推出失败：{e}")))
             }
         };
         self.invalidate_volumes();
