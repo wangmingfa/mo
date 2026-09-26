@@ -101,6 +101,8 @@ vendor/
 # ⚠️ Cargo.lock 刻意**不忽略**：Mo 是二进制应用（不是库），锁定依赖版本
 # 才能保证 Release 流水线用 --locked 构建出与本地完全一致的产物。
 **/target/
+# 跑测试时换一个 target 目录（debug 的 mo.exe 一在跑就锁住 target/debug）
+target-*/
 
 # 测试与覆盖率
 coverage/

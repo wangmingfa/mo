@@ -290,6 +290,10 @@ fn tab(sessions: &Arc<SessionRegistry>) -> AppState {
     static TRASH_SEQ: AtomicUsize = AtomicUsize::new(0);
     let seq = TRASH_SEQ.fetch_add(1, Ordering::SeqCst);
     let trash = std::env::temp_dir().join(format!("mo-trash-{}-{seq}", std::process::id()));
+    // ⚠️ 先清掉同名目录：这些临时回收站**没人删**，而 Windows 会回收 pid——
+    // 隔天复用到同一个 pid + 同一个序号，读到的就是上一轮留下的 `index.json`，
+    // 于是「远程删除不该进本机回收站」那条断言偶发红（实测一轮命中）。
+    let _ = std::fs::remove_dir_all(&trash);
     AppState::with_sessions(trash, sessions.clone())
 }
 
