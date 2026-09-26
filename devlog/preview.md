@@ -100,6 +100,9 @@
 - 缓存键 = 路径 hash + **mtime**：PDF 被改过自动失效，只按路径做键会一直显示旧首页。
 - 验证：一次性 example 探针（跑完即删）渲染真实 PDF 出图正确；mo-preview 单测钉
   「pdf 被识别但不带 image」。真机还要看一眼：两段式占位 → 图淡入的衔接。
+- **Windows 端**改走系统自带的 WinRT `Windows.Data.Pdf`（不随二进制带 pdfium.dll），
+  外加一条只在 Windows 显形的坑：**上面这个两段式对 PDF 从来没启动过**（2026-09-26 修）
+  ——见 [windows-port.md](windows-port.md) §9、§10。
 
 ## 附：系统文件图标（列表行）
 

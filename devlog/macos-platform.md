@@ -70,6 +70,7 @@
 
 * 侧边栏加「位置」区：外接磁盘 / DMG / Time Machine 盘。`mo_platform::volumes()` 列 `/Volumes` 下条目，用 `statfs` 的 `f_fstypename` 把网络型（smbfs/nfs/afp/webdav/cifs/ftp…）过滤掉——那些归「网络」区，别两边列同一个盘。
 * `AppState::volumes()` 带 `VOLUME_TTL=5s` 缓存（侧边栏每帧问，裸 `statfs` 逐个查会抖）；`eject_volume()` 先问平台 `eject` 再退回 `mo_remote::mount::unmount`（Mo 自挂目录 AppKit 不认）。行尾「推出」按钮照样 `stop_propagation()`。
+* **Windows 对应实现**（2026-09-26）：`GetLogicalDrives` + `GetDriveTypeW` 列盘、`CM_Request_Device_Eject` 推出，并把上面那句「先问平台再退回」的分工钉成 `Unsupported` / `Failed` 两种错误——坑与判据见 [windows-port.md](windows-port.md) §6、§7。
 
 ## 11. 系统文件图标（2026-09-22）
 
@@ -77,6 +78,7 @@
 * 缓存：`AppState::file_icon` 把 PNG 写进 `temp_dir()/mo-icons/<hash>.png`，按路径键、封顶 4000 清空，列表行用 `img(path)` 加载（光栅图没法用文字色描边）。远程页（`browsing_remote()`）直接返 None 退回内置 SVG。
 * ⚠️ **`?` 运算符陷阱（这一轮真踩了）**：`on_main_thread(move || …)` 的闭包若返回 `Option<_>`，里面**不能**写 `workspace()?` / `class(..)?`（那是 `Result`，`?` 要求返回类型是 `Result`）——要 `workspace().ok()?` / `class(..).ok()?`。返回 `Result` 的闭包（`reveal`/`eject`）才直接 `?`。这处编译期才发现，但本轮回合一开始写错、靠通读抓回。
 * 只接了主列表（`file_item::view` 加 `system_icon: Option<PathBuf>` 参数 + `file_list` 调用）；grid / columns 当初仍是内置 SVG，见下面的补记。
+* **Windows 对应实现**（2026-09-26）：`SHDefExtractIconW` 按目标尺寸抽图 + 黑白底画两遍解 alpha（GDI 的 DC 没有 alpha 通道），门禁从 `appkit_usable()` 换成 `icon_source_usable()`——见 [windows-port.md](windows-port.md) §8。
 
 ### 11.1 补记：四个视图统一，位图按槽位分两档（2026-09-22 晚）
 

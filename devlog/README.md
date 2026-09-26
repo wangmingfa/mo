@@ -10,6 +10,7 @@
 |---|---|
 | [gpui-layout-and-interaction.md](gpui-layout-and-interaction.md) | GPUI 布局（flex / uniform_list / 定宽槽位）与交互（click / hover / 双击 / 快捷键）的坑 |
 | [macos-platform.md](macos-platform.md) | macOS 平台层：红绿灯定位、⌘Q 退出、Dock 图标、objc FFI |
+| [windows-port.md](windows-port.md) | Windows 移植：cfg 门控、`explorer /select`、`IFileOperation` 回收站与 `$I` 反查、卷宗/推出的 `Unsupported` vs `Failed` 契约、shell 图标解 alpha、WinRT PDF 渲染 |
 | [build-and-lints.md](build-and-lints.md) | 构建与依赖：future-incompat 补丁、workspace lints、cfg 检查 |
 | [engine-testing.md](engine-testing.md) | 引擎逻辑与测试方法：headless 布局测试、通用算法陷阱 |
 | [async-runtime.md](async-runtime.md) | 异步 runtime：后台任务洪泛饿死 UI、刷新竞态、跨目录快照覆盖 |
