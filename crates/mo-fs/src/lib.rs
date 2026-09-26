@@ -171,18 +171,24 @@ pub(crate) fn kind_from_metadata(m: &std::fs::Metadata, path: &Path) -> mo_core:
 
 /// 条目名是否「隐藏」：只看名字，零 IO。
 ///
-/// `.` 开头这一条在 unix 系与 Windows 上都成立（两边都用 `.` 开头的目录放配置），
-/// 也是访达 ⌘⇧. 切的那批。列目录过滤用它打底，macOS 上再叠加标记位判断
-/// （见 [`is_hidden_with_metadata`]）。
+/// `.` 开头这一条在 unix 系与 Windows 上都**照用**——两边都用 `.` 开头的目录放
+/// 配置，Mo 把它当跨平台一致的规则。**注意这不是资源管理器的规则**：Explorer 只
+/// 看属性位，`.cargo` 在它眼里完全不隐藏。所以 Windows 上 Mo 会比 Explorer 多藏
+/// 一批点开头目录，这是有意的取舍，不是漏判（属性位那条见
+/// [`is_hidden_with_metadata`]）。
 pub fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }
 
-/// 在 [`is_hidden_name`] 之上叠加「文件系统标记位」判据（macOS 的 `UF_HIDDEN`）。
+/// 在 [`is_hidden_name`] 之上叠加「文件系统标记位」判据（macOS 的 `UF_HIDDEN`、
+/// Windows 的 `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`）。
 ///
-/// `chflags hidden` 设的条目（`~/Library` 就是这么藏起来的）名字不以 `.` 开头，
-/// 只按名字判会漏；而标记位只有 stat 才拿得到，所以做成「上层手上已有 metadata
-/// 时的补充判据」——`read_dir` 里那次 `DirEntry::metadata()` 是免费的。
+/// 标记位藏起来的条目名字不以 `.` 开头，只按名字判会漏：macOS 上是 `chflags
+/// hidden` 设的 `~/Library`，Windows 上是 `desktop.ini`（Hidden|System）、
+/// `AppData`（Hidden）、`ntuser.dat`（Hidden）这一批——**Windows 的隐藏根本不是
+/// 靠名字**，不读属性位就等于没有隐藏文件判据。而标记位只有 stat 才拿得到，所以
+/// 做成「上层手上已有 metadata 时的补充判据」——`read_dir` 里那次
+/// `DirEntry::metadata()` 是免费的。
 pub fn is_hidden_with_metadata(name: &str, m: &std::fs::Metadata) -> bool {
     if is_hidden_name(name) {
         return true;
@@ -193,9 +199,28 @@ pub fn is_hidden_with_metadata(name: &str, m: &std::fs::Metadata) -> bool {
         // `UF_HIDDEN`：BSD 的隐藏位，Linux 的 `st_flags` 恒为 0（且该字段不存在）。
         m.st_flags() & 0x8000 != 0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        hidden_by_attributes(m.file_attributes())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (name, m);
         false
     }
+}
+
+/// Windows 上算「隐藏」的两个属性位：`FILE_ATTRIBUTE_HIDDEN` (0x2) 与
+/// `FILE_ATTRIBUTE_SYSTEM` (0x4)。
+///
+/// 单独抽出来是为了能不带 IO 地测：`Metadata` 造不出来，而属性位是纯整数判断。
+/// 资源管理器的「隐藏」只认这两位；`SYSTEM` 一并算上是因为 `desktop.ini`、
+/// `boot.ini` 这类是 Hidden|System，只判 HIDDEN 也能中，但单 System 的条目
+/// （某些卷根）Explorer 同样不显示。
+#[cfg(target_os = "windows")]
+fn hidden_by_attributes(attributes: u32) -> bool {
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    attributes & (HIDDEN | SYSTEM) != 0
 }

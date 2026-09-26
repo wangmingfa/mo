@@ -347,3 +347,100 @@ mod unix_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Windows 的「隐藏」不看名字，只看属性位——上面那套 unix 测试在这里一条都跑不到
+/// （模块本身是 `cfg(all(test, unix))`），所以判据接上属性位之后必须另起一组。
+///
+/// 造隐藏文件用 `attrib +h`，与 macOS 那边用 `chflags hidden` 同一套路：属性位
+/// 没有 std 的写入 API，而这判据要测的就是「真读得到那一位」。
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+    use crate::hidden_by_attributes;
+
+    fn set_attr(path: &Path, flags: &str) {
+        let status = std::process::Command::new("attrib")
+            .args([flags, &path.to_string_lossy()])
+            .status()
+            .expect("attrib 应能启动");
+        assert!(status.success(), "attrib {flags} 失败");
+    }
+
+    /// `FILE_ATTRIBUTE_HIDDEN` 必须让条目算隐藏，去掉标记位后又要不算。
+    ///
+    /// 名字是 `attribute_probe.txt`（不以 `.` 开头），所以这里通过的**唯一可能**
+    /// 就是属性位真的被读进来了——dotfile 那条判据在这里帮不上忙。
+    #[test]
+    fn attribute_hidden_files_are_caught() {
+        let dir = std::env::temp_dir().join(format!("mo-fs-win-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let probe = dir.join("attribute_probe.txt");
+        std::fs::write(&probe, b"x").expect("写探针文件");
+
+        set_attr(&probe, "+h");
+        let meta = std::fs::metadata(&probe).expect("读元数据");
+        assert!(
+            is_hidden(&probe, &meta),
+            "只带 Hidden 属性位、名字不以 . 开头的文件必须报告隐藏"
+        );
+
+        // 反向也要成立：取消标记位后不能还判成隐藏，否则「显示隐藏文件」开关会
+        // 变成「永远显示」，普通文件被误藏。
+        set_attr(&probe, "-h");
+        let meta = std::fs::metadata(&probe).expect("读元数据");
+        assert!(!is_hidden(&probe, &meta), "去掉 Hidden 位后不该再是隐藏");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `desktop.ini` 是 Hidden|System、`AppData` 是 Hidden|Directory——这两位里
+    /// 任一位命中都算隐藏；只有 `Archive` 的快捷方式必须照常显示。
+    ///
+    /// 属性值是这台机器上实测的（`[IO.File]::GetAttributes`）：
+    /// `desktop.ini` = 0x26、`AppData` = 0x12、`Atlas.lnk` = 0x20。
+    #[test]
+    fn either_attribute_bit_counts_and_archive_does_not() {
+        assert!(
+            hidden_by_attributes(0x26),
+            "Hidden|System|Archive（desktop.ini）"
+        );
+        assert!(hidden_by_attributes(0x12), "Hidden|Directory（AppData）");
+        assert!(hidden_by_attributes(0x4), "只带 System 位");
+        assert!(!hidden_by_attributes(0x20), "只带 Archive（.lnk 快捷方式）");
+        assert!(!hidden_by_attributes(0x10), "只带 Directory");
+    }
+
+    /// 列目录要把属性位判出来的 hidden 一起交上来，不然上层的开关无从过滤。
+    #[test]
+    fn read_dir_reports_attribute_hidden() {
+        let dir =
+            std::env::temp_dir().join(format!("mo-fs-win-hidden-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::write(dir.join("normal.txt"), b"x").expect("写普通文件");
+        std::fs::write(dir.join("hidden.txt"), b"x").expect("写隐藏文件");
+        std::fs::create_dir_all(dir.join("SystemVolumeDir")).expect("建目录");
+        set_attr(&dir.join("hidden.txt"), "+h");
+        set_attr(&dir.join("SystemVolumeDir"), "+s");
+
+        let entries = LocalFileSystem.read_dir_blocking(&dir).expect("读目录");
+        let hidden_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("目录里应有 {name}"))
+                .hidden
+        };
+        assert!(hidden_of("hidden.txt"), "带 Hidden 位的文件要标 hidden");
+        assert!(
+            hidden_of("SystemVolumeDir"),
+            "带 System 位的目录要标 hidden"
+        );
+        assert!(!hidden_of("normal.txt"), "普通文件不该标 hidden");
+
+        // 收尾：属性位留在临时目录里没意义，但目录本身会被删掉，这里只清文件。
+        set_attr(&dir.join("hidden.txt"), "-h");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
