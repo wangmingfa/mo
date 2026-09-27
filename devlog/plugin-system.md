@@ -133,11 +133,11 @@ pub fn icon_share_of(ext: &str) -> IconShare; // 图标能否按类型共享
 实际接口：
 
 ```rust
-pub(crate) enum Slot { Palette, ContextFile, ContextBlank }
+pub(crate) enum Slot { Palette, ContextFile, ContextBlank }   // P2-2 起是 mo_app::MenuSlot 的别名
 pub(crate) enum ActionKind { User(usize), Workflow(usize) }
 pub(crate) struct ActionSpec { pub title: String, pub category: String,
                                pub kind: ActionKind, pub slots: Vec<Slot> }
-pub(crate) fn contributed(users, workflows) -> Vec<ActionSpec>  // 今天一律 slots = [Palette]
+pub(crate) fn contributed(users, workflows) -> Vec<ActionSpec>  // slots 从 P2-2 起读每条的 menu 声明
 pub(crate) fn for_slot(specs, slot) -> Vec<&ActionSpec>
 ```
 
@@ -155,15 +155,20 @@ pub(crate) fn for_slot(specs, slot) -> Vec<&ActionSpec>
 这一步当时**没做**（菜单还吃不到它，为一个不存在的消费者在每次右键时扫一遍配置目录不划算）
 → **2026-09-27 已做，落地形状见 §4.5。**
 
-P2 剩下要做的：把清单 `where` 里的槽位灌进 `slots`；要引用内置动作时给 `ActionKind`
-加一臂 `Builtin(&'static str)`（`dispatch_action` 已经按字符串 id 匹配，是现成的）；
-`toolbar` 槽位。侧栏那一层已经接好了（§4.4 / P1-3），P2 只欠把清单的 `sidebar` 字段
+P2 剩下要做的：~~把清单 `where` 里的槽位灌进 `slots`~~（✅ 2026-09-27 P2-2，落地形状与
+一次形状偏离见 §4.6——**没有**做成独立数组，而是命令自带 `menu` 字段）；
+要引用内置动作时给 `ActionKind` 加一臂 `Builtin(&'static str)`（`dispatch_action` 已经按
+字符串 id 匹配，是现成的）；`toolbar` 槽位。侧栏那一层已经接好了（§4.4 / P1-3），P2 只欠把清单的 `sidebar` 字段
 映射成一条 `Row`。
 
 **验收**：`cargo test -p mo-ui` 118 绿（新增 5 条：注册表 3 + 菜单 2）；反向验证是把
 `contributed` 的默认槽位加上 `ContextFile` → `everything_is_palette_only_for_now` 变红。
 （这一轮还被 `mv` 恢复旧 mtime 骗了一次，cargo 复用了变异体的产物、绿的其实是上一个二进制，
 详见 [engine-testing.md §8](engine-testing.md)。）
+*⚠️ 那条靶子测试的名字随 P2-2 变了*：`everything_is_palette_only_for_now` 当时测的是
+「一律只投面板」，投递改成看声明之后它不再成立，拆成了 `no_declaration_stays_palette_only`
+（没写 = 仍只投面板，向后兼容）+ `declared_slots_reach_exactly_the_listed_surfaces`
+（写了 = 精确投递，这一条才是今天的反向验证靶子）。
 
 ### 4.3 `ProviderHost`
 
@@ -266,6 +271,93 @@ P2 真让动作进菜单之后，若右键有可感延迟，再考虑按 `mtime`
 「Markdown 统计 · 统计字数」、右键 `notes.txt` 没有、且面板镜像仍是空的。
 **反向验证**：把 `contributed_for` 改回读 `self.user_commands`（收口前的写法）→ 第一条
 断言红（`.md` 那条进不了快照）。另加一条投递层的反向靶子仍在 §4.2 那两处。
+（*P2-2 之后这一段口径已经升级*：那两条 UI 测试断言的是**渲染出来的菜单行**，fixture
+也带上了 `menu` 声明，测试本身改名叫 `context_menu_renders_contributions_by_slot_and_target`
+——见 §4.6。）
+
+
+### 4.6 槽位写在命令自己身上 —— ✅ 已落地（2026-09-27，P2-2）
+
+§4.5 之后菜单已经带着一份贡献表了，但那份表里**每一条的 slots 都是硬编码的**
+`vec![Slot::Palette]`——收口时故意留的，为的是「先让改行为变成改数据」。这一轮就是
+把那句硬编码换成数据。
+
+**与 §3 设计稿不一致，而且要说清为什么**：设计稿里 `menu` 是清单上的一个**独立数组**
+（`{ "action": "srt-tools.stat", "where": [...] }`，动作靠 `<ext-id>.<name>` 字符串引用）。
+落地改成**命令自带一个 `menu` 字段**：
+
+```jsonc
+{ "name": "统计字数", "shell": "wc -w {file}", "menu": ["palette", "context:file"] }
+```
+
+1. 命令今天已经有两个来源（`config.commands[]` 与扩展清单 `commands[]`），两边都是同一个
+   `UserCommand`。投递落点是**这条命令**的属性，做成独立数组就得再造一套「引用哪条命令」
+   的 id 解析——而 `<ext-id>.<name>` 是**展示名**（带 `扩展名 · ` 前缀，见 `flatten`），
+   拿它当外键，打错一个字就是静默失配。
+2. 独立数组真正的用武之地是**给内置命令重排界面**（「把压缩也加进右键菜单」）。那需要
+   `ActionKind::Builtin(&'static str)` 这一臂，注册表今天没有。等到真有这需求时再引入
+   数组，两种形状可以共存——`where` 指向内置动作用字符串、指向扩展命令时干脆不用写。
+
+语义（`MenuSlot`，在 `mo-config`）：
+
+* **缺省 / 空 = 只进命令面板**，与 P2 之前逐条一致（`MenuSlot::defaults()`）。老配置、
+  老清单一个字都不用改。
+* **写了 = 精确投递**，不是追加。一条只写 `context:file` 的命令从此不出现在面板里。
+  这一点最容易反直觉，所以 `contributed()` 只认这一条规则，别处不再补默认值。
+* 写法宽容：`context:file` 与 `context-file` 等价（冒号是设计稿的形状，连字符是手改 JSON
+  时更顺手的形状），大小写与首尾空白不敏感。回写用的规范写法是冒号那种（`as_str`）。
+* **认不出的名字 = 整条不加载**，报错把可用的三个列出来。判据与「空 shell」同级：
+  宁可少一条命令，也不要「用户写了 `context:flle`，结果什么都没发生、也没人说一句」。
+
+**模型里存字符串而不是枚举**（一次值得记下的偏离）：`Config::load` 任何一处反序列化失败，
+`AppState::config()` 都会 `unwrap_or_default()` 把**整份**配置回落成默认值——一个字母打错的
+槽位名会清空用户所有设置。所以：`menu: Vec<String>` 存原样，读侧 `slots_of` 尽量可用，
+`validate` 负责明确报错。以后往 config 里塞任何新字段都照这条办。
+
+三处各自的判据（一处一个职责，不重复判断）：
+
+| 位置 | 职责 |
+|---|---|
+| `mo-config` | `MenuSlot`（`parse` / `as_str` / `defaults`）、`slots_of`、`first_bad_slot`、`slot_error` |
+| `mo-app` | `usercmds::validate` 与 `workflows::validate` 各调一次 `slot_error`。**扩展清单不用另写一处**：`extensions::validate` 本来就逐条走 `usercmds::validate`；扩展带的工作流经 `AppState::workflows()` 里 `sanitize` 的第二遍 |
+| `mo-ui` | `Slot` 从「本 crate 自定义枚举」改成 `mo_app::MenuSlot` 的**别名**；`contributed()` 读 `u.slots()` / `w.slots()` |
+
+UI 侧不再有任何「默认投到哪儿」的判断——那是声明的事。`context_menu.rs` 的
+`push_contributed` 与 `commands_in` 那两处**一行都没改**：P1-2 收口时它们查的就是
+`for_slot(specs, …)`，这一轮只是让那张表里的 slots 第一次真的不一样。
+
+**照实记的缺口**（不是遗漏，是这一轮没做的）：
+
+* **空白处右键也吃选区的 `when_ext`**。`open_context_menu` 算判据用的是
+  `选区 ∪ target`，右键空白时 target 是 `None`、选区还在。于是「刚才选中一个 `.md`、
+  现在对着空白右键」会让 `when_ext: [".md"]` + `menu: ["context:blank"]` 的命令出现。
+  讲得通（条件看的是用户手里有什么），但 §3 里 `when_ext` 的意图是给「针对文件的动作」，
+  `context:blank` 该不该受它约束，等真有插件提出来再定。
+* `ContextFile` 不区分文件与目录，也还没有 `toolbar` 槽位（§4.2 列的下一项）。今天没有
+  需要它的作者，先不加没人为之付维护成本的槽位。
+* 改这个字段**只能手写 JSON / 清单**：全仓没有任何界面写 `Config::commands`（grep
+  `.commands =` / `.commands.push` 只命中读侧），扩展管理器也还没展示「这条投到了哪儿」。
+* 一条只投 `context:file` 的命令在面板里搜不到。如果之后有用户觉得这是消失了的 bug，
+  解法应当是「显式声明就按声明走 + 界面上给一句说明」，而不是偷偷补一个 Palette。
+
+**验收**：`cargo test --workspace --all-features` 全绿（完整日志：`mo-config` 7、
+`mo-app` lib 54、`mo-ui` lib 132、`--test layout` 35，其余各集成套件全过）。
+新增 8 条（`mo-config` 3：宽容解析 / 缺省回落 / 空字段不写进 JSON；`mo-app` 4：命令、
+工作流、扩展清单各一条「认不出就整条丢掉」、一条「摊平不丢声明」）、升级 3 条
+（清单加载那条现在同时验「写了的按声明走」与「写错的被丢掉」；`actions.rs` 与 `app.rs`
+各一条按新语义重写）。
+**反向验证**：把 `contributed()` 里用户命令那臂的 `slots: u.slots()` 换回 P2-1 的硬编码
+`vec![Slot::Palette]` → 两条红，且各红在自己在的层：
+`actions::tests::declared_slots_reach_exactly_the_listed_surfaces`（注册表里就没有
+`ContextFile` 这一项）与
+`app::tests::context_menu_renders_contributions_by_slot_and_target`（后者报出的正是整张菜单
+只剩内置那 15 行，一句 `menu` 声明什么也没换来）。改回后 `touch` + 重跑：132 绿。
+
+⚠️ 这一轮的**测试环境**记录了一条与投递无关的偶发红（整包并行时 `layout.rs` 的
+`trash_empty_asks_for_confirmation` 红过两次，单跑与第三次整包都绿），连同判据一起记在
+[engine-testing.md §9](engine-testing.md)。同一轮里顺手把那条断言改成轮询
+（`wait_for_trash_state`，与 `wait_for_panel_rows` 同一手法），改完
+`cargo test --workspace --all-features --no-fail-fast` 连跑两次都是 0。
 
 
 ## 5. provider 协议（stdio）
@@ -321,8 +413,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
   * **P2-1 ✅（2026-09-27）**：菜单按本次右键目标重取贡献表并自带载荷（§4.5）。
     这一步**没有任何界面变化**（投递策略仍是一律 `Slot::Palette`），它是那条验收标准
     的前置——fixture 扩展的命令现在只跟着目标过滤，不再跟着「上一次开面板的选区」。
-  * 剩下：清单 `menu`/`types`/`keybindings`/`sidebar` 四类字段真正灌进 `slots` 等数据、
-    安装与权限框、扩展管理器展示。
+  * **P2-2 ✅（2026-09-27）**：清单 / 配置里的 `menu` 声明真的决定投递（§4.6）。形状与
+    §3 的独立 `menu` 数组**不同**（命令自带字段），理由与语义（缺省=只进面板、写了=精确
+    投递、认不出=整条不加载）都记在那一节。自此 §8 那条验收标准的前半句成立：
+    **fixture 扩展能往右键菜单里加一项**，headless 断言打在渲染出来的菜单行上。
+  * 剩下：清单 `types` / `keybindings` / `sidebar` 三类字段、安装与权限框、扩展管理器展示。
 * **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
   验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
