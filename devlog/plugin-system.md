@@ -116,20 +116,55 @@ pub fn icon_share_of(ext: &str) -> IconShare; // 图标能否按类型共享
 
 ### 4.2 `ActionRegistry`
 
+### 4.2 `ActionRegistry` —— ✅ 已落地（2026-09-27，P1-2，`crates/mo-ui/src/actions.rs`）
+
+原设计的形状（一条 `ActionSpec` 带 `id` / `when_ext` / `Builtin|Command|ProviderCall`）
+**落地时改小了**，因为跑了一遍现状发现三件事：
+
+1. **内置命令不搬**。`CommandId` 那 ~90 个变体各有 `run_command` 分支，**编译期穷尽**
+   （少一个分支编译不过）。摊成数据表等于把编译期保证换成运行期查表，换不到好处。
+   注册表只收「宿主事先不知道有几条」的那批：用户命令 / 扩展命令 / 工作流。
+2. **`when_ext` 不在这一层判**。`AppState::user_commands(&exts)` 交上来的清单**已经**按
+   各扩展 `when_ext` 过滤过了；这里再判一次就会出现「面板看得到、菜单看不到」这类
+   对不上号的差异（与 engine-testing §7 三份表同一个病根）。判据只放一处。
+3. **载荷带身份而不是下标**。落地的是 `MenuAction::Contributed(ActionKind)`，
+   `ActionKind::User(usize) | Workflow(usize)` 直接装在菜单动作里——原设计的
+   `Plugin(usize)` 是「注册表下标」，而注册表按当前选中项的扩展名**每次重建**，
+   点开菜单到点击之间下标会飘。今天两个面（面板 / 菜单）都各留一份快照，就没有这个问题。
+
+实际接口：
+
 ```rust
-pub struct ActionSpec { pub id: String, pub label: String, pub category: String,
-                        pub where_: Vec<Slot>,           // context:file / context:blank / palette / toolbar
-                        pub when_ext: Vec<String>,
-                        pub kind: ActionKind }           // Builtin(&'static str) | Command(UserCommand) | ProviderCall{method}
+pub(crate) enum Slot { Palette, ContextFile, ContextBlank }
+pub(crate) enum ActionKind { User(usize), Workflow(usize) }
+pub(crate) struct ActionSpec { pub title: String, pub category: String,
+                               pub kind: ActionKind, pub slots: Vec<Slot> }
+pub(crate) fn contributed(users, workflows) -> Vec<ActionSpec>  // 今天一律 slots = [Palette]
+pub(crate) fn for_slot(specs, slot) -> Vec<&ActionSpec>
 ```
 
-落地点三处：
+三个落地点都已接上：`commands_in()` 尾部那两个 for 循环换成查表（顺序 / 分类逐条不变，
+`registry_preserves_order_and_categories` 钉住）；`context_menu::items()` 多收一个
+`&[ActionSpec]`，把命中本槽位的追加在**末尾并给第一条带前导分隔线**（内置那批的分组节奏
+是设计过的，用户自己起的名字混进去会读散）；`run_menu_action` 那两臂直接映射到既有的
+`run_user_command_at` / `run_workflow_at`，**不另开执行路径**（占位符守卫、输出回显都在那边）。
 
-* `commands_in()`（app.rs:418，命令面板数据源）改成读 registry，而不是硬编码函数；
-* `MenuAction` 加逃生口 `Plugin(usize)`（对齐 `CommandId::User(usize)` 已有的做法），
-  `items()` 尾部追加 registry 给的项，`run_menu_action`（app.rs:6285）加一臂；
-* `sidebar.rs` 从手写 div 改成遍历 `Vec<SidebarItem>`——「新增一个侧栏项」从抄 40 行 div
-  变成加一行数据。
+⚠️ **P2 开工前必须先补的一处接线**：`RootView::user_commands` 这份镜像目前只在
+**开命令面板**时刷新（`keys` 的 `palette.open`），也就是「先开过一次面板，扩展命令才存在」，
+而且它反映的是**上一次开面板时那批选中项**的 `when_ext` 过滤结果。今天看不出问题（贡献项
+只投面板），但一旦有动作进右键菜单，判据就必须跟着这一次右键的目标走——
+`open_context_menu` 里重取 `user_commands(&selected_ext_names(...))` / `workflows()`。
+这一步现在**没做**：菜单还吃不到它，为一个不存在的消费者在每次右键时扫一遍配置目录
+不划算。
+
+P2 剩下要做的：把清单 `where` 里的槽位灌进 `slots`；要引用内置动作时给 `ActionKind`
+加一臂 `Builtin(&'static str)`（`dispatch_action` 已经按字符串 id 匹配，是现成的）；
+`toolbar` 槽位；侧栏（§4.4 / P1-3）。
+
+**验收**：`cargo test -p mo-ui` 118 绿（新增 5 条：注册表 3 + 菜单 2）；反向验证是把
+`contributed` 的默认槽位加上 `ContextFile` → `everything_is_palette_only_for_now` 变红。
+（这一轮还被 `mv` 恢复旧 mtime 骗了一次，cargo 复用了变异体的产物、绿的其实是上一个二进制，
+详见 [engine-testing.md §8](engine-testing.md)。）
 
 ### 4.3 `ProviderHost`
 
