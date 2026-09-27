@@ -152,8 +152,8 @@ pub(crate) fn for_slot(specs, slot) -> Vec<&ActionSpec>
 而且它反映的是**上一次开面板时那批选中项**的 `when_ext` 过滤结果。今天看不出问题（贡献项
 只投面板），但一旦有动作进右键菜单，判据就必须跟着这一次右键的目标走——
 `open_context_menu` 里重取 `user_commands(&selected_ext_names(...))` / `workflows()`。
-这一步现在**没做**：菜单还吃不到它，为一个不存在的消费者在每次右键时扫一遍配置目录
-不划算。
+这一步当时**没做**（菜单还吃不到它，为一个不存在的消费者在每次右键时扫一遍配置目录不划算）
+→ **2026-09-27 已做，落地形状见 §4.5。**
 
 P2 剩下要做的：把清单 `where` 里的槽位灌进 `slots`；要引用内置动作时给 `ActionKind`
 加一臂 `Builtin(&'static str)`（`dispatch_action` 已经按字符串 id 匹配，是现成的）；
@@ -219,6 +219,55 @@ headless 侧新增 `layout.rs::clicking_a_sidebar_bookmark_opens_that_folder`—
 （注意 `debug_bounds` 仍然读得到它，只有点击需要被观察，所以这一变体测的正是 `test_support`）；
 ② 把 `bookmark_rows` 的 `path` 换成临时目录 → 「点了书签行，那 3 个文件没画出来」变红。
 
+### 4.5 菜单自带一份贡献表 —— ✅ 已落地（2026-09-27，P2-1）
+
+§4.2 那条 ⚠️ 接线做掉了，但落地的形状不是「在 `open_context_menu` 里重取一下镜像」，
+而是**重取的结果连着载荷一起进 `ContextMenu`**：
+
+```rust
+pub(crate) struct Contributions { specs, commands, workflows }   // actions.rs
+impl Contributions { fn of(users, workflows) -> Self; fn payload(kind) -> Option<Payload> }
+pub(crate) enum Payload { User(mo_app::UserCommand), Workflow(mo_app::Workflow) }
+// context_menu.rs：字段 contributions，items() 不再收 &[ActionSpec]
+```
+
+两个理由，都是「这张表被谁读」：
+
+1. **一次右键只有一个事实来源**。渲染读 `menu.contributions`，点击执行的也是。
+   收口之前是「渲染时现取一张表，点击时再按下标回 `RootView` 的镜像里捞载荷」——
+   中间隔着一次可能被命令面板重取的镜像，正是不对称的地方。
+2. **下标得有人兜住**。`Contributions` 把「第 i 条」和「第 i 条是什么」绑在同一份数据上；
+   查不到就明确报「已不在当前列表里，未执行」，**绝不按位置猜一条顶上**——按位置猜
+   等于静默执行用户没点的那条命令。§4.2 说的「载荷带身份而不是下标」到这一步才算还清。
+
+判据：`selected_ext_names(panel)` 里抽出 `ext_names_of(&[PathBuf])`，两处共用；
+右键的输入是**本次目标 ∪ 当前选区**。目标一般已在选区内（右键会先单选它），但条目
+可能刚好不在可见窗口（watcher 刚换过列表），所以显式并进来。
+
+执行侧：`run_user_command_at` / `run_workflow_at` 留作**下标入口**（面板那条路——打开时
+重取、Enter 立刻执行，中间没有别的写入者），本体拆成 `run_user_command(cmd)` /
+`run_workflow(wf)`。两个入口一条执行路径，占位符守卫与输出回显不分叉。
+
+**代价照实记**：`AppState::user_commands()` 每次都读配置目录 + 全部清单（磁盘 IO），
+现在**每次右键**付一遍。开一次命令面板本来就是同样的开销，右键量级相同，没加缓存——
+加缓存就要处理「用户刚改过清单」的失效，而那件事面板今天也靠每次重取解决。
+P2 真让动作进菜单之后，若右键有可感延迟，再考虑按 `mtime` 失效的一层。
+
+⚠️ 这一轮踩到的一次「单跑绿、整包跑红」（与 [windows-port.md §27](windows-port.md)
+同一类）：fixture 一开始种在**私有**配置目录、临时改 `MO_CONFIG_DIR`。那是进程全局的，
+同进程并行的测试各自调 `isolate_user_dirs_for_tests()` 会把变量换回去，于是本测试读不到
+自己的 fixture。改成种进**共享**隔离目录的 `<MO_CONFIG_DIR>/extensions/mdstats/`、
+测完删掉、全程不动环境变量，就自洽了。**教训**：测试要改的是「目录里有什么」，
+不是「目录是哪个」。
+
+**验收**：`cargo test -p mo-ui --lib` 131 绿（本轮新增 2 条：`actions.rs` 的下标自足、
+`app.rs` 的真接线）。`app.rs` 那条是本阶段第一处**真从磁盘读扩展清单**的 UI 测试：
+种一个 `when_ext: [".md"]` 的 fixture 扩展 → 右键 `README.md` 的快照里有
+「Markdown 统计 · 统计字数」、右键 `notes.txt` 没有、且面板镜像仍是空的。
+**反向验证**：把 `contributed_for` 改回读 `self.user_commands`（收口前的写法）→ 第一条
+断言红（`.md` 那条进不了快照）。另加一条投递层的反向靶子仍在 §4.2 那两处。
+
+
 ## 5. provider 协议（stdio）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
@@ -269,6 +318,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 * **P2 声明层生效**：清单四类 + 安装/权限框 + 扩展管理器展示「本扩展贡献了什么」。
   验收：tests 里一个 fixture 扩展能加一条右键菜单项、一个 `.srt` 标签、一个侧栏项，
   headless 断言渲染出现；**反向验证**（注释掉注册点必须变红）。
+  * **P2-1 ✅（2026-09-27）**：菜单按本次右键目标重取贡献表并自带载荷（§4.5）。
+    这一步**没有任何界面变化**（投递策略仍是一律 `Slot::Palette`），它是那条验收标准
+    的前置——fixture 扩展的命令现在只跟着目标过滤，不再跟着「上一次开面板的选区」。
+  * 剩下：清单 `menu`/`types`/`keybindings`/`sidebar` 四类字段真正灌进 `slots` 等数据、
+    安装与权限框、扩展管理器展示。
 * **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
   验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
