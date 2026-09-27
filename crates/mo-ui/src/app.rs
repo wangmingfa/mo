@@ -208,6 +208,15 @@ pub(crate) enum Modal {
     Settings,
     /// 扩展管理器（列出已加载的扩展，可启停）。
     Extensions,
+    /// 「启用这个扩展」的确认卡（P2-6，devlog §6 的权限确认在声明层的形态）。
+    ///
+    /// 携带的是扩展 **id** 而不是第几行（§4.2「载荷带身份而不是下标」）：卡开着的那段时间里
+    /// `self.extensions` 仍会被刷新（重新打开面板、启停别的扩展），而按位置启用的是**刷新后
+    /// 那一行的邻居**。
+    ///
+    /// 扩展面板**保留在遮罩后面**（中央区仍按 `Modal::Extensions` 画），与
+    /// [`Modal::ConfirmTrash`] 同一套；Esc / 取消 / 点遮罩都回到面板。
+    ConfirmEnableExt(String),
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
     ConnectServer,
     /// 「服务器要求登录」——用户名 + 密码（星号）+ 记住密码。
@@ -3424,19 +3433,52 @@ impl RootView {
         cx.notify();
     }
 
-    /// 启停某个扩展（写回它自己的清单），随后刷新扩展列表。
-    fn toggle_extension(&mut self, i: usize, cx: &mut Context<Self>) {
-        let Some(id) = self.extensions.get(i).map(|e| e.manifest.id.clone()) else {
+    /// 选中某一行 = 展开它的贡献清单（翻状态是右侧那颗状态胶囊与 Enter 的事）。
+    fn select_extension(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.ext_index != i {
+            self.ext_index = i;
+            cx.notify();
+        }
+    }
+
+    /// 启停某个扩展。
+    ///
+    /// **停用立即生效**——关掉一个扩展是收缩边界，没什么要再问的。**启用先过确认卡**：
+    /// 清单里的命令与工作流跑的是外部程序，Mo 不检查它们的内容，所以「启用」等于把一批
+    /// 陌生的命令行放进界面（还要占侧栏、占键位、改「种类」列），得先让用户看清放的是
+    /// 什么再点头。devlog §6 那句「安装时一次性征求」在装了安装流程之前能做到的最接近
+    /// 的形态就是这里（缺口见 §4.10：手放进目录的清单缺省是启用的）。
+    fn toggle_extension(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(e) = self.extensions.iter().find(|x| x.manifest.id == id) else {
             return;
         };
-        let on = !self.extensions.get(i).is_some_and(|e| e.manifest.enabled);
-        if let Err(e) = self.app().set_extension_enabled(&id, on) {
-            self.modal = Modal::Info(format!("切换扩展「{id}」失败：{e}"));
+        let id = id.to_string();
+        if !e.manifest.enabled {
+            self.modal = Modal::ConfirmEnableExt(id);
             cx.notify();
+            return;
+        }
+        if let Err(err) = self.app().set_extension_enabled(&id, false) {
+            self.notice(format!("停用扩展「{id}」失败：{err}"), None, cx);
             return;
         }
         self.extensions = self.app().extensions();
         cx.notify();
+    }
+
+    /// 「扩展」页的展开区与启用确认卡上那一行行的贡献。
+    ///
+    /// 句子来自 [`mo_app::extensions::contributions`]，这里只做措辞——名字、落点、键位
+    /// 三处加工规则都已经有主（`display_name` / `slots()` / `has_chord()`），UI 再各走
+    /// 一遍就是两处作答，而这张表的用途是对用户说真话。
+    fn contribution_lines(&self, id: &str) -> Vec<String> {
+        let Some(e) = self.extensions.iter().find(|x| x.manifest.id == id) else {
+            return Vec::new();
+        };
+        mo_app::extensions::contributions(&e.manifest)
+            .iter()
+            .map(contribution_line)
+            .collect()
     }
 
     fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
@@ -3465,8 +3507,43 @@ impl RootView {
         for (i, e) in self.extensions.iter().enumerate() {
             let m = &e.manifest;
             let selected = i == self.ext_index;
+            // 元素 ID 用扩展 id，不用「第几行」：启停一个扩展、往目录里加/删一份清单都会
+            // 让位置号指到别的扩展上，而点胶囊这件事必须点对那一个扩展（与 P2-5 侧栏行
+            // 同一条理由，也是 §4.2「载荷带身份、不带可漂移的下标」）。选择器从 ID 派生，
+            // 两边不可能分叉。
+            let ext_id = m.id.clone();
+            let contributes = m.commands.len() + m.workflows.len() + m.types.len();
+            // 右侧那颗状态胶囊就是「启用 / 停用」的按钮。**点行本身不翻状态**：这一页
+            // 现在的第一用途是「看清楚这个扩展要往界面里放什么」，而鼠标用户唯一能选中
+            // 一行的动作如果顺手把扩展关了，那「想了解」就成了「有代价」。
+            let pill_id = format!("ext-toggle-{}", m.id);
+            let pill_ent = entity.clone();
+            let mut pill = div()
+                .id(pill_id.clone())
+                .debug_selector(move || format!("mo-{pill_id}"))
+                .flex()
+                .items_center()
+                .px(px(8.0))
+                .h(px(22.0))
+                .rounded(px(11.0))
+                .border_1()
+                .border_color(theme::separator())
+                .text_size(px(11.0))
+                .text_color(if selected {
+                    theme::selected_text()
+                } else {
+                    theme::muted()
+                });
+            let pill_click_id = m.id.clone();
+            pill.interactivity().on_click(move |_ev, _window, cx| {
+                // ⚠️ 必须止泡：外层那一行也有 on_click（选中），一起触发就是「点胶囊
+                // 之前先换了选中行」，看上去像点了别的那条。
+                cx.stop_propagation();
+                pill_ent.update(cx, |v, cx| v.toggle_extension(&pill_click_id, cx));
+            });
             let mut row = div()
-                .id(format!("ext-row-{i}"))
+                .id(format!("ext-row-{ext_id}"))
+                .debug_selector(move || format!("mo-ext-row-{ext_id}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3485,36 +3562,72 @@ impl RootView {
                     theme::text()
                 })
                 .child(text!(format!(
-                    "{}{}（{} 条命令）",
+                    "{}{}（{}）",
                     m.name,
                     if m.version.trim().is_empty() {
                         String::new()
                     } else {
                         format!(" {}", m.version)
                     },
-                    m.commands.len()
+                    if contributes == 0 {
+                        "不改动界面".to_string()
+                    } else {
+                        format!("贡献 {contributes} 项")
+                    }
                 )))
                 .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(if selected {
-                            theme::selected_text()
-                        } else {
-                            theme::muted()
-                        })
-                        .child(text!(if m.enabled { "已启用" } else { "已停用" })),
+                    pill.child(text!(if m.enabled { "已启用" } else { "已停用" }))
+                        .test_support(),
                 );
             let ent = entity.clone();
             row.interactivity().on_click(move |_ev, _window, cx| {
-                ent.update(cx, |v, cx| v.toggle_extension(i, cx));
+                ent.update(cx, |v, cx| v.select_extension(i, cx));
             });
-            body = body.child(row);
+            body = body.child(row.test_support());
+            if !selected {
+                continue;
+            }
+            // 选中那一行把「启用后界面上会多出什么」逐条摊开（P2-6）。确认卡上是
+            // **同一批句子**，所以「先在面板里看清楚、再在卡上点头」不是两段措辞。
+            for (k, line) in self
+                .contribution_lines(&e.manifest.id)
+                .into_iter()
+                .enumerate()
+            {
+                let elem = format!("ext-detail-{}-{k}", e.manifest.id);
+                body = body.child(
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .pl(px(16.0))
+                        .pr(px(6.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::muted())
+                        .child(text!(line)),
+                );
+            }
+            if !e.manifest.when_ext.is_empty() {
+                // `when_ext` 是清单级的开关，报出来免得用户对着一条「点了没出现」的命令猜。
+                let elem = format!("ext-detail-{}-when", e.manifest.id);
+                body = body.child(
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .pl(px(16.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::muted())
+                        .child(text!(format!(
+                            "只在选中这些扩展名时才给出它的命令：{}",
+                            e.manifest.when_ext.join(" / ")
+                        ))),
+                );
+            }
         }
         central_view(
             "扩展",
             "",
             body,
-            "↑↓ 选择 · Enter 启用 / 停用 · Esc 关闭 · 扩展=清单+外部程序，不往进程里塞代码",
+            "↑↓ 选择 · Enter 或点右侧那颗状态胶囊启用 / 停用（启用前会列出它贡献了什么）· Esc 关闭 · 扩展=清单+外部程序，不往进程里塞代码",
         )
     }
 
@@ -6832,7 +6945,8 @@ impl Render for RootView {
         //   由 `central_view` 提供标题栏（见 `dialogs.rs` / 各 `render_*`）。
         // 例外：`ConfirmTrash` 虽是 B 类浮层，但它是**从回收站面板里**弹出来的
         // 确认卡——中央区要渲染的是回收站面板（见下一档的 ConfirmTrash 分支），
-        // 而不是确认前的浏览区。
+        // 而不是确认前的浏览区。`ConfirmEnableExt` 是同一形状的第二例：确认卡浮在
+        // 扩展页上，取消之后人还在那一页（见下面与 Extensions 并档的那条分支）。
         let body: Div = match &self.modal {
             // 对话框（B 类）：走带遮罩的浮层，中央区照常渲染浏览区。
             Modal::None
@@ -6921,7 +7035,7 @@ impl Render for RootView {
             Modal::Diff => self.render_diff(),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
-            Modal::Extensions => self.render_extensions(&entity),
+            Modal::Extensions | Modal::ConfirmEnableExt(_) => self.render_extensions(&entity),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
@@ -7234,6 +7348,19 @@ impl Render for RootView {
             }
             Modal::ConfirmTrash(action) => {
                 root = root.child(render_trash_confirm(self, action, &entity));
+            }
+            // 「启用扩展」确认卡：扩展页保留在遮罩后面（中央区那档照旧按 Extensions 画）。
+            // 清单在这期间被别处改掉了（目录被删）就没有这张卡可画，什么都不挂。
+            Modal::ConfirmEnableExt(id) => {
+                if let Some(m) = self
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == *id)
+                    .map(|e| &e.manifest)
+                {
+                    let lines = self.contribution_lines(id);
+                    root = root.child(render_enable_confirm(m, &lines, &entity));
+                }
             }
             Modal::TrashRename(entry) => {
                 root = root.child(dialogs::trash_rename(self, entry, &entity));
@@ -8017,9 +8144,19 @@ fn handle_modal_key(
                 cx.notify();
             }),
             "enter" => entity.update(cx, |v, cx| {
-                let i = v.ext_index;
-                v.toggle_extension(i, cx);
+                // 光标位只是「当前那一行」，翻状态仍然按 id 找（与点胶囊同一个入口）。
+                let Some(id) = v.extensions.get(v.ext_index).map(|e| e.manifest.id.clone()) else {
+                    return;
+                };
+                v.toggle_extension(&id, cx);
             }),
+            _ => {}
+        },
+        // 确认卡上 Esc / Enter 与那两颗按钮同义（Esc = 取消，Enter = 启用）；这里**不**
+        // 复用扩展页那档的上下键——卡还开着就换选中行，等于确认的是别条扩展。
+        Modal::ConfirmEnableExt(_) => match key {
+            "escape" => dismiss_enable_confirm(entity, cx),
+            "enter" => confirm_enable_ext(entity, cx),
             _ => {}
         },
         Modal::Settings => {
@@ -10722,6 +10859,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_trash_confirm(entity, cx);
         return;
     }
+    // 「启用扩展」确认卡同理：点遮罩 = 不启用，回到扩展页。
+    if matches!(entity.read(cx).modal, Modal::ConfirmEnableExt(_)) {
+        dismiss_enable_confirm(entity, cx);
+        return;
+    }
     close_modal(entity, cx);
 }
 
@@ -10851,6 +10993,211 @@ fn render_trash_confirm(
                 ),
         );
     dialog_overlay(entity, "", "", body, "")
+}
+
+// ---------- 「启用扩展」确认卡（P2-6） ----------
+
+/// 一个落点在界面上的叫法。面板的展开区与确认卡共用这一句措辞，别处不再另写一份。
+fn slot_word(slot: mo_app::MenuSlot) -> &'static str {
+    match slot {
+        mo_app::MenuSlot::Palette => "命令面板",
+        mo_app::MenuSlot::ContextFile => "右键·条目",
+        mo_app::MenuSlot::ContextBlank => "右键·空白",
+        mo_app::MenuSlot::Sidebar => "侧栏",
+    }
+}
+
+/// 一条贡献 → 一句话（数据来自 `mo_app::extensions::contributions`，这里只管措辞）。
+fn contribution_line(c: &mo_app::extensions::Contribution) -> String {
+    use mo_app::extensions::Contribution as C;
+    let surfaces = |slots: &[mo_app::MenuSlot]| {
+        slots
+            .iter()
+            .copied()
+            .map(slot_word)
+            .collect::<Vec<&str>>()
+            .join(" + ")
+    };
+    let bound = |chord: &Option<String>| match chord {
+        Some(k) => format!("，绑键 {k}"),
+        None => String::new(),
+    };
+    match c {
+        C::Command {
+            label,
+            slots,
+            chord,
+            shell,
+        } => format!(
+            "命令「{label}」进 {}{}；跑：{shell}",
+            surfaces(slots),
+            bound(chord)
+        ),
+        C::Workflow {
+            label,
+            slots,
+            chord,
+            steps,
+        } => format!(
+            "工作流「{label}」进 {}{}；{} 步：{}",
+            surfaces(slots),
+            bound(chord),
+            steps.len(),
+            steps.join(" → ")
+        ),
+        C::TypeLabel { exts, label } => {
+            format!("类型：{} 在「种类」列显示为「{label}」", exts.join(" / "))
+        }
+    }
+}
+
+/// 「启用这个扩展」确认卡（`Modal::ConfirmEnableExt`）。
+///
+/// 与其它确认卡共用 [`dialog_overlay`] 外壳（遮罩 + 居中卡片 + 点空白 / Esc 关闭）。
+/// 与回收站那张的差别有两处，都表达的是语义而不是样式偏好：正文是**一行行的贡献清单**
+/// （用户要审的是内容，不是一句固定警告），按钮是主色而不是警示红（启用不是破坏性动作，
+/// 它是把一批陌生命令行放进界面——该看清，不该吓得点得快）。
+///
+/// 扩展页保留在遮罩后面，所以取消 / Esc / 点遮罩都走 [`dismiss_enable_confirm`]，
+/// **不能**走 [`close_modal`]（那会把整页关掉）。
+fn render_enable_confirm(
+    m: &mo_app::extensions::Manifest,
+    lines: &[String],
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
+    let cancel = entity.clone();
+    let ok = entity.clone();
+    let list = if lines.is_empty() {
+        vec!["（这个扩展没声明任何界面改动）".to_string()]
+    } else {
+        lines.to_vec()
+    };
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .child(text!(format!("启用扩展「{}」？", m.name))),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme::muted())
+                        .child(text!(
+                        "它的命令与工作流跑的是外部程序，Mo 不检查内容。启用后界面上会多出这些："
+                            .to_string()
+                    )),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .max_h(px(300.0))
+                .overflow_y_scrollbar()
+                // ⚠️ 每行一个元素 ID：这一批句子出自同一个 `text!` 站点，辅助功能一挂
+                // 上就要按 NodeId 找它们，撞号是 debug 构建里的原地 panic。
+                .children(list.into_iter().enumerate().map(|(k, line)| {
+                    let elem = format!("ext-enable-line-{k}");
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .text_size(px(12.0))
+                        .child(text!(line))
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .id("ext-enable-cancel")
+                        .debug_selector(|| "mo-ext-enable-cancel".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| dismiss_enable_confirm(&cancel, cx))
+                        .child(text!("取消"))
+                        // ⚠️ `.test_support()` 最后包：早包会让后面的事件挂到 Observed
+                        // 包装上，headless 的 click 通道点不中（本文件行渲染那条注释）。
+                        .test_support(),
+                )
+                .child(
+                    div()
+                        .id("ext-enable-ok")
+                        .debug_selector(|| "mo-ext-enable-ok".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(theme::selected_bg())
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| confirm_enable_ext(&ok, cx))
+                        .child(text!("启用"))
+                        .test_support(),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 确认卡上点了「启用」（或按 Enter）：写盘，然后回到扩展页。
+///
+/// id 从模态里**取出来**而不是回读 `ext_index`：确认期间列表可能已经变了（另一个标签页
+/// 改了配置、或用户就是点了别的行），按位置启用等于启用另一条（§4.2 那条纪律）。
+fn confirm_enable_ext(entity: &Entity<RootView>, cx: &mut App) {
+    let id = entity.update(cx, |v, _cx| {
+        match std::mem::replace(&mut v.modal, Modal::Extensions) {
+            Modal::ConfirmEnableExt(id) => Some(id),
+            other => {
+                // 不在确认卡上（重复触发）：原样放回，什么都不做。
+                v.modal = other;
+                None
+            }
+        }
+    });
+    let Some(id) = id else { return };
+    let app = entity.read(cx).app();
+    if let Err(err) = app.set_extension_enabled(&id, true) {
+        entity.update(cx, |v, cx| {
+            v.notice(format!("启用扩展「{id}」失败：{err}"), None, cx);
+        });
+        return;
+    }
+    entity.update(cx, |v, cx| {
+        v.extensions = v.app().extensions();
+        v.modal = Modal::Extensions;
+        cx.notify();
+    });
+}
+
+/// 取消：回到扩展页（**不是** `close_modal`——那会把整页关掉）。
+fn dismiss_enable_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if matches!(v.modal, Modal::ConfirmEnableExt(_)) {
+            v.modal = Modal::Extensions;
+            cx.notify();
+        }
+    });
 }
 
 // ---------- diff 模态辅助 ----------
@@ -11092,8 +11439,9 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, filtered_apps, located_row, type_ahead_repeats_one_char, ConnectAuthState,
-        Modal, OperationHandle, RootView, SettingsTab,
+        box_row_range, contribution_line, filtered_apps, located_row, slot_word,
+        type_ahead_repeats_one_char, ConnectAuthState, Modal, OperationHandle, RootView,
+        SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -12904,6 +13252,353 @@ mod tests {
             ),
         }
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 三类贡献各一句话的**措辞**（P2-6 的展开区与确认卡共用同一批句子）。
+    ///
+    /// 判据（什么算一条贡献、落点从哪来、名字带不带扩展前缀）在
+    /// `mo_app::extensions::contributions` 的单测里，这一条只钉「说清了没有」：
+    /// **跑的是哪条命令行必须写在句子中**——用户在这张卡上要审的就是「它会把什么交给
+    /// shell」，句子只剩「有条命令」就等于没问过。顺带钉住没绑键时不留逗号尾巴。
+    #[test]
+    fn contribution_lines_name_the_surface_and_the_command_line() {
+        use mo_app::extensions::Contribution as C;
+        assert_eq!(
+            contribution_line(&C::Command {
+                label: "字幕工具 · 统计字数".into(),
+                slots: vec![mo_app::MenuSlot::Sidebar, mo_app::MenuSlot::ContextFile],
+                chord: Some("cmd+alt+j".into()),
+                shell: "wc -w {file}".into(),
+            }),
+            "命令「字幕工具 · 统计字数」进 侧栏 + 右键·条目，绑键 cmd+alt+j；跑：wc -w {file}"
+        );
+        assert_eq!(
+            contribution_line(&C::Command {
+                label: "x · y".into(),
+                slots: vec![mo_app::MenuSlot::Palette],
+                chord: None,
+                shell: "echo hi".into(),
+            }),
+            "命令「x · y」进 命令面板；跑：echo hi",
+            "没绑键的那条不该留下「，绑键 ；」这种半句话"
+        );
+        assert_eq!(
+            contribution_line(&C::Workflow {
+                label: "打包".into(),
+                slots: vec![mo_app::MenuSlot::Palette],
+                chord: None,
+                steps: vec!["ffmpeg -i a".into(), "zip out.zip".into()],
+            }),
+            "工作流「打包」进 命令面板；2 步：ffmpeg -i a → zip out.zip"
+        );
+        assert_eq!(
+            contribution_line(&C::TypeLabel {
+                exts: vec![".srt".into(), ".vtt".into()],
+                label: "字幕".into(),
+            }),
+            "类型：.srt / .vtt 在「种类」列显示为「字幕」"
+        );
+        // 四个落点四个名字：这句话是拿去对照界面的，名字对不上界面就还是没说。
+        assert_eq!(slot_word(mo_app::MenuSlot::ContextBlank), "右键·空白");
+    }
+
+    /// 扩展管理器：选中一行 → 看到它贡献了什么 → 点那颗胶囊才弹确认卡 → 不点头盘上不动
+    /// → 点了「启用」才写盘（P2-6 的全链路）。
+    ///
+    /// 这条守的是**顺序**，不是措辞：`contributions()` 说什么由 mo-app 的单测钉，
+    /// 「启用前必须先看」和「看的时候不许顺手改状态」只有走真实渲染帧 + 真实点击才测得出来。
+    /// 两段变异体各红一头：「点行即翻状态」（第一段红——选中那一步就把盘写了）与
+    /// 「启用直接写盘、不弹卡」（第二段红）。
+    ///
+    /// ⚠️ 选择器全部从**扩展 id** 派生（`mo-ext-row-p26manager`），不是「面板第几行」：
+    /// fixture 种进 `isolate_user_dirs_for_tests()` 那份**共享**隔离目录，同 pid 里别的测试
+    /// 种的扩展会把位置号挪走。
+    ///
+    /// 盘上的状态用**扫字符串**判断（mo-ui 不依赖 serde_json，`set_extension_enabled` 写回
+    /// 用的是 `to_string_pretty`，`"enabled": false` 那一行就在文件里）。
+    #[test]
+    fn enabling_an_extension_requires_reading_its_contributions_first() {
+        let dir = crate::isolate_user_dirs_for_tests()
+            .join("extensions")
+            .join("p26manager");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p26manager",
+  "name": "字幕工具P26",
+  "version": "1.0",
+  "enabled": false,
+  "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "menu": ["sidebar"] }],
+  "types": [{ "ext": [".srt"], "label": "字幕" }]
+}"#,
+        )
+        .unwrap();
+        let disk_says = |on: bool| {
+            let text = std::fs::read_to_string(dir.join("manifest.json")).expect("清单在盘上");
+            let (want, other) = if on {
+                ("\"enabled\": true", "\"enabled\": false")
+            } else {
+                ("\"enabled\": false", "\"enabled\": true")
+            };
+            assert!(
+                !text.contains(other),
+                "清单里同时出现两种 enabled 写法，这条测试的判据就失效了：{text}"
+            );
+            text.contains(want)
+        };
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        assert_eq!(modal_of(cx), Modal::None, "起点：没有模态挡着");
+        assert!(
+            disk_says(false),
+            "起点：fixture 自己是停用状态（否则这条测的是停用路径）"
+        );
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        assert!(matches!(modal_of(cx), Modal::Extensions), "扩展页应当打开");
+        cx.debug_bounds("mo-ext-row-p26manager")
+            .expect("清单在盘上，扩展页那一行却没渲染（选择器 mo-ext-row-p26manager）");
+
+        // ① 点行 = 选中并展开贡献，**不改状态**。
+        cx.update(|window, cx| window.click("ext-row-p26manager", cx));
+        cx.run_until_parked();
+        cx.debug_bounds("mo-ext-detail-p26manager-0")
+            .expect("选中那一行没展开出贡献（命令那条，选择器 mo-ext-detail-p26manager-0）");
+        cx.debug_bounds("mo-ext-detail-p26manager-1")
+            .expect("选中那一行没展开出贡献（类型那条，选择器 mo-ext-detail-p26manager-1）");
+        assert!(
+            disk_says(false),
+            "只是想看一眼，盘上不该被改成启用——想看就得有代价的话没人敢点"
+        );
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "点行不该离开扩展页：{:?}",
+            modal_of(cx)
+        );
+        let lines =
+            cx.update(|_w, cx| root.update(cx, |v, _cx| v.contribution_lines("p26manager")));
+        let all = lines.join("\n");
+        for want in [
+            "字幕工具P26 · 统计字数",
+            "wc -w {file}",
+            "侧栏",
+            ".srt",
+            "字幕",
+        ] {
+            assert!(
+                all.contains(want),
+                "贡献清单里没说出「{want}」，这张卡就还没让用户审到那一样：{all}"
+            );
+        }
+
+        // ② 点那颗胶囊 → 弹确认卡；卡开着 = 还没点头，盘上仍然不动。
+        cx.update(|window, cx| window.click("ext-toggle-p26manager", cx));
+        cx.run_until_parked();
+        match modal_of(cx) {
+            Modal::ConfirmEnableExt(id) => assert_eq!(
+                id.as_str(),
+                "p26manager",
+                "卡上确认的必须是刚点的那一个扩展（按位置认人就会确认错家）"
+            ),
+            other => {
+                panic!("点停用中扩展那颗胶囊应当弹确认卡，实际 modal = {other:?}（启用没经过确认）")
+            }
+        }
+        cx.debug_bounds("mo-ext-enable-ok")
+            .expect("确认卡的「启用」按钮没渲染（选择器 mo-ext-enable-ok）");
+        cx.debug_bounds("mo-ext-enable-line-0")
+            .expect("确认卡没把贡献清单摊开（选择器 mo-ext-enable-line-0）");
+        // 卡上的行数 = 展开区读到的条数。headless 里读不出**句子的字面**（gpui 测试没有
+        // 文本快照，见本文件多条注释），所以这里钉的是「一条不许少、一条不许多」：
+        // 少一条 = 卡只让用户审一半；多一条 = 卡上混进了没审过的东西。
+        // ⚠️ `debug_bounds` 要 `&'static str`，行号只能写死——所以先钉住 fixture 是两条。
+        assert_eq!(
+            lines.len(),
+            2,
+            "前置条件：这份 fixture 贡献两条（命令 + 类型），下面的行号断言以此为前提：{all}"
+        );
+        cx.debug_bounds("mo-ext-enable-line-1")
+            .expect("卡上只摊了一条，展开区明明有两条（选择器 mo-ext-enable-line-1）");
+        assert!(
+            cx.debug_bounds("mo-ext-enable-line-2").is_none(),
+            "卡上多出了一条展开区没有的行文"
+        );
+        assert!(
+            disk_says(false),
+            "确认卡弹出来了，但盘上已经写了启用：那这张卡只是通知，不是征求"
+        );
+
+        // ③ Esc = 取消，回到扩展页（不是关掉整页），一个字都不写。
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "Esc 应当回到扩展页，而不是把整页关掉：{:?}",
+            modal_of(cx)
+        );
+        assert!(disk_says(false), "取消 = 不写盘");
+
+        // ④ 再点一次、这回真启用：只有这一步动盘。
+        cx.update(|window, cx| window.click("ext-toggle-p26manager", cx));
+        cx.run_until_parked();
+        assert!(
+            matches!(modal_of(cx), Modal::ConfirmEnableExt(_)),
+            "第二次点胶囊应当还是弹卡"
+        );
+        cx.update(|window, cx| window.click("ext-enable-ok", cx));
+        cx.run_until_parked();
+        let enabled = disk_says(true);
+        let cleaned = std::fs::remove_dir_all(&dir);
+
+        assert!(enabled, "点了「启用」才该写盘");
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "启用后回到扩展页接着看，而不是把面板关掉：{:?}",
+            modal_of(cx)
+        );
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 卡上确认的是**它点名的那一个**扩展，不是「当前选中的那一行」（§4.2）；顺带钉住
+    /// 「点那颗胶囊不会先换选中行」（止泡）与「停用不需要确认、立即生效」。
+    ///
+    /// 只有一份清单时「按 id」与「按位置」是同一件事，任何按位置的实现都能通过上一条测试
+    /// ——所以这里种**两份**，并且把「选中」与「点胶囊」分开：选中 B，再去点 A 那颗胶囊。
+    /// 三个变异体分别只红在一处：
+    /// * `confirm_enable_ext` 把模态带的 id 换成 `extensions[ext_index]` → 第 ③ 段红（启用了
+    ///   用户没点的那一家，而盘面上看着「一切正常」）；
+    /// * 胶囊那颗按钮漏了 `stop_propagation` → 第 ② 段红（选中行先被换掉）；
+    /// * 停用也弹卡 → 第 ④ 段红。
+    #[test]
+    fn the_enable_card_confirms_the_extension_it_names() {
+        let root_dir = crate::isolate_user_dirs_for_tests().join("extensions");
+        let dir_a = root_dir.join("p26a");
+        let dir_b = root_dir.join("p26b");
+        for d in [&dir_a, &dir_b] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let plant = |dir: &std::path::Path, id: &str| {
+            std::fs::write(
+                dir.join("manifest.json"),
+                format!(
+                    r#"{{
+  "id": "{id}",
+  "name": "字幕工具{id}",
+  "version": "1.0",
+  "enabled": false,
+  "commands": [{{ "name": "统计字数", "shell": "wc -w {{file}}" }}]
+}}"#
+                ),
+            )
+            .unwrap();
+        };
+        plant(&dir_a, "p26a");
+        plant(&dir_b, "p26b");
+        let disk_says = |dir: &std::path::Path, on: bool| {
+            let text = std::fs::read_to_string(dir.join("manifest.json")).expect("清单在盘上");
+            text.contains(if on {
+                "\"enabled\": true"
+            } else {
+                "\"enabled\": false"
+            })
+        };
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        // 光标当前指向哪一家（按位置取——正是那条纪律要防的读法，用它当**反证**）。
+        let selected_id = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_w, cx| {
+                root.update(cx, |v, _cx| {
+                    v.extensions.get(v.ext_index).map(|e| e.manifest.id.clone())
+                })
+            })
+        };
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        assert!(
+            disk_says(&dir_a, false) && disk_says(&dir_b, false),
+            "起点：两份清单都是停用（否则后面对「改了什么」的断言没有意义）"
+        );
+
+        // ① 选中 B。
+        cx.update(|window, cx| window.click("ext-row-p26b", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            selected_id(cx).as_deref(),
+            Some("p26b"),
+            "前置条件：点行选中的是那一家"
+        );
+
+        // ② 再点 A 那颗胶囊：弹的是 A 的卡，选中行不许被顺带换掉。
+        cx.update(|window, cx| window.click("ext-toggle-p26a", cx));
+        cx.run_until_parked();
+        match modal_of(cx) {
+            Modal::ConfirmEnableExt(id) => {
+                assert_eq!(id.as_str(), "p26a", "卡应当是关于刚点的那一家");
+            }
+            other => panic!("点停用中扩展那颗胶囊应当弹确认卡，实际 modal = {other:?}"),
+        }
+        assert_eq!(
+            selected_id(cx).as_deref(),
+            Some("p26b"),
+            "点胶囊之前先把选中行换掉，等于让「确认」和「光标」各指一家"
+        );
+
+        // ③ 点头：只有 A 上盘，B 一个字都没动。
+        cx.update(|window, cx| window.click("ext-enable-ok", cx));
+        cx.run_until_parked();
+        let a_on = disk_says(&dir_a, true);
+        let b_still = disk_says(&dir_b, false);
+        assert!(a_on, "卡上写的是 A，点了「启用」就该启用 A");
+        assert!(
+            b_still,
+            "B 只是被选中着，没人点过它的「启用」——按位置确认就会踩到这里"
+        );
+
+        // ④ 停用不弹卡：收缩边界没什么要再问的。
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "启用后回到扩展页：{:?}",
+            modal_of(cx)
+        );
+        cx.update(|window, cx| window.click("ext-toggle-p26a", cx));
+        cx.run_until_parked();
+        let a_off = disk_says(&dir_a, false);
+        let b_off = disk_says(&dir_b, false);
+        let cleaned = std::fs::remove_dir_all(&dir_a);
+        let cleaned_b = std::fs::remove_dir_all(&dir_b);
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "停用是收缩边界，不该再要一次确认：{:?}",
+            modal_of(cx)
+        );
+        assert!(a_off, "停用当场写盘");
+        assert!(
+            b_off,
+            "停用 A 不该顺手改 B 的清单（按位置翻状态就会踩到这里）"
+        );
+        assert!(
+            cleaned.is_ok() && cleaned_b.is_ok(),
+            "清理 fixture 失败：{cleaned:?} {cleaned_b:?}"
+        );
     }
 
     /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。

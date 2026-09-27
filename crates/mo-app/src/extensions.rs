@@ -294,7 +294,7 @@ pub fn flatten(exts: &[Extension], selected_exts: &[String]) -> Vec<UserCommand>
                 }
             }
             let mut c = c.clone();
-            c.name = format!("{} · {}", m.name, c.name);
+            c.name = display_name(&m.name, &c.name);
             if c.category.trim().is_empty() {
                 c.category = m.name.clone();
             }
@@ -302,6 +302,88 @@ pub fn flatten(exts: &[Extension], selected_exts: &[String]) -> Vec<UserCommand>
             out.push(c);
         }
     }
+    out
+}
+
+/// 摊平后的展示名：`扩展名 · 命令名`。**唯一一份拼接**。
+///
+/// 界面上有好几处要报出这个名字：命令面板、右键菜单、侧栏行 ID（P2-5）、扩展管理器的
+/// 贡献清单与启用确认卡（P2-6）。各处各拼一次的话，「清单里写的」与「界面上显示的」
+/// 迟早分叉，而分叉的代价是用户按确认卡找不过来。
+pub fn display_name(ext: &str, cmd: &str) -> String {
+    format!("{ext} · {cmd}")
+}
+
+/// 一个扩展「启用之后会改动界面上的什么」，一条一句。给扩展管理器的展开区与
+/// 启用确认卡用（devlog §6 的「权限确认」在声明层的具体形态）。
+///
+/// 为什么不让 UI 直接遍历清单：这几句答案各有一处**已经定下来**的加工规则——命令名要
+/// 摊平（[`display_name`]）、落点要过 [`mo_config`] 的宽容解析（`slots()`）、组合键要判
+/// 「空白串不算绑定」（`has_chord()`）。UI 再走一遍就是两处作答，而这张表的用途恰恰是
+/// **对用户说真话**：说错一句比不说更糟。
+///
+/// ⚠️ 里面**没有** §6 草案那个 `capabilities` 字段：它在本轮没有强制判据（声明层没有
+/// 任何一处按它放行或拦下），按 §4.7「收一个字段就投一个字段」的规矩，不收「解析了却
+/// 没人读」的东西。这里列的是清单**实际能改的东西**，不是作者自报的意向。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Contribution {
+    /// 一条命令：界面上的名字、出现在哪些界面、绑的键（写了才算）、它要跑的命令行。
+    Command {
+        label: String,
+        slots: Vec<mo_config::MenuSlot>,
+        chord: Option<String>,
+        shell: String,
+    },
+    /// 一个工作流：语义同 [`Self::Command`]，但「要跑什么」是一串步骤。名字**不带**扩展
+    /// 前缀——与 `AppState::workflows` 的现状一致（不对称记在 devlog §4.10 的缺口里，
+    /// 这张表跟着界面走，不跟着草案走；界面说什么是什么是）。
+    Workflow {
+        label: String,
+        slots: Vec<mo_config::MenuSlot>,
+        chord: Option<String>,
+        steps: Vec<String>,
+    },
+    /// 一条类型知识：这些扩展名在「种类」列上会被改叫什么（P2-3 那条投递）。
+    TypeLabel { exts: Vec<String>, label: String },
+}
+
+/// 把一份清单摊成「它会改动界面上的哪些地方」。
+///
+/// 顺序恒为 命令 → 工作流 → 类型标签（与命令面板里那批贡献项同一口径：命令在前）。
+/// 不看 `enabled`：停用中的扩展也要能预览「启用后会发生什么」——这正是确认卡的用法。
+pub fn contributions(m: &Manifest) -> Vec<Contribution> {
+    let mut out: Vec<Contribution> = m
+        .commands
+        .iter()
+        .map(|c| Contribution::Command {
+            label: display_name(&m.name, &c.name),
+            slots: c.slots(),
+            chord: c.has_chord().then(|| c.key.trim().to_string()),
+            shell: c.shell.clone(),
+        })
+        .collect();
+    out.extend(m.workflows.iter().map(|w| Contribution::Workflow {
+        label: w.name.clone(),
+        slots: w.slots(),
+        chord: w.has_chord().then(|| w.key.trim().to_string()),
+        steps: w.steps.clone(),
+    }));
+    out.extend(m.types.iter().filter_map(|t| {
+        // 报的是**实际会命中的**那串扩展名（小写、含点），与 `type_labels` 查表的键同一
+        // 判据；清单里写成 `.SRT` 也报成 `.srt`，免得确认卡上出现一条永远不会命中的名字。
+        let exts: Vec<String> = t
+            .ext
+            .iter()
+            .filter_map(|raw| norm_ext(raw).map(|e| format!(".{e}")))
+            .collect();
+        if exts.is_empty() {
+            return None;
+        }
+        Some(Contribution::TypeLabel {
+            exts,
+            label: t.label.clone(),
+        })
+    }));
     out
 }
 
@@ -578,6 +660,71 @@ mod tests {
                 mo_config::MenuSlot::ContextFile
             ]
         );
+    }
+
+    /// 「这个扩展启用后会改动界面上的什么」——启用确认卡要说的那几句全在这一条里。
+    ///
+    /// 名字必须与 [`flatten`] 给的一致（两处各拼一次迟早分叉，而这张表的用途是**对用户
+    /// 说真话**，说错一句比不说更糟）；落点跟着 `menu` 的宽容解析走；类型标签报成
+    /// **实际会命中的**那串扩展名（`.SRT` → `.srt`，否则确认卡上会出现一条永远不会
+    /// 命中的名字）。
+    #[test]
+    fn contributions_answer_what_the_manifest_will_change() {
+        let mut m = manifest("a");
+        m.commands[0].menu = vec!["sidebar".to_string(), "context:file".to_string()];
+        m.commands[0].key = "cmd+shift+w".into();
+        m.workflows.push(mo_config::Workflow {
+            name: "打包".into(),
+            steps: vec!["tar -czf a.tgz {file}".into(), "echo done".into()],
+            source: None,
+            menu: vec!["palette".to_string()],
+            // 一串空白 = 没绑键（判据在 `Workflow::has_chord`，这里跟着走）。
+            key: "   ".into(),
+        });
+        m.types.push(TypeRule {
+            ext: vec![".SRT".into(), "vtt".into()],
+            label: "字幕".into(),
+        });
+        assert_eq!(
+            contributions(&m),
+            vec![
+                Contribution::Command {
+                    label: "测试扩展 · 统计".into(),
+                    slots: vec![
+                        mo_config::MenuSlot::Sidebar,
+                        mo_config::MenuSlot::ContextFile
+                    ],
+                    chord: Some("cmd+shift+w".into()),
+                    shell: "wc -l {file}".into(),
+                },
+                Contribution::Workflow {
+                    label: "打包".into(),
+                    slots: vec![mo_config::MenuSlot::Palette],
+                    chord: None,
+                    steps: vec!["tar -czf a.tgz {file}".into(), "echo done".into()],
+                },
+                Contribution::TypeLabel {
+                    exts: vec![".srt".into(), ".vtt".into()],
+                    label: "字幕".into(),
+                },
+            ],
+            "顺序恒为命令 → 工作流 → 类型标签，名字与落点都跟着界面那套走"
+        );
+        // 确认卡上写的名字就是列表里出现的那个（同一个拼接函数，不是两份字面量）。
+        let flat = flatten(
+            &[Extension {
+                manifest: m.clone(),
+                path: PathBuf::from("/x/a/manifest.json"),
+            }],
+            &[],
+        );
+        let Contribution::Command { label, .. } = &contributions(&m)[0] else {
+            panic!("第一条应当是命令");
+        };
+        assert_eq!(*label, flat[0].name);
+        // 停用中的扩展照列——确认卡问的正是「启用它会发生什么」。
+        m.enabled = false;
+        assert_eq!(contributions(&m).len(), 3, "不看 enabled：停用的也要能预览");
     }
 
     /// 绑了快捷键、却又被 `when_ext` 约束的命令 → 整条清单不加载。
