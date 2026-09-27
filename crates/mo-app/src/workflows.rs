@@ -31,7 +31,9 @@ pub fn validate(w: &Workflow) -> Option<String> {
     if w.steps.iter().any(|s| s.trim().is_empty()) {
         return Some(format!("工作流「{}」有空步骤", w.name));
     }
-    None
+    // 界面声明与命令同一套校验（见 `usercmds::validate`）：认不出就整条丢掉，
+    // 不静默降级成「只出现在命令面板」——那等于用户写的东西没生效还没声音。
+    mo_config::slot_error("工作流", &w.name, &w.menu)
 }
 
 /// 一步的执行结果。
@@ -168,47 +170,42 @@ mod tests {
         d
     }
 
+    fn wf(name: &str, steps: &[&str]) -> Workflow {
+        Workflow {
+            name: name.into(),
+            steps: steps.iter().map(|s| s.to_string()).collect(),
+            source: None,
+            menu: Vec::new(),
+        }
+    }
+
     /// 校验：空名 / 零步骤 / 空步骤都要被拒。
     #[test]
     fn validates_workflows() {
-        assert!(validate(&Workflow {
-            name: "".into(),
-            steps: vec!["x".into()],
-            source: None
-        })
-        .is_some());
-        assert!(validate(&Workflow {
-            name: "n".into(),
-            steps: vec![],
-            source: None
-        })
-        .is_some());
-        assert!(
-            validate(&Workflow {
-                name: "n".into(),
-                steps: vec!["ok".into(), " ".into()],
-                source: None
-            })
-            .is_some(),
-            "空步骤应被拒"
-        );
-        assert!(validate(&Workflow {
-            name: "n".into(),
-            steps: vec!["ok".into()],
-            source: None
-        })
-        .is_none());
+        assert!(validate(&wf("", &["x"])).is_some());
+        assert!(validate(&wf("n", &[])).is_some());
+        assert!(validate(&wf("n", &["ok", " "])).is_some(), "空步骤应被拒");
+        assert!(validate(&wf("n", &["ok"])).is_none());
+    }
+
+    /// 界面声明写错了整条丢掉（与命令同一套判据）：静默降级成「只进命令面板」
+    /// 等于用户写了 `context:flle` 之后什么都没发生、也没人说明。
+    #[test]
+    fn rejects_unknown_menu_slots() {
+        let mut w = wf("n", &["ok"]);
+        w.menu = vec!["palette".into(), "context:file".into()];
+        assert!(validate(&w).is_none(), "两种写法之外的合法名不该被拒");
+        w.menu = vec!["context-flle".into()];
+        let err = validate(&w).expect("认不出的界面名应被拒");
+        assert!(err.contains("context-flle"), "{err}");
+        assert!(err.contains("context:file"), "{err} 该列出可用的写法");
     }
 
     /// 多步顺序执行，全部成功。
     #[test]
     fn runs_steps_in_order() {
         let dir = tmp("ok");
-        let w = Workflow {
-            name: "两步".into(),
-            steps: vec!["echo one".into(), "echo two".into()],
-            source: None,
-        };
+        let w = wf("两步", &["echo one", "echo two"]);
         let ctx = CommandContext {
             dir: Some(dir.clone()),
             selected: vec![],
@@ -227,11 +224,7 @@ mod tests {
         let dir = tmp("fail");
         let marker = dir.join("third-ran");
         let third = format!("echo x > \"{}\"", marker.display());
-        let w = Workflow {
-            name: "会失败".into(),
-            steps: vec!["echo a".into(), "exit 3".into(), third],
-            source: None,
-        };
+        let w = wf("会失败", &["echo a", "exit 3", &third]);
         let ctx = CommandContext {
             dir: Some(dir.clone()),
             selected: vec![],
@@ -248,11 +241,7 @@ mod tests {
     #[test]
     fn blocked_without_selection() {
         let dir = tmp("blocked");
-        let w = Workflow {
-            name: "要选中".into(),
-            steps: vec!["wc -l {file}".into()],
-            source: None,
-        };
+        let w = wf("要选中", &["wc -l {file}"]);
         let ctx = CommandContext {
             dir: Some(dir.clone()),
             selected: vec![],
@@ -267,11 +256,7 @@ mod tests {
     #[test]
     fn honours_cancel() {
         let dir = tmp("cancel");
-        let w = Workflow {
-            name: "取消".into(),
-            steps: vec!["echo a".into()],
-            source: None,
-        };
+        let w = wf("取消", &["echo a"]);
         let ctx = CommandContext {
             dir: Some(dir.clone()),
             selected: vec![],
@@ -288,11 +273,7 @@ mod tests {
         let dir = tmp("lines");
         let f = dir.join("a.txt");
         fs::write(&f, "hi").unwrap();
-        let w = Workflow {
-            name: "带占位符".into(),
-            steps: vec!["echo {file} && pwd".into()],
-            source: None,
-        };
+        let w = wf("带占位符", &["echo {file} && pwd"]);
         let ctx = CommandContext {
             dir: Some(dir.clone()),
             selected: vec![f.clone()],
@@ -313,24 +294,11 @@ mod tests {
     /// 一批里坏的被丢掉，好的留下。
     #[test]
     fn sanitize_drops_bad_ones() {
-        let list = vec![
-            Workflow {
-                name: "好".into(),
-                steps: vec!["echo a".into()],
-                source: None,
-            },
-            Workflow {
-                name: "".into(),
-                steps: vec!["echo b".into()],
-                source: None,
-            },
-            Workflow {
-                name: "空".into(),
-                steps: vec![],
-                source: None,
-            },
-        ];
-        let kept = sanitize(list);
+        let kept = sanitize(vec![
+            wf("好", &["echo a"]),
+            wf("", &["echo b"]),
+            wf("空", &[]),
+        ]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].name, "好");
     }

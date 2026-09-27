@@ -116,7 +116,9 @@ pub fn validate(cmd: &UserCommand) -> Option<String> {
     if cmd.shell.trim().is_empty() {
         return Some(format!("命令「{}」缺少 shell", cmd.name));
     }
-    None
+    // 界面声明（P2 的 `menu` 字段）：认不出的槽位名整条不加载。宁可少一条命令，
+    // 也不要「用户写了 context:flle，结果什么都没发生」——后者没人会去查。
+    mo_config::slot_error("命令", &cmd.name, &cmd.menu)
 }
 
 /// 从 `dir` 加载命令清单（`*.json`，每个文件是单个对象或对象数组）。
@@ -206,6 +208,7 @@ pub fn run(shell_line: &str, cwd: Option<&Path>) -> Result<CommandOutput, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mo_config::MenuSlot;
 
     fn ctx(dir: &str, sel: &[&str]) -> CommandContext {
         CommandContext {
@@ -256,30 +259,35 @@ mod tests {
         assert_eq!(expand("echo {", &c).0, "echo {");
     }
 
+    fn uc(name: &str, shell: &str) -> UserCommand {
+        UserCommand {
+            name: name.into(),
+            category: String::new(),
+            shell: shell.into(),
+            source: None,
+            menu: Vec::new(),
+        }
+    }
+
     /// 校验：空名 / 空命令都要被拒。
     #[test]
     fn validates_definitions() {
-        assert!(validate(&UserCommand {
-            name: " ".into(),
-            category: String::new(),
-            shell: "x".into(),
-            source: None
-        })
-        .is_some());
-        assert!(validate(&UserCommand {
-            name: "n".into(),
-            category: String::new(),
-            shell: "".into(),
-            source: None
-        })
-        .is_some());
-        assert!(validate(&UserCommand {
-            name: "n".into(),
-            category: String::new(),
-            shell: "x".into(),
-            source: None
-        })
-        .is_none());
+        assert!(validate(&uc(" ", "x")).is_some());
+        assert!(validate(&uc("n", "")).is_some());
+        assert!(validate(&uc("n", "x")).is_none());
+    }
+
+    /// 界面声明写错 → 整条不加载，并把认不出的那个名字和可用的写法一起报出来。
+    /// 静默丢掉这一项的话，用户看到的就只有「我写了菜单，菜单里没有」。
+    #[test]
+    fn rejects_unknown_menu_slots() {
+        let mut c = uc("n", "x");
+        c.menu = vec!["context:file".into(), "context-blank".into()];
+        assert!(validate(&c).is_none(), "冒号与连字符两种写法都收");
+        c.menu = vec!["context-flle".into()];
+        let err = validate(&c).expect("认不出的界面名应被拒");
+        assert!(err.contains("context-flle"), "{err}");
+        assert!(err.contains("palette"), "{err} 该列出可用的写法");
     }
 
     /// 清单加载：数组与单对象都收，坏 JSON / 缺字段的条目跳过但不影响其它。
@@ -289,7 +297,9 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(
             dir.join("a.json"),
-            r#"[{"name":"计数","shell":"wc -l {file}"},{"name":"","shell":"x"}]"#,
+            r#"[{"name":"计数","shell":"wc -l {file}"},{"name":"","shell":"x"},
+                {"name":"进菜单","shell":"pwd","menu":["context:file"]},
+                {"name":"写错了","shell":"pwd","menu":["palett"]}]"#,
         )
         .unwrap();
         std::fs::write(dir.join("b.json"), r#"{"name":"单条","shell":"pwd"}"#).unwrap();
@@ -300,11 +310,15 @@ mod tests {
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["计数", "单条"],
+            vec!["计数", "进菜单", "单条"],
             "坏条目 / 坏文件应被跳过：{names:?}"
         );
         assert_eq!(cmds[0].category, "扩展", "缺省分组应补上");
         assert!(cmds[0].source.is_some());
+        // 没写 menu 的落回「只进面板」；写了 `menu` 的那条按声明投递；
+        // `menu` 里有错字的整条丢掉（见 `rejects_unknown_menu_slots`）。
+        assert_eq!(cmds[0].slots(), vec![MenuSlot::Palette]);
+        assert_eq!(cmds[1].slots(), vec![MenuSlot::ContextFile]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -209,6 +209,7 @@ mod tests {
                 category: String::new(),
                 shell: "wc -l {file}".into(),
                 source: None,
+                menu: Vec::new(),
             }],
             when_ext: Vec::new(),
             workflows: Vec::new(),
@@ -243,6 +244,44 @@ mod tests {
         let mut m2 = manifest("a");
         m2.commands[0].shell = String::new();
         assert!(validate(&m2, Some("a")).is_some(), "空 shell 应被拒");
+    }
+
+    /// 界面声明写错 → 整个扩展被跳过（走的是命令级校验那条现成的路）。
+    /// 判据与 `loads` 里其它坏清单一致：宁可这个扩展不出现，也不要一条「写了菜单
+    /// 却没菜单」的命令留在列表里让人猜。
+    #[test]
+    fn rejects_unknown_menu_slot() {
+        let mut m = manifest("a");
+        assert!(validate(&m, Some("a")).is_none());
+        m.commands[0].menu = vec!["context:flle".into()];
+        let err = validate(&m, Some("a")).expect("认不出的界面名应被拒");
+        assert!(err.contains("context:flle"), "{err}");
+    }
+
+    /// 摊平只改展示名 / 分类 / 来源，**不能**把投递声明弄丢——菜单里看不看得见
+    /// 全靠它一路传到 `mo_ui::actions` 的那张注册表。
+    #[test]
+    fn menu_declaration_survives_flattening() {
+        let mut m = manifest("a");
+        m.commands[0].menu = vec!["palette".into(), "context-file".into()];
+        let cmds = flatten(
+            &[Extension {
+                manifest: m,
+                path: PathBuf::from("/x/a/manifest.json"),
+            }],
+            &[],
+        );
+        assert_eq!(
+            cmds[0].menu,
+            vec!["palette".to_string(), "context-file".to_string()]
+        );
+        assert_eq!(
+            cmds[0].slots(),
+            vec![
+                mo_config::MenuSlot::Palette,
+                mo_config::MenuSlot::ContextFile
+            ]
+        );
     }
 
     /// 摊平：加前缀、补分类、记来源。

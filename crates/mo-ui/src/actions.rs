@@ -16,6 +16,9 @@
 //! 于是必然出现「面板里有、菜单里没有」这种没人解释得了的差异（与
 //! [devlog/engine-testing.md §7](engine-testing) 那三份扩展名表同一个病）。
 //! 收成一张表之后，槽位是**数据**（[`Slot`]），两个界面各自查同一张表。
+//! 而那份数据现在来自**声明本身**：命令 / 工作流上的 `menu` 字段（见
+//! [`mo_app::MenuSlot`]），所以「让一条扩展命令出现在右键菜单里」不再需要改任何
+//! 调用点——写清单的人回答一句「它出现在哪儿」就够了。
 //!
 //! ## 索引语义（⚠️ 别当成稳定的身份）
 //!
@@ -26,15 +29,12 @@
 //! 与既有的 `CommandId::User(usize)` 同语义。
 
 /// 一条动作可以出现的界面位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Slot {
-    /// 命令面板（⌘K / Ctrl+Shift+P 那一个）。
-    Palette,
-    /// 右键菜单：对着一个条目（文件或目录都算，目录级差异由条目自己决定时再说）。
-    ContextFile,
-    /// 右键菜单：空白处（动作对象是当前目录）。
-    ContextBlank,
-}
+///
+/// 类型本体在 `mo-config`（[`mo_app::MenuSlot`]）——那里是它**被写下来**的地方：
+/// 配置与扩展清单里的 `menu: ["palette", "context:file"]` 就译成这个枚举。UI 这边
+/// 只是它**被读出来**的一端，再定义一份枚举就得在两个 crate 之间来回转换，而这两份
+/// 定义除了同步之外没有任何用途。
+pub(crate) type Slot = mo_app::MenuSlot;
 
 /// 一条动作**干什么**。
 ///
@@ -67,10 +67,10 @@ impl ActionSpec {
 
 /// 把「用户命令 + 工作流」摊成一张注册表。
 ///
-/// 今天两类都只投**命令面板**一个槽位——这与收口前的行为逐条一致（收口的目的就是
-/// 让「加一个槽位」变成改数据）。`users` 由 `mo_app::user_commands()` 交上来时
-/// 已经按扩展清单的 `when_ext` 过滤过，所以这里**不再**判扩展名：两处都判就会
-/// 出现「面板看得到、菜单看不到」这类对不上号的差异。
+/// 每条落在哪些界面，由那一条**自己的** `menu` 声明决定（[`mo_app::MenuSlot::defaults`]
+/// = 没写就只进命令面板，与 P2 之前逐条一致）。这里**不**再看扩展名：`users` 由
+/// `mo_app::user_commands()` 交上来时已经按清单的 `when_ext` 过滤过，两处都判就会出现
+/// 「面板看得到、菜单看不到」这类对不上号的差异。
 pub(crate) fn contributed(
     users: &[mo_app::UserCommand],
     workflows: &[mo_app::Workflow],
@@ -85,7 +85,7 @@ pub(crate) fn contributed(
                 u.category.clone()
             },
             kind: ActionKind::User(i),
-            slots: vec![Slot::Palette],
+            slots: u.slots(),
         });
     }
     for (i, w) in workflows.iter().enumerate() {
@@ -93,7 +93,7 @@ pub(crate) fn contributed(
             title: w.name.clone(),
             category: "工作流".to_string(),
             kind: ActionKind::Workflow(i),
-            slots: vec![Slot::Palette],
+            slots: w.slots(),
         });
     }
     out
@@ -151,19 +151,31 @@ mod tests {
     use super::{contributed, for_slot, ActionKind, Contributions, Payload, Slot};
 
     fn user(name: &str, category: &str) -> mo_app::UserCommand {
+        user_in(name, category, &[])
+    }
+
+    /// `menu` 收的是**清单里写下来的那些字符串**（不是枚举）——这一层要验的正是
+    /// 「一句声明走到了哪些界面上」，直接构造枚举就把它要测的东西绕过去了。
+    fn user_in(name: &str, category: &str, menu: &[&str]) -> mo_app::UserCommand {
         mo_app::UserCommand {
             name: name.to_string(),
             category: category.to_string(),
             shell: "wc -l {file}".to_string(),
             source: None,
+            menu: menu.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     fn workflow(name: &str) -> mo_app::Workflow {
+        workflow_in(name, &[])
+    }
+
+    fn workflow_in(name: &str, menu: &[&str]) -> mo_app::Workflow {
         mo_app::Workflow {
             name: name.to_string(),
             steps: vec!["pwd".to_string()],
             source: None,
+            menu: menu.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -197,15 +209,54 @@ mod tests {
         );
     }
 
-    /// 今天两类**只**投面板——这条是「收口不改行为」的正面断言，
-    /// 也是反向验证的靶子：把 `contributed` 里的 slots 加上 ContextFile，这条必红。
+    /// **没写** `menu` 的命令仍只投面板——P2 之前所有已有配置与清单都没有这个字段，
+    /// 这条断言就是「加字段不改行为」的证明。反向验证的靶子：把 `contributed` 里的
+    /// slots 换成硬编码 `vec![Slot::Palette]`，下一条必红。
     #[test]
-    fn everything_is_palette_only_for_now() {
+    fn no_declaration_stays_palette_only() {
         let specs = contributed(&[user("统计", "")], &[workflow("打包")]);
         assert!(specs.iter().all(|s| s.slots == vec![Slot::Palette]));
         assert_eq!(for_slot(&specs, Slot::ContextFile).len(), 0);
         assert_eq!(for_slot(&specs, Slot::ContextBlank).len(), 0);
         assert_eq!(for_slot(&specs, Slot::Palette).len(), 2);
+    }
+
+    /// 写了 `menu` 就**只**去写的那些界面：`context:file` 让扩展命令第一次出现在
+    /// 右键菜单里，而它从此不再出现在命令面板（显式列表 = 精确投递，不是追加）。
+    /// 连字符写法与冒号写法等价（手改配置时更容易写对）。
+    #[test]
+    fn declared_slots_reach_exactly_the_listed_surfaces() {
+        let specs = contributed(
+            &[
+                user_in("统计字数", "", &["context:file"]),
+                user_in("归档到当前目录", "", &["context-blank", "palette"]),
+                user_in(
+                    "转换格式",
+                    "媒体",
+                    &["palette", "context:file", "context:blank"],
+                ),
+            ],
+            &[workflow_in("打包", &["context:file"])],
+        );
+        let hit = |slot| {
+            for_slot(&specs, slot)
+                .into_iter()
+                .map(|s| s.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hit(Slot::Palette), ["归档到当前目录", "转换格式"]);
+        assert_eq!(hit(Slot::ContextFile), ["统计字数", "转换格式", "打包"]);
+        assert_eq!(hit(Slot::ContextBlank), ["归档到当前目录", "转换格式"]);
+        // 一条声明了三个界面的命令，在三处都必须是同一条（下标一致才谈得上执行）。
+        let all_three: Vec<usize> = specs
+            .iter()
+            .filter(|s| s.slots.len() == 3)
+            .map(|s| match s.kind {
+                ActionKind::User(i) => i,
+                ActionKind::Workflow(i) => 1000 + i,
+            })
+            .collect();
+        assert_eq!(all_three, vec![2]);
     }
 
     /// 空 slots = 哪儿都不出现（默认拒绝，而不是默认全开）。

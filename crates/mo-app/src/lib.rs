@@ -44,9 +44,11 @@ pub use mo_core::{GroupKey, Grouping};
 pub use staging::{StagedEntry, Staging};
 pub use treemap::{Rect, Tile, UsageTree};
 // 配置类型经应用层再导出：UI 只依赖 mo-app，不直接抓 mo-config。
+// `MenuSlot` 一起出去：注册表面板的行与右键菜单的行是**同一条声明**翻译出来的，
+// 各翻一份就会出现「面板里名字对得上、菜单里对不上」。
 pub use mo_config::{
-    clamp_icon_scale, ColumnPrefs, Config, SavedServer, ThemeColors, UiPrefs, UserCommand,
-    Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
+    clamp_icon_scale, ColumnPrefs, Config, MenuSlot, SavedServer, ThemeColors, UiPrefs,
+    UserCommand, Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
 };
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};
@@ -4231,12 +4233,14 @@ impl AppState {
         let mut out: Vec<UserCommand> = cfg
             .commands
             .iter()
-            .filter(|c| {
-                let bad = usercmds::validate(c).is_some();
-                if bad {
-                    tracing::warn!("配置里有一条自定义命令不合法，已忽略");
+            .filter(|c| match usercmds::validate(c) {
+                // 报错要带上**为什么**：一条命令凭空从面板里消失，只说「不合法」
+                // 等于让用户自己去猜是哪个字段的哪个字打错了。
+                Some(err) => {
+                    tracing::warn!("配置里有一条自定义命令已忽略：{err}");
+                    false
                 }
-                !bad
+                None => true,
             })
             .cloned()
             .collect();

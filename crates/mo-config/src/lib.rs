@@ -89,6 +89,88 @@ pub struct Config {
     pub remote_servers: Vec<SavedServer>,
 }
 
+/// 一条动作出现在**哪些界面**（插件系统 P2 的投递声明）。
+///
+/// 写进清单 / 配置的是字符串（见 [`UserCommand::menu`]），字面量与
+/// `devlog/plugin-system.md` §3 的 `where` 一致。为什么模型里存字符串而不是枚举：
+/// `Config::load` 任何一处反序列化失败都会让 `AppState::config()` 把**整份**配置
+/// 回落成默认值——一个拼错的槽位名不该清空用户所有设置。认不出的由
+/// `mo_app::usercmds::validate` 报出来（错误可见），映射只在这一处（[`MenuSlot::parse`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuSlot {
+    /// 命令面板（⌘K / Ctrl+Shift+P 那一个）。
+    Palette,
+    /// 右键菜单：对着一个条目（文件或目录）。
+    ContextFile,
+    /// 右键菜单：空白处（动作对象是当前目录）。
+    ContextBlank,
+}
+
+impl MenuSlot {
+    /// 认一个写法；`None` = 不认识。冒号与连字符两种写法都收（`context:file` 是设计稿
+    /// 里的形状，`context-file` 是手改配置时更顺手的那个）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw.trim().to_ascii_lowercase().as_str() {
+            "palette" => Self::Palette,
+            "context:file" | "context-file" => Self::ContextFile,
+            "context:blank" | "context-blank" => Self::ContextBlank,
+            _ => return None,
+        })
+    }
+
+    /// 展示 / 回写用的规范写法。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Palette => "palette",
+            Self::ContextFile => "context:file",
+            Self::ContextBlank => "context:blank",
+        }
+    }
+
+    /// 一条命令**没写** `menu` 时的落点：只进命令面板——与 P2 之前逐条一致。
+    pub fn defaults() -> Vec<Self> {
+        vec![Self::Palette]
+    }
+}
+
+/// 一批声明 → 落点。一条都没认出来就走 [`MenuSlot::defaults`]。
+///
+/// 「写错的槽位名」不在这里报——那是 [`first_bad_slot`] 的活，两处的判据不同：
+/// 解析要**尽量可用**，校验要**明确报错**。
+pub fn slots_of(raw: &[String]) -> Vec<MenuSlot> {
+    let out: Vec<MenuSlot> = raw.iter().filter_map(|s| MenuSlot::parse(s)).collect();
+    if out.is_empty() {
+        MenuSlot::defaults()
+    } else {
+        out
+    }
+}
+
+/// 一批声明里**第一个不认识的写法**（给 `validate` 报错用；`None` = 全部认识）。
+pub fn first_bad_slot(raw: &[String]) -> Option<&str> {
+    raw.iter()
+        .map(|s| s.as_str())
+        .find(|s| MenuSlot::parse(s).is_none())
+}
+
+/// 报错里列「可用」时用的那三个名字——从 [`MenuSlot`] 现拼，不写死字符串，
+/// 否则加第四个槽位时这句提示会先骗人。
+const SLOT_NAMES: [&str; 3] = [
+    MenuSlot::Palette.as_str(),
+    MenuSlot::ContextFile.as_str(),
+    MenuSlot::ContextBlank.as_str(),
+];
+
+/// 「写了个认不出的界面名」那句错误。命令与工作流共用一条措辞（两处各写一份，
+/// 迟早一份说三种、另一份说两种）。`what` 传「命令」或「工作流」。
+pub fn slot_error(what: &str, name: &str, raw: &[String]) -> Option<String> {
+    let bad = first_bad_slot(raw)?;
+    Some(format!(
+        "{what}「{name}」的 menu 里有不认识的界面「{bad}」（可用：{}）",
+        SLOT_NAMES.join(" / ")
+    ))
+}
+
 /// 用户自定义命令（第四阶段·自定义命令，也是插件系统的命令面）。
 ///
 /// `shell` 是要执行的命令行，支持三个占位符：
@@ -110,6 +192,16 @@ pub struct UserCommand {
     /// 命令来源：内建配置里写的，还是从 `commands/` 目录加载的清单。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 这条命令出现在哪些界面（空 = 只进命令面板）。见 [`MenuSlot`]。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub menu: Vec<String>,
+}
+
+impl UserCommand {
+    /// 投递落点（空 / 全写错 = 只进命令面板）。
+    pub fn slots(&self) -> Vec<MenuSlot> {
+        slots_of(&self.menu)
+    }
 }
 
 /// 一个自动化工作流：名字 + 一串按顺序执行的命令模板。
@@ -125,6 +217,16 @@ pub struct Workflow {
     /// 来源（扩展清单带来的会写上文件路径，便于排错）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 这个工作流出现在哪些界面（空 = 只进命令面板）。见 [`MenuSlot`]。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub menu: Vec<String>,
+}
+
+impl Workflow {
+    /// 投递落点，语义与 [`UserCommand::slots`] 同。
+    pub fn slots(&self) -> Vec<MenuSlot> {
+        slots_of(&self.menu)
+    }
 }
 
 /// 列表列的持久化偏好：顺序 + 各列宽度。
@@ -347,5 +449,68 @@ mod tests {
         assert!(!cfg.ui.zebra, "同级的正常字段照常生效");
         assert_eq!(clamp_icon_scale(cfg.ui.icon_scale), ICON_SCALE_MIN);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 界面声明的读法：大小写 / 空白 / 冒号与连字符两种写法都收，认不出的报出来。
+    #[test]
+    fn menu_slots_are_parsed_leniently() {
+        assert_eq!(MenuSlot::parse("palette"), Some(MenuSlot::Palette));
+        assert_eq!(
+            MenuSlot::parse("  Context:FILE "),
+            Some(MenuSlot::ContextFile)
+        );
+        assert_eq!(
+            MenuSlot::parse("context-blank"),
+            Some(MenuSlot::ContextBlank)
+        );
+        assert_eq!(MenuSlot::parse("context:flle"), None);
+        assert_eq!(MenuSlot::parse(""), None);
+        // 规范写法回写用（配置里出现的应该是这一种）。
+        assert_eq!(MenuSlot::ContextFile.as_str(), "context:file");
+    }
+
+    /// 空列表 = 「用户没想过这件事」，落回只进面板；全写错也一样（不是一条都不投，
+    /// 那会让命令凭空消失）。真要报错的是 `first_bad_slot`。
+    #[test]
+    fn empty_or_unrecognized_falls_back_to_palette() {
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(slots_of(&s(&[])), MenuSlot::defaults());
+        assert_eq!(slots_of(&s(&["nope"])), MenuSlot::defaults());
+        assert_eq!(
+            slots_of(&s(&["context:blank", "palette"])),
+            vec![MenuSlot::ContextBlank, MenuSlot::Palette],
+            "顺序按声明来，不重排"
+        );
+        assert_eq!(first_bad_slot(&s(&["palette", "context:file"])), None);
+        assert_eq!(first_bad_slot(&s(&["palette", "palett"])), Some("palett"));
+        let err = slot_error("命令", "统计", &s(&["palett"])).expect("该报错");
+        assert!(err.contains("统计") && err.contains("palett"), "{err}");
+        assert!(err.contains("context:blank"), "{err} 要列出可用的写法");
+    }
+
+    /// `menu` 为空时**不该**出现在写出的配置里（用户没声明就别往 config.json 里
+    /// 塞噪音），缺字段读回来也必须是空。
+    #[test]
+    fn empty_menu_is_not_serialized() {
+        let mut c = UserCommand {
+            name: "统计".into(),
+            category: String::new(),
+            shell: "wc -l {file}".into(),
+            source: None,
+            menu: Vec::new(),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("menu"), "{json}");
+        let back: UserCommand = serde_json::from_str(&json).unwrap();
+        assert!(back.menu.is_empty());
+        assert_eq!(back.slots(), MenuSlot::defaults());
+
+        c.menu = vec!["context:file".into()];
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""menu":["context:file"]"#), "{json}");
+        let back: UserCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.slots(), vec![MenuSlot::ContextFile]);
+        // 读写同一份声明来回一致（回写配置时不该把用户的写法悄悄换掉）。
+        assert_eq!(back.menu, c.menu);
     }
 }

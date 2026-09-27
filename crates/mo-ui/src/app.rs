@@ -12207,25 +12207,30 @@ mod tests {
         assert!(closed, "close_context_menu 没有清掉菜单");
     }
 
-    /// 右键菜单的贡献项按**这一次右键的目标**重取，而不是读命令面板那份镜像。
+    /// 右键菜单的贡献项按**这一次右键的目标**重取（而不是读命令面板那份镜像），
+    /// 并按清单里那句 `menu` **真的渲染出来**。
     ///
-    /// 这是 P2 投动作进菜单之前的必经一步（`devlog/plugin-system.md` §4.2 记的裂缝）：
+    /// 重取是 P2-1 补的那道裂缝（`devlog/plugin-system.md` §4.2）：
     /// `RootView::user_commands` 只在开面板时刷新，反映的是**上一次**选中项的
-    /// `when_ext` 过滤结果。这里种一个只对 `.md` 生效的 fixture 扩展，验证
-    /// 「右键 .md 拿得到、右键 .txt 拿不到」，且这份表只进菜单快照、不污染镜像。
+    /// `when_ext` 过滤结果。投递是 P2-2：槽位从此是**数据**，改一句清单就多一处
+    /// 入口，不用碰任何调用点。这里种一个只对 `.md` 生效、声明了
+    /// `menu: ["palette","context:file"]` 的 fixture 扩展，三个方向各一条断言：
+    /// 右键 `.md` 看得见、右键 `.txt` 看不见（`when_ext`）、右键空白处也看不见
+    /// （没投 `context:blank`），且这份表只进菜单快照、不污染镜像。
     ///
-    /// 断言打在 `contributions`（菜单那份快照）上而不是渲染结果上——今天的注册表
-    /// 全部只投 `Slot::Palette`（那是 P2 后面才改的投递策略），所以「拿得到」目前是
-    /// 「快照里有这条」而不是「菜单上看得到」。
+    /// 断言打在**渲染出来的菜单行**上（不是快照）——P2-2 起，清单里那句 `menu`
+    /// 真的决定它出现在哪个界面上，所以「拿得到」现在就是「菜单上看得到」。
     ///
     /// ⚠️ fixture 种进 `isolate_user_dirs_for_tests()` 给的**共享**隔离目录，测试
     /// 期间不改 `MO_CONFIG_DIR`：那是进程全局的，一改就和同进程并行的其它测试互相
     /// 踩（实测：本测试单跑绿、整包跑红——对面那句 `set_var` 把目录换了回去）。
     ///
-    /// 反向验证：把 `contributed_for` 换成读 `self.user_commands`（收口前的写法），
-    /// 第一条 assert 会因为镜像为空而红。
+    /// 反向验证（本轮真跑过）：把 `contributed()` 里用户命令那臂的 slots 换回硬编码
+    /// `vec![Slot::Palette]` → 第一条断言红，报出来的整张菜单只剩内置那 15 行。
+    /// 另一条靶子（`contributed_for` 改回读 `self.user_commands`）在 P2-1 那轮验过，
+    /// 见 devlog §4.5。
     #[test]
-    fn context_menu_retakes_contributions_from_the_right_click_target() {
+    fn context_menu_renders_contributions_by_slot_and_target() {
         const WANTED: &str = "Markdown 统计 · 统计字数";
         let dir = crate::isolate_user_dirs_for_tests()
             .join("extensions")
@@ -12239,7 +12244,11 @@ mod tests {
   "name": "Markdown 统计",
   "version": "1.0",
   "enabled": true,
-  "commands": [{ "name": "统计字数", "shell": "wc -w {file}" }],
+  "commands": [{
+    "name": "统计字数",
+    "shell": "wc -w {file}",
+    "menu": ["palette", "context:file"]
+  }],
   "when_ext": [".md"]
 }"#,
         )
@@ -12251,29 +12260,31 @@ mod tests {
         let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
         let root = root.clone();
 
-        // 一次右键 → 快照里那几条贡献项的标题。写成宏而不是闭包：`add_window_view`
-        // 返回的上下文类型不想在这里点名。
-        macro_rules! titles_for {
+        // 一次右键 → 菜单**渲染出来的**那些行。写成宏而不是闭包：`add_window_view`
+        // 返回的上下文类型不想在这里点名。传 `None` 就是右键空白处。
+        macro_rules! labels_for {
             ($target:expr) => {{
-                let t = PathBuf::from($target);
+                let t: Option<PathBuf> = $target;
                 cx.update(|_window, cx| {
                     root.update(cx, |v, cx| {
-                        v.open_context_menu(Some((t, false)), 100.0, 100.0, 0, 0, cx);
+                        v.open_context_menu(t.map(|p| (p, false)), 100.0, 100.0, 0, 0, cx);
                         v.context_menu
                             .as_ref()
-                            .unwrap()
-                            .contributions
-                            .specs
-                            .iter()
-                            .map(|s| s.title.clone())
-                            .collect::<Vec<String>>()
+                            .map(|menu| {
+                                crate::context_menu::items(menu, &[])
+                                    .into_iter()
+                                    .map(|i| i.label)
+                                    .collect::<Vec<String>>()
+                            })
+                            .unwrap_or_default()
                     })
                 })
             }};
         }
 
-        let on_md = titles_for!("README.md");
-        let on_txt = titles_for!("notes.txt");
+        let on_md = labels_for!(Some(PathBuf::from("README.md")));
+        let on_txt = labels_for!(Some(PathBuf::from("notes.txt")));
+        let on_blank = labels_for!(None);
         // 镜像没被这次右键改动（它仍然只由「开面板」刷新）。
         let mirror_len = cx.update(|_window, cx| {
             root.update(cx, |v, _| (v.user_commands.len(), v.workflows.len()))
@@ -12283,11 +12294,16 @@ mod tests {
 
         assert!(
             on_md.iter().any(|t| t == WANTED),
-            "右键 .md 时，只对 .md 生效的扩展命令应进入这次右键的快照：{on_md:?}"
+            "右键 .md 时，声明了 context:file 的扩展命令应当出现在菜单里：{on_md:?}"
         );
         assert!(
             !on_txt.iter().any(|t| t == WANTED),
             "右键 .txt 时那份命令不该出现（when_ext=[\".md\"]）：{on_txt:?}"
+        );
+        // 投递是**精确**的：这条只投了面板 + 对着条目的菜单，没投空白处。
+        assert!(
+            !on_blank.iter().any(|t| t == WANTED),
+            "右键空白处不该出现没投 context:blank 的命令：{on_blank:?}"
         );
         assert_eq!(
             mirror_len,
