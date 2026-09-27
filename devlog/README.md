@@ -20,9 +20,12 @@
 | [remote-transfer.md](remote-transfer.md) | 跨端点传输：`Endpoint` 判据、`FileSystem::read_file/is_dir`、`TransferOperation` |
 | [selection.md](selection.md) | 选择交互：反选 / 框选 / type-ahead、软链 FileId |
 | [transfer-badge.md](transfer-badge.md) | 传输指示与任务面板：小块 + 浮层、估速、暂停恢复、回收站面板 |
+| [plugin-system.md](plugin-system.md) | **设计稿（未实现）**：插件系统三层能力、清单 schema、stdio provider 协议、安装与权限、P1~P4 排期 |
 
 ## 约定
 
 * 修好一个新坑后，追加到对应主题文件，格式：`### 现象（简短）` + 根因 + 修法。
 * 如果一个坑横跨多个主题（例如 cfg 告警涉及 objc 宏），放在最主要的那篇，其余位置加一行链接。
 * 只记**已验证**的结论；猜测和未修的问题写在条目末尾的「待办」里。
+* 唯一的例外是 `plugin-system.md`：那是实现前的设计稿，文件顶部标了「未实现」，
+  别把里面的 P1~P4 读成已完成。
