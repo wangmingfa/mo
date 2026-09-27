@@ -109,3 +109,32 @@
 * **教训**：反向验证的可信度取决于「跑的那个二进制确实是这份源码编出来的」。凡是用**文件
   搬运**而非**编辑**切换源码版本的手法（mv / cp / 手工还原），都要显式把 mtime 推到当下。
   更省事的办法是压根不引入搬运：改坏 → 跑 → 用 Edit 改回 → 跑，一次只验一个变异体。
+
+## 9. 只在整包并行时才红的一条：`layout.rs::trash_empty_asks_for_confirmation`（2026-09-27）
+
+* **现象**（P2-2 那一轮，三次 `cargo test --workspace --all-features`）：第一次 101，红的
+  是 `mo-ui --test layout` 的 `trash_empty_asks_for_confirmation`（34 过 1 红）；第二次也
+  101，但**红的到底是哪条我没查到**——第一次的日志被我自己的 grep 截断了（见下面那条流程
+  教训），第二次只留下 `EXIT=101`；第三次 `--no-fail-fast` 完整落盘 → **全绿（0）**。
+  同时：单跑那一个测试绿，单跑整个 layout 二进制连跑三次绿。
+* **为什么判定与 P2-2 无关**（判据写清楚，别只说「看起来不相关」）：这一轮的 diff 只碰
+  ①`mo-config` 多一个数据字段、②`mo-app` 两个 `validate`、③`mo-ui/src/actions.rs` 里
+  slots 的来源。回收站确认卡走的是 `sidebar` → `dialogs` → trash store，**一行都不经过
+  投递层**；`contributed()` 只在开右键菜单与开命令面板时被叫到。
+* **真正的可疑形状（还没修）**：`click("sidebar-trash")` 之后只有 `run_until_parked()` +
+  **一次** `render_frame()`，紧接着就断言 `(2, false)`「前提：两条都在面板上」。回收站
+  条目是从磁盘 `index.json` 真读回来的，而 `run_until_parked` 不等外部线程——与
+  [windows-port.md §27](windows-port.md) 那次同一类。机器忙（整包并行、33 个二进制抢
+  CPU）时窗口就窄，所以只在整包时复现。
+  **修法**：这类「前提断言」前面接轮询（`panel_window_ready_for_tests` / `wait_for_panel_rows`，
+  行数**精确**相等），别在每个测试里各摆一次 `render_frame`。别用 sleep 糊。
+* **顺记一条流程教训**：`out=$(cargo test … 2>&1); echo "$out" | grep -E "^test result|^error" | head -40`
+  会把 `---- xxx stdout ----` 后面的断言文本整段丢掉，于是「红是哪条、为什么红」都不知道，
+  只凭一个印象就差点把「全量绿」报出去。判绿的正确姿势：**完整日志落盘**
+  （`cargo test … > /tmp/ws.log 2>&1; echo EXIT=$?`），再看 `EXIT`，再按名字查断言。
+  与 §7 那条「管道会吞掉退出码」是一对：一个吞的是码，一个吞的是原因。
+* **已修**（同一轮）：`layout.rs` 加 `wait_for_trash_state()`（100 轮 `run_until_parked` +
+  `render_frame`，等到想要的 `(条目数, 确认卡开着)` 才返回，返回最后看到的值交给调用方断言，
+  失败时报得出实际看到什么），该测试**每一次**状态断言前都走它。改完
+  `cargo test --workspace --all-features --no-fail-fast` 连跑两次都是 0
+  （单二进制连跑三次也全绿，35 条）。这是**测试侧**的改动，产品代码一行没动。
