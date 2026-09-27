@@ -3502,12 +3502,20 @@ impl RootView {
 
     /// 顺序执行一个工作流（结果进独立模态，逐步回显）。
     ///
+    /// 下标入口，语义同 [`RootView::run_user_command_at`]。
+    ///
     /// 步骤本身是外部程序，跑起来可能要几十秒，所以放 blocking 池、UI 不卡；
     /// 取消语义是「不再开下一步」——中途强杀外部进程既不可靠也容易留下半成品。
     pub(crate) fn run_workflow_at(&mut self, i: usize, cx: &mut Context<Self>) {
         let Some(wf) = self.workflows.get(i).cloned() else {
             return;
         };
+        self.run_workflow(wf, cx);
+    }
+
+    /// 执行一个工作流的本体。与 [`RootView::run_user_command`] 同理：执行路径一条，
+    /// 「第几条」由调用方（面板下标 / 菜单快照）回答。
+    pub(crate) fn run_workflow(&mut self, wf: mo_app::Workflow, cx: &mut Context<Self>) {
         if self.wf_running {
             return;
         }
@@ -4281,6 +4289,8 @@ impl RootView {
             "compare.jump_prev" => self.jump_diff(cx, -1),
             "palette.open" => {
                 // 打开面板时刷新一次：用户可能刚改过配置或丢了新清单 / 扩展。
+                // 这份镜像**只**给面板用（下标语义）；右键菜单自带一份按当次目标重取的
+                // 快照，见 [`RootView::contributed_for`]。
                 let exts = selected_ext_names(self.panel());
                 self.user_commands = self.app().user_commands(&exts);
                 self.workflows = self.app().workflows();
@@ -4688,10 +4698,20 @@ impl RootView {
     }
 
     /// 执行一条用户自定义命令，输出用信息卡片回显（第四阶段·自定义命令）。
+    ///
+    /// 这里是**下标入口**（命令面板：`self.user_commands` 那份镜像的第 i 条）。
+    /// 右键菜单不走下标——它带着自己那份快照，见 [`RootView::run_user_command`]。
     pub(crate) fn run_user_command_at(&mut self, i: usize, cx: &mut Context<Self>) {
         let Some(cmd) = self.user_commands.get(i).cloned() else {
             return;
         };
+        self.run_user_command(cmd, cx);
+    }
+
+    /// 执行一条用户命令的**本体**：占位符守卫、后台跑、输出回显都在这一处。
+    /// 收成按命令本体（而非下标）是因为有两个来源用两套索引语义：面板镜像 vs
+    /// 菜单快照。执行路径只有一条，差别只在「第几条命令」由谁回答。
+    pub(crate) fn run_user_command(&mut self, cmd: mo_app::UserCommand, cx: &mut Context<Self>) {
         // 占位符上下文：当前目录 + 按可见顺序的选中项。
         let ctx = {
             let panel = self.panel();
@@ -6191,6 +6211,17 @@ impl RootView {
             .panel_at(pane, tab)
             .map(|p| p.app.browsing_remote())
             .unwrap_or(false);
+        // 贡献项（用户 / 扩展命令、工作流）按**这一次右键的目标**重取，见
+        // [`RootView::contributed_for`]。右击的条目一般已经在 `paths` 里（上面刚
+        // 单选过它），但万一它不在可见窗口内（例如 watcher 刚换过列表）就漏了
+        // 判据，所以把 target 也并进来。
+        let mut ext_paths = paths.clone();
+        if let Some(t) = target_path.as_ref() {
+            if !ext_paths.iter().any(|p| p == t) {
+                ext_paths.push(t.clone());
+            }
+        }
+        let contributions = self.contributed_for(&ext_paths);
         self.context_menu = Some(crate::context_menu::ContextMenu {
             x,
             y,
@@ -6199,6 +6230,7 @@ impl RootView {
             selected: paths.len(),
             paths,
             remote,
+            contributions,
         });
         self.ctx_submenu_open = false;
 
@@ -6279,16 +6311,22 @@ impl RootView {
         .detach();
     }
 
-    /// 贡献进来的动作（用户命令 / 扩展命令 / 工作流）——右键菜单与命令面板共用的
-    /// 那张表（见 [`crate::actions`]）。
+    /// 按**给定的这批路径**重取贡献动作（用户命令 / 扩展命令 / 工作流），连同载荷
+    /// 一起交给调用方（见 [`crate::actions::Contributions`]）。
     ///
-    /// 扩展名过滤不在这里做：`user_commands` 是 `AppState::user_commands(&exts)` 按各
-    /// 扩展清单的 `when_ext` 筛过之后交上来的，两处都判就会出现「面板看得到、菜单
-    /// 看不到」这类对不上号的差异。那份镜像目前只在**开命令面板时**刷新（`keys` 的
-    /// `palette.open`）——今天贡献项只投面板，所以够用；P2 要往菜单投动作，得先让
-    /// 菜单按这一次右键的选中项重取一次。
-    fn contributed_actions(&self) -> Vec<crate::actions::ActionSpec> {
-        crate::actions::contributed(&self.user_commands, &self.workflows)
+    /// 为什么不走 `self.user_commands` 那份镜像：它只在**开命令面板**时刷新，反映的
+    /// 是上一次选中项的 `when_ext` 过滤结果。右键菜单必须按这一次的目标算，否则
+    /// 「先选中一个 `.md` 开过面板、再右键一个 `.txt`」会把只对 `.md` 有效的命令挂到
+    /// `.txt` 的菜单上——这正是 `devlog/plugin-system.md` §4.2 记下的那道裂缝，
+    /// P2 投动作进菜单之前必须先补。
+    ///
+    /// 代价：`AppState::user_commands` 每次调用都读配置目录 + 各清单（磁盘 IO）。
+    /// 命令面板开一次也付同样的钱，右键同一量级，不在这里加缓存——加了就要处理
+    /// 「用户刚改过清单」的失效，而那件事面板今天也是靠每次重取解决的。
+    fn contributed_for(&self, paths: &[PathBuf]) -> crate::actions::Contributions {
+        let exts = ext_names_of(paths);
+        let app = self.app();
+        crate::actions::Contributions::of(&app.user_commands(&exts), &app.workflows())
     }
 
     /// 执行一个菜单动作。菜单在此之前就已关闭（动作可能自己开模态）。
@@ -6516,11 +6554,21 @@ impl RootView {
                 .detach();
             }
             A::Stage => self.stage_selection(cx),
-            // 贡献进来的动作（用户命令 / 扩展命令 / 工作流）：走与命令面板同一条执行路，
-            // 所以 `ActionKind` 直接映射到那两个 `*_at`。不另开一条执行路径——占位符
-            // 守卫（缺选中项就不执行并给提示）与输出回显都在那边。
-            A::Contributed(crate::actions::ActionKind::User(i)) => self.run_user_command_at(i, cx),
-            A::Contributed(crate::actions::ActionKind::Workflow(i)) => self.run_workflow_at(i, cx),
+            // 贡献进来的动作（用户命令 / 扩展命令 / 工作流）：执行路径与命令面板同一条
+            // （占位符守卫、输出回显都在那边），差别只在**载荷从哪儿取**——这里从菜单
+            // 自己那份快照取，与渲染时是同一份，所以索引不会漂到另一条命令上。
+            A::Contributed(kind) => {
+                let payload = menu.contributions.payload(kind);
+                match payload {
+                    Some(crate::actions::Payload::User(cmd)) => self.run_user_command(cmd, cx),
+                    Some(crate::actions::Payload::Workflow(wf)) => self.run_workflow(wf, cx),
+                    // 快照里没有 = 菜单弹出后清单被重建过。宁可不执行，也不拿旧索引去
+                    // 点新清单里的另一条命令（那等于静默执行用户没点的那条）。
+                    None => {
+                        self.modal = Modal::Info("该命令已不在当前列表里，未执行。".to_string());
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -7165,11 +7213,9 @@ impl Render for RootView {
         // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
         // 用窗口坐标直接当偏移量——根容器从 (0, 0) 铺满窗口，两者同一套坐标系。
         if let Some(menu) = self.context_menu.clone() {
-            let items = crate::context_menu::items(
-                &menu,
-                &self.open_with_apps,
-                &self.contributed_actions(),
-            );
+            // 贡献项已经在 `menu` 里（打开时按目标重取的那份），渲染不再另取一张表——
+            // 否则「看到的」和「点下去执行的」可能来自两份不同的快照。
+            let items = crate::context_menu::items(&menu, &self.open_with_apps);
             let vs = window.viewport_size();
             root = root.child(crate::context_menu::render(
                 &menu,
@@ -7499,12 +7545,24 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
 
 /// 当前选中项的扩展名集合（小写、含点），供扩展的 `when_ext` 条件判断。
 fn selected_ext_names(panel: &crate::panel::Panel) -> Vec<String> {
-    let mut out: Vec<String> = panel
-        .window_entries()
-        .filter(|e| panel.selection.is_selected(&e.id))
-        .filter_map(|e| {
-            e.path
-                .extension()
+    ext_names_of(
+        &panel
+            .window_entries()
+            .filter(|e| panel.selection.is_selected(&e.id))
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// 一批路径的扩展名集合（小写、含点、去重排序）——`when_ext` 的判据输入。
+///
+/// 输入是一批路径而不绑面板：命令面板问「选中的这些」，右键菜单问「这次右键的
+/// 目标 ∪ 选区」。两处共用一份判据，才不会出现「面板看得到、菜单看不到」。
+fn ext_names_of(paths: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .iter()
+        .filter_map(|p| {
+            p.extension()
                 .and_then(|x| x.to_str())
                 .map(|x| format!(".{}", x.to_ascii_lowercase()))
         })
@@ -12114,9 +12172,9 @@ mod tests {
         let blank_h = cx.update(|_window, cx| {
             root.update(cx, |v, cx| {
                 v.open_context_menu(None, 100.0, 100.0, 0, 0, cx);
-                v.context_menu.as_ref().map(|m| {
-                    crate::context_menu::items(m, &v.open_with_apps, &v.contributed_actions()).len()
-                })
+                v.context_menu
+                    .as_ref()
+                    .map(|m| crate::context_menu::items(m, &v.open_with_apps).len())
             })
         });
         let entry_items = cx.update(|_window, cx| {
@@ -12129,12 +12187,8 @@ mod tests {
                     0,
                     cx,
                 );
-                crate::context_menu::items(
-                    v.context_menu.as_ref().unwrap(),
-                    &v.open_with_apps,
-                    &v.contributed_actions(),
-                )
-                .len()
+                crate::context_menu::items(v.context_menu.as_ref().unwrap(), &v.open_with_apps)
+                    .len()
             })
         });
 
@@ -12151,6 +12205,95 @@ mod tests {
             })
         });
         assert!(closed, "close_context_menu 没有清掉菜单");
+    }
+
+    /// 右键菜单的贡献项按**这一次右键的目标**重取，而不是读命令面板那份镜像。
+    ///
+    /// 这是 P2 投动作进菜单之前的必经一步（`devlog/plugin-system.md` §4.2 记的裂缝）：
+    /// `RootView::user_commands` 只在开面板时刷新，反映的是**上一次**选中项的
+    /// `when_ext` 过滤结果。这里种一个只对 `.md` 生效的 fixture 扩展，验证
+    /// 「右键 .md 拿得到、右键 .txt 拿不到」，且这份表只进菜单快照、不污染镜像。
+    ///
+    /// 断言打在 `contributions`（菜单那份快照）上而不是渲染结果上——今天的注册表
+    /// 全部只投 `Slot::Palette`（那是 P2 后面才改的投递策略），所以「拿得到」目前是
+    /// 「快照里有这条」而不是「菜单上看得到」。
+    ///
+    /// ⚠️ fixture 种进 `isolate_user_dirs_for_tests()` 给的**共享**隔离目录，测试
+    /// 期间不改 `MO_CONFIG_DIR`：那是进程全局的，一改就和同进程并行的其它测试互相
+    /// 踩（实测：本测试单跑绿、整包跑红——对面那句 `set_var` 把目录换了回去）。
+    ///
+    /// 反向验证：把 `contributed_for` 换成读 `self.user_commands`（收口前的写法），
+    /// 第一条 assert 会因为镜像为空而红。
+    #[test]
+    fn context_menu_retakes_contributions_from_the_right_click_target() {
+        const WANTED: &str = "Markdown 统计 · 统计字数";
+        let dir = crate::isolate_user_dirs_for_tests()
+            .join("extensions")
+            .join("mdstats");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "mdstats",
+  "name": "Markdown 统计",
+  "version": "1.0",
+  "enabled": true,
+  "commands": [{ "name": "统计字数", "shell": "wc -w {file}" }],
+  "when_ext": [".md"]
+}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 一次右键 → 快照里那几条贡献项的标题。写成宏而不是闭包：`add_window_view`
+        // 返回的上下文类型不想在这里点名。
+        macro_rules! titles_for {
+            ($target:expr) => {{
+                let t = PathBuf::from($target);
+                cx.update(|_window, cx| {
+                    root.update(cx, |v, cx| {
+                        v.open_context_menu(Some((t, false)), 100.0, 100.0, 0, 0, cx);
+                        v.context_menu
+                            .as_ref()
+                            .unwrap()
+                            .contributions
+                            .specs
+                            .iter()
+                            .map(|s| s.title.clone())
+                            .collect::<Vec<String>>()
+                    })
+                })
+            }};
+        }
+
+        let on_md = titles_for!("README.md");
+        let on_txt = titles_for!("notes.txt");
+        // 镜像没被这次右键改动（它仍然只由「开面板」刷新）。
+        let mirror_len = cx.update(|_window, cx| {
+            root.update(cx, |v, _| (v.user_commands.len(), v.workflows.len()))
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            on_md.iter().any(|t| t == WANTED),
+            "右键 .md 时，只对 .md 生效的扩展命令应进入这次右键的快照：{on_md:?}"
+        );
+        assert!(
+            !on_txt.iter().any(|t| t == WANTED),
+            "右键 .txt 时那份命令不该出现（when_ext=[\".md\"]）：{on_txt:?}"
+        );
+        assert_eq!(
+            mirror_len,
+            (0, 0),
+            "菜单的重取不该写回面板镜像（两套索引语义必须分开）"
+        );
     }
 
     /// 主题选择器：打开时光标停在当前主题；↑↓ 换预览项并真的改到全局调色板；

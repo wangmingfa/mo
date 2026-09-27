@@ -19,11 +19,11 @@
 //!
 //! ## 索引语义（⚠️ 别当成稳定的身份）
 //!
-//! [`ActionKind::User`] / [`ActionKind::Workflow`] 存的是 `RootView::user_commands`
-//! / `workflows` 里的**下标**，不是重建后的位置：点击时按当前那份 vec 取。
-//! 也就是说「面板/菜单打开」到「执行」之间如果用户改了配置导致清单重排，
-//! 执行的可能是另一条。这与既有的 `CommandId::User(usize)` 完全同语义，
-//! 窗口只有一瞬，本层不额外加固；真要加固，做法是改成按 `name + source` 反查。
+//! [`ActionKind::User`] / [`ActionKind::Workflow`] 存的是**建这张表时那两份 vec** 里的
+//! 下标。谁建的表谁负责把载荷一起带上（[`Contributions::payload`]），查不到就当这条不
+//! 存在——`RootView` 上那份镜像随时会被命令面板重取，拿它当下标参照就会点 A 跑出 B。
+//! 命令面板那条路仍是下标（打开时重取、按下 Enter 立刻执行，中间没有别人），
+//! 与既有的 `CommandId::User(usize)` 同语义。
 
 /// 一条动作可以出现的界面位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,11 +104,51 @@ pub(crate) fn for_slot(specs: &[ActionSpec], slot: Slot) -> Vec<&ActionSpec> {
     specs.iter().filter(|s| s.goes_to(slot)).collect()
 }
 
+/// 一张注册表**连着它对应的那两份载荷**。
+///
+/// ⚠️ 为什么要连载荷一起交出去：[`ActionKind::User`] 里的下标指的是**这一批** `users`
+/// 的位置。如果只交注册表、点击时再去 `RootView::user_commands` 那份镜像里查，就留着
+/// 一个空档：菜单开着的时候镜像被人重取一次（再开一次命令面板就会），下标飘了，点 A
+/// 跑出 B。绑成一份数据之后，交出去的那一刻起谁也无法让它俩对不上——
+/// 「载荷带身份而不是下标」这条纪律（见 §4.2）在这里的兑现形式就是这个结构。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Contributions {
+    pub specs: Vec<ActionSpec>,
+    pub commands: Vec<mo_app::UserCommand>,
+    pub workflows: Vec<mo_app::Workflow>,
+}
+
+impl Contributions {
+    /// 由「这一批用户命令 + 这一批工作流」建一份。两边的下标从此锁死在这份数据上。
+    pub(crate) fn of(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) -> Self {
+        Self {
+            specs: contributed(users, workflows),
+            commands: users.to_vec(),
+            workflows: workflows.to_vec(),
+        }
+    }
+
+    /// 这条动作的执行载荷。`None` = 这份数据里没这一条（清单在菜单打开后被人删了，
+    /// 或者下标本来就不该出现在这里）——调用方什么都不做，绝不按位置猜一条顶上。
+    pub(crate) fn payload(&self, kind: ActionKind) -> Option<Payload> {
+        match kind {
+            ActionKind::User(i) => self.commands.get(i).cloned().map(Payload::User),
+            ActionKind::Workflow(i) => self.workflows.get(i).cloned().map(Payload::Workflow),
+        }
+    }
+}
+
+/// 一条贡献动作的实际可执行内容。
+pub(crate) enum Payload {
+    User(mo_app::UserCommand),
+    Workflow(mo_app::Workflow),
+}
+
 #[cfg(test)]
 mod tests {
     // ⚠️ 不 `use super::*` 之外还要留意：本 crate 顶层有 `use gpui_kit::*`，
     // 这里没有，但内置 `#[test]` 与 gpui 的 test 宏撞车的事发生过（见 context_menu）。
-    use super::{contributed, for_slot, ActionKind, Slot};
+    use super::{contributed, for_slot, ActionKind, Contributions, Payload, Slot};
 
     fn user(name: &str, category: &str) -> mo_app::UserCommand {
         mo_app::UserCommand {
@@ -176,5 +216,48 @@ mod tests {
         for slot in [Slot::Palette, Slot::ContextFile, Slot::ContextBlank] {
             assert!(for_slot(&specs, slot).is_empty(), "{slot:?} 不该出现");
         }
+    }
+
+    /// 下标必须指回**建表时那两份 vec**：注册表交出去之后，原来那份切片被人丢了、
+    /// 或者镜像重排了，都不该影响这一份数据里下标对应的载荷。
+    #[test]
+    fn indices_resolve_against_the_table_not_some_later_vec() {
+        let users = [user("统计", ""), user("转换", "媒体")];
+        let wfs = [workflow("打包")];
+        let t = Contributions::of(&users, &wfs);
+
+        // 两条用户命令 + 一条工作流，下标各自成段。
+        let ActionKind::User(a) = t.specs[0].kind else {
+            unreachable!()
+        };
+        let ActionKind::User(b) = t.specs[1].kind else {
+            unreachable!()
+        };
+        let ActionKind::Workflow(w) = t.specs[2].kind else {
+            unreachable!()
+        };
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        match t.payload(ActionKind::User(a)).unwrap() {
+            Payload::User(c) => assert_eq!(c.name, "统计"),
+            Payload::Workflow(_) => panic!("串了类型"),
+        }
+        match t.payload(ActionKind::User(b)).unwrap() {
+            Payload::User(c) => assert_eq!(c.name, "转换"),
+            Payload::Workflow(_) => panic!("串了类型"),
+        }
+        // 工作流的下标是从 0 数起的第二段，别与用户命令混到同一个 vec 里。
+        match t.payload(ActionKind::Workflow(w)).unwrap() {
+            Payload::Workflow(x) => assert_eq!(x.name, "打包"),
+            Payload::User(_) => panic!("串了类型"),
+        }
+        // 越界 = 没有这条，而不是拿别的位置顶上（否则错一个下标就静默执行别人的命令）。
+        assert!(t.payload(ActionKind::User(2)).is_none());
+        assert!(t.payload(ActionKind::Workflow(0)).is_some());
+        assert!(t.payload(ActionKind::Workflow(1)).is_none());
+        // 丢掉原切片后仍自足（`of` 收的是引用）。
+        drop(users);
+        drop(wfs);
+        assert_eq!(t.specs.len(), 3);
     }
 }
