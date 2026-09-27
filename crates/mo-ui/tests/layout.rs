@@ -1404,12 +1404,41 @@ fn trash_zebra_fill_requests_its_own_second_frame(cx: &mut TestAppContext) {
     );
 }
 
+/// 轮询等回收站面板长成 `want`（条目数 + 确认卡是否开着），返回最后看到的那个值。
+///
+/// 与 [`wait_for_panel_rows`] 同一类判据：**回收站那几条是从磁盘 `index.json` 真读
+/// 回来的**，唤醒不记在 `run_until_parked` 的账上，所以「点了侧栏回收站、面板还空着」
+/// 这个中间态会被单次 `render_frame` 撞上（整包并行时实测红过，
+/// 见 devlog/engine-testing.md §9）。返回值交给调用方断言，失败时能报出实际看到什么。
+fn wait_for_trash_state(
+    vcx: &mut VisualTestContext,
+    window: &WindowHandle<RootView>,
+    want: (usize, bool),
+) -> (usize, bool) {
+    let mut last = (0, false);
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        last = window
+            .update(&mut vcx.cx, |root, _w, _cx| {
+                mo_ui::trash_panel_state_for_tests(root)
+            })
+            .unwrap_or(last);
+        if last == want {
+            return last;
+        }
+    }
+    last
+}
+
 /// 清空回收站必须**先弹确认卡**（面板标题栏「清空回收站」按钮）：Esc / 取消 /
 /// 点遮罩回面板、条目原样；确认（Enter 或红色按钮）才真正执行并回到面板。
 ///
 /// 条目**预种进 store**（`<root>/index.json` + 真实落点文件）而不是注入视图：
 /// `sync_panel` 会拿 store 的列表覆盖 `trash_entries`，keystroke 泵 effect 时
 /// 注入的视图本地条目会被空 store 顶掉（本测试首次运行时踩到）。
+///
+/// 每一次状态断言前都走 [`wait_for_trash_state`]：那两条记录要经一次真磁盘读才上面板。
 #[gpui_kit::test]
 fn trash_empty_asks_for_confirmation(cx: &mut TestAppContext) {
     // 独立的回收站根（见 `open_app_with_trash`）：先清干净再预种两条记录
@@ -1438,30 +1467,23 @@ fn trash_empty_asks_for_confirmation(cx: &mut TestAppContext) {
 
     let (mut vcx, window) = open_app_with_trash(size(px(1000.), px(700.)), seed, cx);
     vcx.update(|window, cx| window.click("sidebar-trash", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
-    let state = |vcx: &mut VisualTestContext, window: &WindowHandle<mo_ui::RootView>| {
-        window
-            .update(&mut vcx.cx, |root, _w, _cx| {
-                mo_ui::trash_panel_state_for_tests(root)
-            })
-            .expect("读回收站状态失败")
-    };
-    assert_eq!(state(&mut vcx, &window), (2, false), "前提：两条都在面板上");
+    assert_eq!(
+        wait_for_trash_state(&mut vcx, &window, (2, false)),
+        (2, false),
+        "前提：两条都要读回来摆在面板上"
+    );
     assert!(vcx.debug_bounds("mo-trash-row-1").is_some());
 
     // 点「清空回收站」按钮：只弹确认卡，不执行（条目数不变）。
     vcx.update(|window, cx| window.click("trash-empty-btn", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        wait_for_trash_state(&mut vcx, &window, (2, true)),
+        (2, true),
+        "确认卡出现时条目数不能变"
+    );
     assert!(
         vcx.debug_bounds("mo-dialog-card").is_some(),
         "清空回收站应当先弹确认卡"
-    );
-    assert_eq!(
-        state(&mut vcx, &window),
-        (2, true),
-        "确认卡出现时条目数不能变"
     );
     assert!(
         vcx.debug_bounds("mo-trash-row-1").is_some(),
@@ -1470,36 +1492,40 @@ fn trash_empty_asks_for_confirmation(cx: &mut TestAppContext) {
 
     // Esc：取消——回面板、条目原样。
     cx.simulate_keystrokes(window.into(), "escape");
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        wait_for_trash_state(&mut vcx, &window, (2, false)),
+        (2, false),
+        "取消后条目应原样"
+    );
     assert!(
         vcx.debug_bounds("mo-dialog-card").is_none(),
         "取消后卡应消失"
     );
-    assert_eq!(state(&mut vcx, &window), (2, false), "取消后条目应原样");
 
     // 再点按钮 → 点「取消」按钮：同样回面板、条目原样。
     vcx.update(|window, cx| window.click("trash-empty-btn", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    wait_for_trash_state(&mut vcx, &window, (2, true));
     vcx.update(|window, cx| window.click("trash-confirm-cancel", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        wait_for_trash_state(&mut vcx, &window, (2, false)),
+        (2, false),
+        "点「取消」后条目应原样"
+    );
     assert!(vcx.debug_bounds("mo-dialog-card").is_none());
-    assert_eq!(state(&mut vcx, &window), (2, false));
 
     // 再点按钮 → 点红色「清空」：面板清空（store 里两条记录都被抹掉）。
     vcx.update(|window, cx| window.click("trash-empty-btn", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    wait_for_trash_state(&mut vcx, &window, (2, true));
     vcx.update(|window, cx| window.click("trash-confirm-ok", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        wait_for_trash_state(&mut vcx, &window, (0, false)),
+        (0, false),
+        "清空后面板应为空"
+    );
     assert!(
         vcx.debug_bounds("mo-dialog-card").is_none(),
         "确认后卡应关闭"
     );
-    assert_eq!(state(&mut vcx, &window), (0, false), "清空后面板应为空");
 }
 
 /// 回收站条目支持**预览与打开**（Finder 废纸篓同款）：
