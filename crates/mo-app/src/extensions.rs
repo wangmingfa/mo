@@ -227,9 +227,19 @@ pub fn extensions_root(config_json: &Path) -> PathBuf {
 ///
 /// 单个扩展坏了只跳过它并告警——一个写错的清单不该让其它扩展一起消失。
 pub fn load(root: &Path) -> Vec<Extension> {
-    let mut out = Vec::new();
+    load_report(root).0
+}
+
+/// [`load`] 的完整版：**坏掉的清单也带回来**（P2-7）。
+///
+/// 之前坏了只剩一句 `tracing::warn!`，扩展管理器上什么都不显示——手写清单的人对着
+/// 空面板连「错在哪」都问不出。调用方（扩展管理器）要把这一批亮出来；其余调用方
+/// （键表 / 类型表 / 侧栏）只关心能用的那份，继续走 [`load`]。
+pub fn load_report(root: &Path) -> (Vec<Extension>, Vec<BrokenExtension>) {
+    let mut good = Vec::new();
+    let mut broken = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
+        return (good, broken);
     };
     let mut dirs: Vec<PathBuf> = entries
         .flatten()
@@ -245,14 +255,24 @@ pub fn load(root: &Path) -> Vec<Extension> {
         let text = match std::fs::read_to_string(&manifest) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("扩展清单 {} 读不出来：{e}", manifest.display());
+                let reason = format!("清单读不出来：{e}");
+                tracing::warn!("扩展清单 {}：{reason}", manifest.display());
+                broken.push(BrokenExtension {
+                    path: manifest,
+                    reason,
+                });
                 continue;
             }
         };
         let m: Manifest = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("扩展清单 {} 不是合法 JSON：{e}", manifest.display());
+                let reason = format!("清单不是合法 JSON：{e}");
+                tracing::warn!("扩展清单 {}：{reason}", manifest.display());
+                broken.push(BrokenExtension {
+                    path: manifest,
+                    reason,
+                });
                 continue;
             }
         };
@@ -262,14 +282,28 @@ pub fn load(root: &Path) -> Vec<Extension> {
             .unwrap_or_default();
         if let Some(err) = validate(&m, Some(&dir_name)) {
             tracing::warn!("扩展 {} 被跳过：{err}", manifest.display());
+            broken.push(BrokenExtension {
+                path: manifest,
+                reason: err,
+            });
             continue;
         }
-        out.push(Extension {
+        good.push(Extension {
             manifest: m,
             path: manifest,
         });
     }
-    out
+    (good, broken)
+}
+
+/// 读不了或校验不过的一份清单。扩展管理器把这一批**原样**亮出来——判据（什么算坏、
+/// 错在哪）在 [`validate`]，这里只搬运，不在 UI 里再判一遍。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokenExtension {
+    /// 清单文件路径。
+    pub path: PathBuf,
+    /// 为什么没用上（`validate` 的报错原句，或 IO / JSON 错误）。
+    pub reason: String,
 }
 
 /// 把扩展的命令摊平成用户命令：展示名带扩展前缀，分类默认用扩展名。
@@ -825,6 +859,61 @@ mod tests {
         // 缺省字段：enabled 默认 true，命令分类由扩展名补上。
         assert!(exts[0].manifest.enabled);
         assert_eq!(flatten(&exts, &[])[0].category, "好扩展");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 坏清单要**带原因**回来（P2-7）：扩展管理器要把「为什么没用上」亮出来，
+    /// 而不能只留一句日志。三类坏法各验一种：JSON 解析失败、`validate` 拒收
+    /// （这里用 id 与目录名不一致这例）、以及「目录里根本没有 manifest.json」
+    /// 不算坏（那只是个普通目录，安静跳过的既有语义不变）。
+    #[test]
+    fn broken_manifests_come_back_with_a_reason() {
+        let root = std::env::temp_dir().join(format!("mo-extbrk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["good", "badjson", "badid"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(
+            root.join("good/manifest.json"),
+            r#"{"id":"good","name":"好扩展"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("badjson/manifest.json"), "{ 不是 JSON").unwrap();
+        std::fs::write(
+            root.join("badid/manifest.json"),
+            r#"{"id":"other-name","name":"对不上目录"}"#,
+        )
+        .unwrap();
+
+        let (exts, broken) = load_report(&root);
+        assert_eq!(exts.len(), 1, "能用的还是那一个：{exts:?}");
+        assert_eq!(exts[0].manifest.id, "good");
+        assert_eq!(
+            broken.len(),
+            2,
+            "两份坏清单都要回来，不能静默消失：{broken:?}"
+        );
+        let json_one = broken
+            .iter()
+            .find(|b| b.path.parent().unwrap().file_name().unwrap() == "badjson")
+            .expect("badjson 应当在坏清单里");
+        assert!(
+            json_one.reason.contains("JSON"),
+            "原因要能让人对着清单改：{}",
+            json_one.reason
+        );
+        let id_one = broken
+            .iter()
+            .find(|b| b.path.parent().unwrap().file_name().unwrap() == "badid")
+            .expect("badid 应当在坏清单里");
+        assert!(
+            id_one.reason.contains("不一致"),
+            "`validate` 的报错原句要原样带回来：{}",
+            id_one.reason
+        );
+        // `load` 是报告的投影：老调用方（键表 / 类型表 / 侧栏）拿到的仍然只有能用的。
+        assert_eq!(load(&root).len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

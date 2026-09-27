@@ -4291,6 +4291,17 @@ impl AppState {
         extensions::load(&extensions::extensions_root(&Self::config_path()))
     }
 
+    /// [`Self::extensions`] 的完整版：**加载失败的清单也带回来**（P2-7）。
+    ///
+    /// 扩展管理器用这一份——坏了的要在界面上亮出来并说清原因，否则手写清单的人
+    /// 对着空面板连错在哪都问不出。键表 / 类型表 / 侧栏那些「只要能用的」调用方
+    /// 继续走 [`Self::extensions`]。
+    pub fn extensions_report(
+        &self,
+    ) -> (Vec<extensions::Extension>, Vec<extensions::BrokenExtension>) {
+        extensions::load_report(&extensions::extensions_root(&Self::config_path()))
+    }
+
     /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
     ///
     /// 渲染路径的用法是**每帧取一次**、行循环里只做表查询（`mo_ui::file_list` 就是

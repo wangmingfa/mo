@@ -906,6 +906,8 @@ pub struct RootView {
     sync_busy: bool,
     /// 扩展管理器的光标位。
     ext_index: usize,
+    /// 加载失败的清单（`extensions::load_report` 的另一半）：扩展页要亮出来并说原因。
+    broken_exts: Vec<mo_app::extensions::BrokenExtension>,
     /// 重复文件查找结果（`None` = 还没跑过）。
     dedup: Option<mo_operations::DedupReport>,
     /// 重复文件查找是否在跑。
@@ -1163,6 +1165,7 @@ impl RootView {
             keys_capturing: None,
             user_commands: Vec::new(),
             extensions: Vec::new(),
+            broken_exts: Vec::new(),
             ext_index: 0,
             workflows: Vec::new(),
             wf_running: false,
@@ -3427,8 +3430,15 @@ impl RootView {
 
     /// 打开扩展管理器。
     pub(crate) fn open_extensions_picker(&mut self, cx: &mut Context<Self>) {
-        self.extensions = self.app().extensions();
+        // `extensions_report` 的另一半是坏清单：面板开着的时候必须**这一刻**的答案，
+        // 用户往往就是改完清单马上回来看。键表同理重取（与 `palette.open` 同一个
+        // 时机与同一份 IO）：键位撞车的「没生效」列表住在键表里，不重取就是上次
+        // 开面板时的旧账。
+        let (exts, broken) = self.app().extensions_report();
+        self.extensions = exts;
+        self.broken_exts = broken;
         self.ext_index = 0;
+        self.keymap = keymap_from(&self.app());
         self.modal = Modal::Extensions;
         cx.notify();
     }
@@ -3478,6 +3488,22 @@ impl RootView {
         mo_app::extensions::contributions(&e.manifest)
             .iter()
             .map(contribution_line)
+            .collect()
+    }
+
+    /// 选中那一行下面要附上的「这条绑定没生效」句子（P2-7）。
+    ///
+    /// 判据在键表：`Keymap::build` 收贡献键位时把坏键串 / 撞车的记进 `dropped()`，
+    /// 这里只按**清单路径**把句子对回是哪一家（`Chord::source` 存的就是清单路径原文，
+    /// 命令与工作流同形），不重判一遍——两处判撞车迟早答出两个输家。键表在
+    /// `open_extensions_picker` 里重取过，所以这里看到的是打开面板那一刻的账。
+    fn dropped_chord_lines(&self, manifest: &std::path::Path) -> Vec<String> {
+        let want = manifest.display().to_string();
+        self.keymap
+            .dropped()
+            .iter()
+            .filter(|d| d.chord.source() == Some(want.as_str()))
+            .map(|d| format!("绑键 {} 没生效：{}", d.spec, d.reason))
             .collect()
     }
 
@@ -3622,6 +3648,58 @@ impl RootView {
                         ))),
                 );
             }
+            // 「这条绑定没生效」也要亮在它自己的那一家下面（P2-7）。判据在键表
+            // （`build` 收贡献键位时记录），这里只按清单路径对回是哪家，不重判。
+            for (k, line) in self.dropped_chord_lines(&e.path).into_iter().enumerate() {
+                let elem = format!("ext-detail-{}-drop-{k}", e.manifest.id);
+                body = body.child(
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .pl(px(16.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::muted())
+                        .child(text!(line)),
+                );
+            }
+        }
+        // 坏掉的清单排在能用的之后（P2-7）。它们没有可启停的状态、贡献不出任何东西，
+        // 唯一有用的信息就是「为什么没用上」——所以原因直接摊在行下，不用选中。
+        for e in &self.broken_exts {
+            let dir = e
+                .path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| e.path.display().to_string());
+            let row_id = format!("ext-broken-{dir}");
+            body = body.child(
+                div()
+                    .id(row_id.clone())
+                    .debug_selector(move || format!("mo-{row_id}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .p(px(6.0))
+                    .rounded(px(4.0))
+                    .bg(theme::surface())
+                    .text_color(theme::muted())
+                    .child(text!(format!("（加载失败）{dir}"))),
+            );
+            let why_id = format!("ext-broken-{dir}-why");
+            let reason = e.reason.clone();
+            body = body.child(
+                div()
+                    .id(why_id.clone())
+                    .debug_selector(move || format!("mo-{why_id}"))
+                    .pl(px(16.0))
+                    .pr(px(6.0))
+                    .text_size(px(11.5))
+                    .text_color(theme::muted())
+                    .child(text!(reason)),
+            );
         }
         central_view(
             "扩展",
@@ -13598,6 +13676,118 @@ mod tests {
         assert!(
             cleaned.is_ok() && cleaned_b.is_ok(),
             "清理 fixture 失败：{cleaned:?} {cleaned_b:?}"
+        );
+    }
+
+    /// 坏声明不再静默（P2-7）：加载失败的清单在扩展页亮出来（连着原因），
+    /// 键位撞车的「没生效」亮在它自己那一家下面。
+    ///
+    /// fixture 在**窗口建好之后**才落盘：`RootView::new` 建键表、首帧渲染都发生在
+    /// 没有这两个扩展的时候，全靠 `open_extensions_picker` 那次重取把新清单与新的
+    /// 键表端上来——变异体「面板打开时不再重取键表」只有这条红（§4.8 那条「开一次
+    /// 命令面板才重取」的老规矩，现在是三个入口共用）。
+    ///
+    /// 坏清单用 `id` 与目录名不一致这一例：它过得了 JSON 解析，死在 `validate`，
+    /// 正好钉住「validate 的报错原句要一路带到界面上」。键位撞车用 `cmd+t` 撞内置
+    /// 的「新建标签页」（跨平台同默认，keys::tests 的既有口径）。
+    #[test]
+    fn broken_declarations_show_up_in_the_extension_manager() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let dir_bad = ext_root.join("p27bad");
+        let dir_drop = ext_root.join("p27drop");
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+
+        // 窗口建好之后才种 fixture（见上）。
+        for d in [&dir_bad, &dir_drop] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            dir_bad.join("manifest.json"),
+            r#"{"id":"other-name","name":"对不上目录","commands":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_drop.join("manifest.json"),
+            r#"{
+  "id": "p27drop",
+  "name": "字幕工具P27",
+  "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "key": "cmd+t" }]
+}"#,
+        )
+        .unwrap();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        let cleaned_bad = std::fs::remove_dir_all(&dir_bad);
+        let cleaned_drop = std::fs::remove_dir_all(&dir_drop);
+
+        assert!(matches!(modal_of(cx), Modal::Extensions));
+        // ① 加载失败的清单亮出来了，连着原因行。
+        cx.debug_bounds("mo-ext-broken-p27bad")
+            .expect("加载失败的清单没在扩展页出现（选择器 mo-ext-broken-p27bad）");
+        cx.debug_bounds("mo-ext-broken-p27bad-why")
+            .expect("坏清单的原因行没渲染（选择器 mo-ext-broken-p27bad-why）");
+        // 它没有可启停的胶囊——没有状态可翻。
+        assert!(
+            cx.debug_bounds("mo-ext-toggle-p27bad").is_none(),
+            "加载失败的清单不该有「已启用/已停用」胶囊"
+        );
+        // 模型侧：原因就是 validate 的原句，作者能对着它改清单。
+        let (n_good, reasons) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                (
+                    v.extensions.len(),
+                    v.broken_exts
+                        .iter()
+                        .map(|b| b.reason.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+        });
+        assert!(n_good >= 1, "p27drop 应当加载成功，别把两类混在一栏");
+        assert!(
+            reasons.iter().any(|r| r.contains("不一致")),
+            "validate 的报错要原样带到面板：{reasons:?}"
+        );
+
+        // ② 键位撞车的那一家，行下有「没生效」这句。
+        cx.debug_bounds("mo-ext-row-p27drop")
+            .expect("合法但键位被撞的扩展要正常出现在面板上");
+        cx.update(|window, cx| window.click("ext-row-p27drop", cx));
+        cx.run_until_parked();
+        cx.debug_bounds("mo-ext-detail-p27drop-0")
+            .expect("选中后贡献行没展开（选择器 mo-ext-detail-p27drop-0）");
+        cx.debug_bounds("mo-ext-detail-p27drop-drop-0")
+            .expect("键位撞车的「没生效」没亮在这一家下面（选择器 mo-ext-detail-p27drop-drop-0）");
+        let drop_lines = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                let manifest = v
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == "p27drop")
+                    .map(|e| e.path.clone())
+                    .expect("p27drop 在面板上");
+                v.dropped_chord_lines(&manifest)
+            })
+        });
+        let all = drop_lines.join("\n");
+        for want in ["cmd+t", "新建标签页", "没生效"] {
+            assert!(
+                all.contains(want),
+                "「没生效」那句得说清是哪串键、被谁占了：{all}"
+            );
+        }
+        assert!(
+            cleaned_bad.is_ok() && cleaned_drop.is_ok(),
+            "清理 fixture 失败：{cleaned_bad:?} {cleaned_drop:?}"
         );
     }
 

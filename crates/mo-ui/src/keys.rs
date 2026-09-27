@@ -745,6 +745,18 @@ impl Chord {
             _ => true,
         }
     }
+
+    /// 这条键位来自哪份文件（配置里的命令 / 扩展清单；内置动作 = `None`）。
+    ///
+    /// 扩展管理器靠它把「这条绑定没生效」对回**那一家**的清单上（P2-7）：
+    /// `UserCommand::source` / `Workflow::source` 存的就是清单路径的原文。
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            Chord::Builtin(_) => None,
+            Chord::Command(c) => c.source.as_deref(),
+            Chord::Workflow(w) => w.source.as_deref(),
+        }
+    }
 }
 
 /// 当前键表：`(键组, 动作)`，按平台主修饰键分两段查询。
@@ -756,6 +768,22 @@ pub struct Keymap {
     /// 解绑不等于「这个键没人管」：`⌘T` 解绑后如果继续往下冒泡，会漏给系统 /
     /// 输入组件触发别的行为。命中这里就整次按键吞掉，才算真的「无操作」。
     unbound: Vec<KeyCombo>,
+    /// 被 `build` 拒掉的贡献键位（坏键串 / 键位已被占用）。
+    ///
+    /// 之前只 `tracing::warn!` 一句就扔，扩展管理器与设置页都看不见——「写了没生效
+    /// 还没人告诉他」正是这一批要解决的问题（P2-7）。
+    dropped: Vec<DroppedChord>,
+}
+
+/// 一条没生效的贡献键位。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DroppedChord {
+    /// 清单里写的键串原样（作者的原文，报错要能对着它改）。
+    pub spec: String,
+    /// 这条键位的载荷本体（不是下标，也不是名字——名字会重名，载荷能对回清单）。
+    pub chord: Chord,
+    /// 为什么没生效（撞了谁 / 写法错）。
+    pub reason: String,
 }
 
 impl Keymap {
@@ -811,13 +839,19 @@ impl Keymap {
         out
     }
 
-    /// 收一条贡献的键位：坏键串与已被占用的键位都只跳过 + 告警。
+    /// 收一条贡献的键位：坏键串与已被占用的键位都跳过、告警、**并且记下来**——
+    /// 扩展管理器要能把「这条绑定没生效」亮在那一行上（P2-7）。
     fn push_chord(&mut self, spec: &str, chord: Chord) {
         let Some(combo) = KeyCombo::parse(spec) else {
             tracing::warn!(
                 "「{}」的快捷键「{spec}」不是合法键组，这条绑定没有生效（写法形如 cmd+shift+w）",
                 chord.title()
             );
+            self.dropped.push(DroppedChord {
+                spec: spec.to_string(),
+                chord,
+                reason: format!("「{spec}」不是合法键组（写法形如 cmd+shift+w）"),
+            });
             return;
         };
         if let Some(other) = self.occupant(&combo) {
@@ -827,9 +861,19 @@ impl Keymap {
                 combo.format(),
                 other
             );
+            self.dropped.push(DroppedChord {
+                spec: spec.to_string(),
+                chord,
+                reason: format!("{} 已经是「{}」的键位", combo.format(), other),
+            });
             return;
         }
         self.entries.push((combo, chord));
+    }
+
+    /// [`Self::build`] 拒掉的那批贡献键位（坏键串 / 撞车）。
+    pub fn dropped(&self) -> &[DroppedChord] {
+        &self.dropped
     }
 
     /// 这个键位现在归谁（含「用户显式解绑过」——他说这颗键什么都不该干）。
@@ -1301,6 +1345,69 @@ mod tests {
             BINDINGS.len() + 1,
             "只该收下合法的那几条"
         );
+    }
+
+    /// 被拒的贡献键位要**带原因**记在表外（P2-7）：扩展管理器把「这条绑定没生效」
+    /// 亮在那一行上，靠的就是这份账。变异体「`push_chord` 退回只 warn 不记录」
+    /// 只有这条红——lookup / entries 那些断言对它全都是绿的。
+    #[test]
+    fn dropped_contributed_chords_come_back_with_a_reason() {
+        let map = Keymap::build(
+            &HashMap::new(),
+            &[
+                cmd("键串写错", "不是键"),
+                cmd("先到先得", "cmd+alt+shift+l"),
+                cmd("后到的同键", "cmd+alt+shift+l"),
+                cmd("抢内置", "cmd+t"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            map.dropped().len(),
+            3,
+            "三条被拒的都要有账可查：{:?}",
+            map.dropped()
+        );
+        let bad = map
+            .dropped()
+            .iter()
+            .find(|d| d.spec == "不是键")
+            .expect("坏键串那条要记下来");
+        assert!(
+            bad.reason.contains("不是合法键组"),
+            "原因要能让人对着清单改：{}",
+            bad.reason
+        );
+        assert_eq!(bad.chord.title(), "键串写错");
+        let lost = map
+            .dropped()
+            .iter()
+            .find(|d| d.spec == "cmd+alt+shift+l")
+            .expect("撞车那条要记下来");
+        assert!(
+            lost.reason.contains("先到先得"),
+            "撞车要点名被谁占了：{}",
+            lost.reason
+        );
+        let builtin = map
+            .dropped()
+            .iter()
+            .find(|d| d.spec == "cmd+t")
+            .expect("撞内置那条要记下来");
+        assert!(
+            builtin.reason.contains("新建标签页"),
+            "撞内置的要点名是哪个动作：{}",
+            builtin.reason
+        );
+        // 载荷带身份：靠 source 能对回清单原文（harness 里给的是「测试清单」），
+        // 扩展管理器就是用这一条把句子挂到**那一家的**行下的。
+        assert_eq!(
+            builtin.chord.source(),
+            Some("测试清单"),
+            "没带身份的记录没法对回清单"
+        );
+        // 内置动作没有 source，也就永远不该出现在任何一家的「没生效」下面。
+        assert_eq!(b("tab.new").source(), None);
     }
 
     /// 贡献的命令一律算「读当前选择」——模态打开时要吞键。
