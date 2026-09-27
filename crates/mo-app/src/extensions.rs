@@ -21,10 +21,35 @@
 //! 清单只从**用户自己的配置目录**读，绝不扫描正在浏览的目录：否则「打开别人给的
 //! 文件夹」就等于装了它带来的扩展。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use mo_config::UserCommand;
 use serde::{Deserialize, Serialize};
+
+/// 清单 `types` 的一条：这几个扩展名在「种类」这一问上叫什么。
+///
+/// 只收 `label`，**不收**设计稿（devlog §3）里的 `group` / `icon`：那两个要分别动
+/// 分组那条排序路径与图标 atlas，而这里的规矩是「收一个字段就投一个字段」——不收
+/// 「解析了却没人读」的字段（那种字段的代价是作者写了、界面上没有，还没人告诉他）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeRule {
+    /// 扩展名，写成 `.srt`（与 `when_ext` 同形；大小写不敏感，点可省）。
+    pub ext: Vec<String>,
+    /// 「种类」列的文案，如「字幕」。
+    pub label: String,
+}
+
+/// 摊平后的「扩展名 → 种类文案」表。键是小写、不含点的扩展名，与
+/// `mo_core::types` 那三问同一条判据。
+pub type TypeLabels = BTreeMap<String, String>;
+
+/// [`AppState::type_labels`](crate::AppState::type_labels) 那份缓存的形状：
+/// `(上次读到的清单签名, 表)`，`None` = 还没读过。
+///
+/// 起了名字是因为 `Arc<Mutex<Option<(u64, Arc<TypeLabels>)>>>` 这种嵌套 clippy 会说
+/// 「太复杂」，而它确实到了该有个名字的厚度。
+pub type TypeLabelCache = Option<(u64, std::sync::Arc<TypeLabels>)>;
 
 /// 一个扩展的清单。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +73,9 @@ pub struct Manifest {
     /// 扩展带的工作流（多步命令顺序执行）。
     #[serde(default)]
     pub workflows: Vec<mo_config::Workflow>,
+    /// 扩展贡献的「类型知识」：这些扩展名在「种类」列上叫什么。
+    #[serde(default)]
+    pub types: Vec<TypeRule>,
 }
 
 fn default_true() -> bool {
@@ -68,6 +96,59 @@ fn valid_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// 扩展名规范化：`".SRT"` / `"srt "` → `Some("srt")`；认不出返回 `None`。
+///
+/// 判据与 `mo_core::types` 那三问同一条（小写、不含点、按 `Path::extension()` 的
+/// 口径就是**最后一段**）。所以 `tar.gz` 在这里必然被拒：清单写它，实际命中的却是
+/// `gz`，「写了不生效」比「写不出」难查得多。
+fn norm_ext(raw: &str) -> Option<String> {
+    let s = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(s)
+}
+
+/// 校验一份清单的 `types`；返回错误描述（`None` = 合法）。
+fn validate_types(m: &Manifest) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for t in &m.types {
+        if t.ext.is_empty() {
+            return Some(format!(
+                "扩展「{}」的 types 条目「{}」没写 ext",
+                m.id, t.label
+            ));
+        }
+        if t.label.trim().is_empty() {
+            return Some(format!(
+                "扩展「{}」的 types 条目（.{}）没写 label",
+                m.id,
+                t.ext.first().map(|s| s.as_str()).unwrap_or("?")
+            ));
+        }
+        for raw in &t.ext {
+            let Some(e) = norm_ext(raw) else {
+                return Some(format!(
+                    "扩展「{}」的 types 写了认不出的扩展名「{raw}」（只认 .srt 这样的一段，双后缀如 .tar.gz 不支持）",
+                    m.id
+                ));
+            };
+            if seen.contains(&e) {
+                return Some(format!(
+                    "扩展「{}」的 types 里「.{e}」被两条规则同时认领（谁赢取决于数组顺序，界面上又只显示一条）",
+                    m.id
+                ));
+            }
+            seen.push(e);
+        }
+    }
+    None
 }
 
 /// 校验清单；返回错误描述（`None` = 合法）。
@@ -92,6 +173,9 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
         if let Some(err) = crate::usercmds::validate(c) {
             return Some(format!("扩展「{}」的命令有问题：{err}", m.id));
         }
+    }
+    if let Some(err) = validate_types(m) {
+        return Some(err);
     }
     // 同名命令会让命令面板出现两条无法区分的条目。
     let mut seen: Vec<&str> = Vec::new();
@@ -194,6 +278,83 @@ pub fn flatten(exts: &[Extension], selected_exts: &[String]) -> Vec<UserCommand>
     out
 }
 
+/// 把各清单的 `types` 摊成「扩展名 → 种类文案」。
+///
+/// 两条与 [`flatten`] 同源的规矩：
+/// * 关掉的扩展整体消失（它的命令消失，类型标签也该消失——留着就是「停用了还在改
+///   我的显示」）；
+/// * 两个扩展抢同一个扩展名时**先到先得**。[`load`] 按目录名排过序，所以「谁先」
+///   是确定的；后到的那条告警一句，作者至少知道自己是输的那一个。
+pub fn type_labels(exts: &[Extension]) -> TypeLabels {
+    let mut out = TypeLabels::new();
+    for e in exts {
+        let m = &e.manifest;
+        if !m.enabled {
+            continue;
+        }
+        for t in &m.types {
+            for raw in &t.ext {
+                // `validate` 已经拦过认不出的写法；这里不 panic，只是不收。
+                let Some(key) = norm_ext(raw) else {
+                    continue;
+                };
+                if out.contains_key(&key) {
+                    tracing::warn!(
+                        "扩展「{}」的类型标签「.{}」已被另一个扩展认领，忽略这一条",
+                        m.id,
+                        key
+                    );
+                    continue;
+                }
+                out.insert(key, t.label.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 清单目录的「有没有人动过」签名：扩展的个数与目录名，加上每份清单的修改时间与长度。
+///
+/// 存在的意义是省掉一种 IO：列表每帧每行都要问「这个后缀叫什么」，而清单在磁盘上
+/// （见 `AppState::type_labels` 那条缓存）。用签名而不是 TTL 作废，是为了让用户手改
+/// 清单**下一帧就生效**，不必重启。
+///
+/// ⚠️ 两个已知盲区，都是「签名字节没变但内容变了」：同一时间戳里改成同样长度的内容
+/// （修改时间精度为秒的文件系统上理论可能，NTFS/APFS 是亚微秒），以及清单内容被
+/// 换成同长度同 mtime 的另一份。真撞上就是把标签缓住了，重开一次 Mo 即好。
+pub fn fingerprint(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            names.push(
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    names.sort();
+    names.len().hash(&mut h);
+    for n in names {
+        n.hash(&mut h);
+        let manifest = root.join(&n).join("manifest.json");
+        match std::fs::metadata(&manifest) {
+            Ok(md) => {
+                md.modified().ok().hash(&mut h);
+                md.len().hash(&mut h);
+            }
+            Err(_) => None::<std::time::SystemTime>.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +374,7 @@ mod tests {
             }],
             when_ext: Vec::new(),
             workflows: Vec::new(),
+            types: Vec::new(),
         }
     }
 
@@ -346,6 +508,144 @@ mod tests {
         // 缺省字段：enabled 默认 true，命令分类由扩展名补上。
         assert!(exts[0].manifest.enabled);
         assert_eq!(flatten(&exts, &[])[0].category, "好扩展");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `types` 的四种写坏法都要被拒：整条清单不加载，而不是「收了字段却没人答」。
+    #[test]
+    fn rejects_broken_type_rules() {
+        let cases: Vec<(Vec<TypeRule>, &str)> = vec![
+            (
+                vec![TypeRule {
+                    ext: vec![],
+                    label: "字幕".into(),
+                }],
+                "没写 ext",
+            ),
+            (
+                vec![TypeRule {
+                    ext: vec![".srt".into()],
+                    label: "  ".into(),
+                }],
+                "没写 label",
+            ),
+            (
+                vec![TypeRule {
+                    // 双后缀在这套判据下永远命不中（实际命中的是 gz），所以直接拒。
+                    ext: vec![".tar.gz".into()],
+                    label: "压缩包".into(),
+                }],
+                "认不出的扩展名",
+            ),
+            (
+                vec![
+                    TypeRule {
+                        ext: vec![".srt".into()],
+                        label: "字幕".into(),
+                    },
+                    TypeRule {
+                        ext: vec![".vtt".into(), "SRT".into()],
+                        label: "网络字幕".into(),
+                    },
+                ],
+                "被两条规则同时认领",
+            ),
+        ];
+        for (rules, want) in cases {
+            let mut m = manifest("a");
+            m.types = rules;
+            let err = validate(&m, Some("a")).expect("坏写法应被拒");
+            assert!(err.contains(want), "{want}：报出来的却是「{err}」");
+        }
+    }
+
+    /// 摊平成表：折小写、去点、跳过关掉的扩展、抢同一个后缀时先到先得。
+    #[test]
+    fn type_labels_fold_case_and_keep_the_first_claim() {
+        let rule = |ext: &[&str], label: &str| TypeRule {
+            ext: ext.iter().map(|s| s.to_string()).collect(),
+            label: label.to_string(),
+        };
+        let mut off = manifest("aaa");
+        off.enabled = false;
+        off.types = vec![rule(&[".iso"], "光盘映像")];
+
+        let exts = vec![
+            Extension {
+                manifest: Manifest {
+                    types: vec![rule(&[".SRT ", ".vtt"], "字幕")],
+                    ..manifest("b")
+                },
+                path: PathBuf::new(),
+            },
+            Extension {
+                // 与下面那条抢 `.log`：目录名靠前的赢（load 排过序，顺序是确定的）。
+                manifest: Manifest {
+                    types: vec![rule(&[".log"], "运行日志")],
+                    ..manifest("c")
+                },
+                path: PathBuf::new(),
+            },
+            Extension {
+                manifest: Manifest {
+                    types: vec![rule(&[".log"], "系统日志"), rule(&[".srt"], "第二个 srt")],
+                    ..manifest("d")
+                },
+                path: PathBuf::new(),
+            },
+            Extension {
+                manifest: off,
+                path: PathBuf::new(),
+            },
+        ];
+        let got = type_labels(&exts);
+        assert_eq!(
+            got.get("srt").map(|s| s.as_str()),
+            Some("字幕"),
+            "大写与带点的写法要折进同一把钥匙，且先到先得：{got:?}"
+        );
+        assert_eq!(got.get("vtt").map(|s| s.as_str()), Some("字幕"));
+        assert_eq!(got.get("log").map(|s| s.as_str()), Some("运行日志"));
+        assert!(
+            !got.contains_key("iso"),
+            "关掉的扩展不该留下类型标签：{got:?}"
+        );
+    }
+
+    /// 签名：装一个扩展、改一份清单、再加一个扩展，都要变；什么都不动则不变。
+    ///
+    /// 这条钉的是「用户手改清单下一帧就生效」这件事的另一半——缓存**会**作废。
+    /// （改内容用不同长度，避免踩 mtime 精度这个已知盲区，见 [`fingerprint`] 的告警。）
+    #[test]
+    fn fingerprint_follows_manifest_changes() {
+        let root = std::env::temp_dir().join(format!("mo-extfp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        let one = root.join("one").join("manifest.json");
+        std::fs::write(
+            &one,
+            r#"{"id":"one","name":"一","types":[{"ext":[".srt"],"label":"字幕"}]}"#,
+        )
+        .unwrap();
+        let base = fingerprint(&root);
+        assert_eq!(fingerprint(&root), base, "没动过就该是同一个签名");
+
+        std::fs::write(
+            &one,
+            r#"{"id":"one","name":"一","types":[{"ext":[".srt"],"label":"字幕文件"}]}"#,
+        )
+        .unwrap();
+        let edited = fingerprint(&root);
+        assert_ne!(edited, base, "改过清单还认成没改 = 标签缓死了");
+
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        std::fs::write(
+            root.join("two").join("manifest.json"),
+            r#"{"id":"two","name":"二"}"#,
+        )
+        .unwrap();
+        assert_ne!(fingerprint(&root), edited, "新装的扩展也要让缓存作废");
 
         let _ = std::fs::remove_dir_all(&root);
     }

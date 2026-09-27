@@ -244,6 +244,13 @@ pub struct AppState {
     /// 列都会重读一遍），不能每次都去磁盘 load 一遍 `config.json`。改开关时由
     /// [`AppState::set_show_hidden`] 落盘，并同步所有标签页（见 mo-ui 的分发）。
     show_hidden: Arc<AtomicBool>,
+    /// 扩展贡献的「种类文案」表：`(上次清单签名, 表)`，`None` = 还没读过。
+    ///
+    /// 为什么必须缓存这一份：列表**每帧每行**都要答一次「这个后缀叫什么」，而答案的
+    /// 上半截在磁盘上的清单里。与 [`AppState::net_shares`] 同一条纪律（侧栏每帧都问，
+    /// 所以不能每帧真去读），区别在作废判据不是时间而是 [`extensions::fingerprint`]：
+    /// 用户手改清单，下一帧就是新文案，不必重启。
+    type_labels: Arc<std::sync::Mutex<extensions::TypeLabelCache>>,
 }
 
 /// 把「正在打开某个目录」置位，离开作用域自动收尾。
@@ -872,6 +879,7 @@ impl AppState {
                     .map(|c| c.show_hidden)
                     .unwrap_or(false),
             )),
+            type_labels: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -4272,6 +4280,22 @@ impl AppState {
     /// 已加载的扩展（`<配置目录>/mo/extensions/<id>/manifest.json`）。
     pub fn extensions(&self) -> Vec<extensions::Extension> {
         extensions::load(&extensions::extensions_root(&Self::config_path()))
+    }
+
+    /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
+    ///
+    /// 渲染路径的用法是**每帧取一次**、行循环里只做表查询（`mo_ui::file_list` 就是
+    /// 这么用的），不是每行取一次——见 [`AppState::type_labels`] 字段那段。
+    pub fn type_labels(&self) -> Arc<extensions::TypeLabels> {
+        let fp = extensions::fingerprint(&extensions::extensions_root(&Self::config_path()));
+        let mut g = self.type_labels.lock().unwrap();
+        match &mut *g {
+            Some((seen, table)) if *seen == fp => {}
+            _ => *g = Some((fp, Arc::new(extensions::type_labels(&self.extensions())))),
+        }
+        g.as_ref()
+            .map(|(_, table)| table.clone())
+            .unwrap_or_default()
     }
 
     /// 启用 / 停用某个扩展：改写它自己清单里的 `enabled`。

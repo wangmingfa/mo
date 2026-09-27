@@ -2201,3 +2201,61 @@ fn trash_view_switch_really_switches(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("mo-trash-row-0").is_some());
     assert!(vcx.debug_bounds("mo-trash-header").is_some());
 }
+
+// ── 扩展清单的 `types` 决定「种类」列（P2-3）────────────────────────────────
+
+/// fixture 扩展给 `.srt` 起名「字幕」，列表里那一格就该**画出这句话**。
+///
+/// 断言打在渲染产物上：种类列的选择器带着它那一格的文案（`mo-kind-cell-字幕`，见
+/// `file_item::meta_cell`），所以「有这一格」是 `debug_bounds` 命中的，不是测试自己
+/// 重算了一遍表。第一版这里踩过坑：用一个 `*_for_tests` 访问器读「渲染用的那两个函数
+/// 的结果」，把 `file_list` 传进去的那份表换成空的，测试照绿——那是空壳，见 devlog §4.7。
+///
+/// ⚠️ fixture 种进 `isolate_user_dirs_for_tests()` 给的**共享**隔离目录，全程不碰
+/// `MO_CONFIG_DIR`：那是进程全局的，一改就和同进程并行的其它测试互相踩（P2-1 那次
+/// 「单跑绿、整包跑红」就是这么来的）。目录名取一个别人不会用的。
+#[gpui_kit::test]
+fn contributed_type_label_shows_in_the_kind_column(cx: &mut TestAppContext) {
+    let ext_dir = mo_ui::isolate_user_dirs_for_tests()
+        .join("extensions")
+        .join("p23-srt-tools");
+    let _ = std::fs::remove_dir_all(&ext_dir);
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::write(
+        ext_dir.join("manifest.json"),
+        r#"{
+  "id": "p23-srt-tools",
+  "name": "字幕工具",
+  "types": [{ "ext": [".SRT"], "label": "字幕" }]
+}"#,
+    )
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("mo-layout-types-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("movie.srt"), b"1\n00:00:01,0 --> 00:00:02,0\nhi\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    navigate_and_wait(&mut vcx, &window, cx, dir.clone(), 2);
+
+    let contributed = vcx.debug_bounds("mo-kind-cell-字幕").is_some();
+    // 没被认领的后缀仍走内置表（这条同时挡住「表整个空了」与「覆盖了一切」两种坏法）。
+    let builtin = vcx.debug_bounds("mo-kind-cell-文本文档").is_some();
+    // 内置兜底那句不该再出现——它说明扩展的标签压根没参与。
+    let fell_back = vcx.debug_bounds("mo-kind-cell-SRT 文件").is_some();
+
+    let _ = std::fs::remove_dir_all(&ext_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        contributed,
+        "清单写了 types 的 .srt，种类列应当画出扩展起的名字「字幕」"
+    );
+    assert!(builtin, "没被认领的 .txt 应仍显示内置的「文本文档」");
+    assert!(
+        !fell_back,
+        "种类列仍显示内置兜底「SRT 文件」= 扩展的标签没进到渲染里"
+    );
+}

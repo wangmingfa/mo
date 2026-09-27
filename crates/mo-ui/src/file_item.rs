@@ -79,6 +79,7 @@ pub fn view(
     tag: Option<String>,
     layout: &ColumnLayout,
     system_icon: Option<Arc<Bitmap>>,
+    contributed_kinds: &mo_app::extensions::TypeLabels,
 ) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
@@ -202,28 +203,34 @@ pub fn view(
     } else {
         crate::theme::muted()
     };
-    let meta_cell = |col: ColId, label: String, selector: &'static str| {
-        let w = layout.width(col);
-        let mut cell = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .w(px(w))
-            .flex_shrink_0()
-            .overflow_hidden()
-            .text_size(px(12.0))
-            .text_color(meta_color)
-            // 测试用（release no-op）：本文件单测断言这些列的位置
-            .debug_selector(move || selector.to_string());
-        // 文本过长（列被拖窄）时截断，而不是溢出到相邻列。
-        // ⚠️ `text!` 宏会按调用点位置生成元素 ID；本闭包对同一行渲染 3 次
-        // （日期 / 大小 / 种类），若不显式给 ID，三段文本会得到完全相同的
-        // 元素 ID 路径 → 相同的 a11y NodeId → 开启辅助功能时触发
-        // "Duplicate a11y node id" panic。用每列唯一的 selector 作 ID。
-        cell = cell.child(div().truncate().child(text!(id = selector, label)));
-        cell
-    };
+    let meta_cell =
+        |col: ColId, label: String, selector: &'static str, selector_text: Option<&str>| {
+            let w = layout.width(col);
+            // `selector_text` 只给「种类」列用：那一格的选择器**带上文案**
+            // （`mo-kind-cell-字幕`），测试才能断言「渲染出来的到底是哪句话」。
+            // 另两列不带——日期与大小每行都不同，带上等于没有稳定把手可抓。
+            // 闭包只在登记选择器时才被调用（release 是 no-op），所以这里不额外分配。
+            let dynamic = selector_text.map(|t| format!("{selector}-{t}"));
+            let mut cell = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .w(px(w))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .text_size(px(12.0))
+                .text_color(meta_color)
+                // 测试用（release no-op）：本文件单测断言这些列的位置
+                .debug_selector(move || dynamic.clone().unwrap_or_else(|| selector.to_string()));
+            // 文本过长（列被拖窄）时截断，而不是溢出到相邻列。
+            // ⚠️ `text!` 宏会按调用点位置生成元素 ID；本闭包对同一行渲染 3 次
+            // （日期 / 大小 / 种类），若不显式给 ID，三段文本会得到完全相同的
+            // 元素 ID 路径 → 相同的 a11y NodeId → 开启辅助功能时触发
+            // "Duplicate a11y node id" panic。用每列唯一的 selector 作 ID。
+            cell = cell.child(div().truncate().child(text!(id = selector, label)));
+            cell
+        };
 
     // 按布局里的列序拼装：名称列弹性，其余固定宽。
     // （`Div` 不是 `Clone`，所以名称列用 `Option` 交出唯一那份。）
@@ -234,9 +241,13 @@ pub fn view(
                 .take()
                 .expect("名称列在列序里只会出现一次")
                 .into_any_element(),
-            ColId::Date => meta_cell(*col, date.clone(), "mo-date-cell").into_any_element(),
-            ColId::Size => meta_cell(*col, size.clone(), "mo-size-cell").into_any_element(),
-            ColId::Kind => meta_cell(*col, kind_label(entry), "mo-kind-cell").into_any_element(),
+            ColId::Date => meta_cell(*col, date.clone(), "mo-date-cell", None).into_any_element(),
+            ColId::Size => meta_cell(*col, size.clone(), "mo-size-cell", None).into_any_element(),
+            ColId::Kind => {
+                // 文案进选择器：见 `meta_cell` 那段。
+                let kind = kind_label(entry, contributed_kinds);
+                meta_cell(*col, kind.clone(), "mo-kind-cell", Some(&kind)).into_any_element()
+            }
         };
         row = row.child(cell);
     }
@@ -251,31 +262,42 @@ pub(crate) fn format_modified(t: SystemTime) -> String {
 
 /// 回收站条目的「种类」文案：目录固定，文件按扩展名归类（与 [`kind_label`]
 /// 同一套映射，只是回收站条目没有 `Entry` 可包——账本只有 is_dir + 原名）。
-pub(crate) fn trash_kind_label(is_dir: bool, name: &str) -> String {
+pub(crate) fn trash_kind_label(
+    is_dir: bool,
+    name: &str,
+    contributed: &mo_app::extensions::TypeLabels,
+) -> String {
     if is_dir {
         "文件夹".to_string()
     } else {
-        kind_by_ext(name)
+        kind_by_ext(name, contributed)
     }
 }
 
 /// 「种类」列文案：目录 / 链接固定，文件按扩展名归类（与图标分类一致）。
-pub fn kind_label(entry: &Entry) -> String {
+pub fn kind_label(entry: &Entry, contributed: &mo_app::extensions::TypeLabels) -> String {
     match entry.kind {
         EntryKind::Directory => "文件夹".to_string(),
         EntryKind::Symlink => "符号链接".to_string(),
         EntryKind::Other => "文档".to_string(),
-        EntryKind::File => kind_by_ext(&entry.name),
+        EntryKind::File => kind_by_ext(&entry.name, contributed),
     }
 }
 
 /// 按扩展名映射种类文案。
-fn kind_by_ext(name: &str) -> String {
+///
+/// `contributed` 是扩展清单的 `types` 摊出来的表，**先于**下面那张内置表查：
+/// 作者比自己格式的用户更懂它该叫什么（`.srt` 在内置表里只能兜底成「SRT 文件」）。
+/// 这与 `mo_core::types` 模块头第三条规则同一个方向——贡献的规则先查、可覆盖内置。
+fn kind_by_ext(name: &str, contributed: &mo_app::extensions::TypeLabels) -> String {
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if let Some(label) = contributed.get(&ext) {
+        return label.clone();
+    }
     match ext.as_str() {
         // 图像
         "png" => "PNG 图像",
@@ -337,8 +359,14 @@ mod tests {
         div, px, size, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
         TestAppContext, VisualTestContext, Window,
     };
+    use mo_app::extensions::TypeLabels;
     use mo_core::{Entry, EntryKind, FileId, FileMetadata, MetadataState, Permissions};
     use std::path::PathBuf;
+
+    /// 「没有扩展贡献类型标签」那份表：内置答案的原样。
+    fn none() -> TypeLabels {
+        TypeLabels::new()
+    }
 
     /// 复刻 `file_list::render` 里的行容器（宽满行 + 垂直居中 + 4px 内边距）。
     struct RowProbe(Entry);
@@ -353,7 +381,14 @@ mod tests {
                 .h(px(24.0))
                 .p(px(4.0))
                 .debug_selector(|| "mo-probe-row".to_string())
-                .child(view(&self.0, false, None, &ColumnLayout::default(), None))
+                .child(view(
+                    &self.0,
+                    false,
+                    None,
+                    &ColumnLayout::default(),
+                    None,
+                    &none(),
+                ))
         }
     }
 
@@ -377,12 +412,36 @@ mod tests {
     /// 资源管理器（那边两列分别是 `Atlas` 与「快捷方式」）。
     #[test]
     fn shortcut_kind_says_shortcut_not_the_suffix() {
-        assert_eq!(kind_label(&entry_named("Atlas.lnk")), "快捷方式");
-        assert_eq!(kind_label(&entry_named("Atlas.LNK")), "快捷方式");
+        assert_eq!(kind_label(&entry_named("Atlas.lnk"), &none()), "快捷方式");
+        assert_eq!(kind_label(&entry_named("Atlas.LNK"), &none()), "快捷方式");
         // 回收站条目那份走同一张表（没有 `Entry` 可包）。
-        assert_eq!(trash_kind_label(false, "Atlas.lnk"), "快捷方式");
+        assert_eq!(trash_kind_label(false, "Atlas.lnk", &none()), "快捷方式");
         // 普通类型不受影响。
-        assert_eq!(kind_label(&entry_named("notes.txt")), "文本文档");
+        assert_eq!(kind_label(&entry_named("notes.txt"), &none()), "文本文档");
+    }
+
+    /// 扩展清单的 `types` **先于**内置表答这一问（`.srt` 内置只能兜底成「SRT 文件」）。
+    ///
+    /// 两条边界一起钉：
+    /// * 判据同 `mo_core::types`：大小写折进同一把钥匙；
+    /// * 目录不参与——名字里带点的目录（`a.md/`）仍叫「文件夹」，否则「种类」列
+    ///   会在目录和文件之间说同一句话，用户按它分辨不出能不能进。
+    #[test]
+    fn contributed_type_label_wins_over_builtin() {
+        let mut labels = TypeLabels::new();
+        labels.insert("srt".to_string(), "字幕".to_string());
+        labels.insert("txt".to_string(), "便签".to_string());
+        assert_eq!(kind_label(&entry_named("movie.SRT"), &labels), "字幕");
+        // 没被认领的后缀照旧走内置。
+        assert_eq!(kind_label(&entry_named("movie.vtt"), &labels), "VTT 文件");
+        // 覆盖了内置答案时，覆盖就是覆盖（不是追加）。
+        assert_eq!(kind_label(&entry_named("notes.txt"), &labels), "便签");
+        // 回收站那份同表同序。
+        assert_eq!(trash_kind_label(false, "movie.srt", &labels), "字幕");
+        // 目录不参与。
+        let mut dir = entry_named("notes.txt");
+        dir.kind = EntryKind::Directory;
+        assert_eq!(kind_label(&dir, &labels), "文件夹");
     }
 
     /// 大小列必须固定在「种类」列左侧、种类列贴行右缘，各列间距一致（gap 8）。
@@ -414,7 +473,9 @@ mod tests {
             let row = cx.debug_bounds("mo-probe-row").expect("行没有渲染");
             let date = cx.debug_bounds("mo-date-cell").expect("日期列没有渲染");
             let cell = cx.debug_bounds("mo-size-cell").expect("大小列没有渲染");
-            let kind = cx.debug_bounds("mo-kind-cell").expect("种类列没有渲染");
+            let kind = cx
+                .debug_bounds("mo-kind-cell-文本文档")
+                .expect("种类列没有渲染");
 
             // 种类列贴行右缘（内边距 4）。
             assert_eq!(
@@ -465,7 +526,9 @@ mod tests {
         let mut cx = VisualTestContext::from_window(window.into(), &cx);
         cx.update(|window, cx| window.render_frame(cx));
 
-        let kind = cx.debug_bounds("mo-kind-cell").expect("种类列没有渲染");
+        let kind = cx
+            .debug_bounds("mo-kind-cell-文本文档")
+            .expect("种类列没有渲染");
         let date = cx.debug_bounds("mo-date-cell").expect("日期列没有渲染");
         assert!(
             kind.origin.x < date.origin.x,
@@ -485,7 +548,7 @@ mod tests {
                 .w_full()
                 .h(px(24.0))
                 .p(px(4.0))
-                .child(view(&self.0, false, None, &self.1, None))
+                .child(view(&self.0, false, None, &self.1, None, &none()))
         }
     }
 }

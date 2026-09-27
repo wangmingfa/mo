@@ -323,6 +323,10 @@ pub fn render(
             let Some(panel) = view.panel_at(pane, tab) else {
                 return rows;
             };
+            // 「种类」列里扩展贡献的那半张表：**每帧取一次**，行循环里只做表查询。
+            // 每行取一次等于每帧读一次清单目录（`AppState::type_labels` 有签名缓存，
+            // 但那是一次 read_dir + 每份清单一次 stat，摊到三十行就是一帧十几次调用）。
+            let contributed_kinds = panel.app.type_labels();
             // 只对**真实行**判断窗口覆盖；下标 ≥ count 的补足行没有数据可取，
             // 参与判断会让这条日志每帧都冒出来。
             let real_end = range.end.min(count);
@@ -618,6 +622,7 @@ pub fn render(
                         tag_color,
                         &row_cols,
                         system_icon,
+                        &contributed_kinds,
                     ))
                     .into_any_element(),
                 );

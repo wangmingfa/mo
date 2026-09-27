@@ -9825,6 +9825,9 @@ impl RootView {
             .content_start()
             .gap(px(8.0));
 
+        // 扩展贡献的「种类」表：与文件列表同一条纪律，**每帧取一次**而不是每行取一次。
+        let contributed_kinds = self.app().type_labels();
+
         for (i, e) in self.trash_entries.iter().enumerate() {
             // 选中态以**多选集合**为准：⌘A / ⌘点击 / ⇧连选都画在集合上。
             // ⚠️ 不能用游标 `i == idx` 代替——那是 ⌘A「没反应」的根因：
@@ -9971,7 +9974,7 @@ impl RootView {
                         .map(|s| crate::file_item::format_size(*s))
                         .unwrap_or_else(|| "…".to_string())
                 };
-                let kind = crate::file_item::trash_kind_label(e.is_dir, &name);
+                let kind = crate::file_item::trash_kind_label(e.is_dir, &name, &contributed_kinds);
                 let fg2 = if selected {
                     theme::selected_text()
                 } else {
