@@ -18,6 +18,7 @@ pub mod metadata;
 pub mod navigation;
 pub mod rename;
 pub mod selection;
+pub mod types;
 pub mod view;
 
 #[cfg(test)]

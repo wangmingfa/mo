@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use mo_core::types::PreviewClass;
 use mo_core::MoError;
 
 /// 预览类型。
@@ -82,8 +83,11 @@ pub fn preview_path(path: &Path) -> Result<Preview, MoError> {
         });
     }
 
+    // 类型判据一次取好（表在 `mo_core::types`，见 `class_of`）。
+    let class = class_of(path);
+
     // 图片：按扩展名判断，直接给路径（不解码，留给 UI 的缩略图 / 原图加载）。
-    if is_image(path) {
+    if class == Some(PreviewClass::Image) {
         return Ok(Preview {
             kind: PreviewKind::Image,
             title,
@@ -96,7 +100,7 @@ pub fn preview_path(path: &Path) -> Result<Preview, MoError> {
     // PDF：这里只认类型，**不渲染**——渲染是平台能力（macOS 走 CoreGraphics），
     // mo-preview 刻意不碰平台。首页那张图由 UI 走两段式补上（先占位、图后到）；
     // 渲染不出来时这段占位文案就是最终显示内容，所以要说得清发生了什么。
-    if is_pdf(path) {
+    if class == Some(PreviewClass::Pdf) {
         return Ok(Preview {
             kind: PreviewKind::Pdf,
             title,
@@ -118,7 +122,7 @@ pub fn preview_path(path: &Path) -> Result<Preview, MoError> {
         });
     }
 
-    let kind = kind_by_ext(path);
+    let kind = text_kind(class);
     let text = if size as usize <= MAX_TEXT {
         std::fs::read_to_string(path).map_err(MoError::Io)?
     } else {
@@ -193,26 +197,18 @@ fn is_utf8(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes).is_ok()
 }
 
-fn is_image(path: &Path) -> bool {
-    matches!(
-        ext(path).as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "avif" | "heic")
-    )
+/// 后缀 → 预览类别。判据的表在 [`mo_core::types`]（分组 / 预览 / 图标三问一处答，
+/// 原来这个 crate 还自留一份 `is_image` / `is_pdf` / `kind_by_ext`，会与分组表互相矛盾）。
+fn class_of(path: &Path) -> Option<PreviewClass> {
+    ext(path).as_deref().map(mo_core::types::preview_of)
 }
 
-fn is_pdf(path: &Path) -> bool {
-    matches!(ext(path).as_deref(), Some("pdf"))
-}
-
-fn kind_by_ext(path: &Path) -> PreviewKind {
-    match ext(path).as_deref() {
-        Some("md" | "markdown") => PreviewKind::Markdown,
-        Some("json") => PreviewKind::Json,
-        Some(
-            "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" | "java"
-            | "go" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "ini"
-            | "css" | "html" | "htm" | "xml" | "lua" | "rb" | "php" | "sql",
-        ) => PreviewKind::Code,
+/// 文本族内部再分一档（Markdown / JSON / 代码着色）。
+fn text_kind(class: Option<PreviewClass>) -> PreviewKind {
+    match class {
+        Some(PreviewClass::Markdown) => PreviewKind::Markdown,
+        Some(PreviewClass::Json) => PreviewKind::Json,
+        Some(PreviewClass::Code) => PreviewKind::Code,
         _ => PreviewKind::Text,
     }
 }

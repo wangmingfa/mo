@@ -115,24 +115,6 @@ pub enum Row {
     Entry(usize),
 }
 
-/// 类型分组的后缀 → 键。顺序即匹配表；`Folder` 在调用处按 `kind` 判，不走这里。
-fn kind_group_of(ext: &str) -> GroupKey {
-    match ext {
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "heic" | "svg" => {
-            GroupKey::Image
-        }
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" | "rtf"
-        | "pages" | "numbers" | "key" | "odt" | "ods" => GroupKey::Document,
-        "mp4" | "mov" | "mkv" | "avi" | "webm" | "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" => {
-            GroupKey::Media
-        }
-        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "iso" => {
-            GroupKey::Archive
-        }
-        _ => GroupKey::Other,
-    }
-}
-
 /// 日期分组的桶：24 小时内 = 今天，7 天内 = 最近 7 天，其余 = 更早。
 /// 元数据未加载（`Loading` / `None`）时落「更早」——回填后下一次 rebuild 自然归位。
 fn date_group_of(e: &Entry, now: std::time::SystemTime) -> GroupKey {
@@ -366,7 +348,9 @@ impl DirectoryView {
                         GroupKey::Folder
                     } else {
                         let ext = e.extension();
-                        kind_group_of(&ext)
+                        // 后缀 → 组的表在 `crate::types`（一处答，别处不再各写一份）；
+                        // `Folder` 在上面按 `kind` 判，不走那张表。
+                        crate::types::group_of(&ext)
                     }
                 }
                 Grouping::Date => date_group_of(e, now),

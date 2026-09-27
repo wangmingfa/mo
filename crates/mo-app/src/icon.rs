@@ -145,41 +145,27 @@ pub fn icon_key(path: &Path, is_dir: bool, slot_pt: f32) -> IconKey {
 
 /// 这些后缀在系统里是**包**：每个包显示自己的图标，一律按路径问。
 ///
-/// 目录形态的包已经被上面的 `is_dir` 拦住了，这张表是给**符号链接形态**兜底的——
-/// 指向 `.app` 的快捷方式在 Mo 里是文件，不特判的话一堆 app 会共用同一个图标
-/// （谁先被问到就用谁的，看起来像串图）。
+/// 表在 [`mo_core::types`]（与分组、预览同处一问一答，见那个模块的头注释）；目录形态的包
+/// 已被 `icon_key` 里的 `is_dir` 拦住，这一判是给**符号链接形态**兜底的。
 fn is_package_ext(ext: &str) -> bool {
     matches!(
-        ext,
-        "app"
-            | "bundle"
-            | "framework"
-            | "plugin"
-            | "kext"
-            | "xpc"
-            | "appex"
-            | "prefpane"
-            | "qlgenerator"
-            | "mdimporter"
-            | "saver"
-            | "scptd"
+        mo_core::types::icon_share_of(ext),
+        mo_core::types::IconShare::ByPathPackage
     )
 }
 
 /// 这些后缀在系统里是**每个条目自带图标**的，也必须按路径问（只在 Windows 上有意义）。
 ///
-/// 实测（32px，逐张比对像素指纹）：`.lnk` 的**类型**图标是一张通用白纸，而桌面上三个
-/// 快捷方式各自拿到 atlas 的 `.ico` / PotPlayer / VS Code 的图标；`.exe` 同理
-/// （`notepad.exe`、`cmd.exe` 各自一张，只有没内嵌图标的 `ping.exe` 才等于类型图）。
-/// 误按类型共享的后果是看得见的：整个目录的快捷方式共用**第一个被问到**的那张图，
-/// 看起来像串图。`.url` 与 `.lnk` 同为快捷方式、`.scr` 本质是换了后缀的 `.exe`，
-/// 按同一条规律一起收进来（这两条没实测，机器上没有样本）。
-///
-/// macOS 上这些后缀不成问题：快捷方式是 `.app` 包（上面那张表）或 Finder alias
-/// （`.alias` 的类型图标本来就是通用的那张箭头纸），所以这张表只在 Windows 生效。
+/// 判据与实测记录在 [`mo_core::types::PER_FILE_EXTS`]。**为什么这里还要再套一层 cfg**：
+/// 那张表是跨平台的事实清单，而「快捷方式要不要按路径问」是**平台行为**——macOS 上
+/// 快捷方式是 `.app` 包（上面那一判）或 Finder alias（`.alias` 的类型图标本就是通用的
+/// 那张箭头纸），按路径问反而每张都去敲一次系统。
 #[cfg(target_os = "windows")]
 fn is_per_file_ext(ext: &str) -> bool {
-    matches!(ext, "lnk" | "url" | "exe" | "scr")
+    matches!(
+        mo_core::types::icon_share_of(ext),
+        mo_core::types::IconShare::ByPathExecutable
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
