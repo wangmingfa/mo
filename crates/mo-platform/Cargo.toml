@@ -23,6 +23,9 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
+    # PIDL 那套（`ILCreateFromPathW` / `SHCreateShellItemArrayFromIDLists`）在 0.58 里
+    # 挂在 Shell 的 `Common` 子模块下，要单独开 feature。
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
     # 键盘布局查询（`VkKeyScanExW` / `MapVirtualKeyExW`）：折符号键的 Shift 变体要问当前布局。
     "Win32_UI_Input_KeyboardAndMouse",
@@ -33,8 +36,21 @@ windows = { version = "0.58", features = [
     "Win32_System_Ioctl",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # 实现 COM 接口（拖拽源的 `IDropSource`）：`#[implement]` 要的那批 `*_Impl` trait
+    # 在 0.58 里整份藏在 `implement` feature 后面（`mod.rs` 末尾那句
+    # `#[cfg(feature = "implement")] core::include!("impl.rs")`）。
+    "implement",
+    # 拖出到系统（OLE 拖拽源）：`DoDragDrop` / `IDropSource` 在 Ole 下，而它的回调
+    # 签名用的按键态 `MODIFIERKEYS_FLAGS` 挂在 SystemServices 下。
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    # `STGMEDIUM` / `ReleaseStgMedium` 挂在 Com 的 StructuredStorage 下（0.58 的模块划分不按头文件走）。
+    "Win32_System_Com_StructuredStorage",
     "Win32_Devices_DeviceAndDriverInstallation",
 ] }
+# `#[implement(IDropSource)]` 展开出来的是 `::windows_core::…` 绝对路径，光有上面那个
+# `windows`（它的 `core` 只是再出口）不够，必须让 windows-core 本身是直接依赖。
+windows-core = "0.58"
 # PDF 首页渲染单独用 0.62（别名 `windows_pdf`）：`Windows.Data.Pdf` 的异步入口要的是
 # 0.62 附带 `windows-future` 才有的 `IAsyncOperation::join()`（同步等完，不需要执行器），
 # 而上面那套 Shell / SetupAPI / GDI 调用全按 0.58 的签名验过并上线了——为了一个功能

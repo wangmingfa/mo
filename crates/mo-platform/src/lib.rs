@@ -312,6 +312,48 @@ pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), Platform
     }
 }
 
+// -------------------------------------------------------------- 拖出到系统
+
+/// 这个平台能不能把文件**拖出**到别的应用（资源管理器 / 其它程序的落点）。
+///
+/// 只有 Windows。macOS 上 gpui 自己备了出口（`WindowPlatform::start_external_drag`
+/// → `beginDraggingSessionWithItems`），但它只在拖拽由 gpui 的 `on_drag` 发起时才会
+/// 触发；Mo 的应用内拖拽是自己拿鼠标事件写的，gpui 不知道有一次拖拽正在进行，
+/// 于是那条 hook 永远不会响。要么把行拖拽换成 `on_drag` 那套（会牵动应用内落点
+/// 判定，见 `mo_ui::file_list` 的 `begin_drag`），要么在 mo-platform 里另接一份
+/// AppKit——两条都比这一小段贵，先留空。
+pub fn supports_file_drag() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// 起一次「把这批本机文件拖出到系统」，立刻返回。
+///
+/// 答 `false` = 连拖拽都没起来（平台不支持 / 线程起不来），`on_done` 也不会被调。
+/// 否则结论从 `on_done` 给出：`None` = 没落地（用户取消、Esc、起拖失败），
+/// `Some(true)` = 目标是按**移动**收的，`Some(false)` = 复制。
+///
+/// * 复制还是移动由**目标**定（资源管理器看 Ctrl / Shift 与是否跨盘），Mo 不问按键；
+/// * 答 `Some(true)` 时源文件多半还在原处——OLE 的约定是搬走源是**源端**的活，
+///   调用方得自己去删（Mo 走回收站，比资源管理器直接删更可撤回）。
+///
+/// ⚠️ `on_done` 跑在**拖拽线程**上，不是 UI 线程。OLE 的 `DoDragDrop` 是模态循环，
+/// 放在 UI 线程上会把 gpui 的事件派发重进去（`App` 正被可变借用 → panic），
+/// 所以这一层自己开线程；要回 UI 线程请调用方自己接一条 channel。
+pub fn begin_file_drag(
+    paths: Vec<PathBuf>,
+    on_done: impl FnOnce(Option<bool>) + Send + 'static,
+) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::drag::begin(paths, Box::new(on_done))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (paths, on_done);
+        false
+    }
+}
+
 // -------------------------------------------------------------- 键盘布局
 
 /// 字符 `ch` 在**当前键盘布局**上的基本键（它所在物理键未加 Shift 打出的那个字符）。

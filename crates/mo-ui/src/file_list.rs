@@ -531,8 +531,8 @@ pub fn render(
                 let down_path = entry.path.clone();
                 row.interactivity()
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                        entity_down.update(cx, |v, _cx| {
-                            v.begin_drag(pane, tab, down_path.clone(), id);
+                        entity_down.update(cx, |v, cx| {
+                            v.begin_drag(pane, tab, down_path.clone(), id, cx);
                         });
                     });
                 let entity_up = entity.clone();

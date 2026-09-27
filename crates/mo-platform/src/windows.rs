@@ -75,6 +75,11 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL
 
 use crate::{IconRaster, PlatformError, Volume};
 
+/// 拖出到系统（OLE 拖拽源）单独一个模块：它要在**自己的线程**上跑模态循环，
+/// 与这个文件里其余「在调用线程上把活干完」的接口生命周期完全不同，混在一起看
+/// 容易误用（在 UI 线程上调 `DoDragDrop` 会把 gpui 的借用重进、直接 panic）。
+pub(crate) mod drag;
+
 /// `CLSID_FileOperation`（Windows SDK 里的固定值，crate 没导就自己钉一份）。
 /// ⚠️ 别和 `IFileOperation` 的接口 IID（`947AAB5F-…`）混了——CoCreateInstance
 /// 要的是 coclass 的 CLSID。

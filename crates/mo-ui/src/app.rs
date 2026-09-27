@@ -5364,6 +5364,7 @@ impl RootView {
         tab: usize,
         path: PathBuf,
         id: mo_core::FileId,
+        cx: &mut Context<Self>,
     ) {
         let Some(p) = self.panel_at(pane, tab) else {
             return;
@@ -5378,6 +5379,7 @@ impl RootView {
             vec![path]
         };
         self.drag = Some(DragState { pane, tab, paths });
+        self.watch_drag_egress(cx);
     }
 
     // ------------------------------------------------------- 列表表头交互
@@ -6002,6 +6004,125 @@ impl RootView {
             });
         })
         .detach();
+    }
+
+    // ------------------------------------------------------ 拖出到系统（外部拖放）
+
+    /// [`Self::watch_drag_egress`] 的探测间隔。
+    const DRAG_EGRESS_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+
+    /// 拖拽期间盯着指针什么时候**离开窗口**，一出去就把这批文件交给系统当拖拽源。
+    ///
+    /// 为什么是轮询而不是监听鼠标事件：窗口外收不到元素级事件。gpui 把 `MouseMove`
+    /// 交给元素之前要先过 `hitbox.is_hovered`（`elements/div.rs`），而命中测试是纯
+    /// 几何的（`Frame::hit_test`）——指针一出窗口就什么都不命中，于是任何
+    /// `on_mouse_move` 回调都不会被调用，尽管 OS 因为按下时 `SetCapture` 过本窗口
+    /// 而照旧投消息、`Window::mouse_position` 也照旧更新。gpui 自己那段「拖出去」
+    /// 确实绕开了元素派发（`promote_external_drag_to_platform` 直接在输入回调里查
+    /// 位置），但它只认自己起的拖拽（`cx.active_drag`），Mo 的拖拽是手写鼠标事件来
+    /// 的；把 Mo 迁到 `on_drag` 又会撞进「拖进来」那半依赖的取走 `active_drag` 的
+    /// 派发行为。所以这里只能按时间问一次位置。
+    fn watch_drag_egress(&mut self, cx: &mut Context<Self>) {
+        if !mo_platform::supports_file_drag() {
+            return;
+        }
+        let entity = cx.entity().clone();
+        // 根视图的实体 id 足以反查它所在的窗口（`App::with_window`），而 `Window`
+        // 不把自家的 `AnyWindowHandle` 公开出去。
+        let root = entity.entity_id();
+        cx.spawn(async move |_weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(RootView::DRAG_EGRESS_POLL)
+                    .await;
+                // 一次取窗口就把两件事都问完：拖拽还在不在、指针出界了没有。
+                // 「还在不在」这一问不能省——普通点击也会走到这里（按下即记源），
+                // 抬起时拖拽早已结算干净，循环就该自己结束。
+                let Some((dragging, outside)) = cx.with_window(root, |window, app| {
+                    let dragging = entity.read(app).drag.is_some();
+                    let p = window.mouse_position();
+                    let size = window.viewport_size();
+                    let outside =
+                        p.x < px(0.0) || p.y < px(0.0) || p.x >= size.width || p.y >= size.height;
+                    (dragging, outside)
+                }) else {
+                    // 窗口已经没了，也就无所谓落点。
+                    return;
+                };
+                if !dragging {
+                    return;
+                }
+                if outside {
+                    entity.update(cx, |v, cx| v.hand_off_drag_to_os(cx));
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 按住文件拖出窗口：把这批文件交给系统去做拖拽落点（Windows 的 OLE 源）。
+    ///
+    /// 应用内的落点只有窗口里这几块窗格，指针都出了窗口就无从谈起——正好让 Shell 去
+    /// 问对面接不接。**先取走 `drag`** 再交出去：取走之后行 / 窗格那两条落点分支就
+    /// 拿不到状态了，不会又在本机复制一份。
+    fn hand_off_drag_to_os(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.drag.take() else {
+            return;
+        };
+        if d.paths.is_empty() {
+            return;
+        }
+        let Some(app) = self.pane_app(d.pane) else {
+            return;
+        };
+        let this = cx.entity().clone();
+        let paths = d.paths;
+        // `DoDragDrop` 是模态循环，只活在 mo-platform 自己开的那条 STA 线程上；
+        // 结论用一条 oneshot 递回主线程（gpui 的 `AsyncApp` 不是 `Send`，塞不进
+        // `background_spawn` 的 future，只能靠唤醒主线程上已经 spawn 的那个任务）。
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let started = mo_platform::begin_file_drag(paths.clone(), move |moved| {
+            let _ = tx.send(moved);
+        });
+        if !started {
+            return;
+        }
+        cx.spawn(async move |_weak, cx| {
+            let moved = rx.await.ok().flatten();
+            this.update(cx, |v, cx| v.finish_file_drag(moved, paths, app, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 系统那边给出结论后的收尾。
+    ///
+    /// 只有「目标按移动收了」这一种结论要 Mo 动手：OLE 的约定是搬走源是**源端**的活
+    /// （跨盘移动时资源管理器只往对面复制一份，然后回 `DROPEFFECT_MOVE`）。删除走
+    /// 回收站而不是硬删——与 Mo 其它删除同一口径，而且比资源管理器自己的做法可撤回。
+    ///
+    /// 同盘移动时 Shell 已经自己把源搬走了，那些路径这时根本不存在，所以先按存在筛
+    /// 一遍；不筛就会往回收站操作里塞一批必然失败的任务。
+    fn finish_file_drag(
+        &mut self,
+        moved: Option<bool>,
+        paths: Vec<PathBuf>,
+        app: AppState,
+        cx: &mut Context<Self>,
+    ) {
+        if moved != Some(true) {
+            return;
+        }
+        let left: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
+        if left.is_empty() {
+            return;
+        }
+        cx.spawn(async move |_weak, _cx| {
+            let _ = app.delete_paths(left).await;
+        })
+        .detach();
+        cx.notify();
     }
 
     // ------------------------------------------------------------ 右键菜单

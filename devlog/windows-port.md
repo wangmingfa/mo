@@ -203,13 +203,29 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **验证**：`crates/mo-ui/tests/os_drop.rs` 三个 headless 用例各投一次真的 `FileDropEvent`（`Entered` + `Submit`，经 `to_platform_input()` 走 `dispatch_event`）——拖到目录行 → 文件出现在那个子目录且**源文件留着**；拖到窗格空白 → 进当前目录；拖到回收站 → 源文件消失。反向对照三处：把对应注册点注释掉，三条测试各自红。
 * **侧栏快捷访问没进测试**（代码里挂了监听，但没有用例）：`quick_locations` 用的是真 `dirs`，`isolate_user_dirs_for_tests` 只钉配置和缓存两个目录，钉不住 Desktop/Documents。在开发机上跑这个用例等于往用户的真实桌面写文件。**这条缺口是已知的，不是漏测。**
 
+## 25. 把文件拖出 Mo：Windows 的 OLE 拖拽源，跑在一条没有窗口的线程上
+
+* **gpui 这条路走不通，两条各自的原因**：① `WindowPlatform::start_external_drag` 的 Windows 实现压根没有，走的是 trait 默认的 `false`（`gpui-pre-0.3.6/src/platform.rs:1009`）；② 触发它的那段 `promote_external_drag_to_platform`（`window.rs:5585`）要求这次拖拽是 gpui 自己的 `on_drag` 起的——它取的是 `cx.active_drag.external_payload_source`，而 Mo 的拖拽是手写鼠标事件来的，gpui 不知道有一次拖拽正在进行。把 Mo 迁到 `on_drag` 不是不行，但它会撞上 §24 坑一那条派发行为（`active_drag` 在命中判定之前就被 `take()` 掉），而这正是「拖进来」现在依赖的。所以 Windows 这半自己接 OLE；macOS 那半同样没接（gpui 那边 `beginDraggingSessionWithItems` 是实现了的，可它同样要 `on_drag`）。
+* **⚠️ `DoDragDrop` 不能在 UI 线程上调**：它是模态的——自己起一个消息循环一路泵到落子。而 Mo 的起拖点在 gpui 的输入回调里，那时 `App` 内部的 `RefCell` 正被 `borrow_mut` 持有（`app.rs:99`，普通 `borrow_mut`，不是 `try_`）。鼠标链本身有防重入（`callbacks.input.take()`），但 OLE 的循环里只要派发进一条 `WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD`（`dispatcher.rs:125` → `platform.rs:1091` → `execute_runnable:1190`，这条**没有**任何守卫）就是二次借用，直接 panic。于是拖拽活在**单独一条 STA 线程**上：`CoInitializeEx` + `OleInitialize`（拖拽代理注册表是 per-thread 的，gpui 在 UI 线程上做过一遍不算这条线程的），OLE 只泵这条线程的队列，碰不到 gpui 的隐藏窗口消息，UI 线程照常渲染。
+* **数据对象不自己写**：`ILCreateFromPathW`（每条路径一个 PIDL）→ `SHCreateShellItemArrayFromIDLists` → `BindToHandler(BHID_DataObject)`。这样递出去的不止 `CF_HDROP`，还带 `FileGroupDescriptor`（对面能看懂「一个文件夹里的若干文件」）和拖拽图像；手搓 `IDataObject` 只给得到 `CF_HDROP`，落到资源管理器以外的目标上会明显掉相。任一条路径 shell 不认（不存在 / 名字非法）就**整批不拖**——拖出「一半成功一半 404」比不拖更糟。
+* **`IDropSource` 的落子判据取「或」**：OLE 递来的 `grfKeyState` 里有 `MK_LBUTTON`，但这条线程没有窗口也没拿到鼠标捕获，那一位偶发缺帧；所以再问一次 `GetAsyncKeyState(VK_LBUTTON)`，**两条都认定已抬起**才回 `DRAGDROP_S_DROP`。误判成「还按着」只是多问一轮，误判成「已抬起」会把文件掉在指针底下随便哪个窗口上。Esc 先认，立即 `DRAGDROP_S_CANCEL`。
+* **复制还是移动交给对面**：`DoDragDrop` 只声明 `COPY|MOVE` 两个都允许，具体哪个由目标按 Ctrl / Shift 和是否跨盘定——按键状态 OLE 自己会递过去，比 Mo 在 UI 线程上猜准。
+* **回了 `MOVE` 就得自己删源**（OLE 的约定：目标只负责在原地放一份，搬走源是源端的活；跨盘移动时资源管理器就是只复制、再回 `DROPEFFECT_MOVE`）。Mo 删的时候走**回收站**而不是硬删，与它其它删除同一口径，而且比资源管理器自己的移动可撤回。删之前先按 `exists()` 筛一遍——同盘移动时 Shell 已经把源搬走了，不筛就会往回收站操作里塞一批必然失败的任务。
+* **结论怎么回 UI 线程**：`AsyncApp` 握着 `Rc<AppCell>`，不是 `Send`，塞不进 `background_spawn` 的 future。用一条 `tokio::sync::oneshot`，在 `cx.spawn` 里 await——与 `EventBus`（`tokio::sync::broadcast`）同一条跨线程唤醒路子。
+* **⚠️ 出界判定不能挂在元素上**（这轮真正学到的一条，而且是最开始写完就错的那种）：本来把判断写在 `root` 的 `on_mouse_move` 里，理由是「gpui 按下时 `SetCapture` 过本窗口，出界的 move 照样投递」。投递是对的，**派发**不是：gpui 把 `MouseMove` 交给元素之前要先过 `hitbox.is_hovered`，而 `Frame::hit_test` 是纯几何的——指针一出窗口什么都不命中，于是任何 `on_mouse_move` 回调都不会被调用，尽管 `Window::mouse_position` 一直在被更新（`dispatch_event` 里那句赋值）。gpui 自己那段 promotion 就是在派发**之前**做的，才躲过这一层。现在改成**轮询**：起拖时开一条 16ms 的探测任务，用 `App::with_window(根视图的实体 id)` 读位置（`Window` 不公开自己的 `AnyWindowHandle`，而根视图的实体 id 在 `current_window_by_entity` 里就有）；`drag` 一变空——普通点击、或已经在应用内落下——任务自己退出，不持锁不占帧。
+* **windows 0.58 的几处形状**（都是编译期撞出来的）：`IDropSource_Impl` 之于一整套 `*_Impl` 藏在 `implement` feature 后面（`windows` 的 `impl.rs` 是 `#[cfg(feature = "implement")]` include 进来的）；`#[implement]` 展开成 `::windows_core::…`，所以 `windows-core` 得直接进依赖；`ITEMIDLIST` 在 `Win32_UI_Shell_Common` 而不是 `Win32_UI_Shell`；`STGMEDIUM` / `ReleaseStgMedium` 在 `Win32_System_Com_StructuredStorage`；`DragQueryFileW` 这一版没有 `cch` 参数（缓冲长度从切片取）；`HRESULT` 在 `windows::core` 而 `S_OK` / `DRAGDROP_S_*` 在 `Win32::Foundation`；`DRAGDROP_S_DROP` 与 `DRAGDROP_S_CANCEL` 都是**成功段**，判失败只能用 `is_err()`。
+* **验到了哪一步**：单测验数据对象（`CF_HDROP` 表与给它的逐条相等，含中文名与目录；掺一条不存在的路径就整批不递）和 `QueryContinueDrag` 的两个确定分支（Esc → `CANCEL`；OLE 的按键位说按着 → `S_OK`；第三条「松手就落子」依赖 `GetAsyncKeyState`，环境相关，不写成断言）。
+* **⚠️ 端到端这一轮没验**：「真按住文件拖到资源管理器窗口里松手」headless 做不到——要真鼠标、要另一个进程当落点。我本想用 `SendInput` 演一遍（探针程序都写好了，后来删掉），但那会把光标从用户手底下挪走、也被工具侧的权限判定挡下，不该在没人盯着的会话里做。**所以「出界起拖」和「对面真接住」这两条只有代码审读，没有实测**。人工验一次就够：开着 Mo，按住一个文件拖出窗口、落到资源管理器里松手 → 应复制进去；按住 Shift 再拖 → 移动，源进 Mo 的回收站；中途按 Esc → 什么都没发生。
+
+
+
 ## 待办（还没做，别当成已完成）
 
 * 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
 * **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
 * **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
-* **拖放只通了「进来」**（§24）。**出去**（Mo → 资源管理器 / 别的软件）在 Windows 上要自己写 OLE：`DoDragDrop` + 一个 `IDataObject`（`CF_HDROP` 的字节形状 §20 已经现成，`DROPFILES` 头 20 字节那套直接复用），再加 `IDropSource` 泵鼠标和 `DROPEFFECT`。gpui 的 Windows 后端只有 `IDropTarget`，没有 `start_external_drag`；macOS 侧 `beginDraggingSessionWithItems` 也还没接。
+* **拖放的 Windows 两侧都写完了，但「出去」没实测**（§24 进来、§25 出去）。缺的是同一条：按住文件真拖一次到资源管理器上松手，看它到底落不落子——headless 做不到，得人来。**macOS 两侧都还没接**：`supports_file_drag()` / `supports_file_clipboard()` 在 mac 上都是假，拖出去要嘛迁到 gpui 的 `on_drag`（会撞 §24 坑一），要嘛自己写 `NSDraggingSource`。
 * §21 的缓存隔离只收了 mo-ui / mo-platform 这条路；mo-app / mo-operations 的十余个集成测试仍在写真实 `search.sqlite`。
 * 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
 * 测试留下的临时回收站 `mo-trash-<pid>-<seq>` 在 TEMP 里没人删（§21 那个 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积）。
