@@ -80,6 +80,8 @@ UI 侧有扩展管理器（`mo-ui/src/app.rs:3426 render_extensions`）与命令
 * **动作 id 是 `<ext-id>.<name>` 字符串**，与内置命令同进一张表；内置那批继续用现有 `'static str`。
 * 声明层四类（`types` / `menu` / `keybindings` / `sidebar`）都是**纯数据**，可静态校验、
   向后兼容便宜；带逻辑的一律走 `provider`。
+* 落地进度与形状差异：`menu` 见 §4.6（挂在命令自己身上，不是独立的 `menu` 数组），
+  `types` 见 §4.7（只收 `ext` + `label`，`group` / `icon` 未收）。
 
 ## 4. 宿主侧三张注册表（P1 的主体，本身即重构收益）
 
@@ -360,6 +362,66 @@ UI 侧不再有任何「默认投到哪儿」的判断——那是声明的事�
 `cargo test --workspace --all-features --no-fail-fast` 连跑两次都是 0。
 
 
+### 4.7 清单 `types` 的标签灌进「种类」列 —— ✅ 已落地（2026-09-27，P2-3）
+
+§3 草案里 `types` 有四个键（`ext` / `group` / `icon` / `label`），这一轮**只收 `ext` +
+`label`**：`group` 要动分组的排序路径（`mo_core::view` 那条），`icon` 要动图标 atlas 的
+键空间，两个都不是一句清单能安全改出来的。规矩是「收一个字段就投一个字段」——不收
+「解析了却没人读」的字段，那种字段的代价是作者写了、界面上没有，还没人告诉他。
+
+```json
+"types": [ { "ext": [".srt", ".vtt"], "label": "字幕" } ]
+```
+
+* **投递点**：列表与回收站的「种类」列（`mo_ui::file_item::kind_by_ext`），**先于**内置
+  那张表查。这与 §4.1 第三条规则同一个方向：作者更懂自己的格式，允许覆盖内置答案。
+* **判据同 `mo_core::types`**：小写、不含点、按 `Path::extension()` 的口径（= 最后一段）。
+  所以 `.tar.gz` 在 `validate` 阶段就被拒——写了永远命不中（实际命中的是 `gz`），
+  「写了不生效」比「写不出」难查得多。`*` 之类的 glob 同样拒。
+* **冲突**：同一份清单里两条抢同一个后缀 → 整份清单不加载（与「命令重名」同一条纪律）；
+  不同清单抢同一个后缀 → **先到先得**（`load` 按目录名排过序，所以是确定的）+ 告警。
+* 关掉的扩展（`enabled: false`）整体消失，包含它的类型标签——留着就是「停用了还在改我的显示」。
+
+**为什么要一份缓存（这一轮真正的形状问题）**：「种类」是**每帧每行**都要答的一问，
+而答案的上半截在磁盘上的清单里。`AppState::extensions()` 每次调用真读盘（右键一次
+读一次是无价的，见 §4.5），每帧读一次就是把 customization.md §10 那条坑再踩一遍。
+所以 `AppState::type_labels()` 走 [`extensions::fingerprint`] 签名缓存：
+
+| 谁 | 付什么 |
+|---|---|
+| `file_list::render` | 每帧一次 `type_labels()`（签名一致时 = 一次 `read_dir` + 每份清单一次 `stat`），行循环里只做 `BTreeMap` 查询 |
+| `extensions::fingerprint` | 扩展个数与目录名 + 每份清单的 mtime 与长度 → 一个 `u64` |
+| `AppState::type_labels` | `Mutex<(签名, Arc<表>)>`，签名没变就只 clone 一个 `Arc` |
+
+作废判据用签名而不是 TTL（`net_shares` 那类用的是 TTL）：用户手改清单下一帧就是新文案，
+不必重启，也不用在 TTL 到点前看着旧文案。盲区写进函数注释了：同 mtime 同长度的原地改写
+（NTFS/APFS 精度下基本不可能）会缓住旧表。
+
+**验收**：mo-config 7 / mo-core 39 / mo-app lib 57（+3：坏写法、摊平与先到先得、签名跟随
+改动）/ mo-ui lib 133（+1：贡献标签先于内置、目录不参与）/ `layout` 36（+1 条 headless：
+fixture 扩展的「字幕」真的出现在渲染出来的一格上）。
+
+⚠️ **这一轮先把一条空壳测试改掉了**：第一版的 headless 断言用的是新增的
+`panel_kind_labels_for_tests` 访问器，它自己调 `AppState::type_labels()` + `kind_label()`
+重算一遍。反向验证（把 `file_list::render` 传进 `view` 的那份表换成空的）之后**测试照绿**
+——接线断了没人知道。现在的做法是种类列的 debug 选择器**带上那一格的文案**
+（`mo-kind-cell-字幕`，`file_item::meta_cell` 的 `selector_text`，只在闭包里 `format!`，
+release 不登记选择器所以不付这份分配），断言打在 `debug_bounds` 命中与否上，也就是打在
+渲染产物上；那个访问器删了。日期/大小两列不带文案（每行都不同，带了等于没有稳定把手）。
+两条变异体都真跑过：① `file_list` 递空表 → layout 那条红；② 查表钥匙漂成
+`to_uppercase()`（即 `mo_core::types` 那条判据被破）→ `contributed_type_label_wins_over_builtin`
+红，报 `left: "SRT 文件" right: "字幕"`。两处还原后各自重跑绿（还原前 `touch` 过文件）。
+
+已知缺口（下一轮别当意外）：
+* 「种类」文案仍是 `mo_ui::file_item::kind_by_ext` 里那张**独立的**扩展名表——P1-1 只收了
+  分组/预览/图标三问。贡献接缝开在 UI 侧而不是 `mo_core::types`，因为这一问的答案是
+  运行时字符串（`&'static str` 表装不下），也不该在热路径上查表。真要给类型知识收尾，
+  把这张表搬进 `mo_core::types::label_of` 是第一步。
+* 分栏 / 网格 / 画廊视图不显示「种类」列，所以它们的行不受 `types` 影响（不是漏接）。
+* 点文件（`.gitignore` 这种）`Path::extension()` 是 `None`，插件无法给它起种类名。
+* `group` / `icon` 未收（见上）。
+* 缓存只在**重绘时**才检查签名：列表停着一动不动时改了清单，界面不会自己变（滚动一下就有了）。
+
 ## 5. provider 协议（stdio）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
@@ -417,7 +479,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
     §3 的独立 `menu` 数组**不同**（命令自带字段），理由与语义（缺省=只进面板、写了=精确
     投递、认不出=整条不加载）都记在那一节。自此 §8 那条验收标准的前半句成立：
     **fixture 扩展能往右键菜单里加一项**，headless 断言打在渲染出来的菜单行上。
-  * 剩下：清单 `types` / `keybindings` / `sidebar` 三类字段、安装与权限框、扩展管理器展示。
+  * **P2-3 ✅（2026-09-27）**：清单 `types` 的 `label` 决定「种类」列（§4.7）。自此 §8
+    那条验收标准的第二半句成立：**fixture 扩展能给一个类型起名字**（`group` / `icon`
+    本轮明确不收）。顺带修掉了一条空壳测试——headless 断言从此打在渲染出来的那一格上。
+  * 剩下：清单 `keybindings` / `sidebar` 两类字段（`types` 只落了 `label`，见 §4.7）、
+    安装与权限框、扩展管理器展示。
 * **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
   验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
