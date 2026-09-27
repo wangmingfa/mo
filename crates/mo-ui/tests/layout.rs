@@ -40,6 +40,17 @@ fn open_app_with_trash(
     trash_root: std::path::PathBuf,
     cx: &mut TestAppContext,
 ) -> (VisualTestContext, WindowHandle<RootView>) {
+    open_app_seeded(window_size, trash_root, |_| {}, cx)
+}
+
+/// 同 [`open_app_with_trash`]，但在建窗口之前对 `AppState` 再做一次装配（往配置里预置
+/// 书签之类持久状态）。侧栏后四个区的行要有数据才谈得上点它们。
+fn open_app_seeded(
+    window_size: Size<Pixels>,
+    trash_root: std::path::PathBuf,
+    setup: impl FnOnce(&AppState),
+    cx: &mut TestAppContext,
+) -> (VisualTestContext, WindowHandle<RootView>) {
     // 钉住配置与缓存目录：前者不隔离会读到人家的真实 config.json（视图模式 / 侧边栏
     // 开关会改变渲染结构），后者不隔离会把这些测试爬过的目录写进真实 `search.sqlite`。
     mo_ui::isolate_user_dirs_for_tests();
@@ -58,6 +69,7 @@ fn open_app_with_trash(
     // 真实条目时 `open_trash_panel` 一刷新就会把注入的假条目顶掉（曾让回收站
     // 相关断言靠机器状态侥幸通过）。
     let app = AppState::with_trash(trash_root);
+    setup(&app);
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     // Home 目录是异步加载的；这里只关心布局，跑一轮让首帧画出来即可。
@@ -734,6 +746,45 @@ fn clicking_a_sidebar_location_leaves_the_trash_panel(cx: &mut TestAppContext) {
         vcx.debug_bounds("mo-file-list").is_some(),
         "离开回收站后文件列表没有回来"
     );
+}
+
+/// 侧栏收成数据驱动之后，**每一个区的行都得在 headless 里点得到**。
+///
+/// P1-3 之前只有快捷访问与回收站两行接了 `debug_selector` + `test_support()`，另外
+/// 四个区的行在测试里根本不存在（想点也选不出来）。网络 / 位置 / 远程三区要真挂载点、
+/// 真卷宗、真会话才出得来行，headless 造不动；书签读的是配置，能干净地预置，就拿它
+/// 当这四区的代表钉住两件事：
+///   ① 数据层给行的元素 ID 与渲染层给行的选择器是**同一个**（少一样就点不到）；
+///   ② 点它 = 真的走进那个目录（不是只重绘了一帧）。
+#[gpui_kit::test]
+fn clicking_a_sidebar_bookmark_opens_that_folder(cx: &mut TestAppContext) {
+    let dir = dir_with_files("sidebar-bm", 3);
+    let (mut vcx, window) = open_app_seeded(
+        size(px(1000.), px(700.)),
+        std::env::temp_dir().join(format!("mo-layout-trash-bm-{}", std::process::id())),
+        |app| {
+            // `mo-test-config-<pid>` 会被下一轮（Windows 回收 pid）复用，残留的书签要占掉
+            // `bm-0` 这个位子——先清干净，这一条才是第一条。
+            for old in app.bookmarks() {
+                app.remove_bookmark(&old);
+            }
+            app.add_bookmark(dir.clone());
+        },
+        cx,
+    );
+
+    bounds(&mut vcx, "mo-sidebar-bm-0");
+
+    vcx.update(|window, cx| window.click("sidebar-bm-0", cx));
+    assert!(
+        wait_for_panel_rows(&mut vcx, &window, cx, 3),
+        "点了书签行，那 3 个文件没画出来：要么这行点不到，要么导航没生效"
+    );
+    // 行数相等不够——Home 恰好也是 3 行的话就白过了。落点必须是书签本身。
+    let opened = window
+        .update(cx, |root, _window, _cx| mo_ui::panel_path_for_tests(root))
+        .expect("读当前路径失败");
+    assert_eq!(opened.as_deref(), Some(dir.as_path()));
 }
 
 // ── 空白点击语义与斑马纹铺满一屏（用户报：点空白选中了最后一条；下方空白没有斑马纹）──
