@@ -195,12 +195,29 @@ pub struct UserCommand {
     /// 这条命令出现在哪些界面（空 = 只进命令面板）。见 [`MenuSlot`]。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub menu: Vec<String>,
+    /// 这条命令的组合键，写成 `cmd+shift+w`（空 = 不绑）。
+    ///
+    /// 为什么挂在命令自己身上、而不是设计稿（devlog §3）里那个独立的 `keybindings`
+    /// 数组：数组要靠 `<ext-id>.<name>` 当外键，而那是**展示名**——摊平时会被加上
+    /// 「扩展名 · 」前缀，打错一个字母就是「写了没反应，也不知道为什么」。与 `menu`
+    /// 同一取舍（devlog §4.6）。
+    ///
+    /// 键串**在这里只存原样**，解析发生在 `mo_ui::keys`（那里是它被按下的地方，
+    /// 也要按平台折主修饰键）。所以这一侧不做「写法对不对」的校验：坏键串在键表
+    /// 构建时整条跳过并告警，与「坏清单只跳过这一条」同一尺度。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
 }
 
 impl UserCommand {
     /// 投递落点（空 / 全写错 = 只进命令面板）。
     pub fn slots(&self) -> Vec<MenuSlot> {
         slots_of(&self.menu)
+    }
+
+    /// 这条命令有没有声明组合键（写成一串空白也算没写）。
+    pub fn has_chord(&self) -> bool {
+        !self.key.trim().is_empty()
     }
 }
 
@@ -220,12 +237,21 @@ pub struct Workflow {
     /// 这个工作流出现在哪些界面（空 = 只进命令面板）。见 [`MenuSlot`]。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub menu: Vec<String>,
+    /// 组合键，语义与 [`UserCommand::key`] 同（工作流不受 `when_ext` 约束，所以绑键
+    /// 没有那条限制）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
 }
 
 impl Workflow {
     /// 投递落点，语义与 [`UserCommand::slots`] 同。
     pub fn slots(&self) -> Vec<MenuSlot> {
         slots_of(&self.menu)
+    }
+
+    /// 有没有声明组合键，语义与 [`UserCommand::has_chord`] 同。
+    pub fn has_chord(&self) -> bool {
+        !self.key.trim().is_empty()
     }
 }
 
@@ -488,7 +514,7 @@ mod tests {
         assert!(err.contains("context:blank"), "{err} 要列出可用的写法");
     }
 
-    /// `menu` 为空时**不该**出现在写出的配置里（用户没声明就别往 config.json 里
+    /// `menu` / `key` 为空时**不该**出现在写出的配置里（用户没声明就别往 config.json 里
     /// 塞噪音），缺字段读回来也必须是空。
     #[test]
     fn empty_menu_is_not_serialized() {
@@ -498,11 +524,14 @@ mod tests {
             shell: "wc -l {file}".into(),
             source: None,
             menu: Vec::new(),
+            key: String::new(),
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(!json.contains("menu"), "{json}");
+        assert!(!json.contains("key"), "{json}");
         let back: UserCommand = serde_json::from_str(&json).unwrap();
         assert!(back.menu.is_empty());
+        assert!(!back.has_chord(), "没写 key = 没绑键");
         assert_eq!(back.slots(), MenuSlot::defaults());
 
         c.menu = vec!["context:file".into()];
@@ -512,5 +541,16 @@ mod tests {
         assert_eq!(back.slots(), vec![MenuSlot::ContextFile]);
         // 读写同一份声明来回一致（回写配置时不该把用户的写法悄悄换掉）。
         assert_eq!(back.menu, c.menu);
+
+        c.key = "cmd+shift+w".into();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""key":"cmd+shift+w""#), "{json}");
+        let back: UserCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.key, "cmd+shift+w", "键串必须原样往返");
+        assert!(back.has_chord());
+        // 一串空白不是「绑了键」——写错的人要看到的是没绑，而不是一条永远按不出来的绑定。
+        let blank: UserCommand =
+            serde_json::from_str(r#"{"name":"n","shell":"pwd","key":"   "}"#).unwrap();
+        assert!(!blank.has_chord());
     }
 }

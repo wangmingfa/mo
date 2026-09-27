@@ -163,6 +163,7 @@ mod tests {
             shell: "wc -l {file}".to_string(),
             source: None,
             menu: menu.iter().map(|s| s.to_string()).collect(),
+            key: String::new(),
         }
     }
 
@@ -176,6 +177,7 @@ mod tests {
             steps: vec!["pwd".to_string()],
             source: None,
             menu: menu.iter().map(|s| s.to_string()).collect(),
+            key: String::new(),
         }
     }
 

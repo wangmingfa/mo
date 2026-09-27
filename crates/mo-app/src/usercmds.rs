@@ -266,6 +266,7 @@ mod tests {
             shell: shell.into(),
             source: None,
             menu: Vec::new(),
+            key: String::new(),
         }
     }
 

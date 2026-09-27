@@ -704,10 +704,53 @@ pub fn key_hint(spec: &str) -> String {
         .unwrap_or_else(|| spec.to_string())
 }
 
-/// 当前键表：`(键组, 动作 id)`，按平台主修饰键分两段查询。
+/// 一个键位上挂的**那件事**。
+///
+/// 为什么不只是动作 id：内置那批宿主自己知道怎么跑（`dispatch_action` 里一个
+/// `match`），而贡献进来的那条**宿主事先不知道有它**——它的可执行内容（命令行、来源）
+/// 在清单里。所以这里直接带上载荷本体，命中即执行，不留「拿个 id 再去查一遍」的空档
+/// （查的那份列表随时会被重取，那是 §4.2「载荷带身份而不是下标」的同一条纪律）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Chord {
+    /// 内置动作的 id（[`BINDINGS`] 里那一条）。
+    Builtin(&'static str),
+    /// 配置 / 扩展清单里声明了 `key` 的一条用户命令。
+    Command(mo_app::UserCommand),
+    /// 同上，工作流。
+    Workflow(mo_app::Workflow),
+}
+
+impl Chord {
+    /// 是不是内置表里这条 id（改绑 / 解绑 / 恢复默认都只认内置条目）。
+    fn is_builtin(&self, id: &str) -> bool {
+        matches!(self, Chord::Builtin(other) if *other == id)
+    }
+
+    /// 冲突提示与调试用的名字。
+    pub fn title(&self) -> String {
+        match self {
+            Chord::Builtin(id) => Keymap::label(id).to_string(),
+            Chord::Command(c) => c.name.clone(),
+            Chord::Workflow(w) => w.name.clone(),
+        }
+    }
+
+    /// 这个动作是否**读当前选择**（模态 / 对话框打开时该吞键）。
+    ///
+    /// 贡献进来的命令一律算「是」：它们靠 `{file}` / `{files}` 占位符工作，遮罩后面
+    /// 那个列表的选中项正是它们的输入——与 ⌘C 同一个尺度。
+    pub fn acts_on_selection(&self) -> bool {
+        match self {
+            Chord::Builtin(id) => touches_the_browser(id),
+            _ => true,
+        }
+    }
+}
+
+/// 当前键表：`(键组, 动作)`，按平台主修饰键分两段查询。
 #[derive(Default)]
 pub struct Keymap {
-    entries: Vec<(KeyCombo, &'static str)>,
+    entries: Vec<(KeyCombo, Chord)>,
     /// 被用户显式解绑的默认键位。
     ///
     /// 解绑不等于「这个键没人管」：`⌘T` 解绑后如果继续往下冒泡，会漏给系统 /
@@ -716,11 +759,22 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// 用默认键表 + 用户覆盖构建。
+    /// 用默认键表 + 用户覆盖 + 贡献的键位构建。
     ///
     /// 覆盖里值为空串表示**解绑**该动作；值为坏键串则忽略该条覆盖（保留默认），
     /// 用户手打错一个字母不该让快捷键整体失效。
-    pub fn build(overrides: &HashMap<String, String>) -> Self {
+    ///
+    /// `commands` / `workflows` 是「配置 + 各扩展清单」摊平后的那两份（
+    /// `AppState::user_commands(&[])` / `AppState::workflows()`），其中带了 `key`
+    /// 的进来当贡献项。收 `&[]` 的两条理由：
+    /// * 传 `&[]` 的调用方（单测）就是要一张纯内置表；
+    /// * 扩展名的条件（`when_ext`）不可能进这张表——组合键按下时没有「本次目标」，
+    ///   所以那种命令在 [`mo_app::extensions::validate`] 那一侧就被拒了，这里看不到。
+    pub fn build(
+        overrides: &HashMap<String, String>,
+        commands: &[mo_app::UserCommand],
+        workflows: &[mo_app::Workflow],
+    ) -> Self {
         let mut out = Self::default();
         for b in BINDINGS.iter() {
             let base = default_spec(b);
@@ -733,7 +787,7 @@ impl Keymap {
                 continue;
             }
             if let Some(combo) = KeyCombo::parse(spec) {
-                out.entries.push((combo, b.id));
+                out.entries.push((combo, Chord::Builtin(b.id)));
             } else {
                 // 覆盖值解析不出来：退回默认，别把动作弄丢。
                 tracing::warn!(
@@ -742,11 +796,51 @@ impl Keymap {
                     base
                 );
                 if let Some(combo) = KeyCombo::parse(base) {
-                    out.entries.push((combo, b.id));
+                    out.entries.push((combo, Chord::Builtin(b.id)));
                 }
             }
         }
+        // 贡献的键位**后插**：内置那张（连同用户的改绑）先占位，插件抢不走 ⌘T。
+        // 撞了就跳过并告警——「写了没生效还没人告诉他」正是这一句要解决的问题。
+        for c in commands.iter().filter(|c| c.has_chord()) {
+            out.push_chord(&c.key, Chord::Command(c.clone()));
+        }
+        for w in workflows.iter().filter(|w| w.has_chord()) {
+            out.push_chord(&w.key, Chord::Workflow(w.clone()));
+        }
         out
+    }
+
+    /// 收一条贡献的键位：坏键串与已被占用的键位都只跳过 + 告警。
+    fn push_chord(&mut self, spec: &str, chord: Chord) {
+        let Some(combo) = KeyCombo::parse(spec) else {
+            tracing::warn!(
+                "「{}」的快捷键「{spec}」不是合法键组，这条绑定没有生效（写法形如 cmd+shift+w）",
+                chord.title()
+            );
+            return;
+        };
+        if let Some(other) = self.occupant(&combo) {
+            tracing::warn!(
+                "「{}」想绑 {}，但那个键位已经是「{}」的了，这条绑定没有生效",
+                chord.title(),
+                combo.format(),
+                other
+            );
+            return;
+        }
+        self.entries.push((combo, chord));
+    }
+
+    /// 这个键位现在归谁（含「用户显式解绑过」——他说这颗键什么都不该干）。
+    fn occupant(&self, combo: &KeyCombo) -> Option<String> {
+        if self.is_unbound(combo) {
+            return Some("用户解绑的键位".to_string());
+        }
+        self.entries
+            .iter()
+            .find(|(c, _)| c.matches(combo))
+            .map(|(_, chord)| chord.title())
     }
 
     /// 这个键组是否被显式解绑（命中则应吞掉按键）。
@@ -755,57 +849,70 @@ impl Keymap {
     }
 
     /// 查一次按键对应的动作。
-    pub fn lookup(&self, ks: &KeyCombo) -> Option<&'static str> {
+    ///
+    /// 返回**owned** 的 [`Chord`]：调用方拿到的是「键位 + 要跑的东西」一份自足的
+    /// 数据，不必在按下之后还留着对 `Keymap` 的借用（`read` 的临时借用活不到派发那一步）。
+    pub fn lookup(&self, ks: &KeyCombo) -> Option<Chord> {
         self.entries
             .iter()
             .find(|(c, _)| c.matches(ks))
-            .map(|(_, id)| *id)
+            .map(|(_, chord)| chord.clone())
     }
 
-    /// 某动作当前绑到的键组（被解绑则 `None`）。
+    /// 某内置动作当前绑到的键组（被解绑则 `None`）。
     pub fn combo_of(&self, id: &str) -> Option<&KeyCombo> {
         self.entries
             .iter()
-            .find(|(_, other)| *other == id)
+            .find(|(_, chord)| chord.is_builtin(id))
             .map(|(c, _)| c)
     }
 
-    /// 该键组是否已被别的动作占用（重绑定时做冲突提示）。
-    pub fn conflict(&self, id: &str, combo: &KeyCombo) -> Option<&'static str> {
+    /// 该键组是否已被别的动作占用（重绑定时做冲突提示，占用者的名字够用就行）。
+    pub fn conflict(&self, id: &str, combo: &KeyCombo) -> Option<String> {
         self.entries
             .iter()
-            .find(|(c, other)| *other != id && c.matches(combo))
-            .map(|(_, other)| *other)
+            .find(|(c, other)| !other.is_builtin(id) && c.matches(combo))
+            .map(|(_, other)| other.title())
     }
 
-    /// 把动作绑到新键组（同 id 的旧条目一并替换）。
+    /// 把内置动作绑到新键组（同 id 的旧条目一并替换）。
     pub fn rebind(&mut self, id: &'static str, combo: KeyCombo) {
-        self.entries.retain(|(_, other)| *other != id);
-        self.entries.push((combo, id));
+        self.entries.retain(|(_, other)| !other.is_builtin(id));
+        self.entries.push((combo, Chord::Builtin(id)));
     }
 
-    /// 解绑一个动作：从表里摘掉，并把该键位记入「显式解绑」名单（命中时吞键）。
+    /// 解绑一个内置动作：从表里摘掉，并把该键位记入「显式解绑」名单（命中时吞键）。
     pub fn unbind(&mut self, id: &str, combo: KeyCombo) {
-        self.entries.retain(|(_, other)| *other != id);
+        self.entries.retain(|(_, other)| !other.is_builtin(id));
         if !self.unbound.iter().any(|c| c.matches(&combo)) {
             self.unbound.push(combo);
         }
     }
 
-    /// 恢复某个动作的默认键位。
+    /// 恢复某个内置动作的默认键位。
     pub fn reset(&mut self, id: &str) {
-        self.entries.retain(|(_, other)| *other != id);
+        self.entries.retain(|(_, other)| !other.is_builtin(id));
         self.unbound.clear();
         if let Some(b) = BINDINGS.iter().find(|b| b.id == id) {
             if let Some(combo) = KeyCombo::parse(default_spec(b)) {
-                self.entries.push((combo, b.id));
+                self.entries.push((combo, Chord::Builtin(b.id)));
             }
         }
     }
 
-    /// 全部动作回到默认（清空解绑名单）。
+    /// 全部内置动作回到默认键位（清空解绑名单）。
+    ///
+    /// 贡献的那批**保留**：它们的默认值在清单里，不在这张表里，「恢复默认」不该
+    /// 顺手把别人装的扩展快捷键抹掉。
     pub fn reset_all(&mut self) {
-        *self = Self::build(&HashMap::new());
+        let contributed: Vec<(KeyCombo, Chord)> = self
+            .entries
+            .iter()
+            .filter(|(_, chord)| !matches!(chord, Chord::Builtin(_)))
+            .cloned()
+            .collect();
+        *self = Self::build(&HashMap::new(), &[], &[]);
+        self.entries.extend(contributed);
     }
 
     /// 动作 id → 中文名。
@@ -824,6 +931,23 @@ mod tests {
 
     fn ks(spec: &str) -> KeyCombo {
         KeyCombo::parse(spec).expect("测试里的键串必须能解析")
+    }
+
+    /// 断言用的短写法：一条挂在内置动作上的键位。
+    fn b(id: &'static str) -> Chord {
+        Chord::Builtin(id)
+    }
+
+    /// 造一条带了 `key` 的命令，喂给 [`Keymap::build`] 的贡献那一段。
+    fn cmd(name: &str, key: &str) -> mo_app::UserCommand {
+        mo_app::UserCommand {
+            name: name.into(),
+            category: String::new(),
+            shell: "wc -l {file}".into(),
+            source: Some("测试清单".into()),
+            menu: Vec::new(),
+            key: key.into(),
+        }
     }
 
     /// 解析：顺序无关、大小写无关、别名与符号都收。
@@ -847,11 +971,11 @@ mod tests {
     /// 这里任何一处没折拢，⌘+ / ⌘- 就是「按了没反应」。
     #[test]
     fn zoom_keys_survive_typographic_variants() {
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
 
         let minus = ks("cmd+-");
         assert_eq!(minus.key, "-", "`-` 主键不能被分隔符切掉");
-        assert_eq!(map.lookup(&minus), Some("view.zoom_out"));
+        assert_eq!(map.lookup(&minus), Some(b("view.zoom_out")));
 
         let plus_binding = ks("cmd+=");
         assert_eq!(plus_binding.key, "=");
@@ -867,7 +991,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(typed, plus_binding, "「⌘+」应与 `cmd+=` 折到同一键组");
-        assert_eq!(map.lookup(&typed), Some("view.zoom_in"));
+        assert_eq!(map.lookup(&typed), Some(b("view.zoom_in")));
 
         // 配置里另一种自然写法 `cmd+shift+=` 也命中同一条绑定。结构体本身保留
         // 用户写下的 Shift 位（键位编辑器要按原样显示），折只发生在比对时。
@@ -878,7 +1002,7 @@ mod tests {
             shift_equals.matches(&plus_binding),
             "两种写法该命中同一个动作"
         );
-        assert_eq!(map.lookup(&shift_equals), Some("view.zoom_in"));
+        assert_eq!(map.lookup(&shift_equals), Some(b("view.zoom_in")));
     }
 
     /// 回归：符号键的快捷键在 **Windows** 上按得出来。
@@ -889,7 +1013,7 @@ mod tests {
     /// 全是死键——2026-09-26 实测按下无反应，而同窗口的 Ctrl+Shift+P（字母）正常。
     #[test]
     fn windows_shifted_symbol_events_hit_symbol_bindings() {
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         // 造一次 Windows 形状的按键：主键是 Shift 后的字符、Shift 位已被后端吃掉。
         let pressed = |key: &str| {
             KeyCombo::from_keystroke(&Keystroke {
@@ -902,9 +1026,9 @@ mod tests {
                 ..Default::default()
             })
         };
-        assert_eq!(map.lookup(&pressed(">")), Some("view.hidden"));
-        assert_eq!(map.lookup(&pressed("{")), Some("tab.prev"));
-        assert_eq!(map.lookup(&pressed("}")), Some("tab.next"));
+        assert_eq!(map.lookup(&pressed(">")), Some(b("view.hidden")));
+        assert_eq!(map.lookup(&pressed("{")), Some(b("tab.prev")));
+        assert_eq!(map.lookup(&pressed("}")), Some(b("tab.next")));
         // macOS 形状（同一个键、Shift 位还在）当然也要命中同一条。
         let macish = KeyCombo {
             key: ".".into(),
@@ -913,11 +1037,11 @@ mod tests {
             ctrl: false,
             alt: false,
         };
-        assert_eq!(map.lookup(&macish), Some("view.hidden"));
+        assert_eq!(map.lookup(&macish), Some(b("view.hidden")));
         // 字母键的 Shift 位后端不会吃掉，Ctrl+Shift+P 仍然是命令面板、不会落到 ⌘P 上。
         let mut ctrl_shift_p = pressed("p");
         ctrl_shift_p.shift = true;
-        assert_eq!(map.lookup(&ctrl_shift_p), Some("palette.open"));
+        assert_eq!(map.lookup(&ctrl_shift_p), Some(b("palette.open")));
     }
 
     /// 折拢的纯逻辑跟着**布局**走：布局答什么就按什么折，答不到才退 US 表。
@@ -982,10 +1106,10 @@ mod tests {
     /// 分隔符是 `+`，逗号不该被分割逻辑吃掉；键名也不该被 `known_key` 判成幽灵键。
     #[test]
     fn comma_opens_settings() {
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         let comma = ks("cmd+,");
         assert_eq!(comma.key, ",", "逗号是主键，不能被分隔符切掉");
-        assert_eq!(map.lookup(&comma), Some("settings.open"));
+        assert_eq!(map.lookup(&comma), Some(b("settings.open")));
         // 反向：不带修饰的裸逗号不该命中任何动作（避免误吞输入）。
         assert_eq!(map.lookup(&ks(",")), None);
     }
@@ -1003,10 +1127,10 @@ mod tests {
         let combo = KeyCombo::from_keystroke(&ev);
         // 必须与配置串路径落到同一个内部名，否则重绑 / 键位展示会漂。
         assert_eq!(combo.key, KeyCombo::parse("space").unwrap().key);
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         assert_eq!(
             map.lookup(&combo),
-            Some("list.preview"),
+            Some(b("list.preview")),
             "空格应命中快速预览"
         );
     }
@@ -1031,7 +1155,7 @@ mod tests {
         assert_eq!(KeyCombo::parse("delete").unwrap().key, "delete");
         assert_eq!(KeyCombo::parse("backspace").unwrap().key, "backspace");
 
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         let bare_backspace = KeyCombo {
             cmd: false,
             ctrl: false,
@@ -1059,7 +1183,7 @@ mod tests {
     /// 默认键表能整体构建，且没有内部冲突。
     #[test]
     fn default_keymap_has_no_conflicts() {
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         assert_eq!(map.entries.len(), BINDINGS.len(), "默认表应覆盖全部动作");
         for b in BINDINGS.iter() {
             let combo = map.combo_of(b.id).expect("默认键位应存在");
@@ -1078,9 +1202,9 @@ mod tests {
         o.insert("tab.new".to_string(), "cmd+alt+t".to_string());
         o.insert("search.global".to_string(), "".to_string());
         o.insert("view.list".to_string(), "不是键".to_string());
-        let map = Keymap::build(&o);
+        let map = Keymap::build(&o, &[], &[]);
 
-        assert!(map.lookup(&ks("cmd+alt+t")) == Some("tab.new"));
+        assert!(map.lookup(&ks("cmd+alt+t")) == Some(b("tab.new")));
         assert!(map.lookup(&ks("cmd+t")).is_none(), "旧键位应当失效");
         assert!(map.combo_of("search.global").is_none(), "空串 = 解绑");
         assert_eq!(
@@ -1090,18 +1214,144 @@ mod tests {
         );
     }
 
+    /// 清单里声明的 `key` 进表：命中时交回的是**那条命令本体**，不是一个待查的 id。
+    ///
+    /// P2-4 的核心断言。反向验证的靶子（真跑过，见 devlog §4.8）：把 `build` 里
+    /// 收贡献项那两个 `for` 循环删掉，这里第一条就红。
+    #[test]
+    fn contributed_chords_join_the_table_with_their_payload() {
+        let map = Keymap::build(&HashMap::new(), &[cmd("统计字数", "cmd+alt+shift+j")], &[]);
+        let hit = map
+            .lookup(&ks("cmd+alt+shift+j"))
+            .expect("贡献的键位应命中");
+        assert_eq!(
+            hit,
+            Chord::Command(cmd("统计字数", "cmd+alt+shift+j")),
+            "交回来的必须是那条命令自己（{hit:?}）"
+        );
+        assert_eq!(hit.title(), "统计字数");
+        // 没声明 key 的不该占任何键位（`build` 那一侧的过滤条件是 `has_chord`）。
+        let map = Keymap::build(&HashMap::new(), &[cmd("什么都不绑", "")], &[]);
+        assert!(
+            map.lookup(&ks("cmd+alt+shift+j")).is_none(),
+            "空 key 不是绑定"
+        );
+    }
+
+    /// 冲突时**内置那张先赢**：插件不能抢走 ⌘T，也不能抢走用户自己改绑过的键位。
+    ///
+    /// 抢键是声明式插件最容易撞上的事（谁都想要 ⌘⇧S）。这里的选择是「宿主与用户的
+    /// 表优先，贡献的丢掉并告警」——反过来会让一个扩展静默改掉整机的手感。
+    #[test]
+    fn contributed_chords_never_steal_builtin_slots() {
+        let map = Keymap::build(
+            &HashMap::new(),
+            &[
+                cmd("抢 ⌘T", "cmd+t"),
+                cmd("抢 ⌘W", "cmd+w"),
+                cmd("正常那条", "cmd+alt+shift+k"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            map.lookup(&ks("cmd+t")),
+            Some(b("tab.new")),
+            "⌘T 仍归内置的新建标签页"
+        );
+        assert_eq!(
+            map.lookup(&ks("cmd+w")),
+            Some(b("tab.close")),
+            "⌘W 仍归内置的关闭标签页"
+        );
+        assert!(
+            matches!(map.lookup(&ks("cmd+alt+shift+k")), Some(Chord::Command(_))),
+            "不撞的那条应当照常进表"
+        );
+
+        // 用户改绑之后，插件也不能去占那个键位。
+        let mut o = HashMap::new();
+        o.insert("tab.new".to_string(), "cmd+alt+shift+k".to_string());
+        let map = Keymap::build(&o, &[cmd("抢用户改绑的键", "cmd+alt+shift+k")], &[]);
+        assert_eq!(map.lookup(&ks("cmd+alt+shift+k")), Some(b("tab.new")));
+    }
+
+    /// 坏键串与互相抢键的两条贡献：跳过 + 告警，而不是「表里两条、按下看运气」。
+    #[test]
+    fn bad_contributed_chords_are_dropped_not_guessed() {
+        let map = Keymap::build(
+            &HashMap::new(),
+            &[
+                cmd("键串写错", "不是键"),
+                cmd("先到先得", "cmd+alt+shift+l"),
+                cmd("后到的同键", "cmd+alt+shift+l"),
+            ],
+            &[],
+        );
+        assert!(map.lookup(&ks("cmd+alt+shift+l")).is_some());
+        assert_eq!(
+            map.lookup(&ks("cmd+alt+shift+l"))
+                .map(|c| c.title())
+                .as_deref(),
+            Some("先到先得"),
+            "同一键位两条：留下的必须是声明在前的那条"
+        );
+        // 坏键串不该产出任何一条：它连键组都不是，猜成什么都是错。
+        assert_eq!(
+            map.entries.len(),
+            BINDINGS.len() + 1,
+            "只该收下合法的那几条"
+        );
+    }
+
+    /// 贡献的命令一律算「读当前选择」——模态打开时要吞键。
+    ///
+    /// 它们靠 `{file}` / `{files}` 干活，遮罩后面那个列表的选中项正是输入。内置那批
+    /// 仍按 `BROWSER_SCOPED` 那张名单分。
+    #[test]
+    fn contributed_chords_count_as_reading_the_selection() {
+        assert!(Chord::Command(cmd("统计", "cmd+alt+j")).acts_on_selection());
+        assert!(Chord::Workflow(mo_app::Workflow {
+            name: "打包".into(),
+            steps: vec!["pwd".into()],
+            source: None,
+            menu: Vec::new(),
+            key: "cmd+alt+j".into(),
+        })
+        .acts_on_selection());
+        assert!(b("clipboard.copy").acts_on_selection());
+        assert!(!b("tab.new").acts_on_selection(), "新建标签页不碰选中项");
+    }
+
+    /// 「恢复默认」只清内置那批：别人装的扩展快捷键不该被顺手抹掉。
+    #[test]
+    fn reset_all_keeps_contributed_chords() {
+        let mut map = Keymap::build(&HashMap::new(), &[cmd("统计字数", "cmd+alt+shift+j")], &[]);
+        map.rebind("list.preview", ks("cmd+p"));
+        map.reset_all();
+        assert_eq!(
+            map.combo_of("list.preview").map(|c| c.spec()),
+            Some("space".to_string()),
+            "内置的回到默认"
+        );
+        assert!(
+            matches!(map.lookup(&ks("cmd+alt+shift+j")), Some(Chord::Command(_))),
+            "贡献的那条要留下"
+        );
+    }
+
     /// 重绑与复位。
     #[test]
     fn rebind_and_reset() {
-        let mut map = Keymap::build(&HashMap::new());
+        let mut map = Keymap::build(&HashMap::new(), &[], &[]);
         map.rebind("list.preview", ks("cmd+p"));
         assert!(map.lookup(&ks("space")).is_none(), "旧键位应被换掉");
-        assert_eq!(map.lookup(&ks("cmd+p")), Some("list.preview"));
+        assert_eq!(map.lookup(&ks("cmd+p")), Some(b("list.preview")));
         assert_eq!(map.conflict("list.preview", &ks("cmd+p")), None);
         map.rebind("list.open", ks("cmd+p"));
         assert_eq!(
             map.conflict("list.open", &ks("cmd+p")),
-            Some("list.preview"),
+            // 报的是**中文名**：这句话直接进给用户看的提示里。
+            Some("快速预览".to_string()),
             "应当报出占用者"
         );
         map.reset("list.preview");
@@ -1183,7 +1433,7 @@ mod tests {
         assert_eq!(default_spec(preview), "space", "预览两个平台都是空格");
 
         // 打开与预览必须是**不同**的键：否则「Enter 变成预览」这类回归会重现。
-        let map = Keymap::build(&HashMap::new());
+        let map = Keymap::build(&HashMap::new(), &[], &[]);
         let open_combo = map.combo_of("list.open").unwrap().clone();
         let preview_combo = map.combo_of("list.preview").unwrap().clone();
         assert!(

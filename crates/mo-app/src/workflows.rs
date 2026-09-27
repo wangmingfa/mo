@@ -176,6 +176,7 @@ mod tests {
             steps: steps.iter().map(|s| s.to_string()).collect(),
             source: None,
             menu: Vec::new(),
+            key: String::new(),
         }
     }
 

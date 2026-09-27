@@ -174,6 +174,18 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
             return Some(format!("扩展「{}」的命令有问题：{err}", m.id));
         }
     }
+    // 绑了快捷键的命令不能受 `when_ext` 约束。理由不是「实现麻烦」而是语义：组合键
+    // 按下时**没有「本次右键的目标」这个上下文**，键表也不按选区过滤——绑上去就等于
+    // 「选中 .txt 时按 ⌘⇧W 也会去数字幕」。与其在按下时再判一次选区（那才有两处判据、
+    // 于是「有时生效有时不生效」），不如在加载时就拒掉。
+    if !m.when_ext.is_empty() {
+        if let Some(c) = m.commands.iter().find(|c| c.has_chord()) {
+            return Some(format!(
+                "扩展「{}」写了 when_ext，命令「{}」却绑了快捷键「{}」（快捷键不看选区；要绑键就把 when_ext 去掉，让这条命令一直可见）",
+                m.id, c.name, c.key
+            ));
+        }
+    }
     if let Some(err) = validate_types(m) {
         return Some(err);
     }
@@ -371,6 +383,7 @@ mod tests {
                 shell: "wc -l {file}".into(),
                 source: None,
                 menu: Vec::new(),
+                key: String::new(),
             }],
             when_ext: Vec::new(),
             workflows: Vec::new(),
@@ -444,6 +457,42 @@ mod tests {
                 mo_config::MenuSlot::ContextFile
             ]
         );
+    }
+
+    /// 绑了快捷键、却又被 `when_ext` 约束的命令 → 整条清单不加载。
+    ///
+    /// 这一条钉的是「宁可不加载，也不要一条按得响但语义说不清的命令」：组合键按下时
+    /// 没有「本次目标」这个上下文，让它受选区扩展名约束就会出现「同一颗键，选中 .md
+    /// 时执行、选中 .txt 时也执行同一条」——那 `when_ext` 等于没写。
+    #[test]
+    fn rejects_chord_on_ext_gated_command() {
+        let mut m = manifest("a");
+        m.commands[0].key = "cmd+shift+w".into();
+        assert!(
+            validate(&m, Some("a")).is_none(),
+            "没写 when_ext 时绑键是合法的"
+        );
+        m.when_ext = vec![".srt".into()];
+        let err = validate(&m, Some("a")).expect("when_ext + key 应被拒");
+        assert!(err.contains("统计"), "{err} 要指得出是哪条命令");
+        assert!(err.contains("when_ext"), "{err} 要说出理由");
+    }
+
+    /// 摊平只改展示名 / 分类 / 来源，**不能**把 `key` 声明弄丢——键表读的是摊平之后的
+    /// 那一份，这里掉了字段就是「清单写了快捷键，按下去没反应」（P2-4 的反向验证靶子）。
+    #[test]
+    fn key_declaration_survives_flattening() {
+        let mut m = manifest("a");
+        m.commands[0].key = "cmd+alt+shift+j".into();
+        let cmds = flatten(
+            &[Extension {
+                manifest: m,
+                path: PathBuf::from("/x/a/manifest.json"),
+            }],
+            &[],
+        );
+        assert_eq!(cmds[0].key, "cmd+alt+shift+j");
+        assert!(cmds[0].has_chord());
     }
 
     /// 摊平：加前缀、补分类、记来源。

@@ -1094,6 +1094,21 @@ enum NewEntry {
     File,
 }
 
+/// 「配置文件 + 各扩展清单」→ 键表。
+///
+/// ⚠️ 命令那份要**不带选区过滤**的（`user_commands(&[])`），不是命令面板那份镜像：
+/// 镜像按当前选中的扩展名筛过，键表跟着选区变就会出现「选中 .txt 时按这串键没反应」
+/// ——而组合键本来就不该看选区（看了选区的命令绑不了键，见
+/// [`mo_app::extensions::validate`]）。用 `&[]` 不是「关掉过滤」，是**只要那些本来就
+/// 不受 `when_ext` 约束的**命令，正是能绑键的那一批。
+fn keymap_from(app: &AppState) -> crate::keys::Keymap {
+    crate::keys::Keymap::build(
+        &app.keybindings(),
+        &app.user_commands(&[]),
+        &app.workflows(),
+    )
+}
+
 impl RootView {
     pub fn new(app: AppState, cx: &mut Context<Self>) -> Self {
         // 启动即套用持久化主题：此时还没有 Window，先按浅色基底解析系统外观，
@@ -1106,6 +1121,9 @@ impl RootView {
         ));
         crate::theme::apply_component(cx);
         let ui = app.ui_prefs();
+        // 键表在启动时建一次，之后每开一次命令面板重取（见 `dispatch_action` 的
+        // `palette.open`）——用户手改清单里的 `key` 不必重启 Mo 就生效。
+        let keymap = keymap_from(&app);
         let view = Self {
             panes: vec![Pane::new(panel_with_prefs(app.clone(), &ui))],
             active_pane: 0,
@@ -1131,7 +1149,7 @@ impl RootView {
             op_stats: HashMap::new(),
             ui: app.ui_prefs(),
             layout_index: 0,
-            keymap: crate::keys::Keymap::build(&app.keybindings()),
+            keymap,
             keys_index: 0,
             keys_capturing: None,
             user_commands: Vec::new(),
@@ -4272,6 +4290,19 @@ impl RootView {
 
     // ------------------------------------------------------------ 快捷键
 
+    /// 键表命中一条之后要跑的东西（派发只在这一处分叉）。
+    ///
+    /// 内置那批走 id 的 `match`；贡献进来的**直接执行它自带的那份命令本体**——载荷是
+    /// 跟着键表一起交上来的，这里不再回头查 `self.user_commands` 那份镜像（镜像随时会
+    /// 被重取，拿它当下标参照就是「点 A 跑出 B」，见 §4.2 那条纪律）。
+    pub(crate) fn dispatch_chord(&mut self, chord: crate::keys::Chord, cx: &mut Context<Self>) {
+        match chord {
+            crate::keys::Chord::Builtin(id) => self.dispatch_action(id, cx),
+            crate::keys::Chord::Command(cmd) => self.run_user_command(cmd, cx),
+            crate::keys::Chord::Workflow(wf) => self.run_workflow(wf, cx),
+        }
+    }
+
     /// 执行一个可绑定动作（键表查出来的 id 落到这里）。
     ///
     /// 动作 id 与 `keys::BINDINGS` 一一对应；不认识的 id 静默忽略
@@ -4294,6 +4325,9 @@ impl RootView {
                 let exts = selected_ext_names(self.panel());
                 self.user_commands = self.app().user_commands(&exts);
                 self.workflows = self.app().workflows();
+                // 键表跟着重取一次：手改清单里的 `key` 不必重启 Mo（代价是多读一遍
+                // 配置目录——与上面那两行同一份 IO，同一个「用户主动刷新」的时机）。
+                self.keymap = keymap_from(&self.app());
                 self.modal = Modal::CommandPalette;
                 self.cmd_query.clear();
                 self.palette_index = 0;
@@ -7013,16 +7047,18 @@ impl Render for RootView {
             let combo = crate::keys::KeyCombo::from_keystroke(&ev.keystroke);
             if combo.is_modified() {
                 let hit = entity_key.read(cx).keymap.lookup(&combo);
-                if let Some(action) = hit {
+                if let Some(chord) = hit {
                     // 模态 / 对话框打开时，作用于下层文件列表的动作**吞掉**：
                     // 那个列表在遮罩后面，选中项 / 剪贴板却在背后被改掉。最容易被
                     // 撞见的是 ⌘A——在「连接到服务器」的输入框里按 ⌘A，选中的是后面
                     // 的文件（用户报的就是这个）；⌘X / ⌘V / ⌘Z / Delete 更糟。
                     // 只拦这一类：导航 / 标签页 / 视图 / 切换模态照旧（Finder 的
                     // sheet 也是这个尺度），否则模态一开连 ⌘T 都没了。
-                    if entity_key.read(cx).modal != Modal::None
-                        && crate::keys::touches_the_browser(action)
-                    {
+                    //
+                    // 判据在 [`crate::keys::Chord::acts_on_selection`] 那一侧：贡献进来
+                    // 的命令一律算「读当前选择」（它们靠 `{file}` 干活），所以遮罩后面
+                    // 那个列表被它们改掉同样不行。
+                    if entity_key.read(cx).modal != Modal::None && chord.acts_on_selection() {
                         // 但回收站这类模态自己要吃一部分组合键（⌘A 全选）——
                         // 先交给模态处理器；其余模态不认识这颗键，结果仍是吞掉
                         // （原行为）。只路由、不 return 掉语义：模态处理器对
@@ -7030,7 +7066,7 @@ impl Render for RootView {
                         handle_modal_key(key, plain, &combo, &entity_key, cx);
                         return;
                     }
-                    entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
+                    entity_key.update(cx, |v, cx| v.dispatch_chord(chord, cx));
                     return;
                 }
                 // 显式解绑的键位要吞掉这次按键：漏下去会触发系统 / 输入组件的默认行为。
@@ -7063,8 +7099,10 @@ impl Render for RootView {
             // 让它们也进键表反而会把「按退格删一个过滤字符」这种手感弄没。
             if !combo.is_modified() {
                 let hit = entity_key.read(cx).keymap.lookup(&combo);
-                if let Some(action) = hit {
-                    entity_key.update(cx, |v, cx| v.dispatch_action(action, cx));
+                if let Some(chord) = hit {
+                    // 走到这里模态必然是 `None`（上面整段拦掉了），所以不必再问
+                    // `acts_on_selection`。
+                    entity_key.update(cx, |v, cx| v.dispatch_chord(chord, cx));
                     return;
                 }
             }
@@ -12595,7 +12633,7 @@ mod tests {
             root.update(cx, |v, _cx| {
                 let mut overrides = HashMap::new();
                 overrides.insert("tab.new".to_string(), format!("{main}+alt+t"));
-                v.keymap = crate::keys::Keymap::build(&overrides);
+                v.keymap = crate::keys::Keymap::build(&overrides, &[], &[]);
             })
         });
         let before = tabs(cx);
@@ -12627,14 +12665,14 @@ mod tests {
         .collect();
         cx.update(|_window, cx| {
             root.update(cx, |v, _cx| {
-                v.keymap = crate::keys::Keymap::build(&overrides)
+                v.keymap = crate::keys::Keymap::build(&overrides, &[], &[])
             });
         });
 
         let probe = |v: &RootView, spec: &str| {
             v.keymap
                 .lookup(&crate::keys::KeyCombo::parse(spec).unwrap())
-                .map(|s| s.to_string())
+                .map(|c| c.title())
         };
         let hits = cx.update(|_window, cx| {
             root.update(cx, |v, _cx| {
@@ -12647,7 +12685,7 @@ mod tests {
                 )
             })
         });
-        assert_eq!(hits.0.as_deref(), Some("tab.new"), "改绑的键位应当命中");
+        assert_eq!(hits.0.as_deref(), Some("新建标签页"), "改绑的键位应当命中");
         assert_eq!(hits.1, None, "旧键位应当失效");
         assert_eq!(hits.2, None, "解绑后不该有动作");
         assert!(hits.3, "解绑的键位应当被吞掉，而不是漏给系统");
@@ -12659,6 +12697,115 @@ mod tests {
         });
         let after = cx.update(|_w, cx| root.update(cx, |v, _cx| v.pane().tabs.len()));
         assert_eq!(after, before + 1, "tab.new 应当新建标签页");
+    }
+
+    /// 清单里声明的组合键 → 按下 → 那条命令真的跑到执行层（P2-4 的全链路）。
+    ///
+    /// 为什么不断言「键表里有这一条」：`keys.rs` 的单测已经守住了那张表，而这里要守的
+    /// 是**接线**——`keymap_from` 有没有去读「不带选区过滤」的那份命令列表、
+    /// `dispatch_chord` 有没有把键表里带的载荷交给 `run_user_command`。两处各断一处：
+    /// 变异体「`keymap_from` 里把 `&app.user_commands(&[])` 换成 `&[]`」只有这条红。
+    ///
+    /// 命令用 `{file}` 而**不选中任何条目**：占位符守卫在起进程之前就返回 Err
+    /// （`mo_app::AppState::run_user_command`），所以这一跑不会真 spawn 外部程序
+    /// ——headless 测试不该拉 shell，而那张「未执行」的信息卡恰好证明走到了执行那一层。
+    ///
+    /// ⚠️ fixture 种进 `isolate_user_dirs_for_tests()` 给的**共享**隔离目录，全程不改
+    /// `MO_CONFIG_DIR`（与 §4.5 那条同一个理由：那是进程全局的，会跟并行的测试互相踩）。
+    #[test]
+    fn contributed_chord_from_manifest_reaches_the_command() {
+        let dir = crate::isolate_user_dirs_for_tests()
+            .join("extensions")
+            .join("p24chord");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p24chord",
+  "name": "字幕工具",
+  "version": "1.0",
+  "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "key": "cmd+alt+shift+j" }]
+}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        // 键表在 `RootView::new` 里建，所以 fixture 必须**先**落盘（上面那句）。
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        assert_eq!(modal_of(cx), Modal::None, "起点：没有模态挡着");
+
+        // 先确认「清单 → 键表」这一环通了，再按下去验「键表 → 执行」。分两段是为了
+        // 红的时候知道断在哪头：前者红 = `keymap_from` 没读到那份列表，
+        // 后者红 = 按键路由或 `dispatch_chord` 断了。
+        let in_table = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.keymap
+                    .lookup(&crate::keys::KeyCombo::parse("cmd+alt+shift+j").unwrap())
+                    .map(|c| c.title())
+            })
+        });
+        assert_eq!(
+            in_table.as_deref(),
+            Some("字幕工具 · 统计字数"),
+            "清单里那句 key 应当已经进表（带着那条命令自己）"
+        );
+
+        // 平台主修饰键：macOS 的 ⌘ 在 Windows / Linux 上是 Ctrl（键串里写 `cmd`
+        // 两种平台都算主修饰键，见 `keys` 模块顶部）。
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        // ⚠️ gpui 测试里那串按键用 `-` 分隔（`ctrl-alt-shift-j`），与清单键串的 `+`
+        // 不是同一个语法（`KeyCombo::parse` 两种都收，`simulate_keystrokes` 只认 `-`）。
+        // 先验「模态打开时吞键」：这条命令读的是下层列表的选中项，遮罩后面按下去
+        // 不该执行（与 ⌘C 同一个尺度）。靶子：`Chord::acts_on_selection` 对贡献项
+        // 返回 `false` → 这一句红。
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.dispatch_action("settings.open", cx)));
+        assert!(
+            matches!(modal_of(cx), Modal::Settings),
+            "起点：设置窗口已经打开"
+        );
+        cx.simulate_keystrokes(&format!("{main}-alt-shift-j"));
+        cx.run_until_parked();
+        assert!(
+            matches!(modal_of(cx), Modal::Settings),
+            "遮罩后面不该执行扩展绑的那条命令"
+        );
+        cx.update(|_w, cx| root.update(cx, |v, _cx| v.modal = Modal::None));
+
+        // 再验「键表 → 执行」这一环。
+        cx.simulate_keystrokes(&format!("{main}-alt-shift-j"));
+        cx.run_until_parked();
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+
+        match modal_of(cx) {
+            Modal::Info(text) => {
+                assert!(
+                    text.contains("字幕工具 · 统计字数"),
+                    "信息卡上要点名是哪条命令，否则「按了没反应」与「按错了命令」分不出：{text}"
+                );
+                assert!(
+                    text.contains("未执行"),
+                    "没有选中条目时应当停在占位符守卫那一层（既不 spawn 进程也不静默）：{text}"
+                );
+            }
+            other => panic!(
+                "清单声明的键位应当把那条命令送到执行层，实际 modal = {other:?}（按键没命中键表）"
+            ),
+        }
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
 
     /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。
