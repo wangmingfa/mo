@@ -38,8 +38,8 @@ UI 侧有扩展管理器（`mo-ui/src/app.rs:3426 render_extensions`）与命令
 
 | 想挂的地方 | 今天的形状 | 位置 |
 |---|---|---|
-| 右键菜单 | `enum MenuAction`（`pub(crate)`）约 30 变体，**无** `User(_)` 逃生口；条目 `push` 出来 | `mo-ui/src/context_menu.rs:71`、`items()` :176 |
-| 侧边栏一项 | 无数据模型，六段手写 div | `mo-ui/src/sidebar.rs:16`（回收站那段 :137-179） |
+| 右键菜单 | ~~`enum MenuAction` 约 30 变体，**无** `User(_)` 逃生口~~ **已有一臂收容进来的动作**（P1-2，2026-09-27）：`MenuAction::Contributed(ActionKind)`，条目仍 `push` 出来，但贡献项走 `actions::for_slot` | `mo-ui/src/context_menu.rs`、`actions.rs` |
+| 侧边栏一项 | ~~无数据模型，六段手写 div~~ **已是数据驱动**（P1-3，2026-09-27）：`sidebar::sections()` 交 `Vec<Section>`，加一项 = 多一条 `Row` | `mo-ui/src/sidebar.rs` |
 | 新面板 | `enum Modal` 约 25 态 + render 手写三档 match | `app.rs:174`、`6739` |
 | 类型知识 | ~~三份各自独立的扩展名字符串匹配~~ **已收成一张表**（P1-1，2026-09-27）：`mo-core/src/types.rs`，三问各自一个函数 | 旧三处见 [engine-testing.md §7](engine-testing.md) |
 | 新文件协议 | `trait FileSystem`（`Arc<dyn>`，**已经是真抽象**）但协议表硬编码 | `mo-fs/src/lib.rs:34`、`mo-remote/src/lib.rs:194,202` |
@@ -114,8 +114,6 @@ pub fn icon_share_of(ext: &str) -> IconShare; // 图标能否按类型共享
 刻意留下的两处跨轴矛盾（`.svg` 分组算图片 / 预览算文本；`.avif` 预览算图片 / 分组落
 `Other`）由 `svg_and_avif_are_the_known_cross_axis_disagreements` 钉住。
 
-### 4.2 `ActionRegistry`
-
 ### 4.2 `ActionRegistry` —— ✅ 已落地（2026-09-27，P1-2，`crates/mo-ui/src/actions.rs`）
 
 原设计的形状（一条 `ActionSpec` 带 `id` / `when_ext` / `Builtin|Command|ProviderCall`）
@@ -159,7 +157,8 @@ pub(crate) fn for_slot(specs, slot) -> Vec<&ActionSpec>
 
 P2 剩下要做的：把清单 `where` 里的槽位灌进 `slots`；要引用内置动作时给 `ActionKind`
 加一臂 `Builtin(&'static str)`（`dispatch_action` 已经按字符串 id 匹配，是现成的）；
-`toolbar` 槽位；侧栏（§4.4 / P1-3）。
+`toolbar` 槽位。侧栏那一层已经接好了（§4.4 / P1-3），P2 只欠把清单的 `sidebar` 字段
+映射成一条 `Row`。
 
 **验收**：`cargo test -p mo-ui` 118 绿（新增 5 条：注册表 3 + 菜单 2）；反向验证是把
 `contributed` 的默认槽位加上 `ContextFile` → `everything_is_palette_only_for_now` 变红。
@@ -170,6 +169,55 @@ P2 剩下要做的：把清单 `where` 里的槽位灌进 `slots`；要引用内
 
 起进程、握手、按调用超时、退避停用、结果缓存。UI 侧只在后台线程调用（沿用 mo-app 现有
 的泵模式），**任何 `block_on` 都不许出现在渲染路径上**。
+
+### 4.4 `Vec<SidebarItem>`（侧栏）—— ✅ 已落地（2026-09-27，P1-3，`crates/mo-ui/src/sidebar.rs`）
+
+设计稿里写的是「侧栏改数据驱动，`Vec<SidebarItem>`」。落地成了**两层**，比一条 `SidebarItem`
+枚举更贴合这里的现实：
+
+```rust
+// 数据层（纯函数，不碰 gpui、不读 AppState）
+pub(crate) struct Sources { locations, connections, active_connection, shares, drives, bookmarks }
+pub(crate) fn sections(src: &Sources, current: Option<&Path>, trash_active: bool) -> Vec<Section>
+pub(crate) struct Row { id: ElementId, label, icon, active, truncate,
+                        activate: Activate, trailing: Option<Trailing>, drop: Option<DropOn> }
+pub(crate) enum Activate { Open { path, fallback_to_current_backend, failure },
+                           Connection { id }, TrashPanel }
+// 渲染层（一种行、一处样式）
+pub fn render(app: &AppState, current: &Option<PathBuf>, trash_active: bool, entity) -> impl IntoElement
+```
+
+三个与草案不同的决定，都是读现状代码读出来的：
+
+1. **输入是投影（`Sources`），不是 `&AppState`**。mo-ui 依赖 `mo-platform` 但**不**依赖
+   `mo-remote`，所以根本叫不出 `NetworkShare` / `LiveConnection` 这两个名字；就算叫得出，
+   数据层测试也得会构造一个合法远程 URL 才能跑。投影成「显示名 + 路径 + 协议字符串」之后
+   数据层只认字符串与路径，代价是 `render` 开头那几个 `.map()`。
+2. **行尾挂的是「意图」而不是回调**。草案允许塞 `Box<dyn Fn>`，这里换成 `Activate` /
+   `PowerAction` / `DropOn` 三个枚举：渲染层那个 `match` 因此是**编译期穷尽**的——新增一类
+   语义必须同时在渲染层补一臂，不会出现「数据有了、点了没反应」（回调版本一定会出现）。
+   P2 的清单 `sidebar` 落进来时也只是多一条 `Row`、多一个 `Activate::Contributed(usize)`。
+3. **元素 ID 由数据层给，选择器从 ID 派生**。`debug_selector` 写的就是 `format!("mo-{id}")`，
+   于是元素 ID 与测试选择器不可能分叉；行尾按钮是行 ID 的 `ElementId::NamedChild`
+   （`sidebar-loc-0` → `sidebar-loc-0-power`），**按构造**不会跨行撞车，不用再手工编号。
+   既有选择器逐字符不变（`mo-sidebar-loc-0` / `mo-sidebar-trash`），老的 headless 断言不用改。
+
+⚠️ 顺手抓回一个**会炸但平时看不见**的坑：五个区的手写标题原本各是一句字面量
+`text!("快捷访问")`，五个不同调用点，天然不撞；合成一个循环后变成**一个调用点渲染四个兄弟
+节点**，而 `text!` 的默认 ID 是「调用点位置的哈希」，标题外层那些 div 又都没有元素 ID
+（它们不可交互）——这四个的 a11y NodeId 会全等于同一个。这就是 5562d2e 修过的那类
+debug-only `0xc0000409`（屏幕朗读 / 检查器一挂上才炸）。标题两句都改成
+`text!(id = format!("mo-head-{}", section.title), …)`。行内标签没这问题：外层行 div 各带唯一 ID。
+
+**验收**：`cargo test --workspace --all-features` 全绿（`TEST_EXIT=0`，mo-ui lib 129 条，
+其中 sidebar 11 条：区序 / 空区隐藏 / 三套高亮判据各一条 / 拖放落点 / 行尾按钮归属 /
+分流标记归属 / 推不动的盘不画按钮且行序对齐 / 每行带自己的按钮 ID / 全侧栏 ID 查重）。
+headless 侧新增 `layout.rs::clicking_a_sidebar_bookmark_opens_that_folder`——网络 / 位置 /
+远程三区要真挂载点、真卷宗、真会话才出得来行，headless 造不动，拿可预置的**书签**当这四区
+的代表（收口前它们的行在测试里根本选不出来）。反向验证两次各红一次，且红在该红的那句话上：
+① 去掉行末的 `.test_support()` → `click` 报 `missing ElementId Name("sidebar-bm-0")`
+（注意 `debug_bounds` 仍然读得到它，只有点击需要被观察，所以这一变体测的正是 `test_support`）；
+② 把 `bookmark_rows` 的 `path` 换成临时目录 → 「点了书签行，那 3 个文件没画出来」变红。
 
 ## 5. provider 协议（stdio）
 
@@ -213,8 +261,9 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 ## 8. 排期（每步独立可交付、可测）
 
-* **P1 纯宿主重构，零插件概念**：~~`TypeRegistry` 收三处扩展名表~~（✅ 已完成，见 §4.1）；
-  `ActionRegistry` 收命令面板 + 右键菜单（加 `MenuAction::Plugin`）；侧栏改数据驱动。
+* **P1 纯宿主重构，零插件概念：✅ 三步全部落地（2026-09-27）**——`TypeRegistry` 收三处
+  扩展名表（§4.1）、`ActionRegistry` 收命令面板 + 右键菜单（§4.2）、侧栏改数据驱动
+  （§4.4）。
   验收：全量测试绿 + 新增「三处类型答案出自同一条 rule」的一致性测试。
   （P1-1 那条的落地形态是「三问三函数 + 一张钉住已知矛盾的测试」，验收口径不变。）
 * **P2 声明层生效**：清单四类 + 安装/权限框 + 扩展管理器展示「本扩展贡献了什么」。

@@ -484,6 +484,9 @@ const GLYPH_PX: f32 = 12.0;  // 内置 Lucide 描边 SVG 的绘制尺寸
 ⚠️ 行 / 格 ID 不能省：`uniform_list` 的列表项没有逐项 ID，`text!` 按调用点生成 ID，
 多条占位行会共享同一条元素 ID 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic
 （启动时满屏占位正是崩溃现场）。去掉文字后 `.id()` 仍要留着。
+判据是「**祖先链上有没有一个逐兄弟不同的元素 ID**」：行 div 带 `id` 的（文件行、侧栏行）
+里面的 `text!` 安全；纯展示、外层没有 `id` 的那一种（侧栏各区标题被收成循环时的四句标题）
+必须 `text!(id = …, …)` 显式给，详见 [plugin-system.md §4.4](plugin-system.md)。
 
 **守卫**（`mo-ui/src/app.rs`）：
 
