@@ -731,6 +731,69 @@ e2e 特意把 fixture 种在**窗口建好之后**，让「面板打开时重取
   扩展页按 `source` 过滤后它们（source 是 commands 目录下的文件）没有归属的行。要亮
   得给设置页加一块，本轮不扩面。
 
+### 4.12 安装流程：从磁盘装一个扩展 —— ✅ 已落地（2026-09-27，P2-8）
+
+§4.10 的授权点停在「启用」，根因是没有安装流程——手放进 `extensions/` 的清单缺省
+就是启用的。这一轮把**正门**修出来，门禁装在正门上：
+
+1. **原生目录选择框**：`mo_platform::pick_folder(title)`。Windows 走
+   `IFileOpenDialog` + `FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM`（coclass 的 CLSID 照
+   `CLSID_FILE_OPERATION` 的先例自己钉）；macOS 走 `NSOpenPanel` 只选目录、
+   `on_main_thread` 派发。**取消不是错误**：Windows `Show` 回
+   `HRESULT_FROM_WIN32(ERROR_CANCELLED)`（`0x8007_04C7`）、macOS `runModal` 回 0，
+   都折成 `Ok(None)`。来源必须由用户在对话框里当面指认——没有命令行参数、没有配置
+   入口，那等于给陌生扩展开一条静默安装的门。
+2. **`extensions::install_from(source, root)`**：读来源清单 → `validate` → 拒收
+   （已存在同名 id；来源就在扩展目录里——它已经是装好的；符号链接——链接指到哪
+   只有来源机器知道）→ `copy_tree` 复制进 `<root>/<id>/`（失败即清掉半个目录）→
+   **改写清单为 `enabled: false`** → 写 `installed.json`：`{source, files:[{path,
+   sha256}]}`，逐文件记**相对路径**（统一 `/` 分隔，子目录不与顶层撞名）与 sha256，
+   不含账本自己。中途任何一步失败都不留东西。
+3. **UI**：扩展页底部「从磁盘安装…」（`mo-ext-install`）→ 选完目录装、扩展与键表
+   一起重取（与 `open_extensions_picker` 同一份账——装进来的键位撞了车，「没生效」
+   当场就亮）、选中新行。
+
+**安装即停用**是这一轮的安全落点：装出来的扩展当场以停用状态出现在面板上，点「启用」
+走 §4.10 那张贡献确认卡。「装了就跑」从「唯一路径」收缩为「手工摆放一条」——正门有
+门禁，剩下那条等卸载 / 迁移时收。
+
+**缝拆两半**：`pick_folder` 在 headless 里弹不出来，所以按钮的 `on_click` 只做
+「弹框 + 分派」，装完之后的后半段（`install_extension_from`）单独一个方法、e2e 直接
+调它——盘上状态、行渲染、选中、停用都断言得到；「按钮真的会弹框」这半段 headless
+测不了，本轮没有人工验证路径，记缺口。
+
+**一枚测试自己教的事**：`notice()` 是**模态** Info，第一版「装完弹一句『已安装』」
+直接把扩展页盖掉了——装完正该看的就是这一行，被弹窗顶走等于倒退。成功不弹，失败才
+弹（错误原句经 `notice` 给出）。
+
+**验收**：mo-app lib 66（+2：装出停用 + 账本来源与逐文件 sha256；四类拒收且不剩半个
+目录、不弄坏已装好的）/ mo-ui lib 147（+1：装完当场有行、有胶囊、贡献清单展开、
+模型与盘上都是停用、账本在）。全量 `cargo test --workspace --all-features
+--no-fail-fast` → `TEST_EXIT=0`。
+
+**反向验证**（四条变异体，每条红在预判的那一句；还原 `diff` 字节一致）：
+
+| 变异 | 红在哪 |
+|---|---|
+| M1 `install_from` 不改写 `enabled`（原样 `true`） | mo-app 单测红在 `assert!(!m.enabled, "安装即停用：启用要走确认卡")`——安全语义那一句 |
+| M2 跳过 `installed.json` 写盘 | 单测红在账本读取的 `unwrap` |
+| M3 `install_from` 跳过 `validate` | `refuses_to_install` 红在「validate 不过要拒」，且坏 id 真被装了进去 |
+| M4 `install_extension_from` 不重取扩展 | 只有端到端红在 `mo-ext-row-p28ui`——数据层与接线层各有一条红 |
+
+⚠️ M2 的第一版变异写成 `if source…is_empty() { return }`——条件恒假，测试照绿。
+**变异体自己先死了不算数**：它没走到要保护的代码路径，红的缺席什么都证明不了。
+写变异体先看一眼它真的改变了被执行的语句。
+
+已知缺口（下一轮别当意外）：
+* **`.moext`（zip）没做**：Windows 的 `IFileDialog` 文件模式与目录模式（
+  `FOS_PICKFOLDERS`）不同框，一个按钮给不出「目录或 zip 二选一」；`install_from`
+  的复制语义本身与传输形态无关，zip 只是搬运，后面补一个「装 zip」入口即可。
+* **手工摆放仍缺省启用**：`Manifest.enabled` 缺省 `true` 的语义不能动（手写清单的
+  人不欠一次确认卡），缺口收口靠卸载 / 迁移语义，不在加载侧。
+* **卸载不存在**：重装同名 id 的报错里只能让人手动删目录。
+* macOS 侧 `pick_folder` 是照本仓 objc 惯例写的，本机（Windows）没法跑；CI 编过
+  即算过，真机行为待验。
+
 ## 5. provider 协议（stdio）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
@@ -755,10 +818,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 ## 6. 安装、权限、卸载
 
-> **P2-6 落了这一节的一半**：启用前的贡献确认卡（§4.10）。没落的另一半是**安装**（选目录 /
-> zip / sha256 / `installed.json`）与 `capabilities`——前者卡在「`mo_ui::dialogs` 里没有原生
-> 目录选择框」，后者卡在「P3 之前没有任何执行点会检查它」。所以现在的授权点是「启用」而不是
-> 「安装」，其后果（手放进目录的清单缺省即启用）记在 §4.10 的缺口里。
+> **P2-8 落了安装的主干**（§4.12）：原生目录选择框 + `validate` + 复制 +
+> `installed.json`（来源与逐文件 sha256），且**安装即停用**——装出来的扩展首启必过
+> §4.6 那张确认卡。没落的：`.moext`（zip）入口（Windows 选择框文件 / 目录不同框，
+> 记在 §4.12 缺口）与 `capabilities`（P3 之前没有执行点会检查它）。手工摆放的清单
+> 仍缺省启用——`enabled` 缺省语义不能动，收口靠卸载 / 迁移。
 
 * **安装 = 应用内一步**：扩展管理器加「从磁盘安装」→ 选一个含 `manifest.json` 的目录或
   `.moext`（zip）→ `validate` → 复制进 `<配置>/mo/extensions/<id>/` → **权限确认框**逐条列
@@ -815,6 +879,12 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
     亮在扩展页上，贡献键位撞车 / 坏键串的「没生效」亮在自己那一家下面（§4.11）。
     §4.6 / §4.8 / §4.9 三节共同记的那条「同一个未接的口子」就此闭合；设置「快捷键」页
     看不见贡献键位那条**不在其中**，仍是开口子。
+  * **P2-8 ✅（2026-09-27）**：安装流程主干（§4.12）——原生目录选择框、`validate`、
+    复制进 `extensions/<id>/`、`installed.json` 记来源与逐文件 sha256，且**安装即停用**
+    （首启必过确认卡）。P2-6 那条「手放进目录仍然装了就跑」的债就此从「唯一路径」
+    收缩为「手工摆放一条」。`.moext`（zip）入口与卸载仍是缺口。
+  * P2 剩下：贡献键位在设置「快捷键」页可见、`type_labels` 撞车那条 warn-only
+    （§4.11 的缺口）、安装的收尾（zip 入口 / 卸载）。
 * **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
   验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
