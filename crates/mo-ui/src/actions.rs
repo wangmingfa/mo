@@ -79,11 +79,8 @@ pub(crate) fn contributed(
     for (i, u) in users.iter().enumerate() {
         out.push(ActionSpec {
             title: u.name.clone(),
-            category: if u.category.trim().is_empty() {
-                "自定义".to_string()
-            } else {
-                u.category.clone()
-            },
+            // 分组名的判据在 `UserCommand::group`（侧栏的分区名问同一句），这里不另写一份。
+            category: u.group().to_string(),
             kind: ActionKind::User(i),
             slots: u.slots(),
         });
@@ -91,7 +88,7 @@ pub(crate) fn contributed(
     for (i, w) in workflows.iter().enumerate() {
         out.push(ActionSpec {
             title: w.name.clone(),
-            category: "工作流".to_string(),
+            category: w.group().to_string(),
             kind: ActionKind::Workflow(i),
             slots: w.slots(),
         });

@@ -1,4 +1,6 @@
-//! 侧边栏：五个区（快捷访问〔含回收站入口〕/ 远程 / 网络 / 位置 / 书签）。
+//! 侧边栏：五个内置区（快捷访问〔含回收站入口〕/ 远程 / 网络 / 位置 / 书签），
+//! 后面再追加清单与配置里声明了 `menu: ["sidebar"]` 的那些项（按各自的 `category` 分区，
+//! 见 [`contributed_sections`]）。
 //!
 //! ## 先算数据，再画
 //!
@@ -15,13 +17,14 @@
 //!   对 [`Activate`] / [`DropOn`] 的 `match`（编译期穷尽：加一类语义就必须在这里补一臂，
 //!   不会静默地「数据有了、点了没反应」）。
 //!
-//! P2 的插件清单 `sidebar` 字段落在这张表上：插件加一项 = 多一条 [`Row`] 数据。
+//! P2-5 的清单 `sidebar` 字段就落在这张表上：一条声明加一项 = 多一条 [`Row`] 数据，
+//! 点击走 [`Activate::Contributed`]——调用点上没有为它写第二份 div 链。
 
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
-use mo_app::{AppState, SessionId};
+use mo_app::{extensions::SidebarEntry, AppState, SessionId};
 
 use crate::RootView;
 
@@ -59,6 +62,14 @@ pub(crate) enum Activate {
     /// 打开回收站面板。它是模态面板（`Modal::Trash`），不占任何路径，所以不走
     /// [`Activate::Open`]，也**不**「离开次级视图」——它本身就是进次级视图。
     TrashPanel,
+    /// 执行一条贡献进来的动作（清单 / 配置里写了 `menu: ["sidebar"]`）。
+    ///
+    /// 带的是**声明本身**而不是「第几条命令」：侧栏每帧重画，而下标参照的那两份 vec
+    /// 每帧重取（见 `SidebarEntry` 那段与 devlog §4.2 那条纪律）。
+    ///
+    /// ⚠️ 这一臂**不** `leave_secondary_view`：它不导航，「在回收站面板里点了扩展的
+    /// 一行」应当是「跑那条命令、人还在回收站」，与命令面板那头的语义同源。
+    Contributed(SidebarEntry),
 }
 
 /// 行尾那个小按钮按下去做什么。
@@ -125,7 +136,9 @@ pub(crate) struct Row {
 /// 一个区：标题（可省）+ 若干行。
 #[derive(Debug, Clone)]
 pub(crate) struct Section {
-    title: &'static str,
+    /// ⚠️ 不是 `&'static str`：贡献区的标题来自用户写的 `category`（也可能是扩展名，
+    /// 见 `extensions::flatten` 那句「category 空则取扩展名」），编译期没人知道它是什么。
+    title: String,
     /// 一行都没有时是否仍画标题。快捷访问与远程恒画（远程还要靠标题右侧的「＋」
     /// 发起新连接）；网络 / 位置 / 书签空了就整区不出现，别留一句光杆标题。
     title_when_empty: bool,
@@ -186,20 +199,28 @@ pub(crate) struct Sources {
     drives: Vec<Drive>,
     /// 用户书签（`AppState::bookmarks`）。
     bookmarks: Vec<PathBuf>,
+    /// 声明了 `menu: ["sidebar"]` 的那几条命令 / 工作流（`AppState::sidebar_entries`，
+    /// 缓存过的，见那儿的注释）。放在最后，所以内置五区的顺序与位置一个字都不变。
+    ///
+    /// `Arc` 而不是 `Vec`：这一份是**每帧**取的，缓存的意义就是别在每帧再复制一遍
+    /// 那些字符串（侧栏本身也是每帧重建的，见 `AppState::sidebar_entries` 字段那段）。
+    contributed: std::sync::Arc<Vec<SidebarEntry>>,
 }
 
-/// 五区的数据，顺序即渲染顺序。
+/// 各区的数据，顺序即渲染顺序。
 ///
 /// `current`：当前目录。回收站面板开着时调用方把它置空，改由 `trash_active` 高亮
 /// 回收站入口——两者不并存。
 pub(crate) fn sections(src: &Sources, current: Option<&Path>, trash_active: bool) -> Vec<Section> {
-    vec![
+    let mut out = vec![
         quick_access_section(&src.locations, current, trash_active),
         remote_section(&src.connections, src.active_connection),
         plain_section("网络", share_rows(&src.shares, current)),
         plain_section("位置", drive_rows(&src.drives, current)),
         plain_section("书签", bookmark_rows(&src.bookmarks, current)),
-    ]
+    ];
+    out.extend(contributed_sections(&src.contributed));
+    out
 }
 
 /// 快捷访问 + 回收站入口。快捷访问按「套住当前路径的最深那个」高亮
@@ -250,7 +271,7 @@ fn quick_access_section(
     });
 
     Section {
-        title: "快捷访问",
+        title: "快捷访问".into(),
         title_when_empty: true,
         heading: None,
         rows,
@@ -281,7 +302,7 @@ fn remote_section(connections: &[Connection], active: Option<SessionId>) -> Sect
         .collect();
 
     Section {
-        title: "远程",
+        title: "远程".into(),
         title_when_empty: true,
         heading: Some(Heading::OpenConnectDialog),
         rows,
@@ -370,10 +391,57 @@ fn bookmark_rows(bookmarks: &[PathBuf], current: Option<&Path>) -> Vec<Row> {
         .collect()
 }
 
-/// 网络 / 位置 / 书签：没有标题按钮、空了就整区不出现。
-fn plain_section(title: &'static str, rows: Vec<Row>) -> Section {
+/// 贡献项：清单 / 配置里写了 `menu: ["sidebar"]` 的那几条，按各自的 `category` 分区，
+/// 追加在内置五区之后。
+///
+/// 为什么分区名就是 `category`（而不是再设一个 `section` 字段）：「这条动作归在哪一
+/// 组」在命令面板那里已经有人答过了，侧栏再问一遍就是同一个问题两处作答——两处迟早
+/// 分叉（同 devlog §4.6 那句「声明挂在动作自己身上」）。扩展命令的 category 缺省时
+/// 会被 `extensions::flatten` 填成扩展名，所以一个扩展在侧栏里自然聚成以自己命名的
+/// 那一区。
+///
+/// 空列表 → 一个区都不产出（[`Section::shows`] 那边 `title_when_empty: false`，所以
+/// 「没有扩展投侧栏」这件事在界面上是完全看不见的，正如今天）。
+fn contributed_sections(entries: &[SidebarEntry]) -> Vec<Section> {
+    let mut out: Vec<Section> = Vec::new();
+    for e in entries {
+        // 元素 ID 用**声明本身**（类型 + 名字），不用「侧栏第几行」那种位置号：
+        // 侧栏每帧重取这批数据（改一条配置、启停一个扩展都会让顺序变），而 headless
+        // 测试、排错时手敲的选择器都要能指着同一条。撞号的后果是其中一行点了没反应，
+        // 所以这里的唯一性靠构造：同一 list 里名字重不过（`user_commands` / `workflows`
+        // 各自按名去重过），命令与工作流再由类型段分开。
+        let (kind, label) = match e {
+            SidebarEntry::Command(c) => ("cmd", c.name.as_str()),
+            SidebarEntry::Workflow(w) => ("wf", w.name.as_str()),
+        };
+        let row = Row {
+            id: format!("sidebar-ext-{kind}-{label}").into(),
+            label: e.label().to_string(),
+            icon: crate::icons::EXTENSION,
+            // 这一行不对应任何目录，没有「正在看着它」这回事。
+            active: false,
+            // 名字是用户写的（还可能带「扩展名 · 」前缀），宽度不够就截断。
+            truncate: true,
+            activate: Activate::Contributed(e.clone()),
+            // 行尾不放按钮：停用要去扩展清单里做，在侧栏放一个「✕」等于多开一个维护
+            // 入口（三处能改同一件事，就没有一处是权威）。
+            trailing: None,
+            // 拖文件进来没有语义（这一行不持有路径）。
+            drop: None,
+        };
+        let title = e.group();
+        match out.iter_mut().find(|s| s.title == title) {
+            Some(s) => s.rows.push(row),
+            None => out.push(plain_section(title, vec![row])),
+        }
+    }
+    out
+}
+
+/// 网络 / 位置 / 书签 / 贡献区：没有标题按钮、空了就整区不出现。
+fn plain_section(title: impl Into<String>, rows: Vec<Row>) -> Section {
     Section {
-        title,
+        title: title.into(),
         title_when_empty: false,
         heading: None,
         rows,
@@ -436,6 +504,7 @@ pub fn render(
             })
             .collect(),
         bookmarks: app.bookmarks(),
+        contributed: app.sidebar_entries(),
     };
     // 回收站面板开着时「当前位置」不该再点亮快捷访问：调用方传进来的 `current` 已经
     // 是空的（见 app.rs 的 A 类视图分支），这里不另设判据。
@@ -464,7 +533,7 @@ pub fn render(
         if !section.shows() {
             continue;
         }
-        panel = panel.child(render_heading(&section, ix == 0, entity));
+        panel = panel.child(render_heading(&section, ix, entity));
         for row in section.rows {
             panel = panel.child(render_row(row, app, entity));
         }
@@ -485,20 +554,23 @@ pub fn render(
 /// 全等于同一个。平时看不出来，屏幕朗读或检查器一挂上就 debug panic
 /// （`0xc0000409`，见 devlog 与 memory 里的同一条：循环里的 `text!` 一律显式给 ID）。
 /// 行内的标签没这个问题——它们的外层行 div 各带一个唯一 ID。
-fn render_heading(section: &Section, first: bool, entity: &Entity<RootView>) -> AnyElement {
+///
+/// ⚠️ ID 里带 `ix`（P2-5 起）：贡献区的标题是用户写的 `category`，理论上能与内置区
+/// 撞名（有人把一条命令的 category 写成「书签」就撞了）。只按标题拼 ID 的话，两句
+/// 一样的标题 = 两个一模一样的 a11y NodeId = 上面那条 debug panic 原地复活，而这回
+/// 是用户配置触发的、跟代码无关，最难查。
+fn render_heading(section: &Section, ix: usize, entity: &Entity<RootView>) -> AnyElement {
+    let head_id = format!("mo-head-{ix}-{}", section.title);
     let head = div()
         .px(px(10.0))
         .pb(px(6.0))
-        .pt(if first { px(2.0) } else { px(10.0) })
+        .pt(if ix == 0 { px(2.0) } else { px(10.0) })
         .text_size(px(11.0))
         .text_color(crate::theme::muted());
 
     let Some(button) = section.heading else {
         return head
-            .child(text!(
-                id = format!("mo-head-{}", section.title),
-                section.title
-            ))
+            .child(text!(id = head_id, section.title.clone()))
             .into_any_element();
     };
 
@@ -528,10 +600,7 @@ fn render_heading(section: &Section, first: bool, entity: &Entity<RootView>) -> 
                     .flex_1()
                     .text_size(px(11.0))
                     .text_color(crate::theme::muted())
-                    .child(text!(
-                        id = format!("mo-head-{}", section.title),
-                        section.title
-                    )),
+                    .child(text!(id = head_id, section.title.clone())),
             )
             .child(add.child(crate::icons::icon(
                 crate::icons::PLUS,
@@ -674,6 +743,16 @@ fn render_row(row: Row, app: &AppState, entity: &Entity<RootView>) -> impl IntoE
                 })
                 .detach();
             }
+            Activate::Contributed(entry) => {
+                // 执行的是这一行**自己带的那条声明**，不是「侧栏第几行」。两个入口
+                // （命令面板 / 右键菜单 / 键表）也各自把载荷带在身上，到这里汇进同一
+                // 条执行路径——差别只在「这是哪一条」由谁回答（见 devlog §4.2）。
+                let entry = entry.clone();
+                entity_click.update(cx, |v, cx| match entry {
+                    SidebarEntry::Command(cmd) => v.run_user_command(cmd, cx),
+                    SidebarEntry::Workflow(wf) => v.run_workflow(wf, cx),
+                });
+            }
         }
     });
 
@@ -810,10 +889,11 @@ mod tests {
     // 同名的属性宏 `test`，一挂上来 `#[test]` 就自我展开到递归上限（本文件第一次收口
     // 时实测：`error: recursion limit reached while expanding #[test]`）。
     use super::{
-        drive_rows, sections, share_rows, Activate, Connection, Drive, DropOn, Failure, Heading,
-        PowerAction, Share, Sources, Trailing,
+        contributed_sections, drive_rows, sections, share_rows, Activate, Connection, Drive,
+        DropOn, Failure, Heading, PowerAction, Share, Sources, Trailing,
     };
     use gpui_kit::ElementId;
+    use mo_app::extensions::SidebarEntry;
     use std::path::{Path, PathBuf};
 
     fn conn(id: u64) -> Connection {
@@ -855,6 +935,29 @@ mod tests {
         }
     }
 
+    /// 一条投给侧栏的命令。`menu` 写的是**清单里那种字符串**（`["sidebar"]`），
+    /// 直接构造 `MenuSlot` 枚举就绕过了本层要验的那一句「声明走到了哪个界面」。
+    fn ext_cmd(name: &str, category: &str) -> SidebarEntry {
+        SidebarEntry::Command(mo_app::UserCommand {
+            name: name.to_string(),
+            category: category.to_string(),
+            shell: "wc -w {file}".to_string(),
+            source: None,
+            menu: vec!["sidebar".to_string()],
+            key: String::new(),
+        })
+    }
+
+    fn ext_wf(name: &str) -> SidebarEntry {
+        SidebarEntry::Workflow(mo_app::Workflow {
+            name: name.to_string(),
+            steps: vec!["pwd".to_string()],
+            source: None,
+            menu: vec!["sidebar".to_string()],
+            key: String::new(),
+        })
+    }
+
     /// 每个区各一条数据时：区序、行归属、标题按钮。
     #[test]
     fn sections_have_a_fixed_order_and_owners() {
@@ -865,9 +968,10 @@ mod tests {
             shares: vec![share("NAS", "/mnt/nas")],
             drives: vec![drive("备份盘", "/Volumes/backup", true)],
             bookmarks: vec![PathBuf::from("/home/me/proj")],
+            contributed: Vec::new().into(),
         };
         let got = sections(&s, None, false);
-        let titles: Vec<&str> = got.iter().map(|x| x.title).collect();
+        let titles: Vec<String> = got.iter().map(|x| x.title.clone()).collect();
         assert_eq!(titles, ["快捷访问", "远程", "网络", "位置", "书签"]);
         assert_eq!(got[0].rows.len(), 2, "一行快捷访问 + 回收站");
         assert_eq!(got[0].rows[1].label, "回收站");
@@ -890,7 +994,11 @@ mod tests {
     #[test]
     fn empty_areas_disappear_but_the_permanent_ones_stay() {
         let got = sections(&Sources::default(), None, false);
-        let shown: Vec<&str> = got.iter().filter(|x| x.shows()).map(|x| x.title).collect();
+        let shown: Vec<String> = got
+            .iter()
+            .filter(|x| x.shows())
+            .map(|x| x.title.clone())
+            .collect();
         assert_eq!(shown, ["快捷访问", "远程"]);
         assert_eq!(got[0].rows.len(), 1, "只剩回收站那一行");
         assert!(got[1].rows.is_empty() && got[1].shows());
@@ -1144,6 +1252,14 @@ mod tests {
             bookmarks: (0..3)
                 .map(|i| PathBuf::from(format!("/home/me/b{i}")))
                 .collect(),
+            // 三条贡献项、分在两个区：跨区的行 ID 也必须互不撞（区内序号会重复，
+            // 所以 `contributed_sections` 用的是全局下标）。
+            contributed: vec![
+                ext_cmd("字幕工具 · 统计字数", "字幕工具"),
+                ext_cmd("字幕工具 · 转码", "字幕工具"),
+                ext_wf("打包"),
+            ]
+            .into(),
         };
         // 渲染层的编号规则（`render_row` / `render_trailing` 各一处），这里同款。
         let mut seen: Vec<(ElementId, String)> = Vec::new();
@@ -1170,7 +1286,93 @@ mod tests {
             }
         }
         // 1 个标题「＋」+ 12 快捷访问 + 1 回收站 + 12 行各带一个行尾按钮（远程/网络/
-        // 位置/书签各 3 行）。数目对不上 = 有某区某行根本没进这张表，查重就是空的。
-        assert_eq!(seen.len(), 1 + 12 + 1 + 12 * 2);
+        // 位置/书签各 3 行）+ 3 行贡献项（没有行尾按钮）。数目对不上 = 有某区某行根本
+        // 没进这张表，查重就是空的。
+        assert_eq!(seen.len(), 1 + 12 + 1 + 12 * 2 + 3);
+    }
+
+    /// P2-5：清单里那句 `menu: ["sidebar"]` 变成侧栏的行，**分区名就是它的 `category`**。
+    ///
+    /// 三处各守一个洞：
+    /// * 同 `category` 的合并成一区（每条命令各顶一个标题 = 侧栏变成命令清单的复读机）；
+    /// * 行 ID 由**声明本身**派生（类型段 + 名字），不是「侧栏第几行」——这批数据每帧
+    ///   重取，位置号会飘，而飘了之后两行撞同一个 ID 就是其中一行点了没反应；
+    /// * 行带的是**它自己那条声明**（同上，devlog §4.2）。
+    ///
+    /// 靶子：`contributed_sections` 里把 `e.group()` 换成写死的 `"扩展"` → 第一条红；
+    /// 把 ID 换成位置号 `sidebar-ext-{ix}` → 第二条红（两区各有一条时号就重复了）；
+    /// 把 `e.clone()` 换成 `entries[0].clone()` → 第三条红。
+    #[test]
+    fn contributed_rows_group_by_category_and_carry_themselves() {
+        // 交错喂：真实管线里命令全在工作流之前（`sidebar_entries_of` 定的顺序），
+        // 但 `contributed_sections` 不该依赖那一条——它只认「声明说了什么」。
+        let entries = vec![
+            ext_cmd("字幕工具 · 统计字数", "字幕工具"),
+            ext_wf("打包"),
+            ext_cmd("字幕工具 · 转码", "字幕工具"),
+        ];
+        let got = contributed_sections(&entries);
+        let titles: Vec<&str> = got.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["字幕工具", "工作流"],
+            "同 category 合并、按首次出现排"
+        );
+        assert_eq!(got[0].rows.len(), 2);
+        assert_eq!(got[1].rows.len(), 1);
+        let ids: Vec<String> = got
+            .iter()
+            .flat_map(|s| s.rows.iter().map(|r| r.id.to_string()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "sidebar-ext-cmd-字幕工具 · 统计字数",
+                "sidebar-ext-cmd-字幕工具 · 转码",
+                "sidebar-ext-wf-打包"
+            ],
+            "ID 要指着声明本身"
+        );
+        // 每一行点的是自己那一条。
+        let payloads: Vec<String> = got
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .map(|r| match &r.activate {
+                Activate::Contributed(SidebarEntry::Command(c)) => c.name.clone(),
+                Activate::Contributed(SidebarEntry::Workflow(w)) => w.name.clone(),
+                other => panic!("贡献行的语义应当是 Contributed，实际 {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            // 顺序是「先一区一行行读完，再读下一区」：交错喂进来的那三条在界面上按区
+            // 重排了（同区保持声明顺序），这正是分区这件事的含义。
+            ["字幕工具 · 统计字数", "字幕工具 · 转码", "打包"]
+        );
+        // 空声明 = 一个区都不产出（`title_when_empty: false`，所以「没有扩展投侧栏」
+        // 在界面上完全看不见）。
+        assert!(contributed_sections(&[]).is_empty());
+        // 内置五区不受影响：贡献区永远在最后。
+        let s = Sources {
+            locations: vec![loc("桌面", "/home/me/Desktop")],
+            contributed: entries.into(),
+            ..Default::default()
+        };
+        let all: Vec<String> = sections(&s, None, false)
+            .into_iter()
+            .map(|x| x.title)
+            .collect();
+        assert_eq!(
+            all,
+            [
+                "快捷访问",
+                "远程",
+                "网络",
+                "位置",
+                "书签",
+                "字幕工具",
+                "工作流"
+            ]
+        );
     }
 }

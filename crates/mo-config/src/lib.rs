@@ -104,6 +104,12 @@ pub enum MenuSlot {
     ContextFile,
     /// 右键菜单：空白处（动作对象是当前目录）。
     ContextBlank,
+    /// 侧边栏的一行（P2-5）。落进哪个区由这条动作自己的 `category` 决定——**不再**
+    /// 另设一个 `section` 字段，那是「同一个问题两处作答」（devlog §4.9）。
+    ///
+    /// ⚠️ 侧栏与快捷键一样**不看选区**：这一行永远是全局可见的，所以受 `when_ext`
+    /// 约束的命令不能投到这里（判据在 `mo_app::extensions::validate`，与快捷键同一条）。
+    Sidebar,
 }
 
 impl MenuSlot {
@@ -114,6 +120,7 @@ impl MenuSlot {
             "palette" => Self::Palette,
             "context:file" | "context-file" => Self::ContextFile,
             "context:blank" | "context-blank" => Self::ContextBlank,
+            "sidebar" | "side-bar" | "side:bar" => Self::Sidebar,
             _ => return None,
         })
     }
@@ -124,6 +131,7 @@ impl MenuSlot {
             Self::Palette => "palette",
             Self::ContextFile => "context:file",
             Self::ContextBlank => "context:blank",
+            Self::Sidebar => "sidebar",
         }
     }
 
@@ -153,12 +161,13 @@ pub fn first_bad_slot(raw: &[String]) -> Option<&str> {
         .find(|s| MenuSlot::parse(s).is_none())
 }
 
-/// 报错里列「可用」时用的那三个名字——从 [`MenuSlot`] 现拼，不写死字符串，
-/// 否则加第四个槽位时这句提示会先骗人。
-const SLOT_NAMES: [&str; 3] = [
+/// 报错里列「可用」时用的那几个名字——从 [`MenuSlot`] 现拼，不写死字符串，
+/// 否则加一个新槽位时这句提示会先骗人。
+const SLOT_NAMES: [&str; 4] = [
     MenuSlot::Palette.as_str(),
     MenuSlot::ContextFile.as_str(),
     MenuSlot::ContextBlank.as_str(),
+    MenuSlot::Sidebar.as_str(),
 ];
 
 /// 「写了个认不出的界面名」那句错误。命令与工作流共用一条措辞（两处各写一份，
@@ -215,6 +224,23 @@ impl UserCommand {
         slots_of(&self.menu)
     }
 
+    /// 这条命令有没有落到某个界面上。
+    ///
+    /// 侧栏那一行与「这条投到哪个界面」问的是同一句，所以判据只在这里一份
+    /// （`mo_ui::actions` 建注册表时读的是 [`Self::slots`]，两处同一个来源）。
+    pub fn goes_to(&self, slot: MenuSlot) -> bool {
+        self.slots().contains(&slot)
+    }
+
+    /// 归在哪一组（命令面板的分组名 = 侧栏的分区名，同一个问题一份答案）。
+    pub fn group(&self) -> &str {
+        if self.category.trim().is_empty() {
+            "自定义"
+        } else {
+            self.category.trim()
+        }
+    }
+
     /// 这条命令有没有声明组合键（写成一串空白也算没写）。
     pub fn has_chord(&self) -> bool {
         !self.key.trim().is_empty()
@@ -247,6 +273,18 @@ impl Workflow {
     /// 投递落点，语义与 [`UserCommand::slots`] 同。
     pub fn slots(&self) -> Vec<MenuSlot> {
         slots_of(&self.menu)
+    }
+
+    /// 落到某个界面上没有，语义与 [`UserCommand::goes_to`] 同。
+    pub fn goes_to(&self, slot: MenuSlot) -> bool {
+        self.slots().contains(&slot)
+    }
+
+    /// 工作流恒归「工作流」一组（没有 `category` 字段可写：一条工作流就是一串命令，
+    /// 分组留给命令那边管）。侧栏的分区名与命令面板同一个来源，见
+    /// [`UserCommand::group`]。
+    pub fn group(&self) -> &'static str {
+        "工作流"
     }
 
     /// 有没有声明组合键，语义与 [`UserCommand::has_chord`] 同。
@@ -493,6 +531,22 @@ mod tests {
         assert_eq!(MenuSlot::parse(""), None);
         // 规范写法回写用（配置里出现的应该是这一种）。
         assert_eq!(MenuSlot::ContextFile.as_str(), "context:file");
+        // 侧栏（P2-5）三种写法都收，配置里手改时不必记哪种是官方的。
+        for raw in ["sidebar", "side-bar", "side:bar", " SIDE-BAR "] {
+            assert_eq!(MenuSlot::parse(raw), Some(MenuSlot::Sidebar), "{raw}");
+        }
+    }
+
+    /// 报错里那份「可用的界面名」是从枚举现拼的（`SLOT_NAMES`），但那个数组是**手写**
+    /// 的：将来加第五个槽位时，忘了加进去不会编译失败，只会让提示骗人。这一条钉住
+    /// 四槽齐全，以及「没写的槽位不该混进来」。
+    #[test]
+    fn every_slot_is_listed_in_the_error() {
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        let err = slot_error("命令", "统计", &s(&["sideabr"])).expect("该报错");
+        for name in ["palette", "context:file", "context:blank", "sidebar"] {
+            assert!(err.contains(name), "{err} 漏了 {name}");
+        }
     }
 
     /// 空列表 = 「用户没想过这件事」，落回只进面板；全写错也一样（不是一条都不投，

@@ -117,6 +117,12 @@ pub const FTP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 /// WebDAV：一朵云（DAV over HTTP(S)，实际用的基本都是坚果云 / Nextcloud 这类网盘）。
 pub const WEBDAV: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>"##;
 
+/// 扩展贡献的侧栏项（P2-5）：三格 + 右下角一格「＋」。
+///
+/// 与 [`VIEW_GRID`] 刻意不同：那个是四格填满（「切成网格看」），这一个第四格是加号
+/// （「主程序之外接上来的一块」）。侧栏里两种语义都有，撞成一个形状就没有分辨价值。
+pub const EXTENSION: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M17.5 14.5v6M14.5 17.5h6"/></svg>"##;
+
 /// 按协议名挑图标（`scheme` 不带 `://` 与主机部分）。
 ///
 /// scheme 正常由 `RemoteUrl::parse` 归一成了小写，但配置是明文 JSON、可能被手改过，

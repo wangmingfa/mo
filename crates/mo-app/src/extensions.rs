@@ -178,11 +178,26 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
     // 按下时**没有「本次右键的目标」这个上下文**，键表也不按选区过滤——绑上去就等于
     // 「选中 .txt 时按 ⌘⇧W 也会去数字幕」。与其在按下时再判一次选区（那才有两处判据、
     // 于是「有时生效有时不生效」），不如在加载时就拒掉。
+    //
+    // 侧栏那一行同理（P2-5）：侧栏是全局的，它不属于任何一个条目的上下文。而这一条
+    // 不拦住更糟——投递给侧栏的命令来自「不受 `when_ext` 约束的那一批」（
+    // `AppState::user_commands(&[])`），所以受约束的命令即使写了 `menu: ["sidebar"]`
+    // 也永远到不了侧栏，界面上连一句「这条没生效」都没有。
     if !m.when_ext.is_empty() {
         if let Some(c) = m.commands.iter().find(|c| c.has_chord()) {
             return Some(format!(
                 "扩展「{}」写了 when_ext，命令「{}」却绑了快捷键「{}」（快捷键不看选区；要绑键就把 when_ext 去掉，让这条命令一直可见）",
                 m.id, c.name, c.key
+            ));
+        }
+        if let Some(c) = m
+            .commands
+            .iter()
+            .find(|c| c.goes_to(mo_config::MenuSlot::Sidebar))
+        {
+            return Some(format!(
+                "扩展「{}」写了 when_ext，命令「{}」却投给了侧栏 sidebar（侧栏是全局的，没有「本次目标」这个上下文，这一行永远不会出现；要在侧栏里看到它就把 when_ext 去掉）",
+                m.id, c.name
             ));
         }
     }
@@ -364,6 +379,112 @@ pub fn fingerprint(root: &Path) -> u64 {
             Err(_) => None::<std::time::SystemTime>.hash(&mut h),
         }
     }
+    h.finish()
+}
+
+/// 一条侧栏项背后的动作。
+///
+/// 与 [`crate::actions`] 那边同理：**带的是声明本身**，不是「第几条命令」的下标。
+/// 侧栏每帧都在画，而下标参照的那两份 vec 每帧重取（配置里改一条、扩展启停一次都会
+/// 让下标飘），点 A 跑出 B 就是这么来的。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SidebarEntry {
+    Command(UserCommand),
+    Workflow(mo_config::Workflow),
+}
+
+impl SidebarEntry {
+    /// 侧栏那一行显示的文案（扩展命令已带「扩展名 · 」前缀，见 [`flatten`]）。
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Command(c) => &c.name,
+            Self::Workflow(w) => &w.name,
+        }
+    }
+    /// 落在侧栏的哪个分区（判据与命令面板的分组名同一句，见 `UserCommand::group`）。
+    pub fn group(&self) -> String {
+        match self {
+            Self::Command(c) => c.group().to_string(),
+            Self::Workflow(w) => w.group().to_string(),
+        }
+    }
+}
+
+/// 从「这一批命令 + 这一批工作流」里挑出投给侧栏的那些。
+///
+/// 纯函数、不碰磁盘，所以它可以被单测直接喂数据，也可以被
+/// [`AppState::sidebar_entries`](crate::AppState::sidebar_entries) 缓存起来复用。
+/// 顺序：命令在前、工作流在后，与命令面板那张注册表（`mo_ui::actions::contributed`）
+/// 同一条顺序（界面在两处的同一批动作，相对顺序应当一致，否则「第三行」在两处指不同
+/// 的东西）。
+pub fn sidebar_entries_of(
+    commands: &[UserCommand],
+    workflows: &[mo_config::Workflow],
+) -> Vec<SidebarEntry> {
+    let mut out: Vec<SidebarEntry> = commands
+        .iter()
+        .filter(|c| c.goes_to(mo_config::MenuSlot::Sidebar))
+        .cloned()
+        .map(SidebarEntry::Command)
+        .collect();
+    out.extend(
+        workflows
+            .iter()
+            .filter(|w| w.goes_to(mo_config::MenuSlot::Sidebar))
+            .cloned()
+            .map(SidebarEntry::Workflow),
+    );
+    out
+}
+
+/// [`AppState::sidebar_entries`](crate::AppState::sidebar_entries) 那份缓存的形状：
+/// `(上次读到的声明签名, 列表)`，`None` = 还没读过。
+pub type SidebarCache = Option<(u64, std::sync::Arc<Vec<SidebarEntry>>)>;
+
+/// 把一份文件的「有没有被人改过」摘要进哈希器（修改时间 + 长度）。
+///
+/// 读不到（还没建、或正被人删）也喂一个确定性的哨兵值：否则「文件没了」与「没这个
+/// 文件路径」在签名上撞成同一个数，缓存就作废不掉。
+fn hash_meta(h: &mut impl std::hash::Hasher, path: &Path) {
+    use std::hash::Hash;
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            md.modified().ok().hash(h);
+            md.len().hash(h);
+        }
+        Err(_) => None::<std::time::SystemTime>.hash(h),
+    }
+}
+
+/// 「自定义动作的声明」整体签名：配置里的 `commands` + `commands/*.json` + 扩展清单。
+///
+/// 为什么不像 [`fingerprint`] 那样只签扩展目录：侧栏项的来源是那**三处**，只签一处
+/// 的话用户在手改 `config.json` 加了一条 `menu: ["sidebar"]` 之后侧栏不动，而这里
+/// 能不动的原因是「读一次」的代价是三条声明来源全都要重新读盘解析。
+///
+/// ⚠️ `config.json` 的修改时间会随**任何**一次设置改动而变（列偏好、开关都会落盘），
+/// 所以这一份签名比 [`fingerprint`] 容易失效。那是安全方向的失效：多读一次盘，
+/// 而不是缓住了用户的声明。
+pub fn declarations_fingerprint(config_json: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_meta(&mut h, config_json);
+    let mut cmds: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = config_json.parent().map(|p| p.join("commands")) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            cmds = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().map(|x| x == "json").unwrap_or(false))
+                .collect();
+        }
+    }
+    cmds.sort();
+    cmds.len().hash(&mut h);
+    for p in cmds {
+        hash_meta(&mut h, &p);
+    }
+    fingerprint(&extensions_root(config_json)).hash(&mut h);
     h.finish()
 }
 
@@ -697,5 +818,121 @@ mod tests {
         assert_ne!(fingerprint(&root), edited, "新装的扩展也要让缓存作废");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 投给侧栏的那几条：只挑声明了 `sidebar` 的，命令在前、工作流在后。
+    ///
+    /// 这条守的是 P2-5 的入口判据。两个靶子：把 `goes_to` 换成「有 `menu` 就算」→
+    /// 第一条红（只投面板的那条会凭空多出一行）；把 `sidebar_entries_of` 里工作流
+    /// 那段删掉 → 第二条红。
+    #[test]
+    fn sidebar_entries_picks_only_the_sidebar_slot() {
+        let cmd = |name: &str, menu: &[&str]| UserCommand {
+            name: name.to_string(),
+            category: "字幕".to_string(),
+            shell: "wc -w {file}".to_string(),
+            source: None,
+            menu: menu.iter().map(|s| s.to_string()).collect(),
+            key: String::new(),
+        };
+        let wf = |name: &str, menu: &[&str]| mo_config::Workflow {
+            name: name.to_string(),
+            steps: vec!["pwd".to_string()],
+            source: None,
+            menu: menu.iter().map(|s| s.to_string()).collect(),
+            key: String::new(),
+        };
+        let got = sidebar_entries_of(
+            &[
+                cmd("只进面板", &["palette"]),
+                cmd("进侧栏和面板", &["sidebar", "palette"]),
+                cmd("写错的界面名", &["siderbar"]),
+            ],
+            &[wf("也要进侧栏", &["sidebar"]), wf("打包", &[])],
+        );
+        let names: Vec<&str> = got.iter().map(|e| e.label()).collect();
+        // 只有声明了 sidebar 的两条；工作流排在所有命令之后（与命令面板同一条顺序）。
+        assert_eq!(names, ["进侧栏和面板", "也要进侧栏"]);
+        // 分区名 = `category`，侧栏与命令面板问的是同一句话（P2-5 的取舍，见 devlog §4.9）。
+        assert_eq!(got[0].group(), "字幕");
+        assert_eq!(got[1].group(), "工作流");
+        // 什么都没声明 → 空列表（侧栏一个区都不多出）。
+        assert!(sidebar_entries_of(&[cmd("只进面板", &[])], &[wf("打包", &[])]).is_empty());
+    }
+
+    /// `when_ext` 约束下的命令不能投侧栏（与快捷键同一条判据）。
+    ///
+    /// 为什么这不是「实现麻烦」而是语义：投递给侧栏的那一份来自
+    /// `user_commands(&[])`——**不带选区过滤**的那一批，受 `when_ext` 约束的命令根本
+    /// 不在里面。所以这种声明是「写了、校验过了、界面上永远看不见」，加载期就拒掉。
+    #[test]
+    fn rejects_sidebar_slot_on_ext_gated_command() {
+        let mut m = manifest("a");
+        m.commands[0].menu = vec!["sidebar".to_string()];
+        assert!(
+            validate(&m, Some("a")).is_none(),
+            "没写 when_ext 时投侧栏是合法的"
+        );
+        m.when_ext = vec![".srt".into()];
+        let err = validate(&m, Some("a")).expect("when_ext + sidebar 应被拒");
+        assert!(err.contains("统计"), "{err} 要指得出是哪条命令");
+        assert!(err.contains("侧栏"), "{err} 要说清是哪一处的冲突：{err}");
+        assert!(err.contains("when_ext"), "{err} 要说出理由");
+    }
+
+    /// 声明签名：三处来源（config.json、`commands/*.json`、扩展清单）任一处变动都要
+    /// 让缓存作废；都没动则不变。
+    ///
+    /// 这条钉的是「用户手改任何一处声明，下一帧侧栏就跟着变」——少了 `commands/` 或
+    /// config.json 那两项，改这两处的用户会看到侧栏一动不动，而且**重启才好**（最难查
+    /// 的那类 bug）。同 [`fingerprint`]：改内容用不同长度，避开 mtime 精度盲区。
+    #[test]
+    fn declarations_fingerprint_follows_every_source() {
+        let dir = std::env::temp_dir().join(format!("mo-extdeclfp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, r#"{"commands":[]}"#).unwrap();
+
+        let base = declarations_fingerprint(&cfg);
+        assert_eq!(
+            declarations_fingerprint(&cfg),
+            base,
+            "没动过就该是同一个签名"
+        );
+
+        // 1) 配置里的 commands 段变了（侧栏项也能写在这里）。
+        std::fs::write(&cfg, r#"{"commands":[{"name":"统计"}]}"#).unwrap();
+        let edited = declarations_fingerprint(&cfg);
+        assert_ne!(edited, base, "改了 config.json 还认成没改 = 侧栏缓死了");
+
+        // 2) 多一个 `commands/*.json`。
+        std::fs::create_dir_all(dir.join("commands")).unwrap();
+        std::fs::write(dir.join("commands").join("a.json"), r#"[{"name":"转换"}]"#).unwrap();
+        let with_cmd = declarations_fingerprint(&cfg);
+        assert_ne!(with_cmd, edited, "新增命令清单也要让缓存作废");
+
+        // 3) 改那份清单的内容（同长度不行，换个长度）。
+        std::fs::write(
+            dir.join("commands").join("a.json"),
+            r#"[{"name":"转换格式"}]"#,
+        )
+        .unwrap();
+        assert_ne!(declarations_fingerprint(&cfg), with_cmd);
+
+        // 4) 装一个扩展。
+        std::fs::create_dir_all(dir.join("extensions").join("one")).unwrap();
+        std::fs::write(
+            dir.join("extensions").join("one").join("manifest.json"),
+            r#"{"id":"one","name":"一"}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            declarations_fingerprint(&cfg),
+            with_cmd,
+            "新装的扩展也要让缓存作废"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

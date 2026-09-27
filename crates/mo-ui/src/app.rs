@@ -12808,6 +12808,104 @@ mod tests {
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
 
+    /// 清单里那句 `menu: ["sidebar"]` → 侧栏真多出一行 → 点它 → 那条命令跑到执行层
+    /// （P2-5 的全链路）。
+    ///
+    /// 与 P2-4 那条同一个分工：判据（「什么算投了侧栏」「为什么 `when_ext` 的不能投」）
+    /// 在 `mo_app::extensions` 与 `sidebar::tests` 的单测里，这一条只守**接线**——
+    /// `sidebar::render` 有没有把 `app.sidebar_entries()` 交给数据层，`render_row` 里
+    /// 那个 `match &activate` 有没有为 `Activate::Contributed` 接上 `run_user_command`。
+    /// 变异体「`render` 里那句换成 `Vec::new().into()`」只有第一段红（选择器根本不存在），
+    /// 「点击臂留空 / 走错成 `Modal::None`」只有第二段红。分两段就为了红的时候知道断在
+    /// 哪头。
+    ///
+    /// ⚠️ 选择器从**声明本身**派生（`mo-sidebar-ext-cmd-<展平名>`），不是「侧栏第几行」：
+    /// fixture 种进 `isolate_user_dirs_for_tests()` 给的**共享**隔离目录，同一 pid 里别的
+    /// 测试种的扩展、上一轮留下的书签都可能把位置号挪走（devlog/engine-testing §9 那条
+    /// 「只在整包并行时红」的老坑）。名字里带 `P25` 也是为此——这条贡献行在整包跑时仍然
+    /// 只可能来自这个 fixture。
+    ///
+    /// 命令用 `{file}` 而**不选中任何条目**：占位符守卫在起进程之前就返回 Err，所以这
+    /// 一跑不会真 spawn 外部程序（headless 不该拉 shell），而那张「未执行」的信息卡恰好
+    /// 证明走到了执行那一层。
+    #[test]
+    fn contributed_sidebar_row_from_manifest_runs_its_command() {
+        let dir = crate::isolate_user_dirs_for_tests()
+            .join("extensions")
+            .join("p25sidebar");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p25sidebar",
+  "name": "字幕工具P25",
+  "version": "1.0",
+  "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "menu": ["sidebar"] }]
+}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        // 侧栏每帧现取（`sidebar_entries()` 那份缓存的签名一变就重读），fixture 先落盘
+        // 只是为了首帧就有这一行——少这一步，下面的选择器会先红一次。
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        assert_eq!(modal_of(cx), Modal::None, "起点：没有模态挡着");
+
+        // 「清单 → 缓存 → 数据层 → 渲染帧」这一段。展平名带扩展名前缀，那一句也是断言
+        // 的一部分（侧栏这一行点的是**哪条**命令，只有名字说得清）。
+        //
+        // ⚠️ `debug_bounds` 要 `&'static str`（选择器不参与运行时拼接，见 layout.rs 那个
+        // `bounds()` 同款签名），所以这里写常量、由常量截出文案，而不是两边各拼一次——
+        // 两边各拼的话，改了一头另一头还在通过。
+        const SELECTOR: &str = "mo-sidebar-ext-cmd-字幕工具P25 · 统计字数";
+        let label = SELECTOR
+            .strip_prefix("mo-sidebar-ext-cmd-")
+            .expect("选择器常量自己拼错了");
+        let row = cx
+            .debug_bounds(SELECTOR)
+            .unwrap_or_else(|| panic!("清单声明的侧栏行没出现在渲染帧里（{SELECTOR}）"));
+        let sidebar = cx
+            .debug_bounds("mo-sidebar")
+            .expect("侧栏本身没渲染（选择器 mo-sidebar）");
+        assert!(
+            row.origin.x >= sidebar.origin.x
+                && row.origin.x + row.size.width <= sidebar.origin.x + sidebar.size.width,
+            "贡献行不在侧栏内：sidebar={sidebar:?} row={row:?}"
+        );
+
+        // 再验「点击 → 执行」这一环。
+        cx.update(|window, cx| window.click(format!("sidebar-ext-cmd-{label}"), cx));
+        cx.run_until_parked();
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+
+        match modal_of(cx) {
+            Modal::Info(text) => {
+                assert!(
+                    text.contains(label),
+                    "信息卡上要点名是哪条命令，否则「点了没反应」与「点错了命令」分不出：{text}"
+                );
+                assert!(
+                    text.contains("未执行"),
+                    "没有选中条目时应当停在占位符守卫那一层（既不 spawn 进程也不静默）：{text}"
+                );
+            }
+            other => panic!(
+                "点侧栏那一行应当把那条命令送到执行层，实际 modal = {other:?}（点击臂没接上，或这一行没点到）"
+            ),
+        }
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
     /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。
     ///
     /// 用户要求「访问 FTP 时标签页上要显示出来」。图标与主机名具体怎么画在

@@ -251,6 +251,14 @@ pub struct AppState {
     /// 所以不能每帧真去读），区别在作废判据不是时间而是 [`extensions::fingerprint`]：
     /// 用户手改清单，下一帧就是新文案，不必重启。
     type_labels: Arc<std::sync::Mutex<extensions::TypeLabelCache>>,
+    /// 扩展/配置贡献的侧栏项：`(上次声明签名, 列表)`，`None` = 还没读过。
+    ///
+    /// 与 [`AppState::type_labels`] 同一条理由，而且更硬：侧栏**每帧**都要问一次
+    /// 「有哪几行」，而这一句的上半截在磁盘上——`user_commands(&[])` 一次调用就把配置、
+    /// `commands/*.json`、每个扩展清单全读一遍再解析。不缓存的话每帧十几起文件 IO，
+    /// 顺带把「重名」那几条 `tracing::warn!` 刷成每帧一条（热路径纪律见
+    /// devlog/plugin-system.md §2）。
+    sidebar_entries: Arc<std::sync::Mutex<extensions::SidebarCache>>,
 }
 
 /// 把「正在打开某个目录」置位，离开作用域自动收尾。
@@ -880,6 +888,7 @@ impl AppState {
                     .unwrap_or(false),
             )),
             type_labels: Arc::new(std::sync::Mutex::new(None)),
+            sidebar_entries: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -4296,6 +4305,34 @@ impl AppState {
         g.as_ref()
             .map(|(_, table)| table.clone())
             .unwrap_or_default()
+    }
+
+    /// 该出现在侧栏里的那些贡献项（清单或配置里写了 `menu: ["sidebar"]` 的那几条）。
+    ///
+    /// 缓存的必要性见 [`AppState::sidebar_entries`] 字段那段。返回 `Arc` 而不是
+    /// `Vec`：侧栏每帧都要拿一份，而这一批内容在两次改配置之间根本不变。
+    ///
+    /// ⚠️ 这里取命令用的是 `user_commands(&[])`，也就是**不带选区过滤**的那一份。与
+    /// 快捷键同一尺度：侧栏那一行是全局的，「选中 .srt 才有的那一条」不该在侧栏里
+    /// 冒出来（在加载期 `extensions::validate` 就拒掉这种组合，所以这里看到的必然都是
+    /// 不受 `when_ext` 约束的）。
+    pub fn sidebar_entries(&self) -> Arc<Vec<extensions::SidebarEntry>> {
+        let fp = extensions::declarations_fingerprint(&Self::config_path());
+        let mut g = self.sidebar_entries.lock().unwrap();
+        let stale = match &*g {
+            Some((seen, _)) => *seen != fp,
+            None => true,
+        };
+        if stale {
+            *g = Some((
+                fp,
+                Arc::new(extensions::sidebar_entries_of(
+                    &self.user_commands(&[]),
+                    &self.workflows(),
+                )),
+            ));
+        }
+        g.as_ref().map(|(_, rows)| rows.clone()).unwrap_or_default()
     }
 
     /// 启用 / 停用某个扩展：改写它自己清单里的 `enabled`。
