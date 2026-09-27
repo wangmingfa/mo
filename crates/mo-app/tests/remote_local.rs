@@ -52,6 +52,8 @@ use mo_core::{EntryKind, FileId, FileMetadata, MoError};
 use mo_fs::{FileSystem, ReadDirEntry};
 use mo_remote::RemoteUrl;
 
+mod common;
+
 /// 测试用的远程地址。
 ///
 /// 刻意用 `127.0.0.1:1`：**万一复用的短路失效了**、真的去建连接，本机端口 1
@@ -294,7 +296,10 @@ fn tab(sessions: &Arc<SessionRegistry>) -> AppState {
     // 隔天复用到同一个 pid + 同一个序号，读到的就是上一轮留下的 `index.json`，
     // 于是「远程删除不该进本机回收站」那条断言偶发红（实测一轮命中）。
     let _ = std::fs::remove_dir_all(&trash);
-    AppState::with_sessions(trash, sessions.clone())
+    // 索引库 / 配置也钉进隔离目录（每个 `AppState` 一档，见 common::isolated）。
+    common::isolated(&format!("tab-{seq}"), || {
+        AppState::with_sessions(trash, sessions.clone())
+    })
 }
 
 /// 登入一条假连接，返回 `(编号, 被问过的路径, 改动记录)`。

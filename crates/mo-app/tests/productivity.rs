@@ -5,6 +5,8 @@ use mo_preview::PreviewKind;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod common;
+
 fn tree(tag: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!("mo-prod-{}-{}-{}", tag, std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&base);
@@ -36,13 +38,9 @@ async fn wait_for<F: Fn() -> bool>(f: F) {
 fn global_search_finds_files_across_subdirs() {
     // 索引现在**落在盘上**（`~/Library/Caches/mo/search.sqlite`），不隔离就会往开发者
     // 机器上的真实索引里写测试目录，而且那些记录会一直留在那儿、把后续搜索的前 50
-    // 条挤掉。测试一律把库钉到临时目录。
-    let dir = std::env::temp_dir().join(format!("mo-index-prod-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("建索引目录");
-    std::env::set_var("MO_CACHE_DIR", &dir);
-
+    // 条挤掉。测试一律把库钉进隔离目录（common::isolated）。
     let base = tree("search");
-    let app = AppState::new();
+    let app = common::isolated("search", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -75,7 +73,7 @@ fn delete_selection_removes_the_file() {
     let base = tree("del");
     let trash = trash_root("del");
     let target = base.join("beta.log");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("del", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -105,7 +103,7 @@ fn delete_selection_removes_the_file() {
 #[test]
 fn preview_text_file_reports_kind() {
     let base = tree("pv");
-    let app = AppState::new();
+    let app = common::isolated("pv", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let pv = app.preview(&base.join("alpha.txt")).unwrap();
@@ -120,7 +118,7 @@ fn preview_text_file_reports_kind() {
 fn history_records_executed_operations() {
     let base = tree("hist");
     let trash = trash_root("hist");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("hist", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -145,7 +143,7 @@ fn undo_restores_a_deleted_file_from_trash() {
     let trash = trash_root("undo-del");
     let sub = base.join("sub");
     let target = sub.join("gamma.md");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("undo-del", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&sub).await.unwrap();
@@ -170,7 +168,7 @@ fn undo_restores_a_deleted_file_from_trash() {
 fn trash_list_purge_and_empty() {
     let base = tree("trash-panel");
     let trash = trash_root("trash-panel");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("trash-panel", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -222,7 +220,7 @@ fn undo_reverts_a_copy() {
     let src = base.join("alpha.txt");
     let copied = dst.join("alpha.txt");
 
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("undo-copy", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -252,7 +250,7 @@ fn undo_reverts_a_move() {
     let src = base.join("beta.log");
     let moved = dst.join("beta.log");
 
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("undo-move", || AppState::with_trash(trash.clone()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -282,7 +280,7 @@ fn undo_reverts_a_move() {
 #[test]
 fn move_cursor_moves_focus_and_extends_selection() {
     let base = tree("cursor");
-    let app = AppState::new();
+    let app = common::isolated("cursor", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -318,7 +316,7 @@ fn move_cursor_moves_focus_and_extends_selection() {
 /// 侧边栏快捷位置：至少有主目录，且路径都存在。
 #[test]
 fn quick_locations_contains_home_with_existing_paths() {
-    let app = AppState::new();
+    let app = common::isolated("quick-locations", AppState::new);
     let locs = app.quick_locations();
     assert!(!locs.is_empty(), "至少应解析出主目录");
     assert!(
@@ -337,7 +335,7 @@ fn quick_locations_contains_home_with_existing_paths() {
 #[test]
 fn create_file_is_empty_and_never_overwrites() {
     let base = tree("newfile");
-    let app = AppState::new();
+    let app = common::isolated("newfile", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let first = app.create_file(&base, "新建文本.txt").await.unwrap();
@@ -379,7 +377,7 @@ fn create_file_is_empty_and_never_overwrites() {
 #[test]
 fn focus_by_prefix_jumps_to_first_matching_name() {
     let base = tree("typeahead");
-    let app = AppState::new();
+    let app = common::isolated("typeahead", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -423,7 +421,7 @@ fn focus_by_prefix_jumps_to_first_matching_name() {
 #[test]
 fn invert_selection_flips_visible_set_only() {
     let base = tree("invert");
-    let app = AppState::new();
+    let app = common::isolated("invert", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();
@@ -461,7 +459,7 @@ fn invert_selection_flips_visible_set_only() {
 #[test]
 fn grouping_rows_headers_and_row_range_selection() {
     let base = tree("grouping");
-    let app = AppState::new();
+    let app = common::isolated("grouping", AppState::new);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         app.open_directory(&base).await.unwrap();

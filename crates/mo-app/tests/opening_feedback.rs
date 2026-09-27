@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use mo_app::AppState;
 use mo_core::AppEvent;
 
+mod common;
+
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-app-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -26,7 +28,7 @@ async fn opening_flag_clears_after_a_successful_read() {
     let dir = tmp("opening-ok");
     std::fs::write(dir.join("a.txt"), b"x").unwrap();
 
-    let app = AppState::new();
+    let app = common::isolated("opening-ok", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
     assert_eq!(app.opening_path(), None, "读完应回到空闲");
 }
@@ -34,7 +36,7 @@ async fn opening_flag_clears_after_a_successful_read() {
 /// 读**失败**也要清干净：不然点错一个路径，那条提示就再也退不掉了。
 #[tokio::test]
 async fn opening_flag_clears_when_the_read_fails() {
-    let app = AppState::new();
+    let app = common::isolated("opening-missing", AppState::new);
     let missing = tmp("opening-missing").join("这一层不存在");
     assert!(app.open_directory(&missing).await.is_err(), "应当读失败");
     assert_eq!(app.opening_path(), None, "失败路径同样要收干净");
@@ -46,7 +48,7 @@ async fn opening_events_bracket_the_read() {
     let dir = tmp("opening-events");
     std::fs::write(dir.join("a.txt"), b"x").unwrap();
 
-    let app = AppState::new();
+    let app = common::isolated("opening-events", AppState::new);
     let mut rx = app.bus().subscribe();
     app.open_directory(&dir).await.expect("打开目录失败");
 

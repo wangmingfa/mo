@@ -3,33 +3,15 @@
 //! 开关在 `mo-config` 里一直是有的（`show_hidden`），但列目录的过滤没接上——
 //! dotfile 恒显示，`.git` / `node_modules` 铺满整个列表。这里钉的是**过滤真的生效**
 //! 且**切换后立刻重读**：只改开关不重读的话，界面上什么都没变，用户只会以为按键坏了。
+//!
+//! 早先这两个用例是「读真实配置、测完原样恢复」，而恢复的值本身是竞态读出来的：
+//! 2026-09-26 实测，跑完 `cargo test --workspace`，开发者自己的「显示隐藏文件」被
+//! 悄悄关掉了。现在配置与缓存都由 common::isolated 钉进临时目录。
 
 use mo_app::AppState;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
 
-/// 把配置钉到临时目录（`MO_CONFIG_DIR`），别写开发者机器上的真实 `config.json`。
-///
-/// ⚠️ 按**测试名**分目录 + 全程互斥（见 [`ENV_LOCK`]）：它是进程级环境变量，
-/// 同二进制的测试默认多线程并行，谁最后 `set_var` 谁说话。
-///
-/// 钉之前这两个测试是「读真实配置、测完原样恢复」，而恢复的值本身是竞态读出来的：
-/// B 构造 `AppState` 时盘上正被 A 写成 `false`，B 收尾就把 `false` 留在了用户配置里。
-/// 2026-09-26 实测：跑完 `cargo test --workspace`，开发者自己的「显示隐藏文件」被悄悄关掉。
-fn use_temp_config(tag: &str) {
-    let dir = std::env::temp_dir().join(format!("mo-cfg-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建配置目录");
-    std::env::set_var("MO_CONFIG_DIR", &dir);
-}
-
-/// 串行化本文件里所有动 `MO_CONFIG_DIR` 的测试（进程级变量只能进程级保护）。
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    // 中毒的锁说明某个持锁测试 panic 过——拿回锁继续跑，别让前一个失败把这一个也拖倒。
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+mod common;
 
 fn tree(tag: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!("mo-hidden-{}-{}", tag, std::process::id()));
@@ -49,10 +31,8 @@ async fn names(app: &AppState) -> Vec<String> {
 
 #[test]
 fn hidden_entries_are_filtered_until_the_switch_is_on() {
-    let _env = env_lock();
-    use_temp_config("filter");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let app = AppState::new();
+    let app = common::isolated("filter", AppState::new);
     let base = tree("filter");
 
     let (off, on) = rt.block_on(async {
@@ -87,10 +67,8 @@ fn hidden_entries_are_filtered_until_the_switch_is_on() {
 /// 列视图与主列表同一条判据：换了个画法，藏起来的东西不该冒出来。
 #[test]
 fn columns_view_hides_them_too() {
-    let _env = env_lock();
-    use_temp_config("columns");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let app = AppState::new();
+    let app = common::isolated("columns", AppState::new);
     let base = tree("columns");
 
     let (off, on) = rt.block_on(async {

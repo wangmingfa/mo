@@ -10,7 +10,8 @@
 
 use mo_app::AppState;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+
+mod common;
 
 /// 手搓一份最小可解析的 PDF：一页 100×200 点，左下角一个 60×60 的纯蓝方块。
 ///
@@ -49,76 +50,69 @@ fn sample_pdf() -> Vec<u8> {
     out
 }
 
-/// 把缓存目录钉进临时目录，返回它（渲染产物与搜索索引都落到这里，不碰真实缓存）。
-///
-/// ⚠️ 调用方必须先拿 [`env_lock`]：`MO_CACHE_DIR` 是**进程级**变量，而同二进制的测试
-/// 默认并行——A 刚指到自己的目录，B 又改指过去，A 的「第二次调用命中同一个文件」就
-/// 会随调度时机随机翻车。
-fn temp_cache(tag: &str) -> PathBuf {
+/// 放示例 PDF 的工作目录（渲染产物本身由 common::isolated 钉在自己的缓存目录里）。
+fn workdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("临时目录建得出来");
-    std::env::set_var("MO_CACHE_DIR", &dir);
     dir
-}
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 渲染产物落盘、UI 读得回来，而且第二次调用命中缓存、改过 mtime 就失效。
 #[test]
 fn pdf_first_page_is_rendered_and_cached() {
-    let _guard = env_lock();
-    let dir = temp_cache("pdf-render");
+    let dir = workdir("pdf-render");
     let pdf = dir.join("sample.pdf");
     std::fs::write(&pdf, sample_pdf()).expect("示例 PDF 写得出去");
 
-    let app = AppState::new();
-    let png = app.preview_pdf_page(&pdf).expect("首页要渲染得出来");
-    assert!(png.exists(), "返回的必须是落盘了的文件：{}", png.display());
-    assert_eq!(
-        png.parent().and_then(|p| p.file_name()),
-        Some("pdf-preview".as_ref()),
-        "渲染产物落在 <缓存>/pdf-preview 下"
-    );
+    // ⚠️ 整段都在 `isolated` 里跑：`preview_pdf_page` 每次调用都现读 `MO_CACHE_DIR`
+    // （不像索引库那样在构造时就握住了句柄），锁一放开、隔壁用例把变量改走，
+    // 这里「第二次命中同一个文件」的断言就随调度时机翻车。
+    common::isolated("pdf-render", || {
+        let app = AppState::new();
+        let png = app.preview_pdf_page(&pdf).expect("首页要渲染得出来");
+        assert!(png.exists(), "返回的必须是落盘了的文件：{}", png.display());
+        assert_eq!(
+            png.parent().and_then(|p| p.file_name()),
+            Some("pdf-preview".as_ref()),
+            "渲染产物落在 <缓存>/pdf-preview 下"
+        );
 
-    let bm = mo_thumbnails::decode_bitmap(&png).expect("UI 读得回这张 PNG");
-    let (w, h) = (bm.width(), bm.height());
-    // 100×200 点的一页：72 DPI 是 100×200，96 DPI 是 133×267。
-    assert!((90..=140).contains(&w), "宽该在 100~133 之间，实际 {w}");
-    assert!(
-        (w as usize * 19 / 10..=w as usize * 21 / 10).contains(&(h as usize)),
-        "高约等于宽的 2 倍（100×200 的一页），实际 {w}×{h}"
-    );
-    assert_eq!(bm.bgra().len(), w as usize * h as usize * 4);
-    let px = bm.bgra().as_chunks::<4>().0;
-    assert!(px.iter().all(|p| p[3] == 255), "铺过白纸的首页处处不透明");
-    // BGRA：蓝方块是 `(255, 0, 0)`。一个都没有说明「渲染 → PNG」中间把内容弄丢了。
-    let blue = px.iter().filter(|p| p[0] > 200 && p[2] < 60).count();
-    assert!(
-        blue > (w * h / 20) as usize,
-        "方块得占到画面一成以上，实际 {blue} 个像素"
-    );
+        let bm = mo_thumbnails::decode_bitmap(&png).expect("UI 读得回这张 PNG");
+        let (w, h) = (bm.width(), bm.height());
+        // 100×200 点的一页：72 DPI 是 100×200，96 DPI 是 133×267。
+        assert!((90..=140).contains(&w), "宽该在 100~133 之间，实际 {w}");
+        assert!(
+            (w as usize * 19 / 10..=w as usize * 21 / 10).contains(&(h as usize)),
+            "高约等于宽的 2 倍（100×200 的一页），实际 {w}×{h}"
+        );
+        assert_eq!(bm.bgra().len(), w as usize * h as usize * 4);
+        let px = bm.bgra().as_chunks::<4>().0;
+        assert!(px.iter().all(|p| p[3] == 255), "铺过白纸的首页处处不透明");
+        // BGRA：蓝方块是 `(255, 0, 0)`。一个都没有说明「渲染 → PNG」中间把内容弄丢了。
+        let blue = px.iter().filter(|p| p[0] > 200 && p[2] < 60).count();
+        assert!(
+            blue > (w * h / 20) as usize,
+            "方块得占到画面一成以上，实际 {blue} 个像素"
+        );
 
-    // 第二次：同一份 PDF 没改过 → 命中同一个文件，不再渲染。
-    assert_eq!(
-        app.preview_pdf_page(&pdf),
-        Some(png.clone()),
-        "同一份 PDF 命中缓存"
-    );
+        // 第二次：同一份 PDF 没改过 → 命中同一个文件，不再渲染。
+        assert_eq!(
+            app.preview_pdf_page(&pdf),
+            Some(png.clone()),
+            "同一份 PDF 命中缓存"
+        );
 
-    // 改过 mtime → 键变了，得重渲染成**另一个**文件（否则改完 PDF 预览还是旧图）。
-    touch(&pdf);
-    let again = app
-        .preview_pdf_page(&pdf)
-        .expect("改过的 PDF 照样渲染得出来");
-    assert_ne!(
-        again, png,
-        "mtime 变了就不能再吃旧缓存：{again:?} vs {png:?}"
-    );
+        // 改过 mtime → 键变了，得重渲染成**另一个**文件（否则改完 PDF 预览还是旧图）。
+        touch(&pdf);
+        let again = app
+            .preview_pdf_page(&pdf)
+            .expect("改过的 PDF 照样渲染得出来");
+        assert_ne!(
+            again, png,
+            "mtime 变了就不能再吃旧缓存：{again:?} vs {png:?}"
+        );
+    });
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -136,10 +130,10 @@ fn touch(path: &Path) {
 /// 扩展名骗人 → `None`：调用方退回占位文案，绝不拿这个 PDF 的路径去喂 `img()`。
 #[test]
 fn a_file_that_isnt_a_pdf_renders_nothing() {
-    let _guard = env_lock();
-    let dir = temp_cache("pdf-junk");
+    let dir = workdir("pdf-junk");
     let liar = dir.join("liar.pdf");
     std::fs::write(&liar, b"plain text with a pdf suffix").expect("写得动");
-    assert!(AppState::new().preview_pdf_page(&liar).is_none());
+    let app = common::isolated("pdf-junk", AppState::new);
+    assert!(app.preview_pdf_page(&liar).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use mo_app::AppState;
 use mo_fs::WatcherEvent;
 
+mod common;
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
@@ -39,7 +41,7 @@ fn trash_root(tag: &str) -> PathBuf {
 fn a_rename_out_reported_as_modified_removes_the_entry() {
     let dir = tree("gone", &["gone.txt"]);
     let trash = trash_root("gone");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("gone", || AppState::with_trash(trash.clone()));
 
     runtime().block_on(async {
         app.open_local(&dir).await.expect("打开本地目录");
@@ -78,7 +80,7 @@ fn a_rename_out_reported_as_modified_removes_the_entry() {
 fn a_modify_with_the_file_still_on_disk_keeps_the_entry() {
     let dir = tree("kept", &["kept.txt"]);
     let trash = trash_root("kept");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("kept", || AppState::with_trash(trash.clone()));
 
     runtime().block_on(async {
         app.open_local(&dir).await.expect("打开本地目录");
@@ -108,7 +110,7 @@ fn a_modify_with_the_file_still_on_disk_keeps_the_entry() {
 fn a_cross_directory_rename_event_removes_the_source_entry() {
     let dir = tree("moved", &["moved.txt"]);
     let trash = trash_root("moved");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("moved", || AppState::with_trash(trash.clone()));
     let outside = dir.with_extension("out2");
 
     runtime().block_on(async {
@@ -148,7 +150,7 @@ fn a_cross_directory_rename_event_removes_the_source_entry() {
 fn a_same_directory_rename_still_rewrites_the_entry() {
     let dir = tree("rename", &["old.txt"]);
     let trash = trash_root("rename");
-    let app = AppState::with_trash(trash.clone());
+    let app = common::isolated("rename", || AppState::with_trash(trash.clone()));
 
     runtime().block_on(async {
         app.open_local(&dir).await.expect("打开本地目录");

@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use mo_app::AppState;
 
+mod common;
+
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-app-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -20,7 +22,7 @@ async fn locate_is_case_insensitive_and_does_not_filter() {
         std::fs::write(dir.join(name), b"x").unwrap();
     }
 
-    let app = AppState::new();
+    let app = common::isolated("typeahead", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
     assert_eq!(app.visible_count().await, 3);
 
@@ -70,7 +72,7 @@ async fn repeating_one_letter_jumps_to_the_next_match() {
         std::fs::write(dir.join(name), b"x").unwrap();
     }
 
-    let app = AppState::new();
+    let app = common::isolated("typeahead-repeat", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
 
     // 首个字母从第一个匹配项开始（不跳过）。
@@ -101,7 +103,7 @@ async fn subsequence_fallback_locates_when_no_prefix_matches() {
         std::fs::write(dir.join(name), b"x").unwrap();
     }
 
-    let app = AppState::new();
+    let app = common::isolated("typeahead-subseq", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
 
     // "mt" 不是任何文件的前缀，但按序出现在 Mars.txt 里。
@@ -121,7 +123,7 @@ async fn prefix_match_wins_over_subsequence() {
     std::fs::create_dir_all(dir.join("Documents")).expect("建子目录失败");
     std::fs::write(dir.join("dm.txt"), b"x").unwrap();
 
-    let app = AppState::new();
+    let app = common::isolated("typeahead-prefix-wins", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
 
     app.locate_by_prefix("dm", false)
@@ -138,7 +140,7 @@ async fn cursor_move_reports_both_spaces() {
         std::fs::write(dir.join(name), b"x").unwrap();
     }
 
-    let app = AppState::new();
+    let app = common::isolated("typeahead-cursor", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
 
     let hit = app.locate_cursor(1, false).await.expect("应有焦点");

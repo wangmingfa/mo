@@ -15,6 +15,8 @@ use parking_lot::Mutex as PlMutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod common;
+
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-app-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -22,13 +24,16 @@ fn tmp(tag: &str) -> PathBuf {
     dir
 }
 
-/// 一份独占的暂存区（回收站也钉到临时目录，免得写进开发者机器上的真回收站）。
+/// 一份独占的暂存区：回收站钉到临时目录，免得写进开发者机器上的真回收站；
+/// 配置与索引库则由 common::isolated 钉进隔离目录。
 fn app(tag: &str) -> AppState {
-    AppState::with_staging(
-        tmp(&format!("{tag}-trash")),
-        session_registry(),
-        Arc::new(PlMutex::new(Staging::new())),
-    )
+    common::isolated(tag, || {
+        AppState::with_staging(
+            tmp(&format!("{tag}-trash")),
+            session_registry(),
+            Arc::new(PlMutex::new(Staging::new())),
+        )
+    })
 }
 
 /// 等一个路径出现（传输是后台提交的操作，测试不能「等」，只能轮询）。
@@ -163,16 +168,20 @@ async fn the_list_is_shared_between_two_app_states() {
     std::fs::write(dir.join("a.txt"), b"a").unwrap();
 
     let shared = Arc::new(PlMutex::new(Staging::new()));
-    let one = AppState::with_staging(
-        tmp("staging-shared-trash1"),
-        session_registry(),
-        shared.clone(),
-    );
-    let two = AppState::with_staging(
-        tmp("staging-shared-trash2"),
-        session_registry(),
-        shared.clone(),
-    );
+    let one = common::isolated("staging-shared-one", || {
+        AppState::with_staging(
+            tmp("staging-shared-trash1"),
+            session_registry(),
+            shared.clone(),
+        )
+    });
+    let two = common::isolated("staging-shared-two", || {
+        AppState::with_staging(
+            tmp("staging-shared-trash2"),
+            session_registry(),
+            shared.clone(),
+        )
+    });
 
     // 两个 AppState 指向不同目录，模拟「分栏两边」。
     one.open_directory(&dir).await.expect("打开目录失败");

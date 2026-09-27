@@ -1,6 +1,6 @@
 //! 文件夹同步的应用层集成测试：配对持久化 → 计划 → 执行 → 多余文件交回回收站。
 //!
-//! ⚠️ 必须先设 `MO_CONFIG_DIR`：`set_sync_target` 会写配置文件，不隔离就会
+//! ⚠️ 配置目录必须隔离（common::isolated）：`set_sync_target` 会写配置文件，不隔离就会
 //! 污染开发者机器上的真实配置。
 
 use std::fs;
@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use mo_app::AppState;
 use mo_operations::{SyncConflictPolicy, SyncMode, SyncOptions};
+
+mod common;
 
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -30,24 +32,17 @@ fn put(root: &Path, rel: &str, body: &str) {
     fs::write(&p, body).unwrap();
 }
 
-/// 隔离配置目录（整个测试进程共用一份，所以测试之间不并发写同一个键）。
-fn isolate_config() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mo-sync-it-config-{}", std::process::id()));
-    let _ = fs::create_dir_all(&dir);
-    std::env::set_var("MO_CONFIG_DIR", &dir);
-    dir
-}
-
 #[tokio::test]
 async fn pair_persists_and_plan_executes() {
-    isolate_config();
     let src = scratch("src");
     let dst = scratch("dst");
     put(&src, "a.txt", "AAA");
     put(&src, "sub/b.txt", "BBB");
     put(&dst, "only-dst.txt", "D");
 
-    let app = AppState::new();
+    // 配置钉进隔离目录（见 common::isolated）：`set_sync_target` 写的是
+    // `<配置>/config.json`，不隔离就会盖掉开发者机器上的真实配对。
+    let app = common::isolated("pair", AppState::new);
     // 未配对时读不到目标。
     assert!(app.sync_target(&src).is_none());
 

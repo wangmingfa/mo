@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use mo_app::AppState;
 
+mod common;
+
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-app-lat-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -23,7 +25,7 @@ async fn window_fetch_stays_fast_during_metadata_backfill() {
         std::fs::write(dir.join(format!("{i:08}")), b"x").unwrap();
     }
 
-    let app = AppState::new();
+    let app = common::isolated("probe", AppState::new);
     app.open_directory(&dir).await.expect("打开目录失败");
     let total = app.visible_count().await;
     assert_eq!(total, 27000);

@@ -8,6 +8,8 @@
 use mo_app::AppState;
 use std::path::PathBuf;
 
+mod common;
+
 fn tmp_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     let base = std::env::temp_dir().join(format!("mo-nav-{}-{}", tag, std::process::id()));
     let a = base.join("a");
@@ -21,7 +23,7 @@ fn tmp_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
 #[test]
 fn go_back_keeps_forward_stack_usable() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let app = AppState::new();
+    let app = common::isolated("back-forward", AppState::new);
     let (base, a, b) = tmp_dirs("back-forward");
 
     let outcome = rt.block_on(async {
@@ -53,7 +55,7 @@ fn go_back_keeps_forward_stack_usable() {
 #[test]
 fn refresh_does_not_pollute_history() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let app = AppState::new();
+    let app = common::isolated("refresh", AppState::new);
     let (base, a, _b) = tmp_dirs("refresh");
 
     let outcome = rt.block_on(async {

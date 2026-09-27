@@ -12,18 +12,8 @@
 
 use mo_app::AppState;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
-/// 进程级环境变量的互斥锁（`MO_CACHE_DIR` / `MO_CONFIG_DIR` 都是）。
-///
-/// ⚠️ 与 `global_index.rs` 同一个道理：同二进制的测试默认多线程并行，A 刚把变量
-/// 指到自己的目录、B 又改走，之后谁建 `AppState` 打开的就是别人的库——而且写的
-/// 是开发者机器上真实的 `search.sqlite`。
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+mod common;
 
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mo-clip-{tag}-{}", std::process::id()));
@@ -32,17 +22,9 @@ fn tmp(tag: &str) -> PathBuf {
     dir
 }
 
-/// 一份把缓存与配置都钉到临时目录的 `AppState`。
-///
-/// ⚠️ 必须在持有 [`env_lock`] 时构造：`AppState::build` 当场就要开索引库。
-/// 返回后锁可以立刻放开，库句柄已经指着那个临时文件了。
+/// 一份把缓存与配置都钉进隔离目录的 `AppState`（见 common::isolated）。
 fn app(tag: &str) -> AppState {
-    let dir = std::env::temp_dir().join(format!("mo-clip-store-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建隔离目录");
-    std::env::set_var("MO_CACHE_DIR", &dir);
-    std::env::set_var("MO_CONFIG_DIR", &dir);
-    AppState::with_trash(tmp(&format!("{tag}-trash")))
+    common::isolated(tag, || AppState::with_trash(tmp(&format!("{tag}-trash"))))
 }
 
 /// 等一个路径出现（传输是后台提交的操作，测试不能「等」，只能轮询）。
@@ -64,9 +46,7 @@ async fn copy_survives_the_selection_changing_underneath_it() {
     std::fs::write(src.join("a.txt"), b"a").unwrap();
     std::fs::write(src.join("b.txt"), b"b").unwrap();
 
-    let _env = env_lock();
     let app = app("copy-across-dirs");
-    drop(_env);
 
     app.open_directory(&src).await.expect("打开源目录失败");
     app.select_all_visible().await;
@@ -95,9 +75,7 @@ async fn a_cut_is_consumed_by_the_first_paste() {
     let dst = tmp("cut-dst");
     std::fs::write(src.join("only.txt"), b"x").unwrap();
 
-    let _env = env_lock();
     let app = app("cut-consumed");
-    drop(_env);
 
     app.open_directory(&src).await.expect("打开源目录失败");
     app.select_all_visible().await;
@@ -124,9 +102,7 @@ async fn files_from_the_system_clipboard_land_in_the_current_dir() {
     let victim = foreign.join("from-explorer.txt");
     std::fs::write(&victim, b"copied in explorer").unwrap();
 
-    let _env = env_lock();
     let app = app("external-in");
-    drop(_env);
 
     app.open_directory(&here).await.expect("打开当前目录失败");
     // UI 层从 gpui 读到 `ExternalPaths` 后递进来的就是这一手（路径 + 剪切位）。
@@ -155,9 +131,7 @@ async fn the_same_batch_on_the_system_clipboard_does_not_overrule_the_cut_flag()
     let one = src.join("mine.txt");
     std::fs::write(&one, b"x").unwrap();
 
-    let _env = env_lock();
     let app = app("own-cut-wins");
-    drop(_env);
 
     app.open_directory(&src).await.expect("打开源目录失败");
     app.select_all_visible().await;
@@ -187,9 +161,7 @@ async fn a_different_batch_on_the_system_clipboard_replaces_the_internal_one() {
     std::fs::write(stale_src.join("stale.txt"), b"old").unwrap();
     std::fs::write(new_src.join("fresh.txt"), b"new").unwrap();
 
-    let _env = env_lock();
     let app = app("external-wins");
-    drop(_env);
 
     app.open_directory(&stale_src).await.expect("打开目录失败");
     app.select_all_visible().await;
