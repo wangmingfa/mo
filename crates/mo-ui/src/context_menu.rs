@@ -113,6 +113,12 @@ pub(crate) enum MenuAction {
     InvertSelection,
     /// 收集到暂存区：与「复制」同组但语义是**追加**（见 `mo-app::staging`）。
     Stage,
+    /// 贡献进来的动作（用户自定义命令 / 扩展命令 / 工作流）——这一批宿主事先
+    /// 不知道有几条，条目由 [`crate::actions`] 那张表投进 `ContextFile` / `ContextBlank`。
+    ///
+    /// 载荷直接是 [`crate::actions::ActionKind`]（「第几条用户命令」），执行时不再
+    /// 回头查注册表：注册表按当前选中项的扩展名过滤，点击那一刻可能已经换了一批下标。
+    Contributed(crate::actions::ActionKind),
 }
 
 /// 一行菜单项。`separator_before` 为真时它上方还有一条分隔线。
@@ -173,11 +179,17 @@ fn looks_like_archive(path: &std::path::Path) -> bool {
 /// 空白处（`target == None`）给的是「目录级」动作（新建 / 粘贴 / 刷新 / 全选），
 /// 对着条目给的是「条目级」动作，并按类型 / 选中数裁剪掉不合理的项。
 /// `open_with` 是「打开方式」的候选应用列表（文件才有；在菜单打开时异步查询）。
-pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]) -> Vec<MenuItem> {
+/// `specs` 是**贡献进来的**动作（用户命令 / 扩展命令 / 工作流，见 [`crate::actions`]）；
+/// 其中投了本槽位的那几条追加在末尾。
+pub(crate) fn items(
+    menu: &ContextMenu,
+    open_with: &[mo_app::shell::OpenWithApp],
+    specs: &[crate::actions::ActionSpec],
+) -> Vec<MenuItem> {
     let Some(target) = menu.target.as_ref() else {
         // ------------------------------------------------ 空白处：目录级动作
         // 空白处：目录级动作。两个「新建」同组（中间不隔线）。
-        return vec![
+        let mut out = vec![
             MenuItem::new(MenuAction::NewFolder, "新建文件夹", "", true),
             MenuItem::new(MenuAction::NewFile, "新建文本文件", "", true),
             MenuItem::new(
@@ -204,6 +216,8 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
             MenuItem::new(MenuAction::OpenTerminal, "在终端中打开", "", true).separated(),
             MenuItem::new(MenuAction::Properties, "显示简介", "", true),
         ];
+        push_contributed(&mut out, specs, crate::actions::Slot::ContextBlank);
+        return out;
     };
 
     let is_dir = menu.is_dir;
@@ -388,7 +402,32 @@ pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]
         ));
     }
 
+    push_contributed(&mut out, specs, crate::actions::Slot::ContextFile);
     out
+}
+
+/// 追加「贡献进来的」那几条：注册表里投了本槽位的（按注册表顺序）。
+///
+/// 一律排在末尾、并给第一条带一条前导分隔线。理由是节奏：内置那批的分组
+/// （编辑 / 归档 / 工具 / 信息）是设计过的，名字由用户自己写的命令混进去会把
+/// 分组读散；单独一组「用户自己的东西」反而一眼能找。
+fn push_contributed(
+    out: &mut Vec<MenuItem>,
+    specs: &[crate::actions::ActionSpec],
+    slot: crate::actions::Slot,
+) {
+    let base = out.len();
+    for (n, s) in crate::actions::for_slot(specs, slot)
+        .into_iter()
+        .enumerate()
+    {
+        let item = MenuItem::new(MenuAction::Contributed(s.kind), s.title.clone(), "", true);
+        out.push(if n == 0 && base > 0 {
+            item.separated()
+        } else {
+            item
+        });
+    }
 }
 
 /// 菜单面板的总高度（含内边距与分隔线），用于边缘钳制。
@@ -654,6 +693,7 @@ mod tests {
         items, looks_like_archive, panel_height, ContextMenu, MenuAction, MenuItem, ITEM_H, PAD,
         SEP_H,
     };
+    use crate::actions::{ActionKind, ActionSpec, Slot};
     use std::path::{Path, PathBuf};
 
     fn menu(target: Option<&str>, is_dir: bool, selected: usize) -> ContextMenu {
@@ -678,7 +718,7 @@ mod tests {
     }
 
     fn actions(m: &ContextMenu) -> Vec<MenuAction> {
-        items(m, &[]).into_iter().map(|i| i.action).collect()
+        items(m, &[], &[]).into_iter().map(|i| i.action).collect()
     }
 
     fn find(list: &[MenuItem], a: MenuAction) -> &MenuItem {
@@ -707,7 +747,7 @@ mod tests {
     /// 两个「新建」必须挨在一起、中间没有分隔线（同属「新建」这一组）。
     #[test]
     fn new_items_share_one_group() {
-        let list = items(&menu(None, true, 0), &[]);
+        let list = items(&menu(None, true, 0), &[], &[]);
         let folder = find(&list, MenuAction::NewFolder);
         let file = find(&list, MenuAction::NewFile);
         assert_eq!(folder.label, "新建文件夹");
@@ -781,7 +821,7 @@ mod tests {
     /// （批量重命名对话框与哈希工具本身就支持多项）。
     #[test]
     fn items_track_the_selection_size() {
-        let three = items(&menu(Some("/tmp/a.txt"), false, 3), &[]);
+        let three = items(&menu(Some("/tmp/a.txt"), false, 3), &[], &[]);
         assert!(
             find(&three, MenuAction::Rename).enabled,
             "多项应当能批量重命名"
@@ -790,20 +830,20 @@ mod tests {
         assert!(find(&three, MenuAction::Hash).enabled, "多项应当能算哈希");
         assert!(!find(&three, MenuAction::Compare).enabled, "3 项不能比较");
 
-        let two = items(&menu(Some("/tmp/a.txt"), false, 2), &[]);
+        let two = items(&menu(Some("/tmp/a.txt"), false, 2), &[], &[]);
         assert!(
             find(&two, MenuAction::Compare).enabled,
             "恰好 2 项时应当可以比较"
         );
 
-        let one = items(&menu(Some("/tmp/a.txt"), false, 1), &[]);
+        let one = items(&menu(Some("/tmp/a.txt"), false, 1), &[], &[]);
         assert_eq!(find(&one, MenuAction::Rename).label, "重命名…");
     }
 
     /// 高度要跟着分隔线一起算——钳制用的是它，算错菜单会被切掉一截。
     #[test]
     fn panel_height_accounts_for_separators() {
-        let blank = items(&menu(None, true, 0), &[]);
+        let blank = items(&menu(None, true, 0), &[], &[]);
         assert_eq!(blank.len(), 8);
         // 3 条分隔线：paste / select_all / open_terminal 各自上方一条。
         let seps = blank.iter().filter(|i| i.separator_before).count();
@@ -815,7 +855,7 @@ mod tests {
     /// 二级菜单（候选应用 + 系统选择对话框），「快速查看」仍在但不再占首位。
     #[test]
     fn file_menu_has_open_and_open_with_submenu() {
-        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &[]);
+        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &[], &[]);
         let open = find(&list, MenuAction::Open);
         assert_eq!(open.label, "打开");
 
@@ -839,7 +879,7 @@ mod tests {
                 progid: "AppXxyz".to_string(),
             },
         ];
-        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &apps);
+        let list = items(&menu(Some("/tmp/a.txt"), false, 1), &apps, &[]);
         let ow = find(&list, MenuAction::OpenWithOther);
         assert_eq!(ow.submenu.len(), 3);
         assert_eq!(
@@ -865,5 +905,89 @@ mod tests {
         assert!(!a.contains(&MenuAction::OpenWithOther));
         assert!(!a.contains(&MenuAction::QuickLook));
         assert!(!a.contains(&MenuAction::OpenWith(0)));
+    }
+
+    fn spec(title: &str, index: usize, slots: Vec<Slot>) -> ActionSpec {
+        ActionSpec {
+            title: title.to_string(),
+            category: "自定义".to_string(),
+            kind: ActionKind::User(index),
+            slots,
+        }
+    }
+
+    /// 只投「命令面板」这一个槽位的注册表**不该改变菜单**——这正是今天全部贡献项
+    /// 的形状（见 [`crate::actions::contributed`]），所以这条就是收口前后行为一致
+    /// 的断言。反向验证：把 `contributed` 里的默认 slots 加上 ContextFile，这条必红。
+    #[test]
+    fn palette_only_registry_does_not_change_the_menu() {
+        for m in [
+            menu(Some("/tmp/a.txt"), false, 1),
+            menu(Some("/tmp/dir"), true, 1),
+            menu(None, true, 0),
+        ] {
+            let plain: Vec<MenuAction> = items(&m, &[], &[]).iter().map(|i| i.action).collect();
+            let with_palette_only: Vec<MenuAction> =
+                items(&m, &[], &[spec("统计字数", 0, vec![Slot::Palette])])
+                    .iter()
+                    .map(|i| i.action)
+                    .collect();
+            assert_eq!(plain, with_palette_only, "菜单上下文：{m:?}");
+        }
+    }
+
+    /// 投了某个槽位才出现在那个槽位；顺序在末尾、第一条自带前导分隔线。
+    ///
+    /// 反向验证：把 [`crate::actions::contributed`] 里那句 `separated()` 去掉，
+    /// 或把 `push_contributed` 的槽位判据写反，这条必红。
+    #[test]
+    fn contributed_items_land_only_in_their_slots() {
+        let specs = vec![
+            spec("只进面板", 0, vec![Slot::Palette]),
+            spec("统计字数", 1, vec![Slot::ContextFile]),
+            spec("清空此目录", 2, vec![Slot::ContextBlank]),
+        ];
+
+        let on_entry = items(&menu(Some("/tmp/a.txt"), false, 1), &[], &specs);
+        let labels: Vec<&str> = on_entry.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels.last().copied(),
+            Some("统计字数"),
+            "贡献项应当追加在末尾：{labels:?}"
+        );
+        assert!(
+            !labels.contains(&"清空此目录"),
+            "空白处（目录级）动作不该出现在条目菜单"
+        );
+        assert!(!labels.contains(&"只进面板"), "只投面板的不该出现在菜单里");
+        let stat = find(&on_entry, MenuAction::Contributed(ActionKind::User(1)));
+        assert!(stat.separator_before, "与内置那批之间要有一条分隔线");
+        assert!(stat.enabled, "贡献项没有可用性判据，恒可点");
+
+        let blank = items(&menu(None, true, 0), &[], &specs);
+        let blank_labels: Vec<&str> = blank.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(blank_labels.last().copied(), Some("清空此目录"));
+        assert!(!blank_labels.contains(&"统计字数"));
+
+        // 两条同时命中时：按注册表顺序、彼此之间不再隔线。
+        let both = items(
+            &menu(Some("/tmp/a.txt"), false, 1),
+            &[],
+            &[
+                spec("第一条", 3, vec![Slot::ContextFile]),
+                spec("第二条", 4, vec![Slot::ContextFile]),
+            ],
+        );
+        let tail: Vec<(String, bool)> = both
+            .iter()
+            .rev()
+            .take(2)
+            .map(|i| (i.label.clone(), i.separator_before))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![("第二条".to_string(), false), ("第一条".to_string(), true),],
+            "贡献项之间不该每条都隔一条线"
+        );
     }
 }

@@ -3,6 +3,8 @@
 //! 这一层才使用 GPUI；核心逻辑全部在 `mo-core` / `mo-app` 中，UI 只通过
 //! [`mo_app::AppState`] 发命令、通过事件总线订阅变化，不直接操作文件系统。
 
+/// 动作注册表：外面贡献进来的动作（用户命令 / 扩展命令 / 工作流）出现在哪些槽位。
+mod actions;
 mod app;
 /// 内存位图 → gpui 渲染图的转换缓存（`ImageSource::Render` 同步上屏的根）。
 mod bitmap;

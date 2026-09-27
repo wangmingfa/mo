@@ -414,7 +414,9 @@ struct CmdDef {
 
 /// 命令目录（命令面板的数据源）。
 ///
-/// `users` 是用户自定义命令，追加在内建命令之后（第四阶段·自定义命令）。
+/// 内置那批是硬编码的 `CommandId`（编译期穷尽，见 [`crate::actions`] 模块头为什么
+/// 不把它们摊成数据）；尾部追加的是**贡献进来的**那批（用户自定义命令 / 扩展命令 /
+/// 工作流），走 [`crate::actions`] 那张注册表（第四阶段·自定义命令）。
 fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) -> Vec<CmdDef> {
     let mut out = vec![
         CmdDef {
@@ -747,22 +749,18 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             category: "操作".to_string(),
         });
     }
-    for (i, u) in users.iter().enumerate() {
+    for spec in crate::actions::for_slot(
+        &crate::actions::contributed(users, workflows),
+        crate::actions::Slot::Palette,
+    ) {
+        let id = match spec.kind {
+            crate::actions::ActionKind::User(i) => CommandId::User(i),
+            crate::actions::ActionKind::Workflow(i) => CommandId::Workflow(i),
+        };
         out.push(CmdDef {
-            id: CommandId::User(i),
-            title: u.name.clone(),
-            category: if u.category.trim().is_empty() {
-                "自定义".to_string()
-            } else {
-                u.category.clone()
-            },
-        });
-    }
-    for (i, w) in workflows.iter().enumerate() {
-        out.push(CmdDef {
-            id: CommandId::Workflow(i),
-            title: w.name.clone(),
-            category: "工作流".to_string(),
+            id,
+            title: spec.title.clone(),
+            category: spec.category.clone(),
         });
     }
     out
@@ -6281,6 +6279,18 @@ impl RootView {
         .detach();
     }
 
+    /// 贡献进来的动作（用户命令 / 扩展命令 / 工作流）——右键菜单与命令面板共用的
+    /// 那张表（见 [`crate::actions`]）。
+    ///
+    /// 扩展名过滤不在这里做：`user_commands` 是 `AppState::user_commands(&exts)` 按各
+    /// 扩展清单的 `when_ext` 筛过之后交上来的，两处都判就会出现「面板看得到、菜单
+    /// 看不到」这类对不上号的差异。那份镜像目前只在**开命令面板时**刷新（`keys` 的
+    /// `palette.open`）——今天贡献项只投面板，所以够用；P2 要往菜单投动作，得先让
+    /// 菜单按这一次右键的选中项重取一次。
+    fn contributed_actions(&self) -> Vec<crate::actions::ActionSpec> {
+        crate::actions::contributed(&self.user_commands, &self.workflows)
+    }
+
     /// 执行一个菜单动作。菜单在此之前就已关闭（动作可能自己开模态）。
     pub(crate) fn run_menu_action(
         &mut self,
@@ -6506,6 +6516,11 @@ impl RootView {
                 .detach();
             }
             A::Stage => self.stage_selection(cx),
+            // 贡献进来的动作（用户命令 / 扩展命令 / 工作流）：走与命令面板同一条执行路，
+            // 所以 `ActionKind` 直接映射到那两个 `*_at`。不另开一条执行路径——占位符
+            // 守卫（缺选中项就不执行并给提示）与输出回显都在那边。
+            A::Contributed(crate::actions::ActionKind::User(i)) => self.run_user_command_at(i, cx),
+            A::Contributed(crate::actions::ActionKind::Workflow(i)) => self.run_workflow_at(i, cx),
         }
         cx.notify();
     }
@@ -7150,7 +7165,11 @@ impl Render for RootView {
         // 右键菜单：绝对定位的浮层，最后挂上去（画在最上层、命中链最前）。
         // 用窗口坐标直接当偏移量——根容器从 (0, 0) 铺满窗口，两者同一套坐标系。
         if let Some(menu) = self.context_menu.clone() {
-            let items = crate::context_menu::items(&menu, &self.open_with_apps);
+            let items = crate::context_menu::items(
+                &menu,
+                &self.open_with_apps,
+                &self.contributed_actions(),
+            );
             let vs = window.viewport_size();
             root = root.child(crate::context_menu::render(
                 &menu,
@@ -12095,9 +12114,9 @@ mod tests {
         let blank_h = cx.update(|_window, cx| {
             root.update(cx, |v, cx| {
                 v.open_context_menu(None, 100.0, 100.0, 0, 0, cx);
-                v.context_menu
-                    .as_ref()
-                    .map(|m| crate::context_menu::items(m, &v.open_with_apps).len())
+                v.context_menu.as_ref().map(|m| {
+                    crate::context_menu::items(m, &v.open_with_apps, &v.contributed_actions()).len()
+                })
             })
         });
         let entry_items = cx.update(|_window, cx| {
@@ -12110,8 +12129,12 @@ mod tests {
                     0,
                     cx,
                 );
-                crate::context_menu::items(v.context_menu.as_ref().unwrap(), &v.open_with_apps)
-                    .len()
+                crate::context_menu::items(
+                    v.context_menu.as_ref().unwrap(),
+                    &v.open_with_apps,
+                    &v.contributed_actions(),
+                )
+                .len()
             })
         });
 
