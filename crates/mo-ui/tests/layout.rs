@@ -762,6 +762,34 @@ fn selection_count(window: &WindowHandle<RootView>, cx: &mut TestAppContext) -> 
         .expect("读选中数失败")
 }
 
+/// 轮询到面板真的显示 `want_rows` 行，返回有没有等到。
+///
+/// ⚠️ 目录读取走的是**真 IO**（`spawn_blocking` / tokio worker 读完再唤醒 GPUI 任务），
+/// 而 headless 的 `run_until_parked` 只排自己的任务队列，不等那条线程——所以「导航已经
+/// 生效、列表还没回来」这种中间态会被单次 `render_frame` 撞上（实测一轮约 5 次红 1 次）。
+/// 判据用 `panel_window_ready_for_tests`（行数精确相等）而不是「≥1 行」：后者会被启动时
+/// 那次「按需打开 Home」的内容蒙过去。
+fn wait_for_panel_rows(
+    vcx: &mut VisualTestContext,
+    window: &WindowHandle<RootView>,
+    cx: &mut TestAppContext,
+    want_rows: usize,
+) -> bool {
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        let ready = window
+            .update(cx, |root, _window, _cx| {
+                mo_ui::panel_window_ready_for_tests(root, want_rows)
+            })
+            .unwrap_or(false);
+        if ready {
+            return true;
+        }
+    }
+    false
+}
+
 /// 真实导航到 `dir`，轮询到第 `want_rows` 行真的画出来（含外部 IO 完成唤醒）。
 fn navigate_and_wait(
     vcx: &mut VisualTestContext,
@@ -775,19 +803,11 @@ fn navigate_and_wait(
             mo_ui::navigate_for_tests(root, dir, cx);
         })
         .expect("导航失败");
-    for _ in 0..100 {
-        vcx.run_until_parked();
-        vcx.update(|window, cx| window.render_frame(cx));
-        let ready = window
-            .update(cx, |root, _window, _cx| {
-                mo_ui::panel_window_ready_for_tests(root, want_rows)
-            })
-            .unwrap_or(false);
-        if ready {
-            return;
-        }
-    }
-    panic!("导航后 {} 行没画出来", want_rows);
+    assert!(
+        wait_for_panel_rows(vcx, window, cx, want_rows),
+        "导航后 {} 行没画出来",
+        want_rows
+    );
 }
 
 /// 在列表空白处（最后一行之下）单击，应该**清空选择**，而不是选中最后一行。
@@ -1472,15 +1492,20 @@ fn trash_space_previews_and_double_click_opens(cx: &mut TestAppContext) {
 
     // 双击目录行：退出回收站面板，在当前窗口浏览该目录（列表出现 inner.txt）。
     vcx.update(|window, cx| window.double_click("trash-row-1", cx));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| window.render_frame(cx));
+    // 那次目录读取是真 IO，唤醒不在 `run_until_parked` 的账上，轮询等它（seed-1 里就一个
+    // inner.txt）。不等就有约 1/5 的概率撞上「面板已退出、列表还没回来」而随机红。
+    let opened = wait_for_panel_rows(&mut vcx, &window, cx, 1);
     assert!(
         vcx.debug_bounds("mo-trash-row-0").is_none(),
         "双击目录后应退出回收站面板"
     );
     assert!(
-        vcx.debug_bounds("mo-file-row-0").is_some(),
-        "双击目录后当前窗口应浏览该目录"
+        opened && vcx.debug_bounds("mo-file-row-0").is_some(),
+        "双击目录后当前窗口应浏览该目录（列表里要有 inner.txt），实际停在 {:?}",
+        window
+            .update(cx, |root, _window, _cx| mo_ui::panel_path_for_tests(root))
+            .ok()
+            .flatten()
     );
 
     // 重新打开面板，选中文件行（a.txt 在 row0）后按空格：预览的是 ~/.Trash
