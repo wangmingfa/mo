@@ -166,7 +166,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **现象**：`isolate_config_for_tests()`（§16 那个 helper）只挡了 `MO_CONFIG_DIR`，缓存那半是漏的。`AppState::new()` 一开就接上 `<缓存>/mo/search.sqlite`，测试爬过的每个临时目录都被写进**开发者机器上的真索引**——回头按搜索键找文件，会搜出一批早已被删掉的 `mo-layout-trash-*` 之类的脏根。缩略图 / 预览图 / `metadata.sqlite` 同理，每个会渲染图片的用例都在往真实缓存落文件。
 * **修法**：`mo_cache::cache_dir()`、`mo_thumbnails` 的 thumb / preview 两个根都认 `MO_CACHE_DIR`（和 `AppState::index_path` 同一条理由，之前只有它认）；helper 改名 `isolate_user_dirs_for_tests()`，一次钉两个目录——**名字只说 config 会让后来人以为隔离已经做全了**。
 * **验证方式**：不看日志看 mtime。跑 `cargo test -p mo-ui`（33/33）前后 `%LOCALAPPDATA%\mo\search.sqlite` 与 `metadata.sqlite` 都没动，临时目录里多出 `mo-test-cache-<pid>`。
-* ⚠️ **没修完**：mo-app / mo-operations 的集成测试（`hidden_files`、`large_dir`、`navigation`、`staging`、`sync`、`watcher_refresh` 等十余个）各自 `set_var` 之外不钉缓存，仍在写真实 `search.sqlite`。它们的 app 构造各写各的，要一起收口得先给 mo-app 补一个同款 helper。
+* **没修完的部分**：那一轮只改了 `mo-ui` / `mo-platform` 用的 `isolate_user_dirs_for_tests()`，`mo-app` 的十余个集成测试各自 `set_var` 之外不钉缓存，仍在写真实 `search.sqlite`。这一条在 §26 收口。
 
 ## 22. §15 那张折表只认 US 布局：改成问当前键盘布局
 
@@ -217,6 +217,23 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **验到了哪一步**：单测验数据对象（`CF_HDROP` 表与给它的逐条相等，含中文名与目录；掺一条不存在的路径就整批不递）和 `QueryContinueDrag` 的两个确定分支（Esc → `CANCEL`；OLE 的按键位说按着 → `S_OK`；第三条「松手就落子」依赖 `GetAsyncKeyState`，环境相关，不写成断言）。
 * **⚠️ 端到端这一轮没验**：「真按住文件拖到资源管理器窗口里松手」headless 做不到——要真鼠标、要另一个进程当落点。我本想用 `SendInput` 演一遍（探针程序都写好了，后来删掉），但那会把光标从用户手底下挪走、也被工具侧的权限判定挡下，不该在没人盯着的会话里做。**所以「出界起拖」和「对面真接住」这两条只有代码审读，没有实测**。人工验一次就够：开着 Mo，按住一个文件拖出窗口、落到资源管理器里松手 → 应复制进去；按住 Shift 再拖 → 移动，源进 Mo 的回收站；中途按 Esc → 什么都没发生。
 
+## 26. 收口 mo-app 的集成测试：一个 helper，把「改环境变量 + 构造」绑成一件事
+
+* **为什么要收**：§21 那轮只改了 `mo-ui` / `mo-platform` 这条路，`mo-app` 的十四个集成测试二进制还是各写各的——`AppState` 一构造就接上 `<缓存>/mo/search.sqlite` 的真索引，每个跑过的临时目录都被记进开发者机器上那份全局索引里（用户按搜索键会搜出一堆早已删掉的 `mo-trash-*`），而偏好文件 `<配置>/config.json` 也是真读真写：同一份代码在不同机器上结论不同。
+* **helper 的形状**：`crates/mo-app/tests/common/mod.rs` 的 `isolated(tag, build)`——一次做完「建临时目录 → 钉 `MO_CONFIG_DIR` 与 `MO_CACHE_DIR` → 在这个前提下跑 `build`」，返回 `build` 的值。配置与缓存合成**同一个根**：少一个变量就少一处漏钉。**关键是把两步绑死**，而不是留一个 `use_temp_index()` 让用例自己记得先去拿锁——漏一处就是随机红，而这种随机在单线程 `--test-threads=1` 下永远复现不出来。
+* **锁只覆盖构造，不覆盖整个用例**：`AppState` 构造完已经握住了那批 sqlite 句柄，别的用例此后把环境变量改走也影响不到建好的这一个，所以锁没有理由一直抱着。**但「每次调用都现读环境变量」的接口不在这条保护里**——`preview_pdf_page` 落渲染产物时现场读 `MO_CACHE_DIR`，那种用例（`pdf_first_page_is_rendered_and_cached`）必须把整段塞进一次 `isolated` 的闭包里。
+* **⚠️ 一次调用清一遍目录**：`store()` 每次都 `remove_dir_all` + 重建（防 pid 复用读到上一轮的脏索引），于是「重开应用后索引还在不在」这类要**同一个库上跑两趟**的用例不能写成「同一个 `tag` 调两次 `isolated`」——第二次会把上一轮写下的索引抹成空库。`index_survives_a_restart`、`metadata_cache_primes_entries_on_reopen` 因此改成两次构造夹着等待全放进**一次**闭包。这条是跨平台雷：POSIX 上 `unlink` 对已打开的文件照样生效，Windows 上句柄占着恰好抹不动，所以只在 mac/Linux 上红。
+* **顺带改了一处异步形状**：`metadata_cache_primes_entries_on_reopen` 从 `#[tokio::test]` 改成 `#[test]` + 自己起 `tokio::runtime::Runtime`。原因是 `isolated` 收的是**同步**闭包（它抱着那把 `Mutex`），而「等元数据写回缓存」必须是真异步——只能在闭包里对一个新起的 runtime 调 `block_on`；留在 `#[tokio::test]` 里做不了，在正在跑的 runtime 内部再 `block_on` 会直接 panic（*Cannot block the current thread from within a runtime*）。自己握 runtime 也顺便让「构造在锁内、异步在 `block_on` 内」这个顺序显式可见。
+* **`mo-operations` 不在这次的范围里**（不是漏了）：`conflict.rs` / `transfer.rs` 只碰自己的临时树，`grep` 下来整个 crate 的测试既不构造 `AppState` 也不读这两个变量，写进真实索引这条路压根不存在。
+* **验证方式**：还是 §21 那一条——看 mtime，不看日志。`cargo test -p mo-app --all-features`（50 单测 + 十四个集成二进制共 76 个用例）前后，`%LOCALAPPDATA%\mo\search.sqlite` 的修改时间分毫未动（`2026-09-27 10:14:54`），而 TEMP 里多出 418 个 `mo-app-store-*` 目录——它们的存在就是「每个用例都写到了自己的库里」的实证。代价见文末待办（没人删）。
+
+## 27. 顺手修掉一个跑了五轮的随机红，以及「全绿」这两个字是怎么读出来的
+
+* **现象**：§26 那轮收口之后跑全量测试，`mo-ui/tests/layout.rs` 的 `trash_space_previews_and_double_click_opens` 红了：双击回收站里的目录行，「退出面板」那条断言过了，「当前窗口浏览该目录」（`mo-file-row-0` 存在）没过。单独跑三条全过，整条二进制跑四次红一次。
+* **根因**：目录读取是**真 IO**（`spawn_blocking` / tokio worker 线程读完再回头唤醒 GPUI 任务），而 headless 的 `run_until_parked` 只是 `while tick() {}`——它排自己的任务队列，**不等那条外部线程**。所以「导航已生效、列表还没回来」这个中间态会被一次 `render_frame` 撞上。§24 坑三撞到的是同一件事，当时只在 `os_drop.rs` 就地补了轮询，没抽出来，`layout.rs` 里这条双击的老写法就一直留着。
+* **修法**：把那段轮询提成 `wait_for_panel_rows(vcx, window, cx, rows)`（`navigate_and_wait` 改成调它），双击测试等 `rows == 1`。判据必须是**行数精确相等**，不是「≥1 行」——后者会被启动时那次「按需打开 Home」的内容蒙过去，那正是 §24 坑三的原始形态。修完连跑八次全过。
+* **⚠️ 顺带纠正一处我自己报过的假绿**：之前的全量验证写的是 `cargo test --workspace ... | grep ... | tail -60`，**退出码是管道最后那个命令的**，测试真失败也报 0。§26 那句「全量绿」里混着这么读出来的一次。现在一律 `out=$(cargo test ...); code=$?` 再判断，或者干脆不加管道。凡是靠日志尾巴得出的结论，都要先问一句这个 0 是谁的 0。
+
 
 
 ## 待办（还没做，别当成已完成）
@@ -226,7 +243,6 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
 * **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
 * **拖放的 Windows 两侧都写完了，但「出去」没实测**（§24 进来、§25 出去）。缺的是同一条：按住文件真拖一次到资源管理器上松手，看它到底落不落子——headless 做不到，得人来。**macOS 两侧都还没接**：`supports_file_drag()` / `supports_file_clipboard()` 在 mac 上都是假，拖出去要嘛迁到 gpui 的 `on_drag`（会撞 §24 坑一），要嘛自己写 `NSDraggingSource`。
-* §21 的缓存隔离只收了 mo-ui / mo-platform 这条路；mo-app / mo-operations 的十余个集成测试仍在写真实 `search.sqlite`。
 * 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
-* 测试留下的临时回收站 `mo-trash-<pid>-<seq>` 在 TEMP 里没人删（§21 那个 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积）。
+* 测试留下的临时目录在 TEMP 里没人删：回收站那些 `mo-trash-<pid>-<seq>`（§21 的 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积），以及 §26 之后每个用例各自的 `mo-app-store-<tag>-<pid>`（一次全量 `cargo test -p mo-app` 留下 400 多个）。隔离目录必须活到进程结束，所以要删得在最后统一收，而「最后」在 crash / ctrl-C 时到不了——真正干净的做法是给 `isolated` 挂一个进程退出时的清理，或用带 TTL 的目录名让下一次跑顺手清掉上一次的。
 
