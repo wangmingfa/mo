@@ -1,8 +1,8 @@
 # 插件系统（扩展包 / 能力分层 / provider 协议）
 
-> **状态：设计稿，未实现。** 本篇不遵守 devlog「只记已验证结论」的约定（见
-> [README.md](README.md)），记的是**将要做的**东西与其依据。实现进度一律落在
-> [windows-port.md](windows-port.md) 那样的逐节编年里，别把这里的 P1~P4 当成已完成。
+> **状态：设计稿。P1-1（`TypeRegistry`）已落地，其余未实现。** 本篇不遵守 devlog
+> 「只记已验证结论」的约定（见 [README.md](README.md)），记的是**将要做的**东西与其依据。
+> 已完成的部分在正文里逐条标注（并附 devlog 条目），没标的都还是纸面上的。
 >
 > 日期：2026-09-27。工具链 rustc 1.98.1。作者决策：**按完整三层设计（含 provider），实现一起排**。
 
@@ -41,7 +41,7 @@ UI 侧有扩展管理器（`mo-ui/src/app.rs:3426 render_extensions`）与命令
 | 右键菜单 | `enum MenuAction`（`pub(crate)`）约 30 变体，**无** `User(_)` 逃生口；条目 `push` 出来 | `mo-ui/src/context_menu.rs:71`、`items()` :176 |
 | 侧边栏一项 | 无数据模型，六段手写 div | `mo-ui/src/sidebar.rs:16`（回收站那段 :137-179） |
 | 新面板 | `enum Modal` 约 25 态 + render 手写三档 match | `app.rs:174`、`6739` |
-| 类型知识 | 三份各自独立的扩展名字符串匹配 | `mo-preview/src/lib.rs:196-217`（`is_image`/`is_pdf`/`kind_by_ext`）、`mo-core/src/view.rs:119`（`kind_group_of`）、`mo-app/src/icon.rs:133-165`（`icon_key`/`is_package_ext`） |
+| 类型知识 | ~~三份各自独立的扩展名字符串匹配~~ **已收成一张表**（P1-1，2026-09-27）：`mo-core/src/types.rs`，三问各自一个函数 | 旧三处见 [engine-testing.md §7](engine-testing.md) |
 | 新文件协议 | `trait FileSystem`（`Arc<dyn>`，**已经是真抽象**）但协议表硬编码 | `mo-fs/src/lib.rs:34`、`mo-remote/src/lib.rs:194,202` |
 | 键位 | `BINDINGS: [Binding; 40]` + `dispatch_action(match id: &str)`，配置已能改键 | `mo-ui/src/keys.rs:404`、`app.rs:4273` |
 
@@ -83,23 +83,36 @@ UI 侧有扩展管理器（`mo-ui/src/app.rs:3426 render_extensions`）与命令
 
 ## 4. 宿主侧三张注册表（P1 的主体，本身即重构收益）
 
-### 4.1 `TypeRegistry`（mo-core）
+### 4.1 `TypeRegistry`（mo-core）—— ✅ 已落地（2026-09-27，P1-1）
 
-今天「`.png` 是什么」这件事在三个 crate 各写一份字符串匹配，会互相矛盾（列表分组说是文档、
-预览说是纯文本）。收成一张表：
+今天「`.png` 是什么」这件事在三个 crate 各写一份字符串匹配，会互相矛盾（详见
+[engine-testing.md §7](engine-testing.md)）。收成一张表，落在 `crates/mo-core/src/types.rs`：
 
 ```rust
-pub struct TypeRule { pub ext: &'static [&'static str], pub group: GroupKey,
-                      pub icon_key: IconKey, pub preview: PreviewClass,
-                      pub label: Option<&'static str>, pub is_package: bool }
-pub fn rule_for(ext: &str) -> Option<&TypeRule>;   // 内置打底 + 插件贡献，插件**在前**
+pub enum PreviewClass { Image, Pdf, Markdown, Json, Code, Text }
+pub enum IconShare { ByType, ByPathPackage, ByPathExecutable }
+pub fn group_of(ext: &str) -> GroupKey;       // 分组：未知 = Other
+pub fn preview_of(ext: &str) -> PreviewClass; // 预览：未知 = Text
+pub fn icon_share_of(ext: &str) -> IconShare; // 图标能否按类型共享
 ```
 
-插件规则排在内置**之前**（作者更懂自己的格式，允许覆盖）。三处调用点改为查表：
-`mo-preview/src/lib.rs:196-217`、`mo-core/src/view.rs:119`、`mo-app/src/icon.rs:133-165`。
+**实际形状与原设计不同，而且更好**：没有做成一条 `TypeRule`（分组 + 图标 + 预览 + 标签
+捆在一起），而是**一问一个函数、各自一张 const 表**。理由是覆盖的粒度——插件只改「预览
+方式」而不改「分组」是很常见的需求，捆成一条 rule 就逼作者同时回答三问，答不出来的那些
+反而会被内置值顶掉。等 P2 的 `types` 清单字段进来时，注册表按
+「某一问的覆盖列表」建，不再回到单一 struct。
 
-⚠️ 这一步必须**逐条保持现有答案不变**，且要靠既有测试钉住（icon / preview / view 三组
-都已有断言）；改完加一条一致性测试：同一扩展名在三处得到的答案出自同一条 rule。
+三处调用点已改为查表：`mo-preview` 的 `class_of`/`text_kind`、`mo-core/view.rs` 分组处
+（原来那层只做转发的 `kind_group_of` 删了）、`mo-app/icon.rs` 的 `is_package_ext` 与
+`is_per_file_ext`（后者保留 cfg 外壳：那张表是跨平台事实清单，「快捷方式要不要按路径问」
+是平台行为）。
+
+保持不变的部分（P2 直接沿用）：判据一律是**小写、不含点**的扩展名；三个函数纯匹配、
+**无 IO 无锁**（列目录热路径每条目都要问一次）；插件贡献的规则将来**先于**内置查。
+
+⚠️ 这一步**逐条保持了现有答案**（脚本比对新旧八张集合全等，见 engine-testing §7），
+刻意留下的两处跨轴矛盾（`.svg` 分组算图片 / 预览算文本；`.avif` 预览算图片 / 分组落
+`Other`）由 `svg_and_avif_are_the_known_cross_axis_disagreements` 钉住。
 
 ### 4.2 `ActionRegistry`
 
@@ -165,9 +178,10 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 ## 8. 排期（每步独立可交付、可测）
 
-* **P1 纯宿主重构，零插件概念**：`TypeRegistry` 收三处扩展名表；`ActionRegistry` 收命令面板 +
-  右键菜单（加 `MenuAction::Plugin`）；侧栏改数据驱动。
+* **P1 纯宿主重构，零插件概念**：~~`TypeRegistry` 收三处扩展名表~~（✅ 已完成，见 §4.1）；
+  `ActionRegistry` 收命令面板 + 右键菜单（加 `MenuAction::Plugin`）；侧栏改数据驱动。
   验收：全量测试绿 + 新增「三处类型答案出自同一条 rule」的一致性测试。
+  （P1-1 那条的落地形态是「三问三函数 + 一张钉住已知矛盾的测试」，验收口径不变。）
 * **P2 声明层生效**：清单四类 + 安装/权限框 + 扩展管理器展示「本扩展贡献了什么」。
   验收：tests 里一个 fixture 扩展能加一条右键菜单项、一个 `.srt` 标签、一个侧栏项，
   headless 断言渲染出现；**反向验证**（注释掉注册点必须变红）。
