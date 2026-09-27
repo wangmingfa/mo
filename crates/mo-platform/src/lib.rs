@@ -123,6 +123,26 @@ pub fn eject(path: &Path) -> Result<(), PlatformError> {
     }
 }
 
+/// 原生目录选择框（模态）。用户取消时返回 `Ok(None)`——「取消」不是错误。
+///
+/// 扩展的「从磁盘安装」是唯一调用方：来源必须由用户当面指认，不能带任何
+/// 命令行参数或配置项（那等于给陌生扩展开了个静默安装的口子）。
+pub fn pick_folder(title: &str) -> Result<Option<PathBuf>, PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::pick_folder(title)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pick_folder(title)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = title;
+        Err(PlatformError::Unsupported("目录选择框"))
+    }
+}
+
 /// 一块**已挂载的卷宗**（访达侧边栏「位置」里那种）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Volume {

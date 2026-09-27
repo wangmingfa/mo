@@ -296,6 +296,128 @@ pub fn load_report(root: &Path) -> (Vec<Extension>, Vec<BrokenExtension>) {
     (good, broken)
 }
 
+/// 从磁盘安装一个扩展（§6）：来源要是一个**含 `manifest.json` 的目录**。
+///
+/// 步骤：读来源清单 → [`validate`] → 复制进 `<root>/<id>/` → **改写清单为停用** →
+/// 写 `installed.json` 记来源与每个文件的 sha256。中途任何一步失败都不留半个
+/// 目录（复制失败会把它清掉）。
+///
+/// 「安装即停用」是刻意的：手放进 `extensions/` 的清单缺省是启用的（§4.10 的
+/// 缺口），但**经过安装流程**装出来的不许缺省就跑——装完它以停用状态出现在
+/// 扩展管理器里，点「启用」才走那张贡献确认卡。至此「装了就跑」只剩「手工摆放」
+/// 一条路，安装是正门，正门有门禁。
+pub fn install_from(source: &Path, root: &Path) -> Result<Manifest, String> {
+    let raw = std::fs::read_to_string(source.join("manifest.json")).map_err(|e| {
+        format!(
+            "「{}」里读不到 manifest.json：{e}（要装的是一个含清单的扩展目录）",
+            source.display()
+        )
+    })?;
+    let mut m: Manifest =
+        serde_json::from_str(&raw).map_err(|e| format!("manifest.json 不是合法 JSON：{e}"))?;
+    if let Some(err) = validate(&m, None) {
+        return Err(err);
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("建扩展目录 {} 失败：{e}", root.display()))?;
+    // 来源已经在扩展目录里 → 它本来就是装好的扩展，再「装」一遍只会自己复制自己。
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(src_canon) = std::fs::canonicalize(source) {
+        if src_canon.starts_with(&root_canon) {
+            return Err(format!(
+                "「{}」就在扩展目录里，它已经是装好的了",
+                source.display()
+            ));
+        }
+    }
+    let target = root.join(&m.id);
+    if target.exists() {
+        return Err(format!(
+            "扩展目录里已经有「{}」了；先卸载（删掉那个目录）再装",
+            m.id
+        ));
+    }
+    if let Err(err) = copy_tree(source, &target) {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(err);
+    }
+    m.enabled = false;
+    std::fs::write(
+        target.join("manifest.json"),
+        serde_json::to_string_pretty(&m).map_err(|e| format!("清单写不回去：{e}"))?,
+    )
+    .map_err(|e| format!("清单写不回去：{e}"))?;
+    // 账本：来源 + 每个文件（不含账本自己）的 sha256。逐文件记而不是整目录一个
+    // 总和，是因为将来要回答「这份扩展被动过没有」得能定位到**哪个文件**动了。
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(&target).sort_by_file_name() {
+        let entry = entry.map_err(|e| format!("读安装目录失败：{e}"))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // 记相对路径（统一 / 分隔）：子目录里同名文件在账上不能撞成一条。
+        let rel = entry
+            .path()
+            .strip_prefix(&target)
+            .expect("walkdir 返回的都是 target 下的路径")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == "installed.json" {
+            continue;
+        }
+        files.push(serde_json::json!({
+            "path": rel,
+            "sha256": sha256_file(entry.path())?,
+        }));
+    }
+    let record = serde_json::json!({
+        "source": source.display().to_string(),
+        "files": files,
+    });
+    std::fs::write(
+        target.join("installed.json"),
+        serde_json::to_string_pretty(&record)
+            .map_err(|e| format!("installed.json 写不出来：{e}"))?,
+    )
+    .map_err(|e| format!("installed.json 写不出来：{e}"))?;
+    Ok(m)
+}
+
+/// 把 `src` 整棵复制到 `dst`（dst 必须不存在或为空）。目录按名排序遍历，符号链接
+/// 拒收——扩展是从外部进来的，链接指到哪只有来源机器知道，复制它等于抄一段
+/// 意义不明的目标内容进来。
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(src).sort_by_file_name() {
+        let entry = entry.map_err(|e| format!("读来源 {} 失败：{e}", src.display()))?;
+        let rel = entry
+            .path()
+            .strip_prefix(src)
+            .expect("walkdir 返回的都是 src 下的路径");
+        let to = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| format!("建 {} 失败：{e}", to.display()))?;
+        } else if entry.file_type().is_symlink() {
+            return Err(format!(
+                "{} 是符号链接，不装（扩展包里不该有链接）",
+                entry.path().display()
+            ));
+        } else {
+            std::fs::copy(entry.path(), &to)
+                .map_err(|e| format!("复制 {} 失败：{e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::Digest;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut f, &mut h).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// 读不了或校验不过的一份清单。扩展管理器把这一批**原样**亮出来——判据（什么算坏、
 /// 错在哪）在 [`validate`]，这里只搬运，不在 UI 里再判一遍。
 #[derive(Debug, Clone, PartialEq)]
@@ -916,6 +1038,103 @@ mod tests {
         assert_eq!(load(&root).len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 安装 = 复制 + 改写为停用 + 记账。
+    ///
+    /// 「装了就跑」的口子从正门堵上：装出来当场就是停用的（盘上的清单也写回
+    /// `"enabled": false`），启用要走扩展管理器那张确认卡。账本逐文件带 sha256、
+    /// 记相对路径，作者日后能定位「哪个文件动过」。
+    #[test]
+    fn installs_disabled_with_provenance() {
+        let tmp = std::env::temp_dir().join(format!("mo-extinst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("来源");
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(src.join("子目录")).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"p28","name":"安装来的扩展","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("run.cmd"), "echo hi").unwrap();
+        std::fs::write(src.join("子目录/extra.txt"), "x").unwrap();
+
+        let m = install_from(&src, &root).expect("应当装上");
+        assert!(!m.enabled, "安装即停用：启用要走确认卡");
+        let target = root.join("p28");
+        let on_disk = std::fs::read_to_string(target.join("manifest.json")).unwrap();
+        assert!(
+            on_disk.contains("\"enabled\": false"),
+            "盘上的清单也要写回停用（加载时读的是盘）：{on_disk}"
+        );
+
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(target.join("installed.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["source"], src.display().to_string());
+        let files = record["files"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            3,
+            "manifest.json + run.cmd + 子目录/extra.txt 都在账上：{files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f["path"] == "子目录/extra.txt"),
+            "子目录里的文件记相对路径，不与顶层撞名：{files:?}"
+        );
+        let manifest_entry = files
+            .iter()
+            .find(|f| f["path"] == "manifest.json")
+            .expect("manifest.json 在账上");
+        let want = sha256_file(&target.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest_entry["sha256"],
+            want.as_str(),
+            "账上的 sha 要对得上装出来的那份"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 拒收的几种来路：没有清单、validate 不过、重复安装、来源就在扩展目录里。
+    /// 每一种都不许留下半个目录，也不许弄坏已经装好的那份。
+    #[test]
+    fn refuses_to_install_bad_sources() {
+        let tmp = std::env::temp_dir().join(format!("mo-extrefuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let empty = tmp.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            install_from(&empty, &root).is_err(),
+            "没有 manifest.json 要拒"
+        );
+        assert!(!root.join("empty").exists(), "拒了就不该留东西");
+
+        let bad = tmp.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("manifest.json"), r#"{"id":"不是id","name":"x"}"#).unwrap();
+        assert!(install_from(&bad, &root).is_err(), "validate 不过要拒");
+        assert!(!root.join("bad").exists(), "拒了就不该留东西");
+
+        let good = tmp.join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("manifest.json"), r#"{"id":"p28b","name":"x"}"#).unwrap();
+        install_from(&good, &root).expect("第一次应当装上");
+        assert!(install_from(&good, &root).is_err(), "同一个 id 装两次要拒");
+        assert!(
+            root.join("p28b/manifest.json").is_file() && root.join("p28b/installed.json").is_file(),
+            "拒掉第二次不能弄坏第一次装好的"
+        );
+        assert!(
+            install_from(&root.join("p28b"), &root).is_err(),
+            "来源就在扩展目录里 = 它已经是装好的"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `types` 的四种写坏法都要被拒：整条清单不加载，而不是「收了字段却没人答」。

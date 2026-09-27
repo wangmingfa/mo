@@ -49,7 +49,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_MODE, OPEN_EXISTING,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::DataExchange::{
@@ -66,10 +66,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, MapVirtualKeyExW, VkKeyScanExW, MAPVK_VK_TO_CHAR,
 };
 use windows::Win32::UI::Shell::{
-    IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
-    SHDefExtractIconW, SHGetFileInfoW, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION,
-    FOF_NOERRORUI, FOF_SILENT, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_ICONLOCATION,
-    SHGFI_USEFILEATTRIBUTES,
+    IFileOpenDialog, IFileOperation, IFileOperationProgressSink, IShellItem,
+    SHCreateItemFromParsingName, SHDefExtractIconW, SHGetFileInfoW, FOFX_EARLYFAILURE,
+    FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_ICONLOCATION,
+    SHGFI_USEFILEATTRIBUTES, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON};
 
@@ -85,6 +86,10 @@ pub(crate) mod drag;
 /// 要的是 coclass 的 CLSID。
 const CLSID_FILE_OPERATION: GUID = GUID::from_u128(0x3AD05575_8857_4850_9277_11B85BDB8E09);
 
+/// `CLSID_FileOpenDialog`（同上，crate 没导 coclass 的 CLSID 就自己钉一份）。
+/// ⚠️ 别和 `IFileOpenDialog` 的接口 IID（`D57C7288-…`）混了。
+const CLSID_FILE_OPEN_DIALOG: GUID = GUID::from_u128(0xDC1C5A9C_E88A_4DDE_A5A1_60F82A20AEF7);
+
 /// 在资源管理器里选中 `path`（打开其所在目录并高亮该项）。
 pub fn reveal(path: &Path) -> Result<(), PlatformError> {
     if !path.exists() {
@@ -99,6 +104,57 @@ pub fn reveal(path: &Path) -> Result<(), PlatformError> {
         .spawn()
         .map(|_| ())
         .map_err(|e| PlatformError::Failed(format!("explorer 起不来：{e}")))
+}
+
+/// 原生目录选择框（`IFileOpenDialog` + `FOS_PICKFOLDERS`）。
+///
+/// 在调用线程上跑模态循环，所以**只能在 UI 线程**调（与 [`drag`] 的 `DoDragDrop`
+/// 同一条纪律，反过来：那边是「绝不能在 UI 线程」，这边是「只能在 UI 线程」）。
+/// 用户点「取消」时 `Show` 回 `HRESULT_FROM_WIN32(ERROR_CANCELLED)`
+/// （`0x8007_04C7`），那是正常出路不是错误，折成 `Ok(None)`。
+pub fn pick_folder(title: &str) -> Result<Option<PathBuf>, PlatformError> {
+    let _com = ComGuard::init();
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| PlatformError::Failed(format!("打不开目录选择框：{e}")))?;
+        let options = dialog
+            .GetOptions()
+            .map_err(|e| PlatformError::Failed(format!("目录选择框设置失败：{e}")))?;
+        // FOS_FORCEFILESYSTEM：只要文件系统路径，不收「此电脑」「回收站」这类虚拟位置
+        // ——选个虚拟位置回来没路径可装。
+        dialog
+            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
+            .map_err(|e| PlatformError::Failed(format!("目录选择框设置失败：{e}")))?;
+        let title_w = wide_str(title);
+        dialog
+            .SetTitle(PCWSTR(title_w.as_ptr()))
+            .map_err(|e| PlatformError::Failed(format!("目录选择框设置失败：{e}")))?;
+        if let Err(e) = dialog.Show(None) {
+            if e.code().0 as u32 == 0x8007_04C7 {
+                return Ok(None);
+            }
+            return Err(PlatformError::Failed(format!("目录选择框打不开：{e}")));
+        }
+        let item: IShellItem = dialog
+            .GetResult()
+            .map_err(|e| PlatformError::Failed(format!("拿不到所选目录：{e}")))?;
+        let display = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|e| PlatformError::Failed(format!("所选目录没有文件系统路径：{e}")))?;
+        let path = if display.is_null() {
+            String::new()
+        } else {
+            display.to_string().unwrap_or_default()
+        };
+        CoTaskMemFree(Some(display.0.cast()));
+        if path.is_empty() {
+            return Err(PlatformError::Failed(
+                "所选目录没有文件系统路径，装不了".into(),
+            ));
+        }
+        Ok(Some(PathBuf::from(path)))
+    }
 }
 
 /// 线程级 COM 初始化守卫。

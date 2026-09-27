@@ -4852,8 +4852,10 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
+ "walkdir",
  "windows-sys 0.52.0",
  "winreg",
 ]

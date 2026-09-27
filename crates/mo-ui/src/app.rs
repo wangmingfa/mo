@@ -3476,6 +3476,41 @@ impl RootView {
         cx.notify();
     }
 
+    /// 「从磁盘安装」：弹原生目录选择框，把选中的扩展目录装进配置目录。
+    ///
+    /// 来源必须由用户当面指认——没有命令行参数、没有配置项入口，那等于给陌生
+    /// 扩展开一条静默安装的门。选择框是模态的且只能在 UI 线程跑
+    /// （`mo_platform::pick_folder`）；用户取消（`Ok(None)`）不是错误，什么都不发生。
+    fn install_extension_from_disk(&mut self, cx: &mut Context<Self>) {
+        match mo_platform::pick_folder("选择含 manifest.json 的扩展目录") {
+            Ok(Some(dir)) => self.install_extension_from(&dir, cx),
+            Ok(None) => {}
+            Err(e) => self.notice(format!("打不开目录选择框：{e}"), None, cx),
+        }
+    }
+
+    /// 安装的后半段（选完目录之后）：装、刷新面板、选中新行。
+    ///
+    /// 拆出来是因为这一半可以在 headless 里测（选择框弹不出来，前半段测不了）；
+    /// 键表与扩展一起重取——装进来的键位撞了车，「没生效」的句子当场就能看见，
+    /// 与 `open_extensions_picker` 同一份账。
+    ///
+    /// 成功**不弹**提示：`notice` 是模态 Info，会把扩展页整个盖掉——装完正该看
+    /// 的就是这一行（已停用 + 它会改什么），被弹窗顶走等于倒退。失败才弹。
+    fn install_extension_from(&mut self, source: &std::path::Path, cx: &mut Context<Self>) {
+        match self.app().install_extension(source) {
+            Ok(m) => {
+                self.extensions = self.app().extensions();
+                self.keymap = keymap_from(&self.app());
+                if let Some(i) = self.extensions.iter().position(|x| x.manifest.id == m.id) {
+                    self.ext_index = i;
+                }
+            }
+            Err(err) => self.notice(err, None, cx),
+        }
+        cx.notify();
+    }
+
     /// 「扩展」页的展开区与启用确认卡上那一行行的贡献。
     ///
     /// 句子来自 [`mo_app::extensions::contributions`]，这里只做措辞——名字、落点、键位
@@ -3526,7 +3561,7 @@ impl RootView {
                     .text_size(px(11.0))
                     .text_color(theme::muted())
                     .child(text!(
-                        "把带 manifest.json 的目录放进配置目录下的 extensions/ 即可".to_string()
+                        "点下面的「从磁盘安装」选一个含 manifest.json 的目录，或手工把目录放进配置目录下的 extensions/".to_string()
                     )),
             );
         }
@@ -3701,6 +3736,32 @@ impl RootView {
                     .child(text!(reason)),
             );
         }
+        // 「从磁盘安装」：装出来默认**停用**（启用才走那张贡献确认卡），来源由
+        // 用户在原生对话框里当面选。装完面板当场重取并选中新行（见
+        // `install_extension_from`），不靠「关掉再开」才看到。
+        let mut install_btn = div()
+            .id("ext-install")
+            .debug_selector(|| "mo-ext-install".to_string())
+            .flex()
+            .items_center()
+            .mt(px(8.0))
+            .px(px(10.0))
+            .h(px(26.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme::separator())
+            .bg(theme::surface())
+            .text_size(px(12.0))
+            .text_color(theme::muted())
+            .hover(|s| s.text_color(theme::text()))
+            .child(text!("从磁盘安装…（选一个含 manifest.json 的目录）"));
+        let install_ent = entity.clone();
+        install_btn
+            .interactivity()
+            .on_click(move |_ev, _window, cx| {
+                install_ent.update(cx, |v, cx| v.install_extension_from_disk(cx));
+            });
+        body = body.child(install_btn.test_support());
         central_view(
             "扩展",
             "",
@@ -13788,6 +13849,71 @@ mod tests {
         assert!(
             cleaned_bad.is_ok() && cleaned_drop.is_ok(),
             "清理 fixture 失败：{cleaned_bad:?} {cleaned_drop:?}"
+        );
+    }
+
+    /// 「从磁盘安装」的后半段：装完面板当场重取、选中新行，新行是**停用**的，
+    /// 盘上有账本。
+    ///
+    /// 前半段（原生目录选择框）headless 弹不出来，那条缝测不了——所以按钮的
+    /// `on_click` 直接调 `pick_folder`，而这里直接调选择框之后的
+    /// `install_extension_from`，这条缝的两半各自只测得到一半，devlog §4.12 记账。
+    #[test]
+    fn installing_shows_the_extension_disabled_and_selected() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let src = std::env::temp_dir().join(format!("mo-extsrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"p28ui","name":"界面上装的","commands":[{"name":"看一眼","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.install_extension_from(&src, cx)));
+        cx.run_until_parked();
+
+        cx.debug_bounds("mo-ext-row-p28ui")
+            .expect("装完面板当场要有这一行，不该靠关掉再开");
+        cx.debug_bounds("mo-ext-toggle-p28ui")
+            .expect("新行有可启停的胶囊");
+        cx.debug_bounds("mo-ext-detail-p28ui-0")
+            .expect("装完选中新行，贡献清单当场展开");
+
+        let (installed_enabled, on_disk, has_ledger) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                let enabled = v
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == "p28ui")
+                    .map(|e| e.manifest.enabled);
+                (
+                    enabled,
+                    std::fs::read_to_string(ext_root.join("p28ui/manifest.json")).unwrap(),
+                    ext_root.join("p28ui/installed.json").is_file(),
+                )
+            })
+        });
+        assert_eq!(installed_enabled, Some(false), "安装即停用");
+        assert!(
+            on_disk.contains("\"enabled\": false"),
+            "盘上的清单是停用的（加载时读的是盘）：{on_disk}"
+        );
+        assert!(has_ledger, "installed.json 没写出来");
+
+        let cleaned = std::fs::remove_dir_all(&src);
+        let cleaned_installed = std::fs::remove_dir_all(ext_root.join("p28ui"));
+        assert!(
+            cleaned.is_ok() && cleaned_installed.is_ok(),
+            "清理 fixture 失败：{cleaned:?} {cleaned_installed:?}"
         );
     }
 

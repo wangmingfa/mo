@@ -4302,6 +4302,14 @@ impl AppState {
         extensions::load_report(&extensions::extensions_root(&Self::config_path()))
     }
 
+    /// 从磁盘安装一个扩展（来源要是一个含 `manifest.json` 的目录）。
+    ///
+    /// 装出来的扩展是**停用**的（[`extensions::install_from`]），首次启用走
+    /// 扩展管理器的贡献确认卡。
+    pub fn install_extension(&self, source: &Path) -> Result<extensions::Manifest, String> {
+        extensions::install_from(source, &extensions::extensions_root(&Self::config_path()))
+    }
+
     /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
     ///
     /// 渲染路径的用法是**每帧取一次**、行循环里只做表查询（`mo_ui::file_list` 就是

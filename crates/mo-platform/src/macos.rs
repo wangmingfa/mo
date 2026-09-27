@@ -191,6 +191,55 @@ pub fn reveal(path: &Path) -> Result<(), PlatformError> {
     })
 }
 
+/// 原生目录选择框（`NSOpenPanel`，只选目录）。
+///
+/// `runModal` 在主线程上跑模态循环，所以走 [`on_main_thread`]；用户点「取消」
+/// 时 `runModal` 回 `NSModalResponseCancelled`，那是正常出路不是错误，折成
+/// `Ok(None)`。
+pub fn pick_folder(title: &str) -> Result<Option<PathBuf>, PlatformError> {
+    let owned = title.to_string();
+    on_main_thread(move || {
+        let Some(cls) = Class::get("NSOpenPanel") else {
+            return Err(PlatformError::Failed(
+                "系统里没有 NSOpenPanel（AppKit 没链接上？）".into(),
+            ));
+        };
+        unsafe {
+            let panel: *mut Object = msg_send![cls, openPanel];
+            if panel.is_null() {
+                return Err(PlatformError::Failed("NSOpenPanel 建不出来".into()));
+            }
+            let Some(title) = nsstring(&owned) else {
+                return Err(PlatformError::Failed("标题无法交给系统".into()));
+            };
+            let _: () = msg_send![panel, setTitle: title];
+            let _: () = msg_send![panel, setCanChooseDirectories: true];
+            let _: () = msg_send![panel, setCanChooseFiles: false];
+            let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+            // `NSModalResponseOK == 1`；取消（按钮 / Esc）回 0。
+            let response: isize = msg_send![panel, runModal];
+            if response != 1 {
+                return Ok(None);
+            }
+            let urls: *mut Object = msg_send![panel, URLs];
+            let url: *mut Object = msg_send![urls, firstObject];
+            if url.is_null() {
+                return Ok(None);
+            }
+            let path_obj: *mut Object = msg_send![url, path];
+            let c_str: *const std::os::raw::c_char = msg_send![path_obj, UTF8String];
+            if c_str.is_null() {
+                return Err(PlatformError::Failed("所选目录的路径无法解析".into()));
+            }
+            Ok(Some(PathBuf::from(
+                std::ffi::CStr::from_ptr(c_str)
+                    .to_string_lossy()
+                    .into_owned(),
+            )))
+        }
+    })
+}
+
 /// 推出 / 卸载一个卷宗（挂载点路径）。
 pub fn eject(path: &Path) -> Result<(), PlatformError> {
     let owned = path.to_path_buf();
