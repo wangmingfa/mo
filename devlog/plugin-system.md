@@ -82,7 +82,8 @@ UI 侧有扩展管理器（`mo-ui/src/app.rs:3426 render_extensions`）与命令
   向后兼容便宜；带逻辑的一律走 `provider`。
 * 落地进度与形状差异：`menu` 见 §4.6（挂在命令自己身上，不是独立的 `menu` 数组），
   `types` 见 §4.7（只收 `ext` + `label`，`group` / `icon` 未收），`keybindings` 见 §4.8
-  （同样挂在命令自己身上，是 `key` 字段，不是独立数组）。
+  （同样挂在命令自己身上，是 `key` 字段，不是独立数组），`sidebar` 见 §4.9（也并进 `menu`
+  了：它是第四个槽位，不是第四类数组，`section` / `icon` 两个字段未收）。
 
 ## 4. 宿主侧三张注册表（P1 的主体，本身即重构收益）
 
@@ -205,6 +206,8 @@ pub fn render(app: &AppState, current: &Option<PathBuf>, trash_active: bool, ent
    `PowerAction` / `DropOn` 三个枚举：渲染层那个 `match` 因此是**编译期穷尽**的——新增一类
    语义必须同时在渲染层补一臂，不会出现「数据有了、点了没反应」（回调版本一定会出现）。
    P2 的清单 `sidebar` 落进来时也只是多一条 `Row`、多一个 `Activate::Contributed(usize)`。
+   （真落地那一轮载荷换成了声明本体而不是 `usize`，理由见 §4.9 第 4 条：这批数据每帧重取，
+   下标参照的那两份 vec 也每帧重取。）
 3. **元素 ID 由数据层给，选择器从 ID 派生**。`debug_selector` 写的就是 `format!("mo-{id}")`，
    于是元素 ID 与测试选择器不可能分叉；行尾按钮是行 ID 的 `ElementId::NamedChild`
    （`sidebar-loc-0` → `sidebar-loc-0-power`），**按构造**不会跨行撞车，不用再手工编号。
@@ -494,6 +497,110 @@ mo-ui lib 139（+6：键表 5 条 + 1 条 headless 端到端）。
 * 冲突告警里点名贡献命令用的是**摊平后**的名字（带扩展前缀）。界面口径是对的，但作者在
   清单里写的不是这个串，照着告警找不到自己那一行。
 
+### 4.9 清单的 `sidebar` 灌进侧栏 —— ✅ 已落地（2026-09-27，P2-5）
+
+§3 草案把侧栏项写成第四类独立数组：
+
+```json
+"sidebar": [ { "section": "字幕", "action": "srt-tools.panel", "icon": "subtitle" } ]
+```
+
+这一轮**没有照这个形状做**，改成了 `menu: ["sidebar"]`——也就是 `MenuSlot` 的第四个变体
+（`palette` / `context:file` / `context:blank` / `sidebar`）。三处差异，各有各的理由：
+
+1. **不是独立数组，而是一个投递落点**。独立数组要靠 `action: "srt-tools.stat"` 当外键，
+   那个键在摊平之后是「扩展名 · 命令名」的展示文案（§4.6 为同一件事已经付过一次学费）；
+   更麻烦的是它让**同一条命令**在两处声明投不投——菜单一份名单、侧栏一份名单，谁说了算
+   没有答案。并进 `menu` 之后只有 `goes_to(slot)` 一处判据（`mo_ui::actions` 建注册表读
+   的 `slots()` 是同一个来源）。
+2. **没有 `section` 字段**。分区名直接用这条动作自己的 `category`（`UserCommand::group`
+   / `Workflow::group`）——「这条动作归在哪一组」命令面板已经答过一遍，侧栏再问一遍就是
+   同一个问题两处作答，两处迟早分叉。扩展命令的 `category` 缺省时 `flatten` 填扩展名，
+   所以一个扩展在侧栏里自然聚成以自己命名的那一区，与草案 `section: "字幕"` 的效果同源。
+3. **没有 `icon` 字段**。贡献项共用一颗 `icons::EXTENSION`（三格 + 右下角一颗「＋」，与
+   `VIEW_GRID` 那四格填满刻意区分：侧栏里两种语义都有，撞成一个形状就没有分辨价值）。
+   与 §4.7「收一个字段就投一个字段」同一条纪律——在有一张可信图标表之前，不引入「用户
+   写了、界面上看不见」的字段。
+
+**这一轮定下来的是五条语义**：
+
+1. **投给侧栏的命令不能受 `when_ext` 约束**，`extensions::validate` 阶段整份清单拒掉。
+   这条守卫的价值全在「不拦也不会报错，只是永远不出现」：侧栏取的是 `user_commands(&[])`，
+   而 `flatten` 见 `selected_exts` 为空就把受约束的命令**整批滤掉**，所以「`when_ext` +
+   `menu: ["sidebar"]`」是一份静默失效的声明。与 §4.8 快捷键同一条判据（这两个界面都没有
+   「本次右键目标」这回事）。
+2. **分区 = `category`，同区合并、按首次出现排**，贡献区永远追加在内置五区之后（内置区的
+   顺序与位置一个字没动）。空声明一个区都不产出（`title_when_empty: false`）。缺省怎么填
+   也是同一份答案：配置里的裸命令 `category` 空 → 「自定义」区，工作流没有 `category` 可写、
+   恒进「工作流」区（`group()` 那三个实现就是这三句，侧栏不另立判据）。
+3. **点击不导航**：`Activate::Contributed` 这一臂**不** `leave_secondary_view`——「在回收站
+   面板里点了扩展的一行」应当是「跑那条命令、人还在回收站」，与命令面板那头同源。
+4. **元素 ID 由声明派生**（`sidebar-ext-{cmd|wf}-{摊平后的名字}`），不用「侧栏第几行」那种
+   位置号：这批数据每帧重取（启停一个扩展、改一条配置都会让顺序变），而测试和排错时手敲
+   的选择器要能指着同一条。唯一性靠构造保证——同名命令在 `user_commands` / `workflows`
+   各自去重过，命令与工作流再由类型段分开。载荷也带声明本体而不是下标（§4.2 那条纪律）。
+5. **执行汇进现成那条路**：`run_user_command` / `run_workflow`，与命令面板、右键菜单、
+   键表共用，侧栏这一侧不写第二份执行逻辑，也不为它多画一条 div 链。
+
+**每帧取，但缓存过**。侧栏的渲染路径每帧都要问一次「有哪几行」，而这一句的上半截在磁盘上：
+`user_commands(&[])` 一次调用就把 `config.json`、`commands/*.json`、每个扩展清单全读一遍再
+解析——不缓存就是每帧十几起 IO，顺带把「重名」那几条 `tracing::warn!` 刷成每帧一条（§2 的
+热路径纪律）。缓存挂在 `AppState::sidebar_entries()` 上，判据是新增的
+`extensions::declarations_fingerprint(config.json)`：`config.json` 本身 + `commands/` 目录里
+每一份 + 整个 `extensions/`（复用 §4.7 那个 `fingerprint`）。**三条来源都要签**，因为侧栏项
+正是这三处都能声明——只签 `extensions/` 的话，用户在手改 `config.json` 加一条
+`menu: ["sidebar"]` 之后侧栏不动。副作用说清楚：`config.json` 的 mtime 会随**任何**一次设置
+改动而变（改列偏好、开关侧栏都落盘），所以这一份签名比 §4.7 那个更容易失效——那是安全方向
+的失效（多读一次盘），而不是缓住用户的声明。反面也要说：缓存挡掉的是「每帧读盘 + 解析」，
+挡不掉 `read_dir` / `metadata` 那几次系统调用，**每帧仍然 stat 一遍配置目录、`commands/` 和
+每个扩展的 `manifest.json`**。扩展数上到几十、或配置目录落在网络盘上时这里就是下一处热点，
+届时该问的是「侧栏为什么每帧重建」（§2 第 2 条那句同一尺度）而不是「再加一层缓存」。
+与 §4.8 那条「要开一次命令面板才重取」不同，侧栏每帧都问签名，所以手改清单下一帧就出来，
+不必重启。
+
+**验收**：mo-config 8（+1：`SLOT_NAMES` 那份**手写**的可用列表四槽齐全——漏一个不会编译失败，
+只会让提示骗人；`sidebar` 三种写法都认则补在了原来那条宽松解析测试里）/
+mo-app lib 62（+3：只挑 `sidebar` 那几条、`when_ext` + 侧栏被拒、签名跟着三条来源变）/
+mo-ui lib 141（+2：`contributed_sections` 那条单元测试 + 一条 headless 端到端）。全量
+`cargo test --workspace --all-features --no-fail-fast` → `TEST_EXIT=0`，541 条 `test … ok`。
+端到端那条是真管线：往共享测试目录种一个 `p25sidebar/manifest.json`，断言行出现在渲染帧里、
+落在 `mo-sidebar` 的横向范围内，点它之后 `Modal::Info` 里点名是哪条命令。
+
+⚠️ **三条踩出来的**：
+* `debug_bounds` 要 `&'static str`（选择器不参与运行时拼接），所以测试里写常量
+  `SELECTOR`、再用 `strip_prefix` 从常量里截出命令名——两边各拼一次的话，改了一头另一头
+  还在通过。
+* 测试目录 `mo-test-config-<pid>` 会跨轮复用（Windows 回收 pid），**任何按位置选行的选择器
+  都会在下一轮指着另一条**。这一轮改成按名字派生，顺带把这个坑填了。
+* §4.4 那条老坑（循环里的 `text!` 必须显式给 ID，否则 a11y 一挂就 debug panic
+  `0xc0000409`）这一轮长出了第二个触发条件：**贡献区的标题是用户写的字符串**，理论上能与
+  内置区撞名（有人把 `category` 写成「书签」）。两句一样的标题 = 两个一样的 NodeId = 原地
+  复活，而这回是配置触发的、跟代码无关，最难查。heading 的 ID 现在带 `ix` 前缀。
+
+**反向验证**（八条变异体，每条红在预判的那一句断言上；还原都是**写文件**，mtime 自变）：
+
+| 变异 | 红在哪 |
+|---|---|
+| M1 `render` 那份 `Sources.contributed` 不给（换成空表） | 端到端段1：「清单声明的侧栏行没出现在渲染帧里」 |
+| M2 点击臂 `Activate::Contributed(_) => {}` | 端到端段2：实际 `modal = None`（点击臂没接上） |
+| M3 `contributed_sections` 里分区名写死 `"扩展"` | 单元测试 `left: ["扩展"]` ≠ `right: ["字幕工具","工作流"]` |
+| M4 `validate` 里 `when_ext` + 侧栏那条守卫短路 | `rejects_sidebar_slot_on_ext_gated_command` |
+| M5 行 ID 换成位置号 | 「ID 要指着声明本身」 |
+| M6 `goes_to` 写成 `!self.menu.is_empty()` | `sidebar_entries_picks_only_the_sidebar_slot` 数名字：四条全进来了（`["只进面板","进侧栏和面板","写错的界面名","也要进侧栏"]`），「有没有声明这个界面」退化成「写没写过这个字段」 |
+| M7 `declarations_fingerprint` 不 hash `config.json` | 「改了 config.json 还认成没改 = 侧栏缓死了」 |
+| M8 `SLOT_NAMES` 去掉 `sidebar`（长度改成 3，否则先编译不过） | `every_slot_is_listed_in_the_error`：告警文案里的「可用」只剩三个 |
+
+已知缺口（下一轮别当意外）：
+* 草案里的 `icon` / `section` 两个字段都没收，贡献项共用一颗图标、分区名只能跟着 `category`。
+* 贡献区永远排在内置五区**之后**，没有排序字段可把用户那一区放到快捷访问上面。
+* 贡献行没有行尾按钮（停用要去扩展清单里做：三处能改同一件事，就没有一处是权威）、不接受
+  拖放、`active` 恒 false（它不对应目录，所以点了也不会高亮——这一行是「做一件事」不是
+  「看一个地方」）。
+* **点了就跑，没有任何提示**。在 §6 的权限框落地之前，「装个扩展 = 侧栏多一颗一键执行按钮」
+  这件事界面上看不出来。这是 P2 收尾那轮（安装与权限框）要还的债，别当界面美化往后排。
+* 声明为什么没出现（`when_ext` 被拒、重名被忽略）只有 `tracing::warn!`，界面上没有一处能查。
+  与 §4.6/§4.8 那两条是同一个未接的口子。
+
 ## 5. provider 协议（stdio）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
@@ -556,8 +663,13 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
     本轮明确不收）。顺带修掉了一条空壳测试——headless 断言从此打在渲染出来的那一格上。
   * **P2-4 ✅（2026-09-27）**：清单的 `key` 决定键表，扩展命令能用组合键触发（§4.8）。
     §8 那句验收标准里的第三半句（一个 fixture 扩展贡献一项能**按出来**）自此成立。
-  * 剩下：清单 `sidebar` 一类字段（`types` 只落 `label`、`keybindings` 落成了命令自带的
-    `key`，见 §4.7/§4.8）、安装与权限框、扩展管理器展示。
+  * **P2-5 ✅（2026-09-27）**：清单的 `menu: ["sidebar"]` 决定侧栏，扩展能加一个侧栏项，
+    点它真的执行那条命令（§4.9）。至此 §3 那四类字段全部落地（`types` 只落 `label`、
+    `menu`/`keybindings`/`sidebar` 三类都收进了命令自带的字段），§8 那句验收标准的最后一
+    半句（一个侧栏项、headless 断言渲染出现）也成立了。
+  * 剩下：安装与权限框、扩展管理器展示「本扩展贡献了什么」（含贡献进来的键位在设置里
+    看不见那一条）。四类声明字段的缺口见各节：`types` 的 `group`/`icon`（§4.7）、侧栏的
+    `icon`/`section`（§4.9）、坏声明在界面上无处可查（§4.6/§4.8/§4.9 同一条）。
 * **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
   验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
