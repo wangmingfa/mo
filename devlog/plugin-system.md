@@ -410,7 +410,8 @@ release 不登记选择器所以不付这份分配），断言打在 `debug_boun
 渲染产物上；那个访问器删了。日期/大小两列不带文案（每行都不同，带了等于没有稳定把手）。
 两条变异体都真跑过：① `file_list` 递空表 → layout 那条红；② 查表钥匙漂成
 `to_uppercase()`（即 `mo_core::types` 那条判据被破）→ `contributed_type_label_wins_over_builtin`
-红，报 `left: "SRT 文件" right: "字幕"`。两处还原后各自重跑绿（还原前 `touch` 过文件）。
+红，报 `left: "SRT 文件" right: "字幕"`。两处还原后各自重跑绿（还原是**写文件**、mtime 跟着变，
+所以不会复用变异体那份二进制——用 `mv`/`cp` 还原时才需要补 `touch`）。
 
 已知缺口（下一轮别当意外）：
 * 「种类」文案仍是 `mo_ui::file_item::kind_by_ext` 里那张**独立的**扩展名表——P1-1 只收了
