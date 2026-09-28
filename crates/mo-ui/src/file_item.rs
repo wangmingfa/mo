@@ -80,6 +80,7 @@ pub fn view(
     layout: &ColumnLayout,
     system_icon: Option<Arc<Bitmap>>,
     contributed_kinds: &mo_app::extensions::TypeLabels,
+    provider_kind: Option<&str>,
 ) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
@@ -245,7 +246,11 @@ pub fn view(
             ColId::Size => meta_cell(*col, size.clone(), "mo-size-cell", None).into_any_element(),
             ColId::Kind => {
                 // 文案进选择器：见 `meta_cell` 那段。
-                let kind = kind_label(entry, contributed_kinds);
+                // provider 的逐文件答案（P3 classify）压过清单的静态标签：作者的
+                // 运行时判断比声明层的文案更准。没有答案就回落 kind_label。
+                let kind = provider_kind
+                    .map(str::to_string)
+                    .unwrap_or_else(|| kind_label(entry, contributed_kinds));
                 meta_cell(*col, kind.clone(), "mo-kind-cell", Some(&kind)).into_any_element()
             }
         };
@@ -388,6 +393,32 @@ mod tests {
                     &ColumnLayout::default(),
                     None,
                     &none(),
+                    None,
+                ))
+        }
+    }
+
+    /// 同样的行，但带一条 provider 的逐文件答案（P3 classify 的内存表命中）。
+    struct ProviderRowProbe(Entry, String);
+
+    impl Render for ProviderRowProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .h(px(24.0))
+                .p(px(4.0))
+                .debug_selector(|| "mo-probe-row".to_string())
+                .child(view(
+                    &self.0,
+                    false,
+                    None,
+                    &ColumnLayout::default(),
+                    None,
+                    &none(),
+                    Some(&self.1),
                 ))
         }
     }
@@ -418,6 +449,30 @@ mod tests {
         assert_eq!(trash_kind_label(false, "Atlas.lnk", &none()), "快捷方式");
         // 普通类型不受影响。
         assert_eq!(kind_label(&entry_named("notes.txt"), &none()), "文本文档");
+    }
+
+    /// provider 的逐文件答案（P3 classify）**压过**清单的静态标签：作者的运行时判断
+    /// 比声明层的文案更准。渲染侧钉的是「同一行里选哪个答案」——静态标签仍然渲染
+    /// 得出来，只是 provider 有答案时不再用它。
+    #[test]
+    fn provider_label_overrides_static_kind_in_the_cell() {
+        let mut labels = TypeLabels::new();
+        labels.insert("p3x".to_string(), "静态标签".to_string());
+        let mut cx = TestAppContext::single();
+        let window = cx.open_window(size(px(600.), px(200.)), |_, _cx| {
+            ProviderRowProbe(entry_named("movie.p3x"), "P3逐文件标签".to_string())
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), &cx);
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-kind-cell-P3逐文件标签").is_some(),
+            "provider 的答案应当渲染在种类格里"
+        );
+        assert!(
+            cx.debug_bounds("mo-kind-cell-静态标签").is_none(),
+            "有了 provider 答案就不该再渲染静态标签"
+        );
     }
 
     /// 扩展清单的 `types` **先于**内置表答这一问（`.srt` 内置只能兜底成「SRT 文件」）。
@@ -596,7 +651,7 @@ mod tests {
                 .w_full()
                 .h(px(24.0))
                 .p(px(4.0))
-                .child(view(&self.0, false, None, &self.1, None, &none()))
+                .child(view(&self.0, false, None, &self.1, None, &none(), None))
         }
     }
 }

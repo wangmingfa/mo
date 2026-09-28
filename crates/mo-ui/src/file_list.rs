@@ -334,6 +334,10 @@ pub fn render(
             // 每行取一次等于每帧读一次清单目录（`AppState::type_labels` 有签名缓存，
             // 但那是一次 read_dir + 每份清单一次 stat，摊到三十行就是一帧十几次调用）。
             let contributed_kinds = panel.app.type_labels();
+            // provider（P3 classify）的归属表：同样**每帧取一次**、行循环只查表。
+            // 有归属的扩展名，行内先问内存表有没有答案，没有就把这行排进派发队列。
+            let classify_owners = panel.app.classify_owners();
+            let mut want_classify: Vec<Entry> = Vec::new();
             // 只对**真实行**判断窗口覆盖；下标 ≥ count 的补足行没有数据可取，
             // 参与判断会让这条日志每帧都冒出来。
             let real_end = range.end.min(count);
@@ -629,6 +633,24 @@ pub fn render(
 
                 let app = view.panel_at(pane, tab).map(|p| p.app.clone());
                 let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
+                // provider 的「种类」答案（P3）：文件且归属表命中才问；内存表没有
+                // 就排进派发队列（每帧重复调是安全的，批内去重在 inflight）。
+                let mut provider_kind: Option<String> = None;
+                if matches!(entry.kind, mo_core::EntryKind::File) {
+                    let ext = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase());
+                    if let Some(ext) = ext {
+                        if classify_owners.contains_key(&ext) {
+                            match app.as_ref().and_then(|a| a.classify_label_of(&entry.path)) {
+                                Some(label) => provider_kind = Some(label),
+                                None => want_classify.push(entry.clone()),
+                            }
+                        }
+                    }
+                }
                 // 缩略图：**只为这一行真的要画缩略图、且还没人要过**的时候排一次队。
                 //
                 // 放在渲染路径上（而不是「窗口抓回来时」）是有意的：缩略图的语义就是
@@ -659,6 +681,7 @@ pub fn render(
                         &row_cols,
                         system_icon,
                         &contributed_kinds,
+                        provider_kind.as_deref(),
                     ))
                     .into_any_element(),
                 );
@@ -671,6 +694,12 @@ pub fn render(
             if !want_thumbs.is_empty() {
                 if let Some(a) = view.panel_at(pane, tab).map(|p| p.app.clone()) {
                     a.thumbs().request(a.clone(), want_thumbs);
+                }
+            }
+            // classify（P3）：同一帧统一派发。真活全在 blocking 池，这里只是排队。
+            if !want_classify.is_empty() {
+                if let Some(a) = view.panel_at(pane, tab).map(|p| p.app.clone()) {
+                    a.request_classify(want_classify);
                 }
             }
             rows

@@ -67,6 +67,33 @@ pub struct TypeLabelConflict {
 /// 会说「太复杂」，而它确实到了该有个名字的厚度。
 pub type TypeLabelCache = Option<(u64, std::sync::Arc<TypeLabels>, Vec<TypeLabelConflict>)>;
 
+/// 清单 `provider` 段（P3，devlog §3/§5）：声明宿主怎么起进程、说哪些方法。
+///
+/// 这是「带逻辑的一律走 provider」（§3）的声明形态：清单只说**怎么起**与**说什么**，
+/// 进程说什么话由协议定（JSON Lines，见 `crate::provider`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSpec {
+    /// 启动命令（argv 形态）：`run[0]` 是可执行文件，相对路径按扩展目录解析；
+    /// `run[1..]` 原样作为参数。
+    pub run: Vec<String>,
+    /// 声明要用的方法。本轮（P3）只认 `classify` / `preview`；`list` 是 P4 的，
+    /// 写了会被 [`validate`] 拒（写了不生效的声明不收，与认不出的菜单槽同一判据）。
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// 握手（`initialize`）超时，毫秒。缺省 2000（协议常量见 `crate::provider`）。
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    /// 单次调用超时，毫秒。缺省 800。
+    #[serde(default)]
+    pub call_timeout_ms: Option<u64>,
+}
+
+/// 本轮承认的 provider 方法。`list` 属于 P4，故意不在表里。
+pub const PROVIDER_METHODS: &[&str] = &["classify", "preview"];
+
+/// 清单 `capabilities` 认的四把钥匙（devlog §6）。`read-names` 缺省就给，不必写。
+pub const CAPABILITIES: &[&str] = &["read-names", "read-contents", "write", "net"];
+
 /// 一个扩展的清单。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -92,6 +119,14 @@ pub struct Manifest {
     /// 扩展贡献的「类型知识」：这些扩展名在「种类」列上叫什么。
     #[serde(default)]
     pub types: Vec<TypeRule>,
+    /// provider 进程声明（P3）。`None` = 纯声明层扩展（P2 形态，不起进程）。
+    #[serde(default)]
+    pub provider: Option<ProviderSpec>,
+    /// 申请的能力（devlog §6）：`read-names` 缺省给；`read-contents` 决定宿主要不要把
+    /// 文件头 4 KiB 附进 `classify` 入参；`write` / `net` 本轮没有执行点检查（协议没有
+    /// 反向请求，进程拿不到入参以外的东西），收进来只为在确认卡上说清楚。
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -167,6 +202,93 @@ fn validate_types(m: &Manifest) -> Option<String> {
     None
 }
 
+/// 校验一份清单的 `provider` 与 `capabilities`；返回错误描述（`None` = 合法）。
+///
+/// 与 `validate_types` 同一条纪律：**写了却不生效的声明当场拒**，不收「解析了却没人
+/// 读」的东西——
+///
+/// * `capabilities` 没有执行点检查它们的唯一前提是有 provider 进程（`read-contents`
+///   的执行点是 `classify` 入参附不附文件头；`write` / `net` 的执行点是进程本身）。
+///   声明层扩展写它们 = 永远没人读，拒。
+/// * `methods` 写了 `list`：P4 还没实现，本轮没人会调它——「写了、校验过了、界面上
+///   永远看不见」的组合正是 `when_ext` + 侧栏那条被拒的理由。
+/// * 超时写 0 / 负意义的值：0 ms 的超时等于进程永远不可用，这不是配置是自杀。
+fn validate_provider(m: &Manifest) -> Option<String> {
+    let caps = &m.capabilities;
+    if m.provider.is_none() {
+        if !caps.is_empty() {
+            return Some(format!(
+                "扩展「{}」申请了 capabilities（{}）却没有 provider 进程——能力是给进程用的，没有进程就没有执行点；要么补 provider，要么删掉 capabilities",
+                m.id,
+                caps.join("、")
+            ));
+        }
+        return None;
+    }
+    let p = m.provider.as_ref().expect("刚判过 None");
+    if p.run.is_empty() || p.run[0].trim().is_empty() {
+        return Some(format!(
+            "扩展「{}」的 provider.run 没写可执行文件（argv 形态，如 [\"bin/工具\"]）",
+            m.id
+        ));
+    }
+    if p.methods.is_empty() {
+        return Some(format!(
+            "扩展「{}」的 provider.methods 是空的——起了进程却不说要干什么，宿主永远不会调它",
+            m.id
+        ));
+    }
+    for method in &p.methods {
+        if !PROVIDER_METHODS.contains(&method.as_str()) {
+            let hint = if method == "list" {
+                "（list 是列表源，排在 P4，本轮还没实现——先别写）"
+            } else {
+                ""
+            };
+            return Some(format!(
+                "扩展「{}」的 provider.methods 写了认不出的方法「{method}」{hint}，本轮只认 classify / preview",
+                m.id
+            ));
+        }
+    }
+    for (field, ms) in [
+        ("startup_timeout_ms", p.startup_timeout_ms),
+        ("call_timeout_ms", p.call_timeout_ms),
+    ] {
+        if let Some(v) = ms {
+            if v == 0 {
+                return Some(format!(
+                    "扩展「{}」的 provider.{field} 写了 0——0 毫秒的超时等于永远不可用；要缺省就别写这个字段",
+                    m.id
+                ));
+            }
+            if v > 60_000 {
+                return Some(format!(
+                    "扩展「{}」的 provider.{field} 写了 {v} ms（超过 60 秒）——超时的意义是「卡了就放弃」，一分钟不是超时是死等",
+                    m.id
+                ));
+            }
+        }
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for cap in caps {
+        if !CAPABILITIES.contains(&cap.as_str()) {
+            return Some(format!(
+                "扩展「{}」的 capabilities 写了认不出的能力「{cap}」（只认 read-names / read-contents / write / net）",
+                m.id
+            ));
+        }
+        if seen.contains(&cap.as_str()) {
+            return Some(format!(
+                "扩展「{}」的 capabilities 里「{cap}」写了两遍",
+                m.id
+            ));
+        }
+        seen.push(cap);
+    }
+    None
+}
+
 /// 校验清单；返回错误描述（`None` = 合法）。
 pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
     if !valid_id(&m.id) {
@@ -218,6 +340,9 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
         }
     }
     if let Some(err) = validate_types(m) {
+        return Some(err);
+    }
+    if let Some(err) = validate_provider(m) {
         return Some(err);
     }
     // 同名命令会让命令面板出现两条无法区分的条目。
@@ -633,9 +758,9 @@ pub fn display_name(ext: &str, cmd: &str) -> String {
 /// 「空白串不算绑定」（`has_chord()`）。UI 再走一遍就是两处作答，而这张表的用途恰恰是
 /// **对用户说真话**：说错一句比不说更糟。
 ///
-/// ⚠️ 里面**没有** §6 草案那个 `capabilities` 字段：它在本轮没有强制判据（声明层没有
-/// 任何一处按它放行或拦下），按 §4.7「收一个字段就投一个字段」的规矩，不收「解析了却
-/// 没人读」的东西。这里列的是清单**实际能改的东西**，不是作者自报的意向。
+/// ⚠️ P3 起 [`Self::Provider`] 收了 §6 草案的 `capabilities`：它的执行点随 provider
+/// 落地（`read-contents` 决定 `classify` 入参附不附文件头；进程模型本身没有反向请求，
+/// `write` / `net` 是「说了也拿不到」的声明，收进来只为在确认卡上说真话）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Contribution {
     /// 一条命令：界面上的名字、出现在哪些界面、绑的键（写了才算）、它要跑的命令行。
@@ -656,11 +781,18 @@ pub enum Contribution {
     },
     /// 一条类型知识：这些扩展名在「种类」列上会被改叫什么（P2-3 那条投递）。
     TypeLabel { exts: Vec<String>, label: String },
+    /// provider 进程（P3）：声明的方法与申请的能力。确认卡要让用户看见的是
+    /// 「它要起一个进程、这个进程会拿到什么」——能力说的就是这件事。
+    Provider {
+        methods: Vec<String>,
+        capabilities: Vec<String>,
+    },
 }
 
 /// 把一份清单摊成「它会改动界面上的哪些地方」。
 ///
-/// 顺序恒为 命令 → 工作流 → 类型标签（与命令面板里那批贡献项同一口径：命令在前）。
+/// 顺序恒为 命令 → 工作流 → 类型标签 → provider（与命令面板里那批贡献项同一口径：
+/// 命令在前；进程是「会跑代码的」那一级，放最后）。
 /// 不看 `enabled`：停用中的扩展也要能预览「启用后会发生什么」——这正是确认卡的用法。
 pub fn contributions(m: &Manifest) -> Vec<Contribution> {
     let mut out: Vec<Contribution> = m
@@ -695,6 +827,21 @@ pub fn contributions(m: &Manifest) -> Vec<Contribution> {
             label: t.label.clone(),
         })
     }));
+    if let Some(p) = &m.provider {
+        // `read-names` 缺省就给，不劳作者自己写；这里报的是**实际生效**的能力集合，
+        // 与协议执行点（`crate::provider` 的 head_b64 门）同一条判据。
+        let mut caps: Vec<String> = m
+            .capabilities
+            .iter()
+            .filter(|c| c.as_str() != "read-names")
+            .cloned()
+            .collect();
+        caps.insert(0, "read-names".to_string());
+        out.push(Contribution::Provider {
+            methods: p.methods.clone(),
+            capabilities: caps,
+        });
+    }
     out
 }
 
@@ -915,7 +1062,92 @@ mod tests {
             when_ext: Vec::new(),
             workflows: Vec::new(),
             types: Vec::new(),
+            provider: None,
+            capabilities: Vec::new(),
         }
+    }
+
+    /// provider 段的写坏法都要被拒：capabilities 没有 provider、methods 空 / 认不出、
+    /// run 空、超时写 0。合法的写法（含 list 被拒的措辞）各钉一条。
+    #[test]
+    fn validates_provider_and_capabilities() {
+        let spec = |methods: &[&str]| ProviderSpec {
+            run: vec!["bin/tool".into()],
+            methods: methods.iter().map(|s| s.to_string()).collect(),
+            startup_timeout_ms: None,
+            call_timeout_ms: None,
+        };
+
+        // 合法：provider + classify。
+        let mut m = manifest("a");
+        m.provider = Some(spec(&["classify"]));
+        assert!(validate(&m, Some("a")).is_none());
+
+        // capabilities 没有 provider → 拒（没有执行点 = 永远没人读）。
+        let mut m2 = manifest("a");
+        m2.capabilities = vec!["read-contents".into()];
+        let err = validate(&m2, Some("a")).expect("capabilities 无 provider 应被拒");
+        assert!(err.contains("没有 provider"), "{err}");
+
+        // methods 写 list → 拒，且要指出「P4」。
+        let mut m3 = manifest("a");
+        m3.provider = Some(spec(&["classify", "list"]));
+        let err = validate(&m3, Some("a")).expect("list 应被拒");
+        assert!(err.contains("P4"), "{err}");
+
+        // methods 空 / run 空 / 认不出的方法。
+        let mut m4 = manifest("a");
+        m4.provider = Some(spec(&[]));
+        assert!(validate(&m4, Some("a")).is_some());
+        let mut m5 = manifest("a");
+        m5.provider = Some(ProviderSpec {
+            run: vec![String::new()],
+            ..spec(&["classify"])
+        });
+        assert!(validate(&m5, Some("a")).is_some());
+        let mut m6 = manifest("a");
+        m6.provider = Some(spec(&["host.read_file"]));
+        let err = validate(&m6, Some("a")).expect("反向请求这类方法名应被拒");
+        assert!(err.contains("host.read_file"), "{err}");
+
+        // 超时 0 与超天。
+        let mut m7 = manifest("a");
+        m7.provider = Some(ProviderSpec {
+            call_timeout_ms: Some(0),
+            ..spec(&["classify"])
+        });
+        let err = validate(&m7, Some("a")).expect("0 超时应被拒");
+        assert!(err.contains("call_timeout_ms"), "{err}");
+
+        // 认不出的能力。
+        let mut m8 = manifest("a");
+        m8.provider = Some(spec(&["preview"]));
+        m8.capabilities = vec!["read-everything".into()];
+        let err = validate(&m8, Some("a")).expect("认不出的能力应被拒");
+        assert!(err.contains("read-everything"), "{err}");
+    }
+
+    /// 贡献表：provider 扩展多一条 `Provider`，能力集合**始终含缺省的 read-names**
+    /// （作者不写也在），且排最前——确认卡按这条念。
+    #[test]
+    fn contributions_include_provider_methods_and_capabilities() {
+        let mut m = manifest("a");
+        m.provider = Some(ProviderSpec {
+            run: vec!["bin/tool".into()],
+            methods: vec!["classify".into(), "preview".into()],
+            startup_timeout_ms: None,
+            call_timeout_ms: None,
+        });
+        m.capabilities = vec!["read-contents".into(), "net".into()];
+        let last = contributions(&m).pop().expect("provider 应在贡献表里");
+        assert_eq!(
+            last,
+            Contribution::Provider {
+                methods: vec!["classify".into(), "preview".into()],
+                capabilities: vec!["read-names".into(), "read-contents".into(), "net".into()],
+            },
+            "read-names 是缺省能力，不用写也在；顺序：缺省在前、声明按清单序"
+        );
     }
 
     /// id 规则：要做命名空间与目录名，必须严格。

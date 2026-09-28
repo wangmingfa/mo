@@ -873,7 +873,49 @@ e2e 特意把 fixture 种在**窗口建好之后**，让「面板打开时重取
 * `type_labels` 那份缓存只在**重绘时**检查签名（§4.7 的老缺口原样适用）：列表停着不动
   时改了清单，撞车句也要等下一次重绘才出现。
 
-## 5. provider 协议（stdio）
+### 4.14 P3：provider 宿主落地 —— ✅ 已落地（2026-09-28）
+
+§5 的协议与 §4.3 的宿主照单全收，形状上补齐了三处草案没写细的地方：
+
+* **清单字段**：`provider`（`run` argv / `methods` / 两个超时）与 `capabilities` 进了
+  `Manifest`，`validate` 拒四种写坏法——capabilities 没有 provider（没有执行点 = 永远
+  没人读）、methods 写了 `list`（P4 还没实现，`when_ext` + 侧栏同一条理由）、超时写 0
+  / 超 60 秒、认不出的能力。贡献表新增 `Contribution::Provider`（确认卡上那句
+  「进程：接管 …；申请能力：读文件名、读文件内容（头 4 KiB）」），`read-names` 缺省
+  给、不用写也会出现在能力清单里。
+* **协议**：JSON Lines，`{id, method, params}` / `{id, result|error}`；握手
+  `initialize{protocol:1}` → `{name, version, methods[]}`，握手帧占 id 空间顶端
+  （u64::MAX 往下数），调用帧从 0 递增——迟到的握手应答**按构造**不会撞成某次调用的
+  回答。插件健康地拒答（error 帧）不计失败；超时 / 崩溃 kill 进程、记连续失败，
+  3 次进指数退避（5s 起步翻倍、封顶 5 分钟），扩展管理器亮
+  「provider 已停用 · 约 N 秒后自动恢复；日志：<host.log>」。stderr 全量落
+  `<缓存>/mo/plugin-logs/<id>/host.log`——插件 → 宿主的唯一通道。
+* **capability 执行点在派发侧**：`maybe_head` 授了 `read-contents` 才打开文件读头
+  4 KiB；没授权时连打开都不发生。测试钉的是「读没读」（变异体去掉授权判断即红），
+  不是「字段空不空」。
+* **classify 只收 `label`**：协议答 `group` / `icon_key` / `columns` 收下不用——
+  界面今天只有「种类」列一个消费点（`kind_label` 的 provider 优先级：逐文件答案
+  压过清单静态文案，`ProviderRowProbe` 钉）。`preview` 走单一漏斗
+  `AppState::preview`：认领类型先问插件，`text/markdown/json/code` → 对应
+  PreviewKind，`image-file` 验「文件真的在」再交给图片渲染器，`rows` / `unsupported`
+  / 任何失败**回落内置**（§9 第 3 条的「内置预览照常」就是这条兜底）。
+* **缓存**：`<缓存>/mo/plugin-classify.sqlite`（mo-cache 新增 `ClassifyCache`），
+  行键 `(扩展 id, 路径)`、行内带写入当时的 mtime + size（与缩略图同一套失效逻辑）；
+  内存表 + sqlite 双层，卸载（`forget_ext`）把宿主、内存行、sqlite 行一起清——
+  §6 的卸载语义就此闭合。
+* **渲染路径纪律**：归属表快照每帧取一次（与 `type_labels` 每帧那次同价），行内
+  查表零 IO；真活（起进程 / 问插件 / 落缓存）全在 blocking 池，
+  `request_classify` 与缩略图同一条「每帧调也安全」的 fire-and-forget 形状。
+
+**验收**：`src/bin/p3_provider.rs`（ok / hang / crash / garbage / refuse 五种模式）
+当 §8 要求的 example 夹具；`tests/provider_host.rs` 7 条钉协议行为——
+**「provider 卡死 / 崩了，UI 不受影响」落在**：hang 超时 kill（pgrep 钉「进程真死了」——
+行为上两次都是 Timeout，只有进程表分得出 kill 与否）、crash 连续 3 次进退避后第 4 次
+立刻短路、garbage 行跳过不炸、起不来的 argv 同一条退避账。反向验证五条变异体各红在
+预判句：渲染无视 provider 答案 / 去掉 read-contents 门 / 超时不 kill（pgrep 抓到孤儿
+进程）/ 去掉退避短路 / 卸载不清账。
+
+## 5. provider 协议（stdio）—— ✅ 已落地（2026-09-28，P3，见 §4.14；`list` 方法属 P4 未收）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
   刻意**不用** LSP 的 `Content-Length` 头，也不用完整 JSON-RPC：这里只有「一问一答」、
@@ -899,9 +941,9 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 > **P2-8 落了安装的主干**（§4.12）：原生目录选择框 + `validate` + 复制 +
 > `installed.json`（来源与逐文件 sha256），且**安装即停用**——装出来的扩展首启必过
-> §4.6 那张确认卡。没落的：`.moext`（zip）入口（Windows 选择框文件 / 目录不同框，
-> 记在 §4.12 缺口）与 `capabilities`（P3 之前没有执行点会检查它）。手工摆放的清单
-> 仍缺省启用——`enabled` 缺省语义不能动，收口靠卸载 / 迁移。
+> §4.6 那张确认卡。`capabilities` 已随 P3 落地（2026-09-28，§4.14：validate 收口 +
+> `read-contents` 的执行点 + 确认卡逐条亮）。手工摆放的清单仍缺省启用——`enabled`
+> 缺省语义不能动，收口靠卸载 / 迁移。
 
 * **安装 = 应用内一步**：扩展管理器加「从磁盘安装」→ 选一个含 `manifest.json` 的目录或
   `.moext`（zip）→ `validate` → 复制进 `<配置>/mo/extensions/<id>/` → **权限确认框**逐条列
@@ -965,8 +1007,10 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
   * P2 剩下：~~贡献键位在设置「快捷键」页可见、`type_labels` 撞车那条 warn-only~~
     （✅ 2026-09-28，见 §4.13）、~~安装的收尾（zip 入口 / 卸载）~~（✅ 见 §4.12）。
     **P2 至此全部落地。**
-* **P3 provider 协议**：进程监管 + `classify`/`preview` + 缓存 + 超时 kill。
-  验收：一个 example 插件当夹具；「provider 卡死 / 崩了，UI 不受影响」的确定性测试。
+* **P3 provider 协议 ✅（2026-09-28，见 §4.14）**：进程监管 + `classify`/`preview` +
+  缓存 + 超时 kill 全部落地（capabilities 一并收口）。验收达标：`p3_provider`
+  五模式夹具 + `tests/provider_host.rs`，「provider 卡死 / 崩了，UI 不受影响」
+  由 hang/crash 两条确定性测试钉死。
 * **P4 `list` 列表源**：单独一轮（最依赖前三步，也最容易撞 Mo 列表的不变量）。
 
 ## 9. 现在就不看好的三点（留档，别到时候当意外）
@@ -994,9 +1038,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
    共用一份签名缓存，输家的展开区亮「被抢先认领」，赢家不被告知。
 3. **安装收尾**（§4.12 缺口）：`.moext`（zip）入口 —— ✅ 已落（2026-09-28，见 §4.12 已知缺口）；
    **卸载** —— ✅ 已落（2026-09-28：删目录 + 确认卡 + 面板重取，见 §4.12 已知缺口；
-   §6 说的「清 classify / preview 缓存行」属于 P3 provider 落地后的事，现在缓存按目录
-   指纹自动作废，无残留可清）。
-4. **`capabilities` 不收不查**（§4.10 的既定取舍）：P3 做 provider 授权时一次收到位，别提前收。
+   §6 说的「清 classify / preview 缓存行」—— ✅ 随 P3 落（2026-09-28，§4.14）：
+   卸载经 `Manager::forget_ext` 清宿主、内存表与 `plugin-classify.sqlite` 的行）。
+4. **`capabilities` 不收不查**（§4.10 的既定取舍）—— ✅ 已落（2026-09-28，P3，§4.14）：
+   四把钥匙进了 `validate`（认不出 / 重复 / 无 provider 的组合都拒），`read-contents`
+   的执行点在 `maybe_head`（授了才读头 4 KiB），确认卡逐条亮能力。
 
 **验证欠账（headless 够不着的那半条缝）：**
 
@@ -1007,8 +1053,11 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 **P3 / P4（排期主体，§5 是实现依据）：**
 
-7. **P3 provider 协议**：进程监管 + `classify` / `preview` + 缓存 + 超时 kill + 退避；
-   验收口径见 §8。
+7. **P3 provider 协议** —— ✅ 已落（2026-09-28，§4.14）：进程监管（握手 / 超时 kill /
+   退避停用 / 空闲回收 / shutdown）+ `classify`（sqlite 缓存，mtime+size 失效）+
+   `preview`（单一漏斗回落内置）+ capabilities 收口。验收：`p3_provider` 夹具 +
+   `tests/provider_host.rs`，「provider 卡死 / 崩了，UI 不受影响」由
+   hang/crash 两条确定性测试钉死；反向验证五条变异体各红预判句。
 8. **P4 `list` 列表源**：单独一轮，§9 的三点风险就是为它留档的。
 
 **外围欠账（不属于插件系统，别在这一页修）：**

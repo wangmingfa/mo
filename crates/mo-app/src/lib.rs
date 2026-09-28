@@ -21,6 +21,8 @@ pub mod extensions;
 /// 系统图标：渲染路径只查表，真去问系统放在后台（见模块文档）。
 mod icon;
 mod metadata;
+/// provider 宿主（P3）：起进程、握手、一问一答、超时 kill、退避停用。
+pub mod provider;
 /// 系统 shell 集成（默认打开 / 打开方式）。
 pub mod shell;
 /// 暂存区：跨目录累积待处理文件（见模块文档里与剪贴板的区别）。
@@ -251,6 +253,9 @@ pub struct AppState {
     /// 所以不能每帧真去读），区别在作废判据不是时间而是 [`extensions::fingerprint`]：
     /// 用户手改清单，下一帧就是新文案，不必重启。
     type_labels: Arc<std::sync::Mutex<extensions::TypeLabelCache>>,
+    /// provider 宿主 + classify 结果内存表（P3）。见 [`provider::Manager`]：
+    /// 渲染路径只查表，真活（起进程、问插件、落缓存）在 blocking 池。
+    providers: Arc<provider::Manager>,
     /// 扩展/配置贡献的侧栏项：`(上次声明签名, 列表)`，`None` = 还没读过。
     ///
     /// 与 [`AppState::type_labels`] 同一条理由，而且更硬：侧栏**每帧**都要问一次
@@ -889,6 +894,7 @@ impl AppState {
             )),
             type_labels: Arc::new(std::sync::Mutex::new(None)),
             sidebar_entries: Arc::new(std::sync::Mutex::new(None)),
+            providers: Arc::new(provider::Manager::new()),
         }
     }
 
@@ -3051,7 +3057,16 @@ impl AppState {
     // ---- 文件预览 ----
 
     /// 预览单个文件 / 目录（同步读取，按需提取文本 / 图片路径 / 目录摘要）。
+    /// 预览一个文件：provider 认领的类型先问插件（P3），没答成回落内置。
+    ///
+    /// 「先问插件」意味着多一次带超时的 IPC（devlog §9 第 3 条承认的代价）——
+    /// 插件卡死时最多等一个 `call_timeout`，然后内置预览照常。**必须在 blocking
+    /// 池调用**（调用方已保证）；内置那批（图片 / PDF / 文本）永远不该被插件接管
+    /// ——只要插件不认领那些扩展名，这里的第一问自然落空。
     pub fn preview(&self, path: &Path) -> Result<Preview, MoError> {
+        if let Some(pv) = provider::provider_preview(self, path) {
+            return Ok(pv);
+        }
         mo_preview::preview_path(path)
     }
 
@@ -4328,9 +4343,16 @@ impl AppState {
     ///
     /// 装好的与手工摆放的都能卸——两者落点相同，语义没有分别。成功后调用方重取
     /// [`Self::extensions`] / [`Self::extensions_report`] 即可；键表 / 类型表 / 侧栏
-    /// 的缓存按目录指纹作废，无需手动清。
+    /// 的缓存按目录指纹作废，无需手动清。provider 的账（classify 的内存表与
+    /// sqlite 行、活着的进程）在这里显式清——目录指纹管不到内存表，而 devlog §6
+    /// 的卸载语义本来就包含「清它在缓存里的 classify 行」。
     pub fn uninstall_extension(&self, id: &str) -> Result<(), String> {
-        extensions::uninstall_extension(id, &extensions::extensions_root(&Self::config_path()))
+        let result =
+            extensions::uninstall_extension(id, &extensions::extensions_root(&Self::config_path()));
+        if result.is_ok() {
+            self.providers().forget_ext(id);
+        }
+        result
     }
 
     /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
@@ -4368,6 +4390,69 @@ impl AppState {
                 conflicts
             }
         }
+    }
+
+    // ---- provider（P3，见 [`provider`] 模块文档）----
+
+    fn providers(&self) -> &provider::Manager {
+        &self.providers
+    }
+
+    /// 这个路径的「种类」标签有没有被 provider 答（classify）过。
+    ///
+    /// **渲染路径安全**：短锁查内存表，零 IO。有答案就压过清单的静态标签——
+    /// 逐文件的答案（作者对自家格式的判断）比声明层的静态文案更准。
+    pub fn classify_label_of(&self, path: &Path) -> Option<String> {
+        self.providers().classify_label_of(path)
+    }
+
+    /// 该不该为这个路径派一次 classify（有归属、还没答案、没在途）。渲染路径安全。
+    pub fn needs_classify(&self, path: &Path) -> bool {
+        self.providers().needs_classify(path, &Self::config_path())
+    }
+
+    /// 「哪个扩展名的 classify 归哪个扩展」的归属表快照。
+    ///
+    /// **每帧取一次**（签名检查做一次 read_dir，与 [`Self::type_labels`] 每帧那次
+    /// 同价），行循环里只对快照查表；行内再查 [`Self::classify_label_of`]（纯内存）。
+    pub fn classify_owners(&self) -> Arc<std::collections::BTreeMap<String, String>> {
+        self.providers().owners_snapshot(&Self::config_path())
+    }
+
+    /// 派一批 classify 任务（fire-and-forget，与缩略图同一条纪律：**每帧调也安全**）。
+    ///
+    /// 真活（stat、查缓存、起进程、问插件）全在 blocking 池；批次里会命中缓存的
+    /// 路径直接落账，要问进程的按扩展分组问。落账后置 dirty，刷新泵合并广播。
+    pub fn request_classify(&self, entries: Vec<Entry>) {
+        let mut want: Vec<PathBuf> = Vec::new();
+        for e in entries {
+            // 只派文件：目录的「种类」固定是「文件夹」，不劳插件答；
+            // （万一有个目录叫 `foo.srt`，归属表会命中它，这里挡住。）
+            if !matches!(e.kind, mo_core::EntryKind::File) {
+                continue;
+            }
+            if self.needs_classify(&e.path) {
+                want.push(e.path.clone());
+            }
+        }
+        let want = self.providers().take_inflight(&want);
+        if want.is_empty() {
+            return;
+        }
+        let app = self.clone();
+        self.spawn_blocking(move || provider::classify_batch(&app, want));
+    }
+
+    /// 扩展的 provider 是否在退避停用期（扩展管理器那行「已停用」的来源）。
+    /// **渲染路径安全**：只查内存里已有的宿主，零 IO。
+    pub fn provider_backoff_line(&self, ext_id: &str) -> Option<String> {
+        self.providers().backoff_line(ext_id)
+    }
+
+    /// 测试钩子：直接种一条 classify 答案（headless 测试不起真进程）。
+    #[doc(hidden)]
+    pub fn test_seed_classify_label(&self, path: &Path, label: &str) {
+        self.providers().seed_label_for_tests(path, label);
     }
 
     /// 该出现在侧栏里的那些贡献项（清单或配置里写了 `menu: ["sidebar"]` 的那几条）。

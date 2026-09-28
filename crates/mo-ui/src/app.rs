@@ -3768,6 +3768,21 @@ impl RootView {
                         ))),
                 );
             }
+            // provider 进程的运行状况（P3）：退避停用期要亮在它自己那一家下面——
+            // 「类型标签怎么还是内置文案」这类疑问，答案在这里。判据在宿主
+            // （连续失败的账），这里只搬运，不重判。
+            if let Some(line) = self.app().provider_backoff_line(&e.manifest.id) {
+                let elem = format!("ext-detail-{}-backoff", e.manifest.id);
+                body = body.child(
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .pl(px(16.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::muted())
+                        .child(text!(line)),
+                );
+            }
             // 「这条绑定没生效」也要亮在它自己的那一家下面（P2-7）。判据在键表
             // （`build` 收贡献键位时记录），这里只按清单路径对回是哪家，不重判。
             for (k, line) in self.dropped_chord_lines(&e.path).into_iter().enumerate() {
@@ -11500,6 +11515,25 @@ fn contribution_line(c: &mo_app::extensions::Contribution) -> String {
         C::TypeLabel { exts, label } => {
             format!("类型：{} 在「种类」列显示为「{label}」", exts.join(" / "))
         }
+        C::Provider {
+            methods,
+            capabilities,
+        } => {
+            // 能力的中文文案与 §6 的措辞同源：确认卡要让用户看懂「进程会拿到什么」。
+            let cap_word = |c: &str| match c {
+                "read-names" => "读文件名".to_string(),
+                "read-contents" => "读文件内容（头 4 KiB）".to_string(),
+                "write" => "写入授权".to_string(),
+                "net" => "网络授权".to_string(),
+                other => other.to_string(),
+            };
+            let caps = capabilities
+                .iter()
+                .map(|c| cap_word(c))
+                .collect::<Vec<_>>()
+                .join("、");
+            format!("进程：接管 {}；申请能力：{}", methods.join(" / "), caps)
+        }
     }
 }
 
@@ -13956,6 +13990,14 @@ mod tests {
             }),
             "类型：.srt / .vtt 在「种类」列显示为「字幕」"
         );
+        // P3：provider 进程的贡献行——确认卡要让用户看懂「它要起进程、进程拿到什么」。
+        assert_eq!(
+            contribution_line(&C::Provider {
+                methods: vec!["classify".into(), "preview".into()],
+                capabilities: vec!["read-names".into(), "read-contents".into()],
+            }),
+            "进程：接管 classify / preview；申请能力：读文件名、读文件内容（头 4 KiB）"
+        );
         // 四个落点四个名字：这句话是拿去对照界面的，名字对不上界面就还是没说。
         assert_eq!(slot_word(mo_app::MenuSlot::ContextBlank), "右键·空白");
     }
@@ -14589,15 +14631,18 @@ mod tests {
             "卸载后回到扩展页，而不是把面板关掉：{:?}",
             modal_of(cx)
         );
-        let (row_count, selected_ok) = cx.update(|_w, cx| {
+        // ⚠️ 断言收窄到「卸的那个不见了」，不是「面板空了」：`isolate_user_dirs_for_tests`
+        // 给的是**本进程共享**的 extensions 目录，整包并行时别的测试的 fixture 可能正在场
+        // （engine-testing §9 那条老坑）。这条的本意是「当场重取」，数别人的行是越权。
+        let (unui_gone, selected_ok) = cx.update(|_w, cx| {
             root.update(cx, |v, _cx| {
                 (
-                    v.extensions.len(),
+                    !v.extensions.iter().any(|e| e.manifest.id == "unui"),
                     v.ext_index < v.extensions.len().max(1) || v.extensions.is_empty(),
                 )
             })
         });
-        assert_eq!(row_count, 0, "面板应当当场重取，别靠关掉再开");
+        assert!(unui_gone, "面板应当当场重取，卸掉的扩展不许还在");
         assert!(selected_ok, "选中行下标要夹回合法区间");
     }
 
