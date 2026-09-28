@@ -222,16 +222,18 @@ pub fn generate_to_with(
         .with_guessed_format()
         .map_err(|e| ThumbnailError::Io(e.to_string()))?;
 
-    let format = reader.format();
-    if !matches!(
-        format,
-        Some(ImageFormat::Jpeg)
-            | Some(ImageFormat::Png)
-            | Some(ImageFormat::Gif)
-            | Some(ImageFormat::WebP)
-            | Some(ImageFormat::Bmp)
-            | Some(ImageFormat::Ico)
-    ) {
+    // 这道门和 `entry::supports_thumbnail` 必须问同一份解码集合
+    // （`mo_core::types::THUMBNAIL_DECODABLE_EXTS`），否则 `.tiff` 这种「类型上是图、
+    // 解码器解不动」的后缀会白跑一次取图任务（devlog/engine-testing.md §7）。
+    let ext = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()));
+    if !ext
+        .as_deref()
+        .map(mo_core::types::supports_thumbnail_ext)
+        .unwrap_or(false)
+    {
         return Err(ThumbnailError::Unsupported(src.display().to_string()));
     }
 

@@ -352,7 +352,7 @@ mod tests {
     // 注意：这里**不能**写 `use super::*`——`file_item` 顶部的 `use gpui_kit::*`
     // 会把 gpui 的 `test` 属性宏一起带进来，遮蔽内置的 `#[test]`
     // （表现是 "recursion limit reached while expanding `#[test]`"）。
-    use super::{kind_label, trash_kind_label, view};
+    use super::{kind_by_ext, kind_label, trash_kind_label, view};
     use crate::list_columns::{ColId, ColumnLayout};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -534,6 +534,54 @@ mod tests {
             kind.origin.x < date.origin.x,
             "种类列没有被排到日期列前面：kind={kind:?} date={date:?}"
         );
+    }
+
+    /// 「种类」文案（`kind_by_ext` 那张内置表）与 `mo_core::types::group_of`（分组那问）
+    /// 不能自相矛盾——这正是当初把类型知识收进 `mo_core::types` 要消灭的那类显示：
+    /// 同一文件在分组里叫图片、在「种类」列里却叫文档。两张表各自独立维护，这条把关系钉住。
+    ///
+    /// 同时也钉住内置文案本身：这张表本轮**不**搬进 `mo_core::types::label_of`（那是 P1-1 的
+    /// 刻意独立表，见 devlog §10 #9），但「不搬」不等于「改了没人知道」——搬不搬都得保证
+    /// 它今天是什么样、改动能被看见。
+    ///
+    /// 判据：内置文案里若含某一族的中文名（图像 / 视频 / 音频 / 文档 / 归档），`group_of`
+    /// 必须落到对应的 `GroupKey`。「源代码」「应用程序」「快捷方式」这类文案不含族名、本来
+    /// 就和分组不冲突，不在此列。
+    #[test]
+    fn kind_label_agrees_with_group_of_and_is_stable() {
+        use mo_core::types::group_of;
+        use mo_core::view::GroupKey;
+        let cases: &[(&str, GroupKey, &str)] = &[
+            ("png", GroupKey::Image, "PNG 图像"),
+            ("jpg", GroupKey::Image, "JPEG 图像"),
+            ("jpeg", GroupKey::Image, "JPEG 图像"),
+            ("gif", GroupKey::Image, "图像"),
+            ("webp", GroupKey::Image, "图像"),
+            ("mp4", GroupKey::Media, "视频"),
+            ("mkv", GroupKey::Media, "视频"),
+            ("mp3", GroupKey::Media, "音频"),
+            ("wav", GroupKey::Media, "音频"),
+            ("pdf", GroupKey::Document, "PDF 文稿"),
+            ("docx", GroupKey::Document, "Word 文档"),
+            ("xlsx", GroupKey::Document, "Excel 表格"),
+            ("pptx", GroupKey::Document, "PPT 演示文稿"),
+            ("md", GroupKey::Document, "Markdown 文档"),
+            ("txt", GroupKey::Document, "文本文档"),
+            ("zip", GroupKey::Archive, "归档"),
+            ("tar", GroupKey::Archive, "归档"),
+            ("7z", GroupKey::Archive, "归档"),
+        ];
+        for (ext, want_group, want_label) in cases {
+            let got_label = kind_by_ext(&format!("x.{ext}"), &none());
+            assert_eq!(
+                got_label, *want_label,
+                "内置种类文案要稳定（这张表本轮不搬进 mo_core::types::label_of，但改动得看得见）：{ext}"
+            );
+            assert_eq!(
+                group_of(ext), *want_group,
+                "{ext} 的分组必须和种类文案同族：两边自相矛盾会像 P1 之前那样出现（分组叫图片、种类叫别的）"
+            );
+        }
     }
 
     /// 复刻数据行容器，但用自定义列布局。

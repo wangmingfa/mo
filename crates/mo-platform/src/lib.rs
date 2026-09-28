@@ -143,6 +143,26 @@ pub fn pick_folder(title: &str) -> Result<Option<PathBuf>, PlatformError> {
     }
 }
 
+/// 原生文件选择框（模态）。用户取消时返回 `Ok(None)`——「取消」不是错误。
+///
+/// 扩展的「从 .moext 安装」用它指认一个 `.moext` 压缩包——来源必须由用户当面指认，
+/// 与 [`pick_folder`] 同一条纪律：不给陌生扩展开静默安装的口子。
+pub fn pick_file(title: &str) -> Result<Option<PathBuf>, PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::pick_file(title)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::pick_file(title)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = title;
+        Err(PlatformError::Unsupported("文件选择框"))
+    }
+}
+
 /// 一块**已挂载的卷宗**（访达侧边栏「位置」里那种）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Volume {

@@ -157,6 +157,55 @@ pub fn pick_folder(title: &str) -> Result<Option<PathBuf>, PlatformError> {
     }
 }
 
+/// 原生文件选择框（`IFileOpenDialog`，**只要文件、不要目录**）。
+///
+/// 与 [`pick_folder`] 同一条纪律：在 UI 线程跑模态循环，用户取消折成 `Ok(None)`。
+/// 区别只在选项位——没有 `FOS_PICKFOLDERS`，于是只能选文件（`runModal` 之后拿到的是
+/// 文件路径而不是目录路径）。
+pub fn pick_file(title: &str) -> Result<Option<PathBuf>, PlatformError> {
+    let _com = ComGuard::init();
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| PlatformError::Failed(format!("打不开文件选择框：{e}")))?;
+        let options = dialog
+            .GetOptions()
+            .map_err(|e| PlatformError::Failed(format!("文件选择框设置失败：{e}")))?;
+        // FOS_FORCEFILESYSTEM：只要文件系统路径，不收「此电脑」「回收站」这类虚拟位置。
+        dialog
+            .SetOptions(options | FOS_FORCEFILESYSTEM)
+            .map_err(|e| PlatformError::Failed(format!("文件选择框设置失败：{e}")))?;
+        let title_w = wide_str(title);
+        dialog
+            .SetTitle(PCWSTR(title_w.as_ptr()))
+            .map_err(|e| PlatformError::Failed(format!("文件选择框设置失败：{e}")))?;
+        if let Err(e) = dialog.Show(None) {
+            if e.code().0 as u32 == 0x8007_04C7 {
+                return Ok(None);
+            }
+            return Err(PlatformError::Failed(format!("文件选择框打不开：{e}")));
+        }
+        let item: IShellItem = dialog
+            .GetResult()
+            .map_err(|e| PlatformError::Failed(format!("拿不到所选文件：{e}")))?;
+        let display = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|e| PlatformError::Failed(format!("所选文件没有文件系统路径：{e}")))?;
+        let path = if display.is_null() {
+            String::new()
+        } else {
+            display.to_string().unwrap_or_default()
+        };
+        CoTaskMemFree(Some(display.0.cast()));
+        if path.is_empty() {
+            return Err(PlatformError::Failed(
+                "所选文件没有文件系统路径，装不了".into(),
+            ));
+        }
+        Ok(Some(PathBuf::from(path)))
+    }
+}
+
 /// 线程级 COM 初始化守卫。
 ///
 /// tokio 的 blocking 线程会被复用：第二次进来 `CoInitializeEx` 返回

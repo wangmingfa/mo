@@ -165,6 +165,26 @@ fn thumbnail_support_is_image_files_only() {
     assert!(!entry("d.png", EntryKind::Directory, 4).supports_thumbnail());
 }
 
+#[test]
+fn thumbnail_support_excludes_formats_the_embedded_decoder_cannot_handle() {
+    // `.tiff` 类型上仍是图片（分组/预览都收它），但嵌入解码器没开 tiff 特性，
+    // 解不动——它**不该**派取图任务，否则白跑一次还看不出毛病
+    // （devlog/engine-testing.md §7）。这是当初的假阳性来源。
+    assert!(!entry("e.tiff", EntryKind::File, 5).supports_thumbnail());
+    assert!(!entry("f.tif", EntryKind::File, 6).supports_thumbnail());
+    assert!(!entry("g.heic", EntryKind::File, 7).supports_thumbnail());
+    assert!(!entry("h.avif", EntryKind::File, 8).supports_thumbnail());
+    // 解码器能解的那六种照常派任务。
+    for name in [
+        "i.jpg", "j.jpeg", "k.png", "l.gif", "m.webp", "n.bmp", "o.ico",
+    ] {
+        assert!(
+            entry(name, EntryKind::File, 9).supports_thumbnail(),
+            "{name} 应能派取图任务"
+        );
+    }
+}
+
 #[tokio::test]
 async fn event_bus_publish_subscribe() {
     let bus = EventBus::new();

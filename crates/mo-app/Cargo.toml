@@ -27,6 +27,8 @@ keyring.workspace = true
 # 安装扩展：递归复制来源目录 + 逐文件 sha256（installed.json 记账）。
 sha2.workspace = true
 walkdir.workspace = true
+# 安装扩展：从 .moext（zip）压缩包解压后再走 install_from。
+zip.workspace = true
 
 # Windows shell 集成（默认打开 / 打开方式）：ShellExecute 系列 FFI + 注册表枚举。
 [target.'cfg(windows)'.dependencies]

@@ -4310,6 +4310,29 @@ impl AppState {
         extensions::install_from(source, &extensions::extensions_root(&Self::config_path()))
     }
 
+    /// 从一份 `.moext`（zip）压缩包安装扩展。
+    ///
+    /// 解压到临时目录后复用 [`Self::install_extension`] 的那条「装出来即停用」路线
+    /// （见 [`extensions::install_from_archive`]）。
+    pub fn install_extension_from_zip(
+        &self,
+        archive: &Path,
+    ) -> Result<extensions::Manifest, String> {
+        extensions::install_from_archive(
+            archive,
+            &extensions::extensions_root(&Self::config_path()),
+        )
+    }
+
+    /// 卸载一个扩展（删 `<配置目录>/mo/extensions/<id>` 整个目录）。
+    ///
+    /// 装好的与手工摆放的都能卸——两者落点相同，语义没有分别。成功后调用方重取
+    /// [`Self::extensions`] / [`Self::extensions_report`] 即可；键表 / 类型表 / 侧栏
+    /// 的缓存按目录指纹作废，无需手动清。
+    pub fn uninstall_extension(&self, id: &str) -> Result<(), String> {
+        extensions::uninstall_extension(id, &extensions::extensions_root(&Self::config_path()))
+    }
+
     /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
     ///
     /// 渲染路径的用法是**每帧取一次**、行循环里只做表查询（`mo_ui::file_list` 就是
@@ -4318,12 +4341,33 @@ impl AppState {
         let fp = extensions::fingerprint(&extensions::extensions_root(&Self::config_path()));
         let mut g = self.type_labels.lock().unwrap();
         match &mut *g {
-            Some((seen, table)) if *seen == fp => {}
-            _ => *g = Some((fp, Arc::new(extensions::type_labels(&self.extensions())))),
+            Some((seen, table, _)) if *seen == fp => {}
+            _ => {
+                let (table, conflicts) = extensions::type_labels_report(&self.extensions());
+                *g = Some((fp, Arc::new(table), conflicts));
+            }
         }
         g.as_ref()
-            .map(|(_, table)| table.clone())
+            .map(|(_, table, _)| table.clone())
             .unwrap_or_default()
+    }
+
+    /// 扩展贡献「种类」标签时的撞车记录（P2 剩余 #2）：两个扩展抢同一个扩展名、输的那方。
+    ///
+    /// 与 [`Self::type_labels`] 共用同一份签名缓存——打开扩展面板时重取一次就够了。
+    /// 扩展管理器按 `loser` 归并，把「你的 `.xxx` 被别人抢先认领、这条不生效」亮在输家
+    /// 那一家的下面。
+    pub fn type_label_conflicts(&self) -> Vec<extensions::TypeLabelConflict> {
+        let fp = extensions::fingerprint(&extensions::extensions_root(&Self::config_path()));
+        let mut g = self.type_labels.lock().unwrap();
+        match &mut *g {
+            Some((seen, _, conflicts)) if *seen == fp => conflicts.clone(),
+            _ => {
+                let (table, conflicts) = extensions::type_labels_report(&self.extensions());
+                *g = Some((fp, Arc::new(table), conflicts.clone()));
+                conflicts
+            }
+        }
     }
 
     /// 该出现在侧栏里的那些贡献项（清单或配置里写了 `menu: ["sidebar"]` 的那几条）。

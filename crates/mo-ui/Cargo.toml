@@ -52,3 +52,5 @@ all = "deny"
 # `test-support` 打开 GPUI 的 headless 测试通道（TestAppContext / debug_bounds）：
 # 不依赖真实窗口即可验证布局，见 tests/layout.rs。
 gpui-kit = { workspace = true, features = ["test-support"] }
+# 造 .moext（zip）fixture 用：把一份扩展打成压缩包喂给「从 .moext 安装」那条路。
+zip.workspace = true

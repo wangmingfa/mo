@@ -217,6 +217,11 @@ pub(crate) enum Modal {
     /// 扩展面板**保留在遮罩后面**（中央区仍按 `Modal::Extensions` 画），与
     /// [`Modal::ConfirmTrash`] 同一套；Esc / 取消 / 点遮罩都回到面板。
     ConfirmEnableExt(String),
+    /// 「卸载这个扩展」的确认卡（删 `<id>/` 目录，不可恢复）。
+    ///
+    /// 携带扩展 **id** 而不是第几行（与 [`Modal::ConfirmEnableExt`] 同一条纪律）；
+    /// 扩展面板保留在遮罩后面，Esc / 取消 / 点遮罩都回到面板。
+    ConfirmUninstallExt(String),
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
     ConnectServer,
     /// 「服务器要求登录」——用户名 + 密码（星号）+ 记住密码。
@@ -837,6 +842,13 @@ pub struct RootView {
     cmd_query: String,
     /// 命令面板 / 搜索结果的高亮下标。
     palette_index: usize,
+    /// 命令面板 / 应用选择器 / 全局搜索三个键盘导航列表各自的滚动句柄：
+    /// 上下键改 `palette_index` 时把选中行滚进可视区。三个分开持——句柄的
+    /// 「待滚动项」状态在 prepaint 时被消费，跨模态共用一个会把上一个模态
+    /// 的残留下标滚进下一个模态的列表。
+    palette_scroll: ScrollHandle,
+    app_picker_scroll: ScrollHandle,
+    search_scroll: ScrollHandle,
     /// 回收站面板的**多选**集合（行下标）。UI 本地状态：`trash_entries` 快照
     /// 内容真的变了才作废（见 `sync_panel` 里的比对——任何总线事件都会重跑
     /// sync，不能见事件就清）。`pub(crate)` 仅为测试探针读取。
@@ -1143,6 +1155,9 @@ impl RootView {
             modal: Modal::None,
             cmd_query: String::new(),
             palette_index: 0,
+            palette_scroll: ScrollHandle::default(),
+            app_picker_scroll: ScrollHandle::default(),
+            search_scroll: ScrollHandle::default(),
             trash_selected: BTreeSet::new(),
             trash_anchor: None,
             search_query: String::new(),
@@ -3071,6 +3086,20 @@ impl RootView {
         }
     }
 
+    /// 选中行变化后（上下键、过滤词增删），把高亮行滚进可视区。
+    ///
+    /// 滚动句柄是「面板在用」还是「应用选择器在用」二选一：两者共用
+    /// `palette_index`，但同屏只渲染其中一个列表，把待滚动项记到在用的
+    /// 那个句柄上即可（另一个的残留状态不会被消费）。
+    fn scroll_palette_to_selection(&mut self) {
+        let handle = if self.app_picker.is_some() {
+            &self.app_picker_scroll
+        } else {
+            &self.palette_scroll
+        };
+        handle.scroll_to_item(self.palette_index);
+    }
+
     /// 打开「选择其他应用…」的选择器（macOS）。
     ///
     /// 复用命令面板那层壳：输入即过滤、↑↓ 移动、Enter 用选中的应用打开。
@@ -3476,6 +3505,13 @@ impl RootView {
         cx.notify();
     }
 
+    /// 「卸载这个扩展」：先过确认卡（删目录不可恢复，与清空回收站同级的破坏性
+    /// 动作）。载荷带 id 不带下标——卡开着期间列表变了，按位置删等于删另一条。
+    fn ask_uninstall_extension(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.modal = Modal::ConfirmUninstallExt(id.to_string());
+        cx.notify();
+    }
+
     /// 「从磁盘安装」：弹原生目录选择框，把选中的扩展目录装进配置目录。
     ///
     /// 来源必须由用户当面指认——没有命令行参数、没有配置项入口，那等于给陌生
@@ -3499,6 +3535,38 @@ impl RootView {
     /// 的就是这一行（已停用 + 它会改什么），被弹窗顶走等于倒退。失败才弹。
     fn install_extension_from(&mut self, source: &std::path::Path, cx: &mut Context<Self>) {
         match self.app().install_extension(source) {
+            Ok(m) => {
+                self.extensions = self.app().extensions();
+                self.keymap = keymap_from(&self.app());
+                if let Some(i) = self.extensions.iter().position(|x| x.manifest.id == m.id) {
+                    self.ext_index = i;
+                }
+            }
+            Err(err) => self.notice(err, None, cx),
+        }
+        cx.notify();
+    }
+
+    /// 「从 .moext 安装」：弹原生文件选择框，把选中的压缩包解压后再装。
+    ///
+    /// 与 [`Self::install_extension_from_disk`] 同一条纪律——来源必须由用户当面指认
+    /// （`mo_platform::pick_file` 模态、UI 线程、取消折成 `Ok(None)`），不给陌生扩展
+    /// 开静默安装的口子。后半段走 [`Self::install_extension_from_zip`]。
+    fn install_extension_from_zip_disk(&mut self, cx: &mut Context<Self>) {
+        match mo_platform::pick_file("选择 .moext 扩展包（zip）") {
+            Ok(Some(path)) => self.install_extension_from_zip(&path, cx),
+            Ok(None) => {}
+            Err(e) => self.notice(format!("打不开文件选择框：{e}"), None, cx),
+        }
+    }
+
+    /// 「从 .moext 安装」的后半段（选完文件之后）：解压、装、刷新面板、选中新行。
+    ///
+    /// 拆出来是因为这一半可以在 headless 里测（选择框弹不出来，前半段测不了）。
+    /// 解压与「装出来即停用」都发生在 [`mo_app::extensions::install_from_archive`]，
+    /// 这里只负责把结果刷进面板——与 [`Self::install_extension_from`] 同一套刷新逻辑。
+    fn install_extension_from_zip(&mut self, archive: &std::path::Path, cx: &mut Context<Self>) {
+        match self.app().install_extension_from_zip(archive) {
             Ok(m) => {
                 self.extensions = self.app().extensions();
                 self.keymap = keymap_from(&self.app());
@@ -3539,6 +3607,23 @@ impl RootView {
             .iter()
             .filter(|d| d.chord.source() == Some(want.as_str()))
             .map(|d| format!("绑键 {} 没生效：{}", d.spec, d.reason))
+            .collect()
+    }
+
+    /// 类型标签撞车（P2 剩余 #2）：判据在缓存——`AppState::type_label_conflicts`
+    /// 记的是「输家 = 本扩展」的那几条（赢家不需要被告知，它的标签生效着）。这里只按
+    /// 扩展 id 对回是哪家，不重判一遍——两处判撞车迟早答出两个输家。
+    fn type_label_conflict_lines(&self, ext_id: &str) -> Vec<String> {
+        self.app()
+            .type_label_conflicts()
+            .iter()
+            .filter(|c| c.loser == ext_id)
+            .map(|c| {
+                format!(
+                    "类型标签「.{}」被扩展「{}」抢先认领，这一条不生效",
+                    c.ext, c.winner
+                )
+            })
             .collect()
     }
 
@@ -3697,6 +3782,53 @@ impl RootView {
                         .child(text!(line)),
                 );
             }
+            // 类型标签撞车也要亮在输家那一家下面（P2 剩余 #2）。判据在缓存
+            // （`type_labels_report` 先到先得后记账），这里只按扩展 id 对回是哪家，
+            // 不重判——与上面那条「绑定没生效」同一个「界面上能查、不重判」的理由。
+            for (k, line) in self
+                .type_label_conflict_lines(&e.manifest.id)
+                .into_iter()
+                .enumerate()
+            {
+                let elem = format!("ext-detail-{}-typelabel-{k}", e.manifest.id);
+                body = body.child(
+                    div()
+                        .id(elem.clone())
+                        .debug_selector(move || format!("mo-{elem}"))
+                        .pl(px(16.0))
+                        .text_size(px(11.5))
+                        .text_color(theme::muted())
+                        .child(text!(line)),
+                );
+            }
+            // 「卸载…」：选中那行的动作，收进详情区而不是挤在行上——先选中、看清
+            // 它贡献了什么、再决定删不删。点开的是确认卡（删目录不可恢复）。
+            let uninstall_id = e.manifest.id.clone();
+            let uninstall_name = e.manifest.name.clone();
+            let click_id = uninstall_id.clone();
+            let mut uninstall_btn = div()
+                .id(format!("ext-uninstall-{uninstall_id}"))
+                .debug_selector(move || format!("mo-ext-uninstall-{uninstall_id}"))
+                .flex()
+                .items_center()
+                .ml(px(16.0))
+                .mt(px(4.0))
+                .px(px(8.0))
+                .h(px(22.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme::separator())
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .hover(|s| s.text_color(theme::text()))
+                .child(text!(format!("卸载「{uninstall_name}」…")));
+            let uninstall_ent = entity.clone();
+            uninstall_btn
+                .interactivity()
+                .on_click(move |_ev, _window, cx| {
+                    uninstall_ent.update(cx, |v, cx| v.ask_uninstall_extension(&click_id, cx));
+                });
+            body = body.child(uninstall_btn.test_support());
         }
         // 坏掉的清单排在能用的之后（P2-7）。它们没有可启停的状态、贡献不出任何东西，
         // 唯一有用的信息就是「为什么没用上」——所以原因直接摊在行下，不用选中。
@@ -3762,6 +3894,32 @@ impl RootView {
                 install_ent.update(cx, |v, cx| v.install_extension_from_disk(cx));
             });
         body = body.child(install_btn.test_support());
+
+        // 「从 .moext 安装」：分发场景用的另一条正门——下载得到的是一份文件而不是
+        // 一坨散目录。点下去弹文件选择框指认 `.moext`（zip），解压后再走与「从磁盘安装」
+        // 同一套「装出来即停用」的路线。两个按钮并排，区分只在来源形态。
+        let mut moext_btn = div()
+            .id("ext-install-moext")
+            .debug_selector(|| "mo-ext-install-moext".to_string())
+            .flex()
+            .items_center()
+            .mt(px(8.0))
+            .px(px(10.0))
+            .h(px(26.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme::separator())
+            .bg(theme::surface())
+            .text_size(px(12.0))
+            .text_color(theme::muted())
+            .hover(|s| s.text_color(theme::text()))
+            .child(text!("从 .moext 安装…（选一个 .moext / zip 扩展包）"));
+        let moext_ent = entity.clone();
+        moext_btn.interactivity().on_click(move |_ev, _window, cx| {
+            moext_ent.update(cx, |v, cx| v.install_extension_from_zip_disk(cx));
+        });
+        body = body.child(moext_btn.test_support());
+
         central_view(
             "扩展",
             "",
@@ -4948,7 +5106,84 @@ impl RootView {
         reset_row.interactivity().on_click(move |_ev, _window, cx| {
             reset_ent.update(cx, |v, cx| v.keys_reset_all(cx));
         });
-        body = body.child(list).child(reset_row);
+        body = body.child(list);
+        // 扩展 / 自定义命令贡献的键位（P2 剩余 #1）：之前 `keys_body` 只遍历内置
+        // `BINDINGS`，这批在设置页完全看不见。这里单列一块——生效的列出动作名 + 键位，
+        // 被拒的（坏键串 / 撞车，含用户 `commands/*.json` 里写坏的）列出原因。
+        let mut ext_block = div().flex().flex_col().gap(px(1.0)).mt(px(8.0)).p(px(4.0));
+        ext_block = ext_block.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .px(px(4.0))
+                .pb(px(4.0))
+                .child(text!(
+                    "扩展 / 自定义命令的快捷键（改绑请在命令面板或扩展清单里做）".to_string()
+                )),
+        );
+        let mut any_contrib = false;
+        for (ci, (combo, chord)) in self.keymap.contributed().into_iter().enumerate() {
+            any_contrib = true;
+            let row_id = format!("keys-contrib-{ci}");
+            let row = div()
+                .id(row_id.clone())
+                .debug_selector(move || format!("mo-{row_id}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
+                .px(px(10.0))
+                .h(px(30.0))
+                .rounded(px(8.0))
+                .text_size(px(13.0))
+                .bg(theme::surface())
+                .text_color(theme::text())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(text!(chord.title())),
+                )
+                .child(tag_pill(&combo.format(), false));
+            ext_block = ext_block.child(row);
+        }
+        for (di, d) in self.keymap.dropped().iter().enumerate() {
+            any_contrib = true;
+            let row_id = format!("keys-drop-{di}");
+            let row = div()
+                .id(row_id.clone())
+                .debug_selector(move || format!("mo-{row_id}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
+                .px(px(10.0))
+                .h(px(30.0))
+                .rounded(px(8.0))
+                .text_size(px(13.0))
+                .bg(theme::surface())
+                .text_color(theme::muted())
+                .child(div().flex_1().min_w_0().truncate().child(text!(format!(
+                    "{}（{}）没生效：{}",
+                    d.chord.title(),
+                    d.spec,
+                    d.reason
+                ))));
+            ext_block = ext_block.child(row);
+        }
+        if !any_contrib {
+            ext_block = ext_block.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme::muted())
+                    .px(px(4.0))
+                    .child(text!("（还没有扩展或自定义命令贡献任何快捷键）".to_string())),
+            );
+        }
+        body = body.child(ext_block).child(reset_row);
         body
     }
 
@@ -7174,7 +7409,9 @@ impl Render for RootView {
             Modal::Diff => self.render_diff(),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
-            Modal::Extensions | Modal::ConfirmEnableExt(_) => self.render_extensions(&entity),
+            Modal::Extensions | Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => {
+                self.render_extensions(&entity)
+            }
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::Sync => self.render_sync(&entity),
@@ -7499,6 +7736,18 @@ impl Render for RootView {
                 {
                     let lines = self.contribution_lines(id);
                     root = root.child(render_enable_confirm(m, &lines, &entity));
+                }
+            }
+            // 「卸载扩展」确认卡：同一形状的第三例。卡开着期间清单被别处改掉了
+            // （目录被删）就没有这张卡可画，什么都不挂。
+            Modal::ConfirmUninstallExt(id) => {
+                if let Some(m) = self
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == *id)
+                    .map(|e| &e.manifest)
+                {
+                    root = root.child(render_uninstall_confirm(m, &entity));
                 }
             }
             Modal::TrashRename(entry) => {
@@ -7917,6 +8166,7 @@ fn handle_modal_key(
             "up" | "arrowup" => entity.update(cx, |v, cx| {
                 if v.palette_index > 0 {
                     v.palette_index -= 1;
+                    v.scroll_palette_to_selection();
                 }
                 cx.notify();
             }),
@@ -7924,6 +8174,7 @@ fn handle_modal_key(
                 let n = v.palette_len();
                 if n > 0 {
                     v.palette_index = (v.palette_index + 1).min(n - 1);
+                    v.scroll_palette_to_selection();
                 }
                 cx.notify();
             }),
@@ -7933,12 +8184,14 @@ fn handle_modal_key(
                 entity.update(cx, |v, cx| {
                     v.cmd_query.push(ch);
                     v.palette_index = 0;
+                    v.scroll_palette_to_selection();
                     cx.notify();
                 });
             }
             "backspace" => entity.update(cx, |v, cx| {
                 v.cmd_query.pop();
                 v.palette_index = 0;
+                v.scroll_palette_to_selection();
                 cx.notify();
             }),
             _ => {}
@@ -7948,6 +8201,7 @@ fn handle_modal_key(
             "up" | "arrowup" => entity.update(cx, |v, cx| {
                 if v.palette_index > 0 {
                     v.palette_index -= 1;
+                    v.search_scroll.scroll_to_item(v.palette_index);
                 }
                 cx.notify();
             }),
@@ -7955,6 +8209,7 @@ fn handle_modal_key(
                 let n = v.search_results.len();
                 if n > 0 {
                     v.palette_index = (v.palette_index + 1).min(n - 1);
+                    v.search_scroll.scroll_to_item(v.palette_index);
                 }
                 cx.notify();
             }),
@@ -7972,6 +8227,7 @@ fn handle_modal_key(
                 entity.update(cx, |v, cx| {
                     v.search_results = results;
                     v.palette_index = 0;
+                    v.search_scroll.scroll_to_item(0);
                     cx.notify();
                 });
             }
@@ -7986,6 +8242,7 @@ fn handle_modal_key(
                 entity.update(cx, |v, cx| {
                     v.search_results = results;
                     v.palette_index = 0;
+                    v.search_scroll.scroll_to_item(0);
                     cx.notify();
                 });
             }
@@ -8296,6 +8553,12 @@ fn handle_modal_key(
         Modal::ConfirmEnableExt(_) => match key {
             "escape" => dismiss_enable_confirm(entity, cx),
             "enter" => confirm_enable_ext(entity, cx),
+            _ => {}
+        },
+        // 卸载确认卡同款（Enter = 确认删，Esc = 取消）；同样不吃上下键。
+        Modal::ConfirmUninstallExt(_) => match key {
+            "escape" => dismiss_uninstall_confirm(entity, cx),
+            "enter" => confirm_uninstall_ext(entity, cx),
             _ => {}
         },
         Modal::Settings => {
@@ -9692,12 +9955,21 @@ impl RootView {
         let idx = self.palette_index;
         let mut body = div().flex().flex_col();
         body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤命令…"));
-        let mut rows = div()
+        // 行列表。kit 的 `overflow_y_scrollbar()` 把滚动句柄藏进私有 keyed
+        // state，拿不到就没法让「键盘选中行」滚进可视区；照它 wrapper 的三层
+        // 结构自拼：root 定尺寸 + relative，滚动区 track_scroll **直接持有行**
+        // （child_bounds 才逐行记录，`scroll_to_item` 找得到目标），滚动条挂
+        // root 上与滚动区**平级**——挂进滚动区会被记成 child_bounds[0]，把
+        // 全部行号顶后一位，跟随滚动就对不上行了。
+        let mut rows_area = div()
+            .id("palette-scroll-area")
+            .size_full()
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .overflow_y_scrollbar()
-            .h(px(340.0));
+            .overflow_y_scroll()
+            .track_scroll(&self.palette_scroll)
+            .restrict_scroll_to_axis();
         for (i, id) in list.iter().enumerate() {
             let def = commands_in(&self.user_commands, &self.workflows)
                 .into_iter()
@@ -9705,14 +9977,22 @@ impl RootView {
                 .unwrap();
             let selected = i == idx;
             // 分类放右侧胶囊：左缘是对齐的命令名，扫读时不必先跳过一串分类词。
-            rows = rows.child(
+            rows_area = rows_area.child(
                 picker_row(&format!("cmd-row-{i}"), selected, &def.title)
+                    .flex_none()
                     .child(tag_pill(&def.category, selected)),
             );
         }
         if list.is_empty() {
-            rows = rows.child(dialog_empty_row("无匹配命令"));
+            rows_area = rows_area.child(dialog_empty_row("无匹配命令"));
         }
+        let rows = div()
+            .id("palette-scroll")
+            .h(px(340.0))
+            .relative()
+            .overflow_hidden()
+            .child(rows_area)
+            .vertical_scrollbar(&self.palette_scroll);
         body = body.child(rows);
         dialog_overlay_sized(
             entity,
@@ -9737,15 +10017,20 @@ impl RootView {
         let idx = self.palette_index;
         let mut body = div().flex().flex_col();
         body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤应用…"));
-        let mut rows = div()
+        // 结构同命令面板（见那里的注释）。
+        let mut rows_area = div()
+            .id("app-picker-scroll-area")
+            .size_full()
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .overflow_y_scrollbar()
-            .h(px(340.0));
+            .overflow_y_scroll()
+            .track_scroll(&self.app_picker_scroll)
+            .restrict_scroll_to_axis();
         for (i, a) in list.iter().enumerate() {
             let selected = i == idx;
-            rows = rows.child(picker_row(&format!("app-row-{i}"), selected, &a.name));
+            rows_area =
+                rows_area.child(picker_row(&format!("app-row-{i}"), selected, &a.name).flex_none());
         }
         if list.is_empty() {
             // 列表还没加载完（异步扫目录）与「真的没有」要分开说，否则看着像坏了。
@@ -9754,8 +10039,15 @@ impl RootView {
             } else {
                 "无匹配应用"
             };
-            rows = rows.child(dialog_empty_row(msg));
+            rows_area = rows_area.child(dialog_empty_row(msg));
         }
+        let rows = div()
+            .id("app-picker-scroll")
+            .h(px(340.0))
+            .relative()
+            .overflow_hidden()
+            .child(rows_area)
+            .vertical_scrollbar(&self.app_picker_scroll);
         body = body.child(rows);
         dialog_overlay_sized(
             entity,
@@ -9771,17 +10063,21 @@ impl RootView {
     fn render_global_search(&self, _entity: &Entity<RootView>) -> Div {
         let idx = self.palette_index;
         // 吃满中央区剩余高度（原先写死 360px 是为了配合 640px 卡片）。
-        let mut body = div()
+        // 结构同命令面板（见那里的注释）。
+        let mut rows_area = div()
+            .id("search-scroll-area")
+            .size_full()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_h_0()
             .gap(px(2.0))
-            .overflow_y_scrollbar();
+            .overflow_y_scroll()
+            .track_scroll(&self.search_scroll)
+            .restrict_scroll_to_axis();
         for (i, hit) in self.search_results.iter().enumerate() {
             let selected = i == idx;
             let row = div()
                 .id(format!("search-row-{i}"))
+                .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -9799,7 +10095,7 @@ impl RootView {
                 })
                 .child(text!(mo_core::display_name(&hit.name).to_string()))
                 .child(text!(format!("{}", hit.path.display())));
-            body = body.child(row);
+            rows_area = rows_area.child(row);
         }
         if self.search_results.is_empty() {
             // 「索引还没建起来」与「搜了但没匹配」是两件事，提示必须分开：前者用户
@@ -9809,8 +10105,16 @@ impl RootView {
             } else {
                 "输入关键词搜索整个文件系统".to_string()
             };
-            body = body.child(text!(hint));
+            rows_area = rows_area.child(text!(hint));
         }
+        let body = div()
+            .id("search-scroll")
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .child(rows_area)
+            .vertical_scrollbar(&self.search_scroll);
         central_view(
             &format!("全局搜索（已索引 {} 项）", self.indexed),
             &format!("🔍 {}", self.search_query),
@@ -11003,6 +11307,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_enable_confirm(entity, cx);
         return;
     }
+    // 「卸载扩展」确认卡同理：点遮罩 = 不卸载，回到扩展页。
+    if matches!(entity.read(cx).modal, Modal::ConfirmUninstallExt(_)) {
+        dismiss_uninstall_confirm(entity, cx);
+        return;
+    }
     close_modal(entity, cx);
 }
 
@@ -11333,6 +11642,139 @@ fn confirm_enable_ext(entity: &Entity<RootView>, cx: &mut App) {
 fn dismiss_enable_confirm(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         if matches!(v.modal, Modal::ConfirmEnableExt(_)) {
+            v.modal = Modal::Extensions;
+            cx.notify();
+        }
+    });
+}
+
+/// 「卸载这个扩展」确认卡（`Modal::ConfirmUninstallExt`）。
+///
+/// 外壳与「启用」那张同款；两处差别都表达语义：按钮用**警示红**（删目录不可恢复，
+/// 与清空回收站同级），正文是一句后果说明而不是贡献清单——卸载是收缩边界，用户
+/// 不需要再审一遍它贡献了什么，只需要确认「真的要删」。
+fn render_uninstall_confirm(
+    m: &mo_app::extensions::Manifest,
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
+    let cancel = entity.clone();
+    let ok = entity.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .child(text!(format!("卸载扩展「{}」？", m.name))),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme::muted())
+                        .child(text!(
+                            "将删除它在扩展目录里的整个文件夹，此操作不可恢复。它贡献的命令、工作流、键位与「种类」文案都会消失。"
+                                .to_string()
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .id("ext-uninstall-cancel")
+                        .debug_selector(|| "mo-ext-uninstall-cancel".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| dismiss_uninstall_confirm(&cancel, cx))
+                        .child(text!("取消"))
+                        // ⚠️ `.test_support()` 最后包（与「启用」那张同一条纪律）。
+                        .test_support(),
+                )
+                .child(
+                    div()
+                        .id("ext-uninstall-ok")
+                        .debug_selector(|| "mo-ext-uninstall-ok".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(rgba(0xd70015))
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| confirm_uninstall_ext(&ok, cx))
+                        .child(text!("卸载"))
+                        .test_support(),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 确认卡上点了「卸载」（或按 Enter）：删目录，然后回到扩展页。
+///
+/// id 从模态里**取出来**而不是回读 `ext_index`（与 [`confirm_enable_ext`] 同一条
+/// 纪律）：确认期间列表可能已经变了，按位置删等于删另一条。删完后选中行夹回
+/// 合法区间——原来的行没了，别指到界外去。
+fn confirm_uninstall_ext(entity: &Entity<RootView>, cx: &mut App) {
+    let (id, name) = entity.update(cx, |v, _cx| {
+        match std::mem::replace(&mut v.modal, Modal::Extensions) {
+            Modal::ConfirmUninstallExt(id) => {
+                let name = v
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == id)
+                    .map(|e| e.manifest.name.clone())
+                    .unwrap_or_else(|| id.clone());
+                (Some(id), name)
+            }
+            other => {
+                // 不在确认卡上（重复触发）：原样放回，什么都不做。
+                v.modal = other;
+                (None, String::new())
+            }
+        }
+    });
+    let Some(id) = id else { return };
+    let app = entity.read(cx).app();
+    if let Err(err) = app.uninstall_extension(&id) {
+        entity.update(cx, |v, cx| {
+            v.notice(format!("卸载扩展「{name}」失败：{err}"), None, cx);
+        });
+        return;
+    }
+    entity.update(cx, |v, cx| {
+        let (exts, broken) = v.app().extensions_report();
+        v.extensions = exts;
+        v.broken_exts = broken;
+        v.keymap = keymap_from(&v.app());
+        v.ext_index = v.ext_index.min(v.extensions.len().saturating_sub(1));
+        v.modal = Modal::Extensions;
+        cx.notify();
+    });
+}
+
+/// 取消：回到扩展页（**不是** `close_modal`——那会把整页关掉）。
+fn dismiss_uninstall_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if matches!(v.modal, Modal::ConfirmUninstallExt(_)) {
             v.modal = Modal::Extensions;
             cx.notify();
         }
@@ -13130,6 +13572,79 @@ mod tests {
         assert_eq!(tabs(cx), before + 1, "新键位应当生效");
     }
 
+    /// 上下键移动选中行时滚动必须跟随：把高亮推到列表末尾，滚动偏移要离开
+    /// 顶部；按回第一行后偏移归零。
+    ///
+    /// 回归 2026-09-28：命令面板上下键只改 `palette_index`，列表纹丝不动，
+    /// 高亮行跑出视口后用户只能鼠标滚。
+    #[test]
+    fn palette_selection_follows_keyboard_scrolling() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&format!("{main}-shift-p"));
+        cx.run_until_parked();
+
+        let n = cx.update(|_window, cx| root.update(cx, |v, _cx| v.palette_len()));
+        assert!(n > 12, "内置命令才 {n} 行，一屏装得下就测不出滚动跟随");
+
+        let offset_y = |cx: &mut gpui_kit::VisualTestContext| {
+            // `scroll_to_item` 的待滚动项在 prepaint 时才被消费——headless 必须
+            // 先强制走一遍绘制，偏移才会真的变。
+            cx.update(|window, _cx| {
+                let _ = window.painted_quads();
+            });
+            cx.update(|_window, cx| {
+                root.update(cx, |v, _cx| f32::from(v.palette_scroll.offset().y))
+            })
+        };
+        assert_eq!(offset_y(cx), 0.0, "开场应停在列表顶部");
+
+        for _ in 0..n - 1 {
+            cx.simulate_keystrokes("down");
+        }
+        let index = cx.update(|_window, cx| root.update(cx, |v, _cx| v.palette_index));
+        assert_eq!(index, n - 1, "down 键应把选中行推到列表末尾");
+        // gpui 的滚动偏移向下滚是**负值**（顶=0，底=-max_offset）。
+        assert!(
+            offset_y(cx) < 0.0,
+            "选中行推到列表末尾后应向下滚（偏移为负）"
+        );
+
+        for _ in 0..n - 1 {
+            cx.simulate_keystrokes("up");
+        }
+        let index = cx.update(|_window, cx| root.update(cx, |v, _cx| v.palette_index));
+        assert_eq!(index, 0, "up 键应把选中行带回第一行");
+        assert_eq!(offset_y(cx), 0.0, "回到第一行后应滚回顶部");
+
+        // 行号对位：child_bounds[0] 必须是第一行（约 34px 高），不能是别的
+        // 东西——滚动条覆盖层一旦混进滚动容器的 child 列表，全部行号就会
+        // 顶后一位，跟随滚动永远慢一拍（修复前正是这个病）。
+        let row0_h = cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                v.palette_scroll
+                    .bounds_for_item(0)
+                    .map(|b| f32::from(b.size.height))
+            })
+        });
+        assert_eq!(
+            row0_h,
+            Some(34.0),
+            "child_bounds[0] 应是第一行（34px），滚动条层混进来了"
+        );
+    }
+
     /// 键表要真的驱动按键语义：改绑后旧键位失效、解绑吞键，派发动作可用。
     ///
     /// ⚠️ 这里刻意**不写配置文件**：配置目录是整个测试进程共享的一份，
@@ -13915,6 +14430,171 @@ mod tests {
             cleaned.is_ok() && cleaned_installed.is_ok(),
             "清理 fixture 失败：{cleaned:?} {cleaned_installed:?}"
         );
+    }
+
+    /// 「从 .moext 安装」的后半段：解压 → 装 → 面板重取、选中新行，新行停用、盘上有账本。
+    ///
+    /// 前半段（原生文件选择框）headless 弹不出来，所以这里直接调选择框之后的
+    /// [`Self::install_extension_from_zip`]，与 [`Self::installing_shows_the_extension_disabled_and_selected`]
+    /// 同一缝、同一套断言，只是来源形态从「目录」换成「.moext（zip）」。解压与「装出来即
+    /// 停用」都在 `mo_app::extensions::install_from_archive` 里，这里只验证 UI 半段把结果
+    /// 刷进了面板。
+    #[test]
+    fn installing_from_moext_shows_the_extension_disabled_and_selected() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        // 造一份 .moext：压包根下恰好一个子目录（扩展目录）含 manifest.json。
+        let archive = std::env::temp_dir().join(format!("mo-extmoext-{}", std::process::id()));
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("p28zip/manifest.json", opts).unwrap();
+            zw.write_all(
+                r#"{"id":"p28zip","name":"压缩包装的","commands":[{"name":"看一眼","shell":"pwd"}]}"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            zw.finish().unwrap();
+        }
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.install_extension_from_zip(&archive, cx)));
+        cx.run_until_parked();
+
+        cx.debug_bounds("mo-ext-row-p28zip")
+            .expect("装完面板当场要有这一行，不该靠关掉再开");
+        cx.debug_bounds("mo-ext-toggle-p28zip")
+            .expect("新行有可启停的胶囊");
+        cx.debug_bounds("mo-ext-detail-p28zip-0")
+            .expect("装完选中新行，贡献清单当场展开");
+
+        let (installed_enabled, on_disk, has_ledger) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                let enabled = v
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == "p28zip")
+                    .map(|e| e.manifest.enabled);
+                (
+                    enabled,
+                    std::fs::read_to_string(ext_root.join("p28zip/manifest.json")).unwrap(),
+                    ext_root.join("p28zip/installed.json").is_file(),
+                )
+            })
+        });
+        assert_eq!(installed_enabled, Some(false), "从压缩包装出来也是停用的");
+        assert!(
+            on_disk.contains("\"enabled\": false"),
+            "盘上的清单是停用的（加载时读的是盘）：{on_disk}"
+        );
+        assert!(has_ledger, "installed.json 没写出来");
+
+        let cleaned = std::fs::remove_file(&archive);
+        let cleaned_installed = std::fs::remove_dir_all(ext_root.join("p28zip"));
+        assert!(
+            cleaned.is_ok() && cleaned_installed.is_ok(),
+            "清理 fixture 失败：{cleaned:?} {cleaned_installed:?}"
+        );
+    }
+
+    /// 卸载扩展的全链路：选中行展开区有「卸载…」按钮 → 点它弹确认卡（盘上不动）
+    /// → Esc 取消回扩展页 → 再点、确认 → **目录整个消失**、面板当场重取、选中行夹回
+    /// 合法区间。与清空回收站同级的破坏性动作，必须过确认卡才动盘。
+    ///
+    /// 选择器全部从扩展 id 派生（与启用确认卡那条同一条纪律——fixture 种在共享的
+    /// 隔离目录里，位置号会被别的测试挪走）。
+    #[test]
+    fn uninstalling_requires_confirmation_then_removes_the_directory() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let dir = ext_root.join("unui");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"id":"unui","name":"要卸载的扩展","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+        cx.debug_bounds("mo-ext-row-unui")
+            .expect("fixture 在盘上，扩展页应当有这一行");
+        // 选中首行（唯一一行）后，详情区里应当有那颗「卸载…」按钮。
+        cx.update(|window, cx| window.click("ext-row-unui", cx));
+        cx.run_until_parked();
+        cx.debug_bounds("mo-ext-uninstall-unui")
+            .expect("选中行的展开区里没有「卸载…」按钮（选择器 mo-ext-uninstall-unui）");
+
+        // ① 点「卸载…」→ 弹确认卡；卡开着 = 还没删，目录原地不动。
+        cx.update(|window, cx| window.click("ext-uninstall-unui", cx));
+        cx.run_until_parked();
+        match modal_of(cx) {
+            Modal::ConfirmUninstallExt(id) => assert_eq!(
+                id.as_str(),
+                "unui",
+                "卡上确认的必须是刚点的那一个扩展（按位置认人就会删错家）"
+            ),
+            other => panic!("点「卸载…」应当弹确认卡，实际 modal = {other:?}（删除没经过确认）"),
+        }
+        cx.debug_bounds("mo-ext-uninstall-ok")
+            .expect("确认卡的「卸载」按钮没渲染（选择器 mo-ext-uninstall-ok）");
+        assert!(dir.is_dir(), "确认卡开着，盘上不该已经删了");
+
+        // ② Esc = 取消，回到扩展页，目录还在。
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "Esc 应当回到扩展页，而不是把整页关掉：{:?}",
+            modal_of(cx)
+        );
+        assert!(dir.is_dir(), "取消 = 不删盘");
+
+        // ③ 再点一次、这回真卸：目录整个消失，面板当场重取（行没了）、回到扩展页。
+        cx.update(|window, cx| window.click("ext-uninstall-unui", cx));
+        cx.run_until_parked();
+        assert!(
+            matches!(modal_of(cx), Modal::ConfirmUninstallExt(_)),
+            "第二次点应当还是弹卡"
+        );
+        cx.update(|window, cx| window.click("ext-uninstall-ok", cx));
+        cx.run_until_parked();
+
+        assert!(!dir.exists(), "点了「卸载」之后目录应当整个消失");
+        assert!(
+            matches!(modal_of(cx), Modal::Extensions),
+            "卸载后回到扩展页，而不是把面板关掉：{:?}",
+            modal_of(cx)
+        );
+        let (row_count, selected_ok) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                (
+                    v.extensions.len(),
+                    v.ext_index < v.extensions.len().max(1) || v.extensions.is_empty(),
+                )
+            })
+        });
+        assert_eq!(row_count, 0, "面板应当当场重取，别靠关掉再开");
+        assert!(selected_ok, "选中行下标要夹回合法区间");
     }
 
     /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。

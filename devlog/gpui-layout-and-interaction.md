@@ -862,3 +862,29 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
     `move_cursor` 仍只给列表行）。
   - `mo-ui/src/app.rs` 单测：`located_row` 的四种视图换算（含 `grid_cols = 0`
     按 1 列算、不 panic）与连按检测的边界（`""` / `"a"` / `"ab"` / `"aaa"`）。
+
+## 键盘选中行跟随滚动（命令面板 / 全局搜索，2026-09-28）
+
+* **病**：命令面板上下键只改 `palette_index`，列表纹丝不动；kit 的
+  `overflow_y_scrollbar()` 把滚动句柄藏进私有 keyed state
+  （`scroll_handle_for` 私有，`use_keyed_state(id)`），外面拿不到，没法
+  `scroll_to_item`。
+* **收口**：自持 `ScrollHandle`（gpui 本体的，实现了 kit 的
+  `ScrollbarHandle`），照 kit wrapper 的三层结构自拼：root 定尺寸 +
+  `relative` + `overflow_hidden`；滚动区（area）`overflow_y_scroll` +
+  `track_scroll(&handle)` + `restrict_scroll_to_axis`，**直接持有行**；
+  kit 的 `vertical_scrollbar(&handle)` 挂 root 上与滚动区**平级**。
+  行加 `flex_none`（gpui 子元素默认 `flex_shrink: 1.0`，不定住会被视口
+  压扁而不是溢出滚动）。先例：kit 自家 popup_menu / dock tab_panel。
+* ⚠️ **滚动条层绝不能挂进被 track 的滚动容器**：`vertical_scrollbar` 会往
+  该元素的 child 列表追加一个 `absolute inset_0` 覆盖层，它被记成
+  `child_bounds[0]`（340px 高那次探针就是这么抓到的），**全部行号顶后一
+  位**，`scroll_to_item` 静默滚错行/不滚。滚动区必须只装内容。
+* ⚠️ **`scroll_to_item` 的待滚动项在 prepaint 才被消费**：headless 测试里
+  先 `window.painted_quads()` 强制画一帧，再读 `handle.offset()`。
+* ⚠️ **偏移符号**：向下滚是**负值**（顶=0，底=-max_offset），断言别写反。
+* 三个列表各持一个句柄（`palette_scroll` / `app_picker_scroll` /
+  `search_scroll`），不共用——句柄的待滚动项状态跨模态残留会把上一个
+  模态的下标滚进下一个模态。
+* 回归：`palette_selection_follows_keyboard_scrolling`（推到底偏移<0、
+  回顶归零、`bounds_for_item(0)` 高=34px 钉行号对位）。

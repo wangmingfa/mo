@@ -121,15 +121,20 @@ impl Entry {
         image_extension(&self.name).unwrap_or_default()
     }
 
-    /// 该条目是否值得生成缩略图（目前只处理图片）。
+    /// 该条目是否值得生成缩略图。
+    ///
+    /// 问的是嵌入解码器**实际能解**的集合（`types::supports_thumbnail_ext`，
+    /// `mo-thumbnails::generate_to_with` 的同一份判据），不是「类型上是不是图片」——
+    /// 否则 `.tiff` 这种类型表当图片认、解码器却解不动的后缀会白派一次取图任务
+    /// （devlog/engine-testing.md §7）。
     pub fn supports_thumbnail(&self) -> bool {
         if !self.kind.is_file() {
             return false;
         }
-        matches!(
-            image_extension(&self.name).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff")
-        )
+        image_extension(&self.name)
+            .as_deref()
+            .map(crate::types::supports_thumbnail_ext)
+            .unwrap_or(false)
     }
 
     /// 给用户看的名字（见 [`display_name`]）。

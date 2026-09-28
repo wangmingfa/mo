@@ -44,12 +44,28 @@ pub struct TypeRule {
 /// `mo_core::types` 那三问同一条判据。
 pub type TypeLabels = BTreeMap<String, String>;
 
-/// [`AppState::type_labels`](crate::AppState::type_labels) 那份缓存的形状：
-/// `(上次读到的清单签名, 表)`，`None` = 还没读过。
+/// 两个扩展抢同一个扩展名、先到先得之后，输的那一方的那条记录。
 ///
-/// 起了名字是因为 `Arc<Mutex<Option<(u64, Arc<TypeLabels>)>>>` 这种嵌套 clippy 会说
-/// 「太复杂」，而它确实到了该有个名字的厚度。
-pub type TypeLabelCache = Option<(u64, std::sync::Arc<TypeLabels>)>;
+/// 缓存里带这一批是为了让扩展管理器能按 `loser` 归并、把「你的 `.xxx` 被别人抢先认领、
+/// 这条不生效」亮在输家那一家的下面（P2 剩余 #2）——否则它只会留在 `tracing::warn!`
+/// 里，写清单的人对着界面查不出自己的标签为什么没出现。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeLabelConflict {
+    /// 被抢的扩展名（小写、不含点）。
+    pub ext: String,
+    /// 赢家扩展 id（按目录名排序先到）。
+    pub winner: String,
+    /// 输家扩展 id（它的 `types` 里写了这个扩展名，但表里已经有人先占了）。
+    pub loser: String,
+}
+
+/// [`AppState::type_labels`](crate::AppState::type_labels) 那份缓存的形状：
+/// `(上次读到的清单签名, 表, 撞车记录)`，`None` = 还没读过。
+///
+/// 起了名字是因为
+/// `Arc<Mutex<Option<(u64, Arc<TypeLabels>, Vec<TypeLabelConflict>)>>>` 这种嵌套 clippy
+/// 会说「太复杂」，而它确实到了该有个名字的厚度。
+pub type TypeLabelCache = Option<(u64, std::sync::Arc<TypeLabels>, Vec<TypeLabelConflict>)>;
 
 /// 一个扩展的清单。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,6 +399,145 @@ pub fn install_from(source: &Path, root: &Path) -> Result<Manifest, String> {
     Ok(m)
 }
 
+/// 把一份 `.moext`（zip 压缩包）装进来：解压到临时目录 → 定位扩展目录 → 走
+/// [`install_from`](crate::extensions::install_from)（复制 + 改写停用 + 记账）。
+///
+/// `.moext` 是「正门之外」的另一条正门：用户当面在一份文件上点选，比「把一个目录
+/// 拖来指认」更适合分发——下载得到的就是一份文件，而不是一坨散目录。解压失败 / 定位
+/// 不到清单 / 装失败，都要把临时目录清掉，不留半截在 `TMPDIR` 里。
+///
+/// 压缩包里的布局两种都认（给作者留余地）：清单 `manifest.json` 要么在解压根，要么在
+/// 根下恰好一个子目录里（那个子目录就是扩展目录）。其它布局（根下多个目录、或散文件
+/// 没有清单）一律拒——那不是一份扩展包，硬塞只会装出结构错乱的一坨。
+pub fn install_from_archive(archive: &Path, root: &Path) -> Result<Manifest, String> {
+    let dest = std::env::temp_dir().join(format!(
+        "mo-moext-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    if let Err(e) = extract_zip(archive, &dest) {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(e);
+    }
+    let source = match locate_source(&dest) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(e);
+        }
+    };
+    // 解压出来的是副本，`install_from` 还会再复制一份进扩展目录；装完（成功或失败）
+    // 临时目录都没用了，清掉。
+    let result = install_from(&source, root);
+    let _ = std::fs::remove_dir_all(&dest);
+    result
+}
+
+/// 卸载一个扩展：删掉 `root/<id>` 整个目录。
+///
+/// 「卸载 = 删目录」是这张扩展模型的语义：一个扩展就是「一份清单 + 它带的文件」，
+/// 没有注册表、没有要回收的系统资源——目录没了，它贡献的一切（命令 / 工作流 /
+/// 键位 / 侧栏行 / 种类文案）在调用方下次重取时自然消失（缓存按目录指纹作废，
+/// 见 `fingerprint` / `declarations_fingerprint`）。装好的与手工摆放的落点相同，
+/// 卸载语义没有分别。
+///
+/// id 先过 [`valid_id`] 再拼路径：这是外部进来的字符串，`..` 里的点不在合法字符
+/// 集里，`root.join(id)` 就指不出扩展目录，路径穿越无门。
+pub fn uninstall_extension(id: &str, root: &Path) -> Result<(), String> {
+    if !valid_id(id) {
+        return Err(format!("id「{id}」不合法（只允许小写字母、数字、_、-）"));
+    }
+    let target = root.join(id);
+    if !target.is_dir() {
+        return Err(format!("扩展目录里没有「{id}」（可能已经卸载了）"));
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| format!("删 {} 失败：{e}", target.display()))
+}
+
+/// 解压一个 zip 到 `dest`（dst 必须不存在或为空）。
+///
+/// 三条与 [`copy_tree`](crate::extensions::copy_tree) 同一条纪律：目录按名排序遍历
+/// （zip 里条目顺序不定，排序让结果可复现）、符号链接拒收、路径要防 zip-slip（
+/// [`zip::ZipFile::enclosed_name`] 会把 `../` 与绝对路径挡成 `None`）。压包是从外部
+/// 进来的，里面的链接指向哪只有来源机器知道，复制它等于抄一段意义不明的内容进来。
+fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(archive).map_err(|e| format!("打不开 .moext：{e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!(".moext 不是合法的 zip：{e}"))?;
+    std::fs::create_dir_all(dest).map_err(|e| format!("建临时解压目录失败：{e}"))?;
+    for i in 0..archive.len() {
+        let mut zf = archive
+            .by_index(i)
+            .map_err(|e| format!("读 .moext 内容失败：{e}"))?;
+        // enclosed_name：路径若想逃出 dest（../ 或绝对路径）就返回 None——防 zip-slip。
+        let Some(safe) = zf.enclosed_name().map(|p| p.to_path_buf()) else {
+            return Err(format!("压包里有不安全路径「{}」，不装", zf.name()));
+        };
+        let out = dest.join(&safe);
+        if zf.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("建 {} 失败：{e}", out.display()))?;
+            continue;
+        }
+        // 拒收符号链接：与 copy_tree 同一句判据（unix 上靠 mode 识别；Windows 上 zip
+        // 几乎没有 symlink 概念，这条静默跳过即可）。
+        #[cfg(unix)]
+        {
+            let mode = zf.unix_mode().unwrap_or(0);
+            if (mode & 0o170000) == 0o120000 {
+                return Err(format!(
+                    "{} 是符号链接，不装（扩展包里不该有链接）",
+                    zf.name()
+                ));
+            }
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("建 {} 失败：{e}", parent.display()))?;
+        }
+        let mut buf = Vec::with_capacity(zf.size() as usize);
+        zf.read_to_end(&mut buf)
+            .map_err(|e| format!("读 {} 失败：{e}", zf.name()))?;
+        std::fs::write(&out, &buf).map_err(|e| format!("写 {} 失败：{e}", out.display()))?;
+    }
+    Ok(())
+}
+
+/// 在解压根里找到「扩展目录」：清单 `manifest.json` 要么直接在此，要么在根下恰好一个
+/// 子目录里。
+fn locate_source(extracted: &Path) -> Result<PathBuf, String> {
+    if extracted.join("manifest.json").is_file() {
+        return Ok(extracted.to_path_buf());
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut entries = std::fs::read_dir(extracted).map_err(|e| format!("读解压目录失败：{e}"))?;
+    while let Some(e) = entries
+        .next()
+        .transpose()
+        .map_err(|e| format!("读解压目录失败：{e}"))?
+    {
+        let p = e.path();
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    if dirs.len() == 1 && dirs[0].join("manifest.json").is_file() {
+        return Ok(dirs.swap_remove(0));
+    }
+    Err(
+        "压包里找不到 manifest.json（.moext 应当是一份扩展目录，或顶层直接含 manifest.json）"
+            .into(),
+    )
+}
+
+/// 一个尽量不撞车的临时目录后缀：进程 id 不够（同一进程里多次安装会撞），补上纳秒。
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 /// 把 `src` 整棵复制到 `dst`（dst 必须不存在或为空）。目录按名排序遍历，符号链接
 /// 拒收——扩展是从外部进来的，链接指到哪只有来源机器知道，复制它等于抄一段
 /// 意义不明的目标内容进来。
@@ -543,15 +698,20 @@ pub fn contributions(m: &Manifest) -> Vec<Contribution> {
     out
 }
 
-/// 把各清单的 `types` 摊成「扩展名 → 种类文案」。
+/// 把各清单的 `types` 摊成「扩展名 → 种类文案」，并顺手记下**撞车**（P2 剩余 #2）。
 ///
 /// 两条与 [`flatten`] 同源的规矩：
 /// * 关掉的扩展整体消失（它的命令消失，类型标签也该消失——留着就是「停用了还在改
 ///   我的显示」）；
 /// * 两个扩展抢同一个扩展名时**先到先得**。[`load`] 按目录名排过序，所以「谁先」
-///   是确定的；后到的那条告警一句，作者至少知道自己是输的那一个。
-pub fn type_labels(exts: &[Extension]) -> TypeLabels {
+///   是确定的；后到的那一条被记进 [`TypeLabelConflict`] 的 `loser`，由扩展管理器
+///   按扩展 id 归并亮出，不再只留在 `tracing::warn!` 里。
+pub fn type_labels_report(exts: &[Extension]) -> (TypeLabels, Vec<TypeLabelConflict>) {
     let mut out = TypeLabels::new();
+    // 扩展名 → 占用它的扩展 id：撞车时查赢家用，也顺带挡掉「同一扩展内部重复」（
+    // `validate` 已拒，这里双保险）。
+    let mut owner: BTreeMap<String, String> = BTreeMap::new();
+    let mut conflicts = Vec::new();
     for e in exts {
         let m = &e.manifest;
         if !m.enabled {
@@ -563,19 +723,27 @@ pub fn type_labels(exts: &[Extension]) -> TypeLabels {
                 let Some(key) = norm_ext(raw) else {
                     continue;
                 };
-                if out.contains_key(&key) {
-                    tracing::warn!(
-                        "扩展「{}」的类型标签「.{}」已被另一个扩展认领，忽略这一条",
-                        m.id,
-                        key
-                    );
+                if let Some(winner) = owner.get(&key) {
+                    if winner != &m.id {
+                        conflicts.push(TypeLabelConflict {
+                            ext: key.clone(),
+                            winner: winner.clone(),
+                            loser: m.id.clone(),
+                        });
+                    }
                     continue;
                 }
+                owner.insert(key.clone(), m.id.clone());
                 out.insert(key, t.label.clone());
             }
         }
     }
-    out
+    (out, conflicts)
+}
+
+/// [`type_labels_report`] 的投影：只要表的那一半（列表渲染热路径只用表，不需要撞车记录）。
+pub fn type_labels(exts: &[Extension]) -> TypeLabels {
+    type_labels_report(exts).0
 }
 
 /// 清单目录的「有没有人动过」签名：扩展的个数与目录名，加上每份清单的修改时间与长度。
@@ -1238,6 +1406,59 @@ mod tests {
         );
     }
 
+    /// 撞车要被记进 [`TypeLabelConflict`]、不再只留在日志里（P2 剩余 #2）。
+    ///
+    /// 判据：先到先得（按目录名排序），输家记录 winner / loser；赢家本身不记；关掉的
+    /// 扩展既不抢也不输。这条钉的是「界面上能查到自己的标签为什么没生效」这一半——
+    /// 之前它只会进 `tracing::warn!`。
+    #[test]
+    fn type_labels_report_records_conflicts() {
+        let rule = |ext: &[&str], label: &str| TypeRule {
+            ext: ext.iter().map(|s| s.to_string()).collect(),
+            label: label.to_string(),
+        };
+        let mut off = manifest("off");
+        off.enabled = false;
+        off.types = vec![rule(&[".off"], "停用的标签")];
+        let exts = vec![
+            Extension {
+                manifest: Manifest {
+                    types: vec![rule(&[".log"], "赢家日志")],
+                    ..manifest("win")
+                },
+                path: PathBuf::new(),
+            },
+            Extension {
+                // 与 win 抢 .log，目录名靠后 → 输家。
+                manifest: Manifest {
+                    types: vec![rule(&[".log"], "输家日志")],
+                    ..manifest("lose")
+                },
+                path: PathBuf::new(),
+            },
+            Extension {
+                manifest: off,
+                path: PathBuf::new(),
+            },
+        ];
+        let (labels, conflicts) = type_labels_report(&exts);
+        assert_eq!(
+            labels.get("log").map(|s| s.as_str()),
+            Some("赢家日志"),
+            "先到先得：赢家的标签生效"
+        );
+        let only = conflicts
+            .iter()
+            .find(|c| c.ext == "log")
+            .expect("应当记一条撞车");
+        assert_eq!(only.winner, "win");
+        assert_eq!(only.loser, "lose");
+        assert!(
+            conflicts.iter().all(|c| c.ext != "off"),
+            "停用的扩展不该参与撞车：{conflicts:?}"
+        );
+    }
+
     /// 签名：装一个扩展、改一份清单、再加一个扩展，都要变；什么都不动则不变。
     ///
     /// 这条钉的是「用户手改清单下一帧就生效」这件事的另一半——缓存**会**作废。
@@ -1389,5 +1610,156 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 从 .moext（zip）安装：解压 → 定位扩展目录 → 复制 + 写回停用 + 记账。
+    ///
+    /// 这条钉的是「分发得到的压缩包也能走正门」——与 `install_from` 同一套「装出来即停用」
+    /// 与记账逻辑，只是来源形态从「目录」换成「解压出来的目录」。布局 A：压包根下恰好
+    /// 一个子目录（扩展目录）含 manifest.json。
+    #[test]
+    fn installs_from_archive_unzips_then_disables() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("mo-extzip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let archive = tmp.join("p28.moext");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("p28/manifest.json", opts).unwrap();
+            zw.write_all(
+                r#"{"id":"p28","name":"压缩包来的扩展","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#
+                    .as_bytes(),
+            )
+            .unwrap();
+            zw.start_file("p28/run.cmd", opts).unwrap();
+            zw.write_all(b"echo hi").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let m = install_from_archive(&archive, &root).expect("应当从压缩包装上");
+        assert!(!m.enabled, "从压缩包装出来也是停用的");
+        let target = root.join("p28");
+        assert!(target.join("manifest.json").is_file());
+        assert!(target.join("run.cmd").is_file());
+        let on_disk = std::fs::read_to_string(target.join("manifest.json")).unwrap();
+        assert!(
+            on_disk.contains("\"enabled\": false"),
+            "盘上的清单也要写回停用：{on_disk}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 布局 B：manifest.json 直接在解压根（没有外层扩展目录）。
+    #[test]
+    fn installs_from_archive_with_manifest_at_root() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("mo-extziproot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let archive = tmp.join("flat.moext");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("manifest.json", opts).unwrap();
+            zw.write_all(r#"{"id":"flat42","name":"顶层清单扩展"}"#.as_bytes())
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let m = install_from_archive(&archive, &root).expect("应当装上");
+        assert_eq!(m.id, "flat42");
+        assert!(root.join("flat42/manifest.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 压包里找不到 manifest.json（顶层全是散文件、或根下多个目录）→ 整包拒掉，
+    /// 不留半个目录在扩展目录里，也不留临时解压目录在 TMPDIR。
+    #[test]
+    fn refuses_archive_without_manifest() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("mo-extzipbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let archive = tmp.join("bad.moext");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("readme.txt", opts).unwrap();
+            zw.write_all(b"no manifest here").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(
+            install_from_archive(&archive, &root).is_err(),
+            "没有清单要拒"
+        );
+        assert!(!root.join("bad").exists(), "拒了就不该在扩展目录留东西");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 卸载 = 删整个扩展目录；装好的（带 `installed.json` 账本）与手工摆放的
+    /// 落点相同，语义没有分别。
+    #[test]
+    fn uninstall_removes_the_extension_directory() {
+        let tmp = std::env::temp_dir().join(format!("mo-extun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        let src = tmp.join("来源");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"un1","name":"要被卸载的扩展"}"#,
+        )
+        .unwrap();
+        install_from(&src, &root).expect("先装上");
+        assert!(root.join("un1").is_dir());
+
+        uninstall_extension("un1", &root).expect("应当卸掉");
+        assert!(!root.join("un1").exists(), "目录必须整个消失");
+        // 再卸一次：目录已经不在了，报错而不是静默成功（调用方好提示）。
+        assert!(
+            uninstall_extension("un1", &root).is_err(),
+            "目录不存在应当报错"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// id 是外部进来的字符串，拼路径前必须过合法性：`../` 里的点不在
+    /// `[a-z0-9_-]` 里，路径穿越无门。
+    #[test]
+    fn uninstall_rejects_ids_that_could_escape_the_root() {
+        let tmp = std::env::temp_dir().join(format!("mo-extunescape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        std::fs::create_dir_all(root.join("victim")).unwrap();
+
+        for bad in ["../victim", "a/b", "..", "UPPER", ""] {
+            assert!(
+                uninstall_extension(bad, &root).is_err(),
+                "id「{bad}」不该被放行"
+            );
+        }
+        assert!(
+            root.join("victim").is_dir(),
+            "邻目录必须原地不动：穿越被 valid_id 拦下"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

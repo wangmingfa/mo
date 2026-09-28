@@ -182,6 +182,24 @@ pub fn icon_share_of(ext: &str) -> IconShare {
     }
 }
 
+/// 嵌入的 `image` crate（`default-features = false`，根 `Cargo.toml` 只开六种特性）
+/// 真正能解码缩略图的后缀。**这是「文件能不能出缩略图」的唯一判据来源**：
+/// * `entry::supports_thumbnail` 据此决定**派不派**取图任务；
+/// * `mo_thumbnails::generate_to_with` 据此（映射到 `ImageFormat`）决定**解不解**。
+///
+/// 两处必须都问这里——否则像 `.tiff` 会因类型表（`preview_of` 当图片认）而派任务、
+/// 解码器却解不动，白跑一次取图任务还看不出毛病（见 devlog/engine-testing.md §7）。
+///
+/// ⚠️ **故意不含** `tiff` / `avif` / `heic`：它们类型上是图片（分组/预览都收），
+/// 但嵌入解码器没开对应特性，解不动。要收紧的是「派不派任务」这道门，不是「是不是图片」——
+/// 把 `tiff` 从类型表删掉是错的方向（那会连分组/预览一起改判）。
+pub const THUMBNAIL_DECODABLE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico"];
+
+/// 这个后缀在嵌入解码器下能出缩略图吗（纯后缀门，不看内容）。
+pub fn supports_thumbnail_ext(ext: &str) -> bool {
+    in_set(THUMBNAIL_DECODABLE_EXTS, ext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +240,35 @@ mod tests {
 
         assert_eq!(preview_of("avif"), PreviewClass::Image);
         assert_eq!(group_of("avif"), GroupKey::Other, "avif 的分组还没跟上");
+    }
+
+    /// 「派不派缩略图任务」与「解码器能不能解」必须问同一份集合
+    /// （`THUMBNAIL_DECODABLE_EXTS`）——这是 devlog/engine-testing.md §7 那个
+    /// `.tiff` 假阳性的根因：类型表（`preview_of`）把 tiff 当图片，而解码闸解不动，
+    /// 两处各说各话，于是白派一次取图任务。
+    ///
+    /// 这道门**故意不含** tiff / avif / heic：它们类型上是图片，但嵌入的 `image`
+    /// crate 没开对应特性，解不动。修法是让 `entry::supports_thumbnail` 与
+    /// `mo_thumbnails::generate_to_with` 都引用这里，而不是把 tiff 从类型表删掉
+    /// （那会连分组/预览一起改判）。
+    #[test]
+    fn thumbnail_decoder_set_matches_what_supports_thumbnail_allows() {
+        // 类型上仍是图片、但解码器解不动——缩略图这道门必须拒。
+        // （`tiff` / `heic` / `avif` 在 `PREVIEW_IMAGE_EXTS` 里被当图片认，正是当初
+        // `.tiff` 假阳性的来源；`tif` 连图片都不是，但解码器同样解不动。）
+        for ext in ["tiff", "tif", "heic", "avif"] {
+            assert!(
+                !supports_thumbnail_ext(ext),
+                "{ext} 不该派取图任务（解码器解不动）"
+            );
+        }
+        for ext in ["tiff", "heic", "avif"] {
+            assert_eq!(preview_of(ext), PreviewClass::Image, "{ext} 仍是图片类型");
+        }
+        // 解码器能解的那六种照常放行。
+        for ext in ["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico"] {
+            assert!(supports_thumbnail_ext(ext), "{ext} 应被缩略图这道门放行");
+        }
     }
 
     /// 集合不许重叠：一个后缀在两问的同一轴上只能属于一族。

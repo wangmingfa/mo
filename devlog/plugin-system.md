@@ -785,12 +785,24 @@ e2e 特意把 fixture 种在**窗口建好之后**，让「面板打开时重取
 写变异体先看一眼它真的改变了被执行的语句。
 
 已知缺口（下一轮别当意外）：
-* **`.moext`（zip）没做**：Windows 的 `IFileDialog` 文件模式与目录模式（
-  `FOS_PICKFOLDERS`）不同框，一个按钮给不出「目录或 zip 二选一」；`install_from`
-  的复制语义本身与传输形态无关，zip 只是搬运，后面补一个「装 zip」入口即可。
+* **`.moext`（zip）入口 ✅ 已落（2026-09-28）**：新增 `mo_platform::pick_file`（Windows
+  `IFileOpenDialog` 文件模式**不**带 `FOS_PICKFOLDERS`、macOS `NSOpenPanel` 只选文件），
+  `extensions::install_from_archive` 解压到临时目录 → 定位扩展目录（清单在解压根、或根下
+  恰好一个子目录里）→ 复用 `install_from`（复制 + 写回停用 + 账本）→ 装完清临时目录不留半截；
+  扩展页加「从 .moext 安装…」（`mo-ext-install-moext`）。两种压包布局都认、zip-slip 与符号
+  链接都拒、压包里找不到清单整包拒掉。`mo-app` +3 单测（`installs_from_archive_unzips_then_disables`
+  / `installs_from_archive_with_manifest_at_root` / `refuses_archive_without_manifest`）、
+  `mo-ui` +1 headless（装完当场有行、停用、账本在）。
 * **手工摆放仍缺省启用**：`Manifest.enabled` 缺省 `true` 的语义不能动（手写清单的
   人不欠一次确认卡），缺口收口靠卸载 / 迁移语义，不在加载侧。
-* **卸载不存在**：重装同名 id 的报错里只能让人手动删目录。
+* **卸载 ✅ 已落（2026-09-28，§10 #3 的另一半）**：`extensions::uninstall_extension`
+  （删 `root/<id>` 整目录，id 先过 `valid_id` 再拼路径——`..` 的点不在合法字符集里，
+  路径穿越无门）+ `AppState::uninstall_extension`；扩展页选中行展开区加「卸载…」按钮
+  （`ext-uninstall-<id>`），先过确认卡 `Modal::ConfirmUninstallExt`（载荷带 id 不带下标，
+  红色确认键，与清空回收站同级的破坏性动作）——Esc / 取消 / 点遮罩都回扩展页，点了
+  「卸载」才删盘、删完面板当场重取、选中行夹回合法区间。缓存按目录指纹自动作废，无需
+  手动清。`mo-app` +2 单测（删目录 / id 穿越拒收）、`mo-ui` +1 headless（弹卡 → 不点头
+  不动盘 → Esc 回页 → 确认后目录消失、行当场没了）。
 * macOS 侧 `pick_folder` 是照本仓 objc 惯例写的，本机（Windows）没法跑；CI 编过
   即算过，真机行为待验。
 
@@ -913,9 +925,10 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 2. **`type_labels` 撞车 warn-only**（§4.11 缺口）：两个扩展抢同一个扩展名、先到先得这件事
    发生在 `AppState::type_labels()` 的缓存里，不在键表里；要亮出来得给类型表也开一条报告
    通道（`load_report` 已有的形状可以照搬）。
-3. **安装收尾**（§4.12 缺口）：`.moext`（zip）入口——Windows 的 `IFileDialog` 文件模式与
-   目录模式不同框，要单独一个按钮或一套自判；**卸载**——删目录 + 清它在 `<缓存>` 里的
-   classify / preview 行（§6），现在重装同名 id 只能让用户手动删。
+3. **安装收尾**（§4.12 缺口）：`.moext`（zip）入口 —— ✅ 已落（2026-09-28，见 §4.12 已知缺口）；
+   **卸载** —— ✅ 已落（2026-09-28：删目录 + 确认卡 + 面板重取，见 §4.12 已知缺口；
+   §6 说的「清 classify / preview 缓存行」属于 P3 provider 落地后的事，现在缓存按目录
+   指纹自动作废，无残留可清）。
 4. **`capabilities` 不收不查**（§4.10 的既定取舍）：P3 做 provider 授权时一次收到位，别提前收。
 
 **验证欠账（headless 够不着的那半条缝）：**
@@ -933,11 +946,23 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
 
 **外围欠账（不属于插件系统，别在这一页修）：**
 
-9. **任务 #24（P1-1 补强）**：`mo_core::types` 一张表三处作答的守卫断言 + tiff 缩略图假阳性
-   + 「种类」文案收口 `mo_core::types::label_of`（P2-3 起那张独立表是刻意的，见记忆里的
-   设计取舍）。
-10. **手工摆放的清单仍缺省启用**：正门（安装）已闭合；这条等卸载 / 迁移语义，不在加载侧动
-    `enabled` 的缺省值。
+9. **任务 #24（P1-1 补强）**：
+   * `mo_core::types` 一问一答的守卫断言 ✅（2026-09-28）：三问的形状 / 跨轴矛盾（`.svg`、
+     `.avif`）/ 分组四族互斥 / 小写判据都在 `crates/mo-core/src/types.rs` 的 `tests` 里；
+     `mo-ui/file_item::kind_by_ext`（种类文案那张内置表，本轮**不**搬进 `label_of`，见下）与
+     `mo_core::types::group_of`（分组那问）的自相矛盾也钉住了
+     （`kind_label_agrees_with_group_of_and_is_stable`）——正是收口类型知识要消灭的「分组叫图片、
+     种类列却叫别的」那一类显示。
+   * tiff 缩略图假阳性 —— **已修（2026-09-28）**：根因是「派不派取图任务」
+     （`entry::supports_thumbnail`）与「解码器解不解」（`mo_thumbnails::generate_to_with`）两处各说各话，
+     `preview_of` 把 `tiff` 当图片认、解码闸却只放六种格式。修法是把唯一判据收进
+     `mo_core::types::THUMBNAIL_DECODABLE_EXTS` + `supports_thumbnail_ext`，
+     两处都引用它（不是把 tiff 从类型表删掉——那会连分组/预览一起改判）。
+     `mo-core` +2 测试、mo-thumbnails 13 全过。见 `devlog/engine-testing.md` §7。
+   * 「种类」文案收口 `mo_core::types::label_of` —— **按用户决策不做**：`kind_by_ext` 那张独立表是
+     刻意的（P2-3 起），搬进去是大重构，且与 `group_of` 的关系已由上面的守卫钉住，先不迁。
+10. **手工摆放的清单仍缺省启用**：正门（安装）与退路（卸载）都已闭合；`enabled` 缺省值
+    仍不动（手写清单的人不欠一次确认卡）——这是定下的语义，不是待办。
 11. **右键空白处吃选区的 `when_ext`**（§4.6 记了）：语义等有真实插件再定。
 12. macOS 拖出 / 文件剪贴板写、地址栏不认 `/`、TEMP 里没人删的测试目录、§22 macOS US 键表、
     Linux 整体未验——都记在 `devlog/windows-port.md` 文末那份待办里，这里不重复。

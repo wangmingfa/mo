@@ -876,6 +876,19 @@ impl Keymap {
         &self.dropped
     }
 
+    /// 所有**非内置**的绑定（配置里的用户命令 / 工作流、扩展清单贡献的那些）。
+    ///
+    /// 设置页要把这批亮出来——之前 `keys_body` 只遍历 [`BINDINGS`]，写扩展 / 自定义命令
+    /// 的人对着设置页查不到自己贡献的键位（P2 剩余 #1）。返回引用：渲染只需读取，不改
+    /// 这张表。
+    pub fn contributed(&self) -> Vec<(&KeyCombo, &Chord)> {
+        self.entries
+            .iter()
+            .filter(|(_, chord)| !matches!(chord, Chord::Builtin(_)))
+            .map(|(combo, chord)| (combo, chord))
+            .collect()
+    }
+
     /// 这个键位现在归谁（含「用户显式解绑过」——他说这颗键什么都不该干）。
     fn occupant(&self, combo: &KeyCombo) -> Option<String> {
         if self.is_unbound(combo) {
@@ -1408,6 +1421,24 @@ mod tests {
         );
         // 内置动作没有 source，也就永远不该出现在任何一家的「没生效」下面。
         assert_eq!(b("tab.new").source(), None);
+    }
+
+    /// 设置页要能列出非内置的键位（P2 剩余 #1）：`contributed()` 把配置 / 扩展贡献的
+    /// 生效键位挑出来，且不含任何内置动作（内置那批由 `BINDINGS` 列表单独管）。
+    #[test]
+    fn contributed_keys_are_listed_alongside_builtins() {
+        let map = Keymap::build(&HashMap::new(), &[cmd("数一下", "cmd+alt+shift+j")], &[]);
+        let titles: Vec<String> = map.contributed().iter().map(|(_, c)| c.title()).collect();
+        assert!(
+            titles.iter().any(|t| t == "数一下"),
+            "生效的贡献键位要出现：{titles:?}"
+        );
+        assert!(
+            map.contributed()
+                .iter()
+                .all(|(_, chord)| !matches!(chord, Chord::Builtin(_))),
+            "contributed 不该含任何内置动作"
+        );
     }
 
     /// 贡献的命令一律算「读当前选择」——模态打开时要吞键。
