@@ -4954,6 +4954,10 @@ impl RootView {
 
     /// 打开快捷键设置器——统一设置窗口的「快捷键」页。
     pub(crate) fn open_keys_picker(&mut self, cx: &mut Context<Self>) {
+        // 这一夜起这页要展示贡献键位与被拒的那批（P2 剩余 #1），键表重取的理由与
+        // [`Self::open_extensions_picker`] 同一个：用户改完清单 / 配置马上来看，
+        // 看到的必须是**这一刻**的账，不是启动时或上次开面板的旧账。
+        self.keymap = keymap_from(&self.app());
         self.open_settings(SettingsTab::Keys, cx);
     }
 
@@ -14595,6 +14599,183 @@ mod tests {
         });
         assert_eq!(row_count, 0, "面板应当当场重取，别靠关掉再开");
         assert!(selected_ok, "选中行下标要夹回合法区间");
+    }
+
+    /// 设置「快捷键」页要列出贡献键位（P2 剩余 #1 的收口）。
+    ///
+    /// 三件事：生效的贡献键位一行（动作名 + 键位）、被拒的亮出原因（坏键串 / 撞车）、
+    /// **用户 `commands/*.json` 里写坏的键串也有地方看**——扩展页按 source 过滤后它们
+    /// 没有归属行（§4.11 的缺口），设置页不挑来源，是它们唯一的去处。
+    ///
+    /// 判据在 `keys.rs`（`contributed()` / `dropped()` 各有单测），这里守的是**接线**：
+    /// `open_keys_picker` 有没有重取键表（fixture 在窗口建好**之后**才种，不重取就是
+    /// 启动时的旧账——与 §4.11 的 M3 同一个手法）、`keys_body` 有没有把这两批画出来。
+    /// 变异体「`open_keys_picker` 里不重取」红在模型侧那句；「`keys_body` 跳过贡献块」
+    /// 只有渲染侧那几句红。
+    #[test]
+    fn settings_keys_page_lists_contributed_and_dropped_chords() {
+        let config = crate::isolate_user_dirs_for_tests();
+        let dir = config.join("extensions").join("p29keys");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 用户自己的命令清单写坏键串：来源是 commands 目录，扩展页亮不出来。
+        let cmds_dir = config.join("commands");
+        std::fs::create_dir_all(&cmds_dir).unwrap();
+        let cmds_file = cmds_dir.join("p29keys.json");
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        // 窗口建好**之后**才种 fixture（键表在 `RootView::new` 里按当时的盘上状态建）：
+        // 这样键表里的贡献键位只能来自 `open_keys_picker` 的重取，接线断了这条就红。
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p29keys",
+  "name": "字幕工具P29",
+  "commands": [
+    { "name": "数一数", "shell": "wc -w {file}", "key": "cmd+alt+shift+y" },
+    { "name": "键串写错", "shell": "pwd", "key": "p29-不是键" }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &cmds_file,
+            r#"{ "name": "配置里写错的", "shell": "pwd", "key": "p29cfg-不是键" }"#,
+        )
+        .unwrap();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_keys_picker(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // 模型侧：生效的一条 + 被拒的两条（来源不同、都在账上）。
+        let (contrib_pos, drop_positions) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                let contrib_pos = v
+                    .keymap
+                    .contributed()
+                    .iter()
+                    .position(|(_, c)| c.title() == "字幕工具P29 · 数一数");
+                let drops: Vec<usize> = v
+                    .keymap
+                    .dropped()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.spec.starts_with("p29"))
+                    .map(|(i, _)| i)
+                    .collect();
+                (contrib_pos, drops)
+            })
+        });
+        let contrib_pos =
+            contrib_pos.expect("生效的贡献键位应当进表（open_keys_picker 应当重取键表）");
+        assert_eq!(
+            drop_positions.len(),
+            2,
+            "两条写坏的键串都要有账可查：扩展清单一条、用户命令一条（{drop_positions:?}）"
+        );
+
+        // 渲染侧：三行都画出来了。行的选择器是「第几条」——上面模型侧已把下标钉住，
+        // 这里按下标找行，并行测试污染了账的长度也不会指错行。
+        // ⚠️ `debug_bounds` 认 `&'static str`（选择器不参与运行时拼接），测试里下标
+        // 是动态的，leak 一份（测试进程退出即回收，量级几字节）。
+        let sel_contrib: &'static str =
+            Box::leak(format!("mo-keys-contrib-{contrib_pos}").into_boxed_str());
+        cx.debug_bounds(sel_contrib)
+            .unwrap_or_else(|| panic!("贡献键位那行没画出来（{sel_contrib}）"));
+        for i in &drop_positions {
+            let sel: &'static str = Box::leak(format!("mo-keys-drop-{i}").into_boxed_str());
+            cx.debug_bounds(sel)
+                .unwrap_or_else(|| panic!("被拒键位那行没画出来（{sel}）"));
+        }
+
+        let cleaned_ext = std::fs::remove_dir_all(&dir);
+        let cleaned_cmds = std::fs::remove_file(&cmds_file);
+        assert!(
+            cleaned_ext.is_ok() && cleaned_cmds.is_ok(),
+            "清理 fixture 失败：{cleaned_ext:?} {cleaned_cmds:?}"
+        );
+    }
+
+    /// 类型标签撞车亮在**输家**那一家下面（P2 剩余 #2 的收口）。
+    ///
+    /// 判据在 `extensions::type_labels_report`（先到先得后记账，有单测），这里守的是
+    /// **接线**：`AppState::type_label_conflicts` 有没有把缓存里那一半交出来、
+    /// `render_extensions` 有没有按 `loser` 把句子画到那一家的展开区。变异体
+    /// 「`type_label_conflict_lines` 返回空」只有渲染侧红；「接线断了」模型侧先红。
+    ///
+    /// fixture 两家：目录名字典序决定谁先到（`load` 按目录名排序），所以 `p29a` 赢、
+    /// `p29b` 输。赢家不被告知（它的标签生效着）。
+    #[test]
+    fn type_label_conflicts_show_under_the_loser_extension() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let dir_win = ext_root.join("p29a");
+        let dir_lose = ext_root.join("p29b");
+        for (d, label) in [(&dir_win, "赢家标签P29"), (&dir_lose, "输家标签P29")] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("manifest.json"),
+                format!(
+                    r#"{{ "id": "{}", "name": "{}", "types": [ {{ "ext": [".p29z"], "label": "{}" }} ] }}"#,
+                    d.file_name().unwrap().to_string_lossy(),
+                    label,
+                    label
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.debug_bounds("mo-ext-row-p29a").expect("赢家那行没出现");
+        cx.debug_bounds("mo-ext-row-p29b").expect("输家那行没出现");
+
+        // 模型侧：一笔账，赢家 p29a / 输家 p29b，停用语义由单测管（这里两家都启用）。
+        let conflicts =
+            cx.update(|_w, cx| root.update(cx, |v, _cx| v.app().type_label_conflicts()));
+        let hit = conflicts
+            .iter()
+            .find(|c| c.ext == "p29z")
+            .expect("撞车没有被记进缓存");
+        assert_eq!(
+            (hit.winner.as_str(), hit.loser.as_str()),
+            ("p29a", "p29b"),
+            "先到先得按目录名字典序：{conflicts:?}"
+        );
+
+        // 渲染侧：选输家 → 句子亮在它下面；选赢家 → 没有这句。
+        cx.update(|window, cx| window.click("ext-row-p29b", cx));
+        cx.run_until_parked();
+        cx.debug_bounds("mo-ext-detail-p29b-typelabel-0")
+            .expect("输家那家的展开区没有「被抢先认领」这句");
+        cx.update(|window, cx| window.click("ext-row-p29a", cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("mo-ext-detail-p29a-typelabel-0").is_none(),
+            "赢家的标签生效着，不该被告诉「这条不生效」"
+        );
+
+        let cleaned_win = std::fs::remove_dir_all(&dir_win);
+        let cleaned_lose = std::fs::remove_dir_all(&dir_lose);
+        assert!(
+            cleaned_win.is_ok() && cleaned_lose.is_ok(),
+            "清理 fixture 失败：{cleaned_win:?} {cleaned_lose:?}"
+        );
     }
 
     /// 标签页的远程徽标只在「正在浏览远程」的标签上出现。
