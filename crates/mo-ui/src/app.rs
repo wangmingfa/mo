@@ -15339,6 +15339,109 @@ mod tests {
         );
     }
 
+    /// 连续选中的块：块首只圆上角、块尾只圆下角、中间直角相连（用户报：
+    /// 连选中间不该出现圆角豁口）；块外的行四角全圆。
+    #[test]
+    fn selected_run_rounds_only_its_outer_corners() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 5 行：选中间三行（1..=3）成一个连续块，0 / 4 作块外对照。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                let p = v.panel_mut();
+                p.view_mode = crate::panel::ViewMode::List;
+                p.path = Some(PathBuf::from("/mo-run-rounding-test"));
+                p.window_start = 0;
+                p.window = (0..5usize)
+                    .map(|i| {
+                        mo_app::WindowRow::Entry(mo_core::Entry::new(
+                            mo_core::FileId::new(0, i as u128),
+                            format!("entry-{i}"),
+                            mo_core::EntryKind::Directory,
+                            PathBuf::from(format!("/mo-run-rounding-test/{i}")),
+                        ))
+                    })
+                    .collect();
+                p.visible_count = 5;
+                p.list_count = 5;
+                for i in 1..=3 {
+                    p.selection.toggle(mo_core::FileId::new(0, i as u128));
+                }
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let scale = cx.update(|window, _cx| window.scale_factor());
+        let radius = crate::file_list::ROW_RADIUS * scale;
+
+        // 找到每一行**满行尺寸**的底色 quad，读它的四角半径
+        // （顺序：左上、右上、右下、左下）。
+        let quads = cx.update(|window, _cx| window.painted_quads());
+        let mut corners_at = |selector: &'static str| {
+            let b = cx.debug_bounds(selector).expect("行没有渲染");
+            let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+            let (x, y, w, h) = (
+                f32::from(b.origin.x) * scale,
+                f32::from(b.origin.y) * scale,
+                f32::from(b.size.width) * scale,
+                f32::from(b.size.height) * scale,
+            );
+            quads
+                .iter()
+                .find(|q| {
+                    near(q.bounds.origin.x.as_f32(), x)
+                        && near(q.bounds.origin.y.as_f32(), y)
+                        && near(q.bounds.size.width.as_f32(), w)
+                        && near(q.bounds.size.height.as_f32(), h)
+                })
+                .map(|q| {
+                    let c = q.corner_radii;
+                    (
+                        c.top_left.as_f32(),
+                        c.top_right.as_f32(),
+                        c.bottom_right.as_f32(),
+                        c.bottom_left.as_f32(),
+                    )
+                })
+                .unwrap_or_else(|| panic!("{selector} 没有画出同位同尺寸的底色 quad"))
+        };
+
+        let rounded = (radius, radius, radius, radius);
+        let square = (0.0, 0.0, 0.0, 0.0);
+        // 块外（未选中）：四角全圆。
+        assert_eq!(
+            corners_at("mo-file-row-0"),
+            rounded,
+            "块外第 0 行应四角全圆"
+        );
+        assert_eq!(
+            corners_at("mo-file-row-4"),
+            rounded,
+            "块外第 4 行应四角全圆"
+        );
+        // 块首：只圆上角，下角与下一行直角相接。
+        assert_eq!(
+            corners_at("mo-file-row-1"),
+            (radius, radius, 0.0, 0.0),
+            "块首应只圆上角"
+        );
+        // 块中：四角全直——中间不出现豁口。
+        assert_eq!(corners_at("mo-file-row-2"), square, "块中间应四角全直");
+        // 块尾：只圆下角。
+        assert_eq!(
+            corners_at("mo-file-row-3"),
+            (0.0, 0.0, radius, radius),
+            "块尾应只圆下角"
+        );
+    }
+
     /// 网格视图缺格时画的是**同尺寸的空骨架格**（不是 `…`）。
     #[test]
     fn unfilled_grid_cells_match_cell_geometry() {

@@ -258,6 +258,13 @@ fn group_title(key: mo_app::GroupKey) -> &'static str {
 /// 覆盖层（它实现了 `ScrollbarHandle`）。handle 由面板持有——
 /// 每帧新建会把滚动位置清零。
 ///
+/// 列表行底色的圆角半径：斑马纹灰条 / 选中蓝底 / hover 共用同一款
+/// （三者的 bg 都长在同一个行 div 上）。24px 行高下 6px 接近 Finder 手感。
+///
+/// 连续选中的块例外：内部接缝压成直角（见渲染处的 `rounded_t` / `rounded_b`），
+/// 只有块的**外缘**角保持这个半径。
+pub(crate) const ROW_RADIUS: f32 = 6.0;
+
 /// 列表视图的「外壳」状态：列布局 + 排序 + 正在拖动的列。
 ///
 /// 打包传递而不是逐个当参数：`render` 已经有 5 个位置参数，再加 3 个会撞上
@@ -372,6 +379,7 @@ pub fn render(
                             .w_full()
                             .h(px(24.0))
                             .px(px(4.0))
+                            .rounded(px(ROW_RADIUS))
                             .bg(if zebra && i % 2 == 1 {
                                 crate::theme::zebra()
                             } else {
@@ -400,6 +408,7 @@ pub fn render(
                             .w_full()
                             .h(px(24.0))
                             .px(px(4.0))
+                            .rounded(px(ROW_RADIUS))
                             .bg(crate::theme::zebra())
                             .debug_selector(move || format!("mo-file-hd-{i}"))
                             .child(
@@ -436,6 +445,9 @@ pub fn render(
                     .w_full()
                     .h(px(24.0))
                     .px(px(4.0))
+                    // 圆角对斑马纹 / 选中蓝底 / hover / 分栏对比染色统一生效
+                    // （它们都是这一个 div 的 bg，见 `ROW_RADIUS`）。
+                    .rounded(px(ROW_RADIUS))
                     // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
                     // 对比色排在斑马纹**前面**：它比「奇偶行」信息量大得多。
                     .bg(if selected {
@@ -449,6 +461,30 @@ pub fn render(
                     })
                     // 测试用（release no-op）：按绝对行号定位，断言首行相对列表顶部的留白。
                     .debug_selector(move || format!("mo-file-row-{i}"));
+
+                // 连续选中块的**接缝判据**：看窗口快照里的相邻行是否也是「选中的
+                // 数据行」。组头 / 占位 / 未选中行都是天然的块边界（组头横条本身
+                // 横在中间，视觉上必须断开）。窗口快照带上下 BUFFER 行余量，可见
+                // 行的邻居永远取得到；真取不到（列表首尾）就按块边界处理。
+                let run_neighbor_selected = |off: Option<usize>| -> bool {
+                    off.and_then(|o| panel.window.get(o))
+                        .and_then(|r| r.entry())
+                        .map(|e| panel.selection.is_selected(&e.id))
+                        .unwrap_or(false)
+                };
+                let prev_in_run = run_neighbor_selected(offset.checked_sub(1));
+                let next_in_run = run_neighbor_selected(Some(offset + 1));
+                // 块的内部接缝不做圆角：块首只圆上角、块尾只圆下角、中间直角相连，
+                // 视觉上合成一整条圆角带（Finder 同款）。未选中行四角全圆——
+                // 斑马条本来就是一根独立的圆角棒。
+                if selected {
+                    if prev_in_run {
+                        row = row.rounded_t(px(0.0));
+                    }
+                    if next_in_run {
+                        row = row.rounded_b(px(0.0));
+                    }
+                }
 
                 if !selected {
                     // fluent `hover` 在 `InteractiveElement` 上，`Div` 实现了它。
