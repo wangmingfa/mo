@@ -30,7 +30,8 @@ extern "C" {}
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
-use objc::runtime::{Class, Object};
+use objc::declare::ClassDecl;
+use objc::runtime::{Class, Object, Protocol, Sel, BOOL};
 use objc::{msg_send, sel, sel_impl};
 
 use crate::{IconRaster, PlatformError, Volume};
@@ -238,6 +239,258 @@ pub fn write_file_clipboard(paths: &[PathBuf], _cut: bool) -> Result<(), Platfor
         }
         Ok(())
     })
+}
+
+// -------------------------------------------------------------- 拖出到系统
+
+/// `NSPoint` 的 Rust 镜像。`objc` 0.2 的 `Encode` 没有结构体编码的现成实现，
+/// 手工按 Apple 的类型编码表给（`{NSPoint=dd}`）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DragPoint {
+    x: f64,
+    y: f64,
+}
+
+// SAFETY: 编码串与 `NSPoint` 的真实布局一致（双 `double`）。
+unsafe impl objc::Encode for DragPoint {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{NSPoint=dd}") }
+    }
+}
+
+/// `NSRect` 的 Rust 镜像（`NSSize` 同为双 `double`，复用 [`DragPoint`]）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DragRect {
+    origin: DragPoint,
+    size: DragPoint,
+}
+
+// SAFETY: 编码串与 `NSRect` 的真实布局一致。
+unsafe impl objc::Encode for DragRect {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{NSRect={NSPoint=dd}{NSSize=dd}}") }
+    }
+}
+
+/// 拖拽结论回调。`None` = 没落地（取消 / Esc / 起拖失败）。
+type DragDone = Box<dyn FnOnce(Option<bool>) + Send>;
+
+/// `NSDragOperation` 里我们关心的两位。
+const DRAG_OP_COPY: usize = 1;
+const DRAG_OP_MOVE: usize = 16;
+/// 复制与移动都声明，选哪个交给**目标**定（与 Windows 侧同一口径）。
+const DRAG_MASK: usize = DRAG_OP_COPY | DRAG_OP_MOVE;
+
+/// 拖拽源类（`NSDraggingSource`）：一次拖拽一个实例，握着把结论递回 UI 的回调。
+///
+/// 不用 `declare_class!` 而手工 `ClassDecl`：要挂协议（`add_protocol`），顺手把三个
+/// 方法的注册写在一处。类只注册一次（`OnceLock`）。
+fn drag_source_class() -> &'static Class {
+    static CLASS: std::sync::OnceLock<&'static Class> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        let superclass = Class::get("NSObject").expect("NSObject 一定在");
+        let mut decl = ClassDecl::new("MoDragSource", superclass).expect("注册 MoDragSource");
+        // 回调槽：`Box<Option<DragDone>>` 的裸指针存成 usize（`None` = 已消费）。
+        decl.add_ivar::<usize>("mo_callback");
+        unsafe {
+            decl.add_method(
+                sel!(draggingSourceOperationMaskForLocal:),
+                drag_mask_for_local as extern "C" fn(&mut Object, Sel, BOOL) -> usize,
+            );
+            // 新式会话（beginDraggingSession）问的是这一个；旧式问上面那个。
+            // 两个都答，谁问都一样。
+            decl.add_method(
+                sel!(draggingSession:sourceOperationMaskForDraggingContext:),
+                drag_mask_for_context
+                    as extern "C" fn(&mut Object, Sel, *mut Object, isize) -> usize,
+            );
+            decl.add_method(
+                sel!(draggingSession:endedAtPoint:operation:),
+                drag_ended as extern "C" fn(&mut Object, Sel, *mut Object, DragPoint, usize),
+            );
+        }
+        decl.add_protocol(Protocol::get("NSDraggingSource").expect("NSDraggingSource"));
+        decl.register()
+    })
+}
+
+extern "C" fn drag_mask_for_local(_this: &mut Object, _sel: Sel, _local: BOOL) -> usize {
+    DRAG_MASK
+}
+
+extern "C" fn drag_mask_for_context(
+    _this: &mut Object,
+    _sel: Sel,
+    _session: *mut Object,
+    _context: isize,
+) -> usize {
+    DRAG_MASK
+}
+
+/// 会话结束：按目标回的操作判「移动 / 复制 / 没落地」，把回调消费掉。
+extern "C" fn drag_ended(
+    this: &mut Object,
+    _sel: Sel,
+    _session: *mut Object,
+    _at: DragPoint,
+    operation: usize,
+) {
+    let Some(done) = take_drag_callback(this) else {
+        return;
+    };
+    let result = if operation & DRAG_OP_MOVE != 0 {
+        Some(true)
+    } else if operation & DRAG_OP_COPY != 0 {
+        Some(false)
+    } else {
+        None
+    };
+    done(result);
+}
+
+/// 取走回调槽（只消费一次；`None` = 已经取过 / 从没放过）。
+fn take_drag_callback(this: &mut Object) -> Option<DragDone> {
+    let slot = unsafe { *this.get_ivar::<usize>("mo_callback") };
+    if slot == 0 {
+        return None;
+    }
+    unsafe { this.set_ivar("mo_callback", 0usize) };
+    let boxed = unsafe { Box::from_raw(slot as *mut Option<DragDone>) };
+    *boxed
+}
+
+/// 把一批本机文件起一次**真**拖拽（`NSView.beginDraggingSessionWithItems:`）。
+///
+/// ⚠️ 这条**不进单元测试**：起真拖拽会抓住用户的指针跟着走。真机验证只能人工：
+/// 按住文件拖出 Mo 窗口、落到访达里松手。
+///
+/// 手写拖拽没有留下 NSEvent，但按住拖动期间窗口**持续**收到 `mouseDragged`
+/// （事件循环跟着按键走，与指针在不在窗口里无关），`[NSApp currentEvent]` 就是
+/// 最新那一条——起拖直接用它，拖图的位置也锚在它上面（AppKit 记的是「拖图离
+/// 事件位置的距离」作为光标偏移）。
+pub fn begin_drag(paths: Vec<PathBuf>, on_done: DragDone) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    if !appkit_usable() {
+        return false;
+    }
+    // AppKit 调用；不在主线程就丢回去（Mo 的起拖点在 gpui 输入回调里，多半已在）。
+    on_main_thread(move || unsafe { begin_drag_on_main(paths, on_done) })
+}
+
+/// ⚠️ 只在主线程跑（见 [`begin_drag`]）。
+unsafe fn begin_drag_on_main(paths: Vec<PathBuf>, on_done: DragDone) -> bool {
+    let declined = |slot: *mut Option<DragDone>| {
+        // 起拖失败：回调作废（契约是「没起来就不会被调」）。
+        drop(unsafe { Box::from_raw(slot) });
+        false
+    };
+    let slot: *mut Option<DragDone> = Box::into_raw(Box::new(Some(on_done)));
+
+    let Some(app_cls) = Class::get("NSApplication") else {
+        return declined(slot);
+    };
+    let app: *mut Object = msg_send![app_cls, sharedApplication];
+    if app.is_null() {
+        return declined(slot);
+    }
+    // 按住拖动时 Mo 的窗口是 key；拿不到再试 main。
+    let mut window: *mut Object = msg_send![app, keyWindow];
+    if window.is_null() {
+        window = msg_send![app, mainWindow];
+    }
+    if window.is_null() {
+        return declined(slot);
+    }
+    let view: *mut Object = msg_send![window, contentView];
+    if view.is_null() {
+        return declined(slot);
+    }
+    let event: *mut Object = msg_send![app, currentEvent];
+    if event.is_null() {
+        return declined(slot);
+    }
+    // `NSEventTypeLeftMouseDown = 1`、`LeftMouseDragged = 6`。别的类型（滚轮 /
+    // 键盘……）说明此刻根本没有拖拽进行，不硬起。
+    let event_type: isize = msg_send![event, type];
+    if event_type != 1 && event_type != 6 {
+        return declined(slot);
+    }
+    let location: DragPoint = msg_send![event, locationInWindow];
+
+    let Some(items_cls) = Class::get("NSMutableArray") else {
+        return declined(slot);
+    };
+    let items: *mut Object = msg_send![items_cls, array];
+    for p in &paths {
+        let Some(url) = nsurl_for(p) else {
+            return declined(slot);
+        };
+        let Some(item_cls) = Class::get("NSDraggingItem") else {
+            return declined(slot);
+        };
+        let item: *mut Object = msg_send![item_cls, alloc];
+        let item: *mut Object = msg_send![item, initWithPasteboardWriter: url];
+        if item.is_null() {
+            return declined(slot);
+        }
+        // 拖图按**扩展名**取（与 gpui-pre 同款）：`iconForFile:` 会同步打
+        // LaunchServices（还会抖，见 icon.rs 的坑），一批几十条能把起拖卡住。
+        let kind = if p.is_dir() {
+            "public.folder".to_string()
+        } else {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "public.data".to_string())
+        };
+        let Some(ns_kind) = nsstring(&kind) else {
+            return declined(slot);
+        };
+        let ws: *mut Object = msg_send![Class::get("NSWorkspace").unwrap(), sharedWorkspace];
+        let icon: *mut Object = msg_send![ws, iconForFileType: ns_kind];
+        // 拖图框锚在事件位置上：AppKit 把这个框与事件位置的距离记成拖图的光标偏移。
+        let frame = DragRect {
+            origin: DragPoint {
+                x: location.x - 16.0,
+                y: location.y - 16.0,
+            },
+            size: DragPoint { x: 32.0, y: 32.0 },
+        };
+        // 便捷入口是**一条**消息：setDraggingFrame:contents:（frame 与 contents
+        // 同发）。没有 setImageContents: 这个选择器——上一版把它拆成两条发，
+        // 第二条打到不认识它的 NSDraggingItem 上，直接 NSInvalidArgumentException 闪退。
+        let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
+        let _: () = msg_send![items, addObject: item];
+    }
+    let count: usize = msg_send![items, count];
+    if count == 0 {
+        return declined(slot);
+    }
+
+    let cls = drag_source_class();
+    let source: *mut Object = msg_send![cls, alloc];
+    let source: *mut Object = msg_send![source, init];
+    if source.is_null() {
+        return declined(slot);
+    }
+    (*source).set_ivar("mo_callback", slot as usize);
+
+    let session: *mut Object =
+        msg_send![view, beginDraggingSessionWithItems: items event: event source: source];
+    if session.is_null() {
+        // source 这时还没被 AppKit 持有，我们自己的 +1 自己放。
+        (*source).set_ivar("mo_callback", 0usize);
+        let _: () = msg_send![source, release];
+        return declined(slot);
+    }
+    // 会话持有 source 到结束；结束时 AppKit 放掉 → dealloc。我们这边的 +1 用
+    // autorelease 交出去，引用账目两清。
+    let _: () = msg_send![source, autorelease];
+    true
 }
 
 /// 原生目录选择框（`NSOpenPanel`，只选目录）。
@@ -981,5 +1234,26 @@ mod tests {
         );
         // 交叉验证：`cargo test` 里闩从未置位，所以后台任务一律保守。
         assert!(!appkit_usable(), "测试进程没标记过主循环，必须保守");
+    }
+
+    /// 拖拽源类只注册一次，且 `NSDraggingSource` 的关键方法都挂在实例上。
+    ///
+    /// 这条**不起真拖拽**（那会抓住用户的指针），只验注册本身——方法漏挂 /
+    /// 协议没挂的错，AppKit 要到用户拖出去那一刻才炸，单测能在这一步就拦住。
+    #[test]
+    fn drag_source_class_registers_with_its_methods() {
+        let cls = drag_source_class();
+        // 第二次拿必须是同一个类（OnceLock 幂等）。
+        assert!(std::ptr::eq(cls, drag_source_class()));
+        let check = |name: &str| {
+            let sel = Sel::register(name);
+            // `responds_to` 走元类查类方法；实例方法要用 instancesRespondToSelector，
+            // objc 0.2 没包这一层，直接发消息问。
+            let yes: BOOL = unsafe { msg_send![cls, instancesRespondToSelector: sel] };
+            assert_eq!(yes, objc::runtime::YES, "MoDragSource 应响应 {name}");
+        };
+        check("draggingSourceOperationMaskForLocal:");
+        check("draggingSession:sourceOperationMaskForDraggingContext:");
+        check("draggingSession:endedAtPoint:operation:");
     }
 }

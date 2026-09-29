@@ -272,3 +272,41 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
     `ForClassesForOptions`）+ **空字典**作 options——传 `null` 会被桥成 NSNull，
     炸 `unrecognized selector count`。
 * **真机验证通过**（2026-09-29 用户亲测）：Mo 里复制几个文件 → 访达 ⌘V，粘得出。
+
+## 29. macOS 文件拖出补齐：`beginDraggingSessionWithItems`（2026-09-29，04d6e51）
+
+* §25 只接了 Windows 的 OLE 源；macOS 上 `supports_file_drag()` 恒假，拖出窗口后
+  应用内拖拽悄悄死掉。补上 AppKit 那半：`macos::begin_drag` =
+  `NSView.beginDraggingSessionWithItems:`，`NSDraggingItem` 按 `NSURL` 走
+  `NSPasteboardWriting`（与 §28 剪贴板同一类型面）。**mo-ui 零改动**——出界轮询
+  （§25 那条 16ms 探测）与 oneshot 回传本来就是跨平台的，`supports_file_drag()`
+  一翻自然接上。
+* **NSEvent 从哪来**：手写拖拽没像 gpui 那样保留 mouseDown 事件；但按住拖动期间
+  窗口**持续**收到 `mouseDragged`（事件循环跟着按键走，与指针在不在窗口里无关），
+  `[NSApp currentEvent]` 就是最新那条——起拖直接用它，拖图框也锚在它的
+  `locationInWindow` 上（AppKit 记「拖图离事件位置的距离」当光标偏移，gpui-pre
+  注释里点明了这一点）。类型不是 `LeftMouseDown(1)` / `LeftMouseDragged(6)` 就
+  拒绝起拖，不硬来。
+* **拖图按扩展名取**（`iconForFileType:`，gpui-pre 同款）：`iconForFile:` 同步打
+  LaunchServices 且会抖（见 devlog/macos-platform.md 的图标服务坑），一批几十条
+  能把起拖卡住。目录给 `public.folder`，无扩展名给 `public.data`。
+* **NSDraggingSource 手工 `ClassDecl` 注册**（不用 `declare_class!`——要挂协议）：
+  复制与移动都声明、目标定（与 Windows 同一口径）；新式会话问
+  `draggingSession:sourceOperationMaskForDraggingContext:`，旧式问
+  `draggingSourceOperationMaskForLocal:`，两个都答。结论在
+  `draggingSession:endedAtPoint:operation:` 里按回的操作给：
+  Move→`Some(true)`（上层走回收站删源，`finish_file_drag` 现成）、
+  Copy→`Some(false)`、零→`None`。回调槽 `Box<Option<…>>` 裸指针存 ivar，只消费一次。
+* **objc 0.2 的两个坑**：
+  * `Encode` 没有结构体编码——`NSPoint`/`NSRect` 用 `#[repr(C)]` 镜像 +
+    `Encoding::from_str("{NSPoint=dd}")` 手工补；方法签名里的 `NSPoint` 参数
+    （`endedAtPoint:`）就靠它。
+  * **`BOOL` 按架构变型**：x86_64 是 `c_schar`，**aarch64 上是 `bool`**（0.2.7 的
+    cfg）。断言别写 `yes != 0`，用 `assert_eq!(yes, YES)` 两种架构通吃。
+* **测试边界**：起真拖拽会抓住用户的指针跟着走——不进测试（与剪贴板同一条红线）。
+  能测的是：空名单拒绝起拖（回调不被调）；`MoDragSource` 注册冒烟（三个方法
+  `instancesRespondToSelector:` 全响应、`OnceLock` 幂等）——方法漏挂的错 AppKit
+  要到用户拖出去那一刻才炸，注册冒烟在这一步就拦住。
+* **真机验证清单**（人工）：①按住文件拖出 Mo 窗口 → 落到访达 → 应复制进去、
+  源文件留着；②拖出后按 Esc → 什么都没发生；③拖到访达**同一卷宗**里看对面给
+  的结论（若对面判移动 → 源进 Mo 回收站）。Windows 侧 §25 的同款实测仍欠着。

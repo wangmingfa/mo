@@ -358,16 +358,15 @@ pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), Platform
 
 // -------------------------------------------------------------- 拖出到系统
 
-/// 这个平台能不能把文件**拖出**到别的应用（资源管理器 / 其它程序的落点）。
+/// 这个平台能不能把文件**拖出**到别的应用（资源管理器 / 访达 / 其它程序的落点）。
 ///
-/// 只有 Windows。macOS 上 gpui 自己备了出口（`WindowPlatform::start_external_drag`
-/// → `beginDraggingSessionWithItems`），但它只在拖拽由 gpui 的 `on_drag` 发起时才会
-/// 触发；Mo 的应用内拖拽是自己拿鼠标事件写的，gpui 不知道有一次拖拽正在进行，
-/// 于是那条 hook 永远不会响。要么把行拖拽换成 `on_drag` 那套（会牵动应用内落点
-/// 判定，见 `mo_ui::file_list` 的 `begin_drag`），要么在 mo-platform 里另接一份
-/// AppKit——两条都比这一小段贵，先留空。
+/// macOS 走 `NSView.beginDraggingSessionWithItems:`（见 `macos::begin_drag`），
+/// Windows 走 OLE 拖拽源（见 §25）。两条都**不**走 gpui：gpui 的
+/// `promote_external_drag_to_platform` 只认它自己 `on_drag` 起的拖拽，而 Mo 的
+/// 应用内拖拽是手写鼠标事件来的；迁到 `on_drag` 会撞 §24 坑一那条派发行为
+/// （`active_drag` 在命中判定之前就被取走），「拖进来」正是靠它。
 pub fn supports_file_drag() -> bool {
-    cfg!(target_os = "windows")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 起一次「把这批本机文件拖出到系统」，立刻返回。
@@ -380,18 +379,23 @@ pub fn supports_file_drag() -> bool {
 /// * 答 `Some(true)` 时源文件多半还在原处——OLE 的约定是搬走源是**源端**的活，
 ///   调用方得自己去删（Mo 走回收站，比资源管理器直接删更可撤回）。
 ///
-/// ⚠️ `on_done` 跑在**拖拽线程**上，不是 UI 线程。OLE 的 `DoDragDrop` 是模态循环，
-/// 放在 UI 线程上会把 gpui 的事件派发重进去（`App` 正被可变借用 → panic），
-/// 所以这一层自己开线程；要回 UI 线程请调用方自己接一条 channel。
+/// ⚠️ `on_done` 在 Windows 上跑在**拖拽线程**上（OLE 的 `DoDragDrop` 是模态循环，
+/// 放在 UI 线程上会把 gpui 的事件派发重进去 → panic），macOS 上跑在**主线程**上
+/// （AppKit 在会话结束时回调拖拽源）。两条路都不是「调用后立刻拿结论」，
+/// 要回 UI 线程请调用方自己接一条 channel。
 pub fn begin_file_drag(
     paths: Vec<PathBuf>,
     on_done: impl FnOnce(Option<bool>) + Send + 'static,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::begin_drag(paths, Box::new(on_done))
+    }
     #[cfg(target_os = "windows")]
     {
         windows::drag::begin(paths, Box::new(on_done))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (paths, on_done);
         false
@@ -581,6 +585,8 @@ mod tests {
         assert_eq!(supports_volumes(), here_is_macos || here_is_windows);
         assert_eq!(supports_file_icons(), here_is_macos || here_is_windows);
         assert_eq!(supports_pdf(), here_is_macos || here_is_windows);
+        assert_eq!(supports_file_clipboard(), here_is_macos || here_is_windows);
+        assert_eq!(supports_file_drag(), here_is_macos || here_is_windows);
         // 图标泵的闸门：macOS 上还要看主队列（测试进程里必为假，否则 `dispatch_sync`
         // 挂死），Windows 上 shell 查询不挑线程、平台支持即可用。
         if here_is_macos {
@@ -595,6 +601,24 @@ mod tests {
         } else {
             assert_eq!(reveal_label(), "在文件管理器中显示");
         }
+    }
+
+    /// 空名单必须**拒绝起拖**（返回 `false`、回调不被调）。
+    ///
+    /// ⚠️ 只测这一个分支：起真拖拽会抓住用户的指针跟着走（与剪贴板同一条
+    /// 「不碰开发者真实环境」的红线），真机验证走人工。
+    #[test]
+    fn begin_file_drag_declines_empty_paths() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let started = begin_file_drag(Vec::new(), move |_| {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(!started, "空名单不该起拖");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::Relaxed),
+            "没起来的拖拽不许回结论"
+        );
     }
 
     /// 真把它送进**系统**废纸篓：原处必须消失。
