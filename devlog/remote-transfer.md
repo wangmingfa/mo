@@ -147,6 +147,29 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 * 拖拽 / 外部拖入原先散落的 refresh 收编，`submit_os_drop` 的 `refresh` 参数删除。
 * Lagged（广播掉队）按「齐了」处理——刷新是尽力而为，别为它挂死等待。
 
+## 7. 冲突确认卡（2026-09-29，97d669c）
+
+远程目标重名不再静默改名——提交前探测分类 + `Modal::ConfirmConflict` 三选一：
+
+* **分类**（`transfer_between`，与续传共用同一次 `metadata` 探测）：
+  `0 < 已传 < 源大小` → 续传候选；其余已存在（完整同名 / 更大 / 目录）→ 冲突。
+  注意「目标比源**短**的完整文件」按续传语义处理而不是冲突。**冲突优先于续传**：
+  一批里两种都有时只弹冲突卡。
+* **引擎**（mo-operations）：`TransferOpts.overwrite`；`remove_source / resume /
+  overwrite` 收成 `TreeFlags` 把 `transfer_tree` 压回 clippy 7 参内。覆盖 = 不
+  `free_path`、首块 TRUNCATE 照原名重写；目录是**合并**语义——`create_dir` 撞
+  已存在且 overwrite 时继续往里传，其它失败原样上报。
+* **应用层**：`resolve_conflict(pending, ConflictDecision)` 三选一（Overwrite /
+  Rename / Skip，取消 = 丢弃请求）；`submit_transfer_entry` 的两个布尔收成
+  `SubmitMode` 三态压回 7 参。非冲突文件挂 Resume，批里并存的部分完成文件仍可
+  续写（`can_resume` 兜底）。
+* **UI**：与续传卡同外壳同交互（Esc / 点遮罩什么都不提交）；按钮顺序把危险的
+  「覆盖」放最右、不给主色，主色与 Enter 都给安全的「改名」；决策提交后同款挂
+  完成即刷新（§6 的 `watch_then_refresh_task`）。
+* **测试**：`mo-app/tests/conflict.rs`（探测不提交 + 三决策；桩补 `offset==0`
+  TRUNCATE 语义——纯区间替换桩会让覆盖写残留旧尾，四个真实后端都是清的）；
+  mo-ui headless 用例。反向验证：禁用探测 → 4 条全红。
+
 ## 待办
 
 * 大文件**整份进内存**已修（2026-09-29 起，2026-09-30 收尾四个后端）：`FileSystem` 加
@@ -157,7 +180,8 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   每块 O(n²) 重传）。读侧 local/sftp/ftp 走 range/整份切片；**webdav 读侧也已加 Range GET**
   （`read_file_chunk` 发 `Range: bytes=…` 的 GET，206 即这一块；服务器不支持 Range 时回 200
   整份，按区间切出、行为仍正确但内存退回整份——服务器限制）。断点续传已做（§5，重提弹确认卡，无 journal、靠磁盘上的部分文件判断，进程内 / 重启后都能续）。
-* 远程传输的**冲突策略**只做到「目标名去重」，没有冲突对话框 / 覆盖选项。
+* ~~远程传输的**冲突策略**只做到「目标名去重」~~ 已做（§7，批级三选一 + 取消；
+  逐个文件决策、本地对的冲突对话框仍没有——本地有 `ConflictPolicy::Rename` 兜底）。
 * 远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义。
 * 远程目录没有 watcher（改完必须重读）——传输完成的自动刷新已做（§6），但**其它**改动
   （另一台设备写入、本进程外部的操作）仍要用户手动刷新或重进目录。
