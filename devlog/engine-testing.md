@@ -242,3 +242,5 @@ for _ in 0..n - 1 { cx.simulate_keystrokes("down"); }
 * **守卫**：`isolate_sweep_tests::sweep_removes_only_mo_test_prefixed_dirs`——
   TTL=0 下我们的前缀必删、前缀不匹配不碰、本进程目录不碰。
 * 残留的存量目录不用手动清：24h 前的下一次测试跑起来就扫掉了。
+
+* **补记（同日 69655e6）**：清扫下沉成 `mo_fs::sweep_stale_temp_dirs(prefixes, ttl)` 共用——mo-app 的 `mo-app-store-*` / `mo-trash-*` 也是大户（一次全量留 400+），由 `tests/common::store()` 进程级一次性扫；mo-ui 的实现删除、委托过来。行为钉子也跟着搬进 mo-fs。

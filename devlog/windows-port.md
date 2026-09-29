@@ -225,7 +225,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **⚠️ 一次调用清一遍目录**：`store()` 每次都 `remove_dir_all` + 重建（防 pid 复用读到上一轮的脏索引），于是「重开应用后索引还在不在」这类要**同一个库上跑两趟**的用例不能写成「同一个 `tag` 调两次 `isolated`」——第二次会把上一轮写下的索引抹成空库。`index_survives_a_restart`、`metadata_cache_primes_entries_on_reopen` 因此改成两次构造夹着等待全放进**一次**闭包。这条是跨平台雷：POSIX 上 `unlink` 对已打开的文件照样生效，Windows 上句柄占着恰好抹不动，所以只在 mac/Linux 上红。
 * **顺带改了一处异步形状**：`metadata_cache_primes_entries_on_reopen` 从 `#[tokio::test]` 改成 `#[test]` + 自己起 `tokio::runtime::Runtime`。原因是 `isolated` 收的是**同步**闭包（它抱着那把 `Mutex`），而「等元数据写回缓存」必须是真异步——只能在闭包里对一个新起的 runtime 调 `block_on`；留在 `#[tokio::test]` 里做不了，在正在跑的 runtime 内部再 `block_on` 会直接 panic（*Cannot block the current thread from within a runtime*）。自己握 runtime 也顺便让「构造在锁内、异步在 `block_on` 内」这个顺序显式可见。
 * **`mo-operations` 不在这次的范围里**（不是漏了）：`conflict.rs` / `transfer.rs` 只碰自己的临时树，`grep` 下来整个 crate 的测试既不构造 `AppState` 也不读这两个变量，写进真实索引这条路压根不存在。
-* **验证方式**：还是 §21 那一条——看 mtime，不看日志。`cargo test -p mo-app --all-features`（50 单测 + 十四个集成二进制共 76 个用例）前后，`%LOCALAPPDATA%\mo\search.sqlite` 的修改时间分毫未动（`2026-09-27 10:14:54`），而 TEMP 里多出 418 个 `mo-app-store-*` 目录——它们的存在就是「每个用例都写到了自己的库里」的实证。代价见文末待办（没人删）。
+* **验证方式**：还是 §21 那一条——看 mtime，不看日志。`cargo test -p mo-app --all-features`（50 单测 + 十四个集成二进制共 76 个用例）前后，`%LOCALAPPDATA%\mo\search.sqlite` 的修改时间分毫未动（`2026-09-27 10:14:54`），而 TEMP 里多出 418 个 `mo-app-store-*` 目录——它们的存在就是「每个用例都写到了自己的库里」的实证。堆积的代价已解（TTL 清扫，见 devlog/engine-testing.md 与 `mo_fs::sweep_stale_temp_dirs`）。
 
 ## 27. 顺手修掉一个跑了五轮的随机红，以及「全绿」这两个字是怎么读出来的
 
@@ -241,10 +241,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
 * **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
-* **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
-* **拖放的 Windows 两侧都写完了，但「出去」没实测**（§24 进来、§25 出去）。缺的是同一条：按住文件真拖一次到资源管理器上松手，看它到底落不落子——headless 做不到，得人来。**macOS 两侧都还没接**：`supports_file_drag()` / `supports_file_clipboard()` 在 mac 上都是假，拖出去要嘛迁到 gpui 的 `on_drag`（会撞 §24 坑一），要嘛自己写 `NSDraggingSource`。
-* 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测）。**2026-09-29 查因未果但已布防**（3dd9c69）：读整条链没找到显性根因——std 在 Windows 上按分量解析、两种斜杠本就等价，`submit_address` → `open_directory` → `load_path` → 本地后端也都不改写路径；解析已收口成纯函数 `resolve_address_input`（单测钉住，等价断言 cfg(windows)），submit 打 debug 日志（文本 / 在看远程否 / is_dir 判定结果）。**下次 Windows 复测**：`RUST_LOG=mo_ui=debug cargo run --bin mo`，敲一次路径看日志卡在哪段（解析 / is_dir 拒绝 / 导航失败）。
-* 测试留下的临时目录在 TEMP 里没人删：回收站那些 `mo-trash-<pid>-<seq>`（§21 的 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积），以及 §26 之后每个用例各自的 `mo-app-store-<tag>-<pid>`（一次全量 `cargo test -p mo-app` 留下 400 多个）。隔离目录必须活到进程结束，所以要删得在最后统一收，而「最后」在 crash / ctrl-C 时到不了——真正干净的做法是给 `isolated` 挂一个进程退出时的清理，或用带 TTL 的目录名让下一次跑顺手清掉上一次的。
+* **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
