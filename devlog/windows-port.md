@@ -243,7 +243,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
 * **macOS 的文件剪贴板「出去」没做**（§20 只写了 Windows；`supports_file_clipboard()` 在 mac 上为假）。NSPasteboard 写 `NSURL` 数组是公开 API，工作量不大，但得在 mac 上验，不能空写。
 * **拖放的 Windows 两侧都写完了，但「出去」没实测**（§24 进来、§25 出去）。缺的是同一条：按住文件真拖一次到资源管理器上松手，看它到底落不落子——headless 做不到，得人来。**macOS 两侧都还没接**：`supports_file_drag()` / `supports_file_clipboard()` 在 mac 上都是假，拖出去要嘛迁到 gpui 的 `on_drag`（会撞 §24 坑一），要嘛自己写 `NSDraggingSource`。
-* 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
+* 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测）。**2026-09-29 查因未果但已布防**（3dd9c69）：读整条链没找到显性根因——std 在 Windows 上按分量解析、两种斜杠本就等价，`submit_address` → `open_directory` → `load_path` → 本地后端也都不改写路径；解析已收口成纯函数 `resolve_address_input`（单测钉住，等价断言 cfg(windows)），submit 打 debug 日志（文本 / 在看远程否 / is_dir 判定结果）。**下次 Windows 复测**：`RUST_LOG=mo_ui=debug cargo run --bin mo`，敲一次路径看日志卡在哪段（解析 / is_dir 拒绝 / 导航失败）。
 * 测试留下的临时目录在 TEMP 里没人删：回收站那些 `mo-trash-<pid>-<seq>`（§21 的 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积），以及 §26 之后每个用例各自的 `mo-app-store-<tag>-<pid>`（一次全量 `cargo test -p mo-app` 留下 400 多个）。隔离目录必须活到进程结束，所以要删得在最后统一收，而「最后」在 crash / ctrl-C 时到不了——真正干净的做法是给 `isolated` 挂一个进程退出时的清理，或用带 TTL 的目录名让下一次跑顺手清掉上一次的。
 
 
