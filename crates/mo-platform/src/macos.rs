@@ -1255,5 +1255,21 @@ mod tests {
         check("draggingSourceOperationMaskForLocal:");
         check("draggingSession:sourceOperationMaskForDraggingContext:");
         check("draggingSession:endedAtPoint:operation:");
+
+        // 我们对**系统类**发的选择器也要在测试里核一遍：objc 的消息编译期不校验，
+        // 拼错选择器（或拆错参数）要到用户拖出去那一刻才 NSInvalidArgumentException
+        // 闪退。这次起拖挂掉的就是这类——`setImageContents:` 根本不存在，正确的是
+        // setDraggingFrame:contents:。
+        let system = |cls_name: &str, name: &str| {
+            let Some(cls) = Class::get(cls_name) else {
+                panic!("系统类 {cls_name} 不该缺席");
+            };
+            let sel = Sel::register(name);
+            let yes: BOOL = unsafe { msg_send![cls, instancesRespondToSelector: sel] };
+            assert_eq!(yes, objc::runtime::YES, "{cls_name} 应响应 {name}");
+        };
+        system("NSDraggingItem", "setDraggingFrame:contents:");
+        system("NSDraggingItem", "initWithPasteboardWriter:");
+        system("NSWorkspace", "iconForFileType:");
     }
 }
