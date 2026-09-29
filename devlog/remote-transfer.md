@@ -100,6 +100,37 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
   - `downloading_from_a_remote_endpoint_writes_locally`：下载侧内容真的落到本机。
   （假后端 `FakeRemoteFs` 为此补了 `read_file`，只认它列表里那一条。）
 
+## 5. 断点续传（2026-09-29，21f21bb + 9e6d060）
+
+**引擎**（mo-operations，`21f21bb`）：`TransferOperation::with_resume`（选项收进
+`TransferOpts`，压住 clippy 7 参数上限）；`transfer_tree` 文件分支探测目标已传字节，
+仅当 **`0 < 已传 < 源大小`** 才跳过 `free_path` 按断点续写、进度预置已传部分。
+Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永不静默覆盖」同一原则。
+测试桩加 `min_read_offset`（初值 `u64::MAX`），反向验证：强制 `can_resume=false`
+时续传用例红。
+
+**接线**（mo-app + mo-ui，`9e6d060`）：
+
+* `transfer_between` 提交前探测：远程 leg 目标里有部分完成的就**整批不提交**，
+  交回 `TransferOutcome::NeedsResumeConfirmation(Box<PendingResume>)`（载荷带整批
+  路径 + **发起方的 AppState**——操作管理器按标签页各一份，决策必须交回原来那
+  一份）；没有就直接 `Started`。只对远程 leg 探测——本地对的冲突归
+  `ConflictPolicy`，与续传无关。
+* `resolve_resume(pending, ResumeDecision)` 三选一：**继续**（部分文件走续传，
+  是否真续仍由 `can_resume` 把守）、**重传**（全部照常改名）、**跳过**（部分文件
+  不提交）。粘贴（移动）链路置 `clear_staging_on_resolve`，决策后清暂存区，
+  避免下一次粘贴撞一堆失效条目。
+* UI 收口 `RootView::handle_transfer_outcome`（拖拽 / 外部拖入 / 暂存粘贴 /
+  剪贴板粘贴五处共用）：等决策弹 `Modal::ConfirmResume`。载荷不进 Modal 枚举
+  （要保 `PartialEq, Eq`），放 `RootView::resume_pending`；卡上继续 / 重传 /
+  跳过 / 取消四颗按钮，Esc / 点遮罩**什么都不提交**。
+* 测试：`mo-app/tests/resume.rs`（探测不提交 + 三种决策，端点直传 `Endpoint::Remote`
+  假后端、不需要 SessionRegistry）；mo-ui 内联 headless 用例（按钮齐全 +
+  取消 / 跳过收卡清请求；「继续」会真提交 IO，headless 不点，由上面两条钉住）。
+
+**已知边界**：探测对整批各多两次 `metadata`（远程 = 网络往返），大批量时有感
+知成本；决策期间目标被别人动过 → `can_resume` 自动退回改名重传，不会续坏。
+
 ## 待办
 
 * 大文件**整份进内存**已修（2026-09-29 起，2026-09-30 收尾四个后端）：`FileSystem` 加
@@ -109,7 +140,7 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
   `open`+seek+`write_all` 真随机写、**webdav** 各块落本地临时文件 + `finalize` 时单 PUT（不再
   每块 O(n²) 重传）。读侧 local/sftp/ftp 走 range/整份切片；**webdav 读侧也已加 Range GET**
   （`read_file_chunk` 发 `Range: bytes=…` 的 GET，206 即这一块；服务器不支持 Range 时回 200
-  整份，按区间切出、行为仍正确但内存退回整份——服务器限制）。**断点续传没做**（中断从头重传）。
+  整份，按区间切出、行为仍正确但内存退回整份——服务器限制）。断点续传已做（§5，重提弹确认卡，无 journal、靠磁盘上的部分文件判断，进程内 / 重启后都能续）。
 * 远程传输的**冲突策略**只做到「目标名去重」，没有冲突对话框 / 覆盖选项。
 * 远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义。
 * 远程目录没有 watcher（改完必须重读），跨端点传输完成后靠调用方主动 `refresh`。
