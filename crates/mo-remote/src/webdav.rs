@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
 use percent_encoding::percent_decode_str;
+use reqwest_dav::re_exports::reqwest;
 use reqwest_dav::types::list_cmd::{ListProp, ListResponse};
 use reqwest_dav::{Auth, ClientBuilder, DecodeError, Depth, Error as DavError};
 use std::io::SeekFrom;
@@ -404,6 +405,56 @@ impl FileSystem for WebDavFileSystem {
                 .await
                 .map(|b| b.to_vec())
                 .map_err(|e| RemoteError::transport("下载", e))
+        })
+        .await
+    }
+
+    // 读侧也按块：发 `Range: bytes=offset-(offset+len-1)` 的 GET（206 即这一块），
+    // 不再整份拉进内存。服务器若不支持 Range 会回 200 整份——这种情况按区间切出，
+    // 行为仍正确，只是内存退回整份（服务器限制，devlog 已记）。越界（offset>=大小）
+    // 回 416，直接给空，与 trait 默认语义一致。
+    async fn read_file_chunk(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, MoError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let remote = Self::remote(path);
+        let client = self.client.clone();
+        self.dispatch("下载", async move {
+            let end = offset + len - 1;
+            let mut req = client
+                .start_request(reqwest::Method::GET, &remote)
+                .await
+                .map_err(|e| classify("下载", &e))?;
+            req = req.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| RemoteError::transport("下载", e))?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                return Ok(Vec::new());
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| RemoteError::transport("下载", e))?;
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                Ok(bytes.to_vec())
+            } else {
+                // 200：服务器忽略 Range，返回了整份。按区间切出。
+                let start = offset as usize;
+                if start >= bytes.len() {
+                    Ok(Vec::new())
+                } else {
+                    let end_idx = (start + len as usize).min(bytes.len());
+                    Ok(bytes[start..end_idx].to_vec())
+                }
+            }
         })
         .await
     }
