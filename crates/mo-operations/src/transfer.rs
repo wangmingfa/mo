@@ -40,13 +40,26 @@ pub struct TransferOperation {
     dst: PathBuf,
     /// 传完删源（「移动」语义）。
     remove_source: bool,
+    /// 断点续传：true 时 `transfer_tree` 跳过 `free_path`、按目标已传字节续写（见下）。
+    resume: bool,
     /// 描述里用的动作词（上传 / 下载 / 复制 / 移动），由调用方按方向给出。
     label: &'static str,
     state: Arc<Mutex<OpInner>>,
 }
 
+/// 构造 `TransferOperation` 时一次性给出的选项，用来把构造函数压在 clippy 的
+/// 7 参数上限以内（`remove_source` / `label` / `resume` 三者一组）。
+pub struct TransferOpts {
+    /// 传完删源（「移动」语义）。
+    pub remove_source: bool,
+    /// 描述里用的动作词（上传 / 下载 / 复制 / 移动），由调用方按方向给出。
+    pub label: &'static str,
+    /// 断点续传：true 时 `transfer_tree` 跳过 `free_path`、按目标已传字节续写。
+    pub resume: bool,
+}
+
 impl TransferOperation {
-    /// 新建一次跨文件系统传输。
+    /// 新建一次跨文件系统传输（不续传）。
     ///
     /// 两个端点相同时（远程 → 远程）也走这条路：读整份再写整份，不去赌协议自带的
     /// COPY 指令（FTP 没有，WebDAV 的实现各家不一致）。
@@ -59,14 +72,39 @@ impl TransferOperation {
         remove_source: bool,
         label: &'static str,
     ) -> Arc<Self> {
+        Self::with_resume(
+            id,
+            src_fs,
+            dst_fs,
+            src,
+            dst,
+            TransferOpts {
+                remove_source,
+                label,
+                resume: false,
+            },
+        )
+    }
+
+    /// 断点续传版本：`opts.resume = true` 时 `transfer_tree` 跳过 `free_path`、按目标已传
+    /// 字节续写（仅当目标是「部分完成」才真续，见 `transfer_tree` 的 `can_resume` 判据）。
+    pub fn with_resume(
+        id: u64,
+        src_fs: Arc<dyn FileSystem>,
+        dst_fs: Arc<dyn FileSystem>,
+        src: PathBuf,
+        dst: PathBuf,
+        opts: TransferOpts,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             src_fs,
             dst_fs,
             src,
             dst,
-            remove_source,
-            label,
+            remove_source: opts.remove_source,
+            resume: opts.resume,
+            label: opts.label,
             state: Arc::new(Mutex::new(OpInner::new())),
         })
     }
@@ -130,6 +168,7 @@ impl Operation for TransferOperation {
             self.src.clone(),
             self.dst.clone(),
             self.remove_source,
+            self.resume,
             self.state.clone(),
         ));
 
@@ -163,6 +202,7 @@ fn transfer_tree(
     src: PathBuf,
     dst: PathBuf,
     remove_source: bool,
+    resume: bool,
     state: Arc<Mutex<OpInner>>,
 ) -> BoxFut<Result<(), MoError>> {
     Box::pin(async move {
@@ -171,7 +211,12 @@ fn transfer_tree(
         }
 
         if src_fs.is_dir(&src).await {
-            let dst = free_path(&dst_fs, &dst).await;
+            // 续传时目录不改名（直接用原目标路径），子项各自判断能否续写。
+            let dst = if resume {
+                dst
+            } else {
+                free_path(&dst_fs, &dst).await
+            };
             dst_fs.create_dir(&dst).await?;
             // 名字排一下序：递归顺序稳定，进度推进与「哪几个文件在传」都可复现。
             let mut children = src_fs.read_dir(&src).await?;
@@ -183,6 +228,7 @@ fn transfer_tree(
                     child.path.clone(),
                     dst.join(&child.name),
                     remove_source,
+                    resume,
                     state.clone(),
                 )
                 .await?;
@@ -193,25 +239,41 @@ fn transfer_tree(
             return Ok(());
         }
 
-        // 文件：先按 size 把分母定下来（进度条的分母在写之前就该定），再分块读 /
-        // 分块写，进度逐块累加——大文件不再整份进内存。
-        let dst = free_path(&dst_fs, &dst).await;
+        // 文件：先定 size（进度分母在写之前就该定），再决定能否续传。
+        let size = src_fs.metadata(&src).await?.size;
+        // 断点续传：仅当目标是「部分完成」（0 < 已传 < 源大小）才跳过 free_path 直接
+        // 续写；否则退回常规行为（free_path 改名）。这样 Foreign/更大的文件绝不会被我们
+        // 就地续写，避免旧尾部污染（与「永不静默覆盖」同一原则）。
+        let dst_size = if resume {
+            dst_fs.metadata(&dst).await.map(|m| m.size).ok()
+        } else {
+            None
+        };
+        let can_resume = resume && matches!(dst_size, Some(s) if s > 0 && s < size);
+        let dst = if can_resume {
+            dst
+        } else {
+            free_path(&dst_fs, &dst).await
+        };
         if let Some(parent) = dst.parent() {
             if !parent.as_os_str().is_empty() {
                 // 目标父目录可能还不存在（拖到远程的某个新目录里）；建一次幂等。
                 dst_fs.create_dir(parent).await?;
             }
         }
-        let size = src_fs.metadata(&src).await?.size;
+        let already = if can_resume { dst_size.unwrap() } else { 0 };
         {
             let mut s = state.lock();
             s.total += size;
+            // 续传时把已传部分直接计入进度，进度条一开局就显示「已完成的比例」。
+            s.done += already;
         }
         if size == 0 {
-            // 空文件：写一块空内容把（改名后的）目标建出来。
+            // 空文件：写一块空内容把目标建出来（续传时空文件已存在，写空块无副作用）。
             dst_fs.write_file_chunk(&dst, 0, &[]).await?;
         } else {
-            let mut offset: u64 = 0;
+            // 从已传字节处接着写，不再重传前面的部分。
+            let mut offset: u64 = already;
             while offset < size {
                 if wait_if_paused(&state) {
                     return Err(MoError::Cancelled);

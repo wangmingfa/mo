@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, LocalFileSystem, ReadDirEntry};
-use mo_operations::{Operation, OperationStatus, TransferOperation};
+use mo_operations::{Operation, OperationStatus, TransferOperation, TransferOpts};
 
 /// 内存文件系统：把目录与文件都放在一张表里，行为对齐 `LocalFileSystem`
 /// （`write_file` 拒绝覆盖、`metadata` 对不存在的路径报错）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MemFs {
     inner: Arc<Mutex<Mem>>,
     /// 记录分块传输里「单次读取请求的最大长度」，用来断言传输真的走了分块路径
@@ -25,6 +25,20 @@ struct MemFs {
     /// 记录 `finalize_file_chunk` 被调用次数，用来断言传输循环确实在每块写完后收尾
     ///（WebDAV 的依赖：不收尾就永远不 PUT）。
     finalize_calls: Arc<Mutex<u64>>,
+    /// 记录「源端被读的最小 offset」，用来断言续传真的从断点起读、没重读前面的部分。
+    /// 初值 `u64::MAX`：没被读过时断言 `== half` 不会误中 0。
+    min_read_offset: Arc<Mutex<u64>>,
+}
+
+impl Default for MemFs {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Mem::default())),
+            max_chunk: Arc::new(Mutex::new(0)),
+            finalize_calls: Arc::new(Mutex::new(0)),
+            min_read_offset: Arc::new(Mutex::new(u64::MAX)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +94,11 @@ impl MemFs {
     /// 测试桩访问器：返回 `finalize_file_chunk` 被调用的次数。
     fn finalize_calls(&self) -> u64 {
         *self.finalize_calls.lock().unwrap()
+    }
+
+    /// 测试桩访问器：返回源端被读的最小 offset（u64::MAX 表示没被读过）。
+    fn min_read_offset(&self) -> u64 {
+        *self.min_read_offset.lock().unwrap()
     }
 }
 
@@ -230,6 +249,10 @@ impl FileSystem for MemFs {
             let mut m = self.max_chunk.lock().unwrap();
             if len > *m {
                 *m = len;
+            }
+            let mut o = self.min_read_offset.lock().unwrap();
+            if offset < *o {
+                *o = offset;
             }
         }
         let m = self.inner.lock().unwrap();
@@ -534,4 +557,87 @@ async fn transfer_calls_finalize_once_per_destination_file() {
     );
     assert_eq!(mem.bytes("/dst/a.txt").as_deref(), Some(&b"abc"[..]));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 断点续传：目标已是「部分完成」时，从断点接着写，不重传已传部分，最终字节完全一致。
+#[tokio::test]
+async fn resume_continues_a_partial_destination() {
+    let payload = vec![0xABu8; 10 * 1024 * 1024];
+    let src = MemFs::default();
+    src.put("/big.bin", &payload);
+
+    // 目标端预置「半份」内容，模拟上次被取消留下来的部分文件。
+    let half = payload.len() / 2;
+    let dst = MemFs::default();
+    dst.put("/big.bin", &payload[..half]);
+
+    let op = TransferOperation::with_resume(
+        10,
+        Arc::new(src.clone()),
+        Arc::new(dst.clone()),
+        PathBuf::from("/big.bin"),
+        PathBuf::from("/big.bin"),
+        TransferOpts {
+            remove_source: false,
+            label: "下载",
+            resume: true,
+        },
+    );
+    run_in_blocking(op.clone()).await.expect("续传应成功");
+
+    assert_eq!(op.status(), OperationStatus::Completed);
+    assert_eq!(
+        op.progress(),
+        (payload.len() as u64, payload.len() as u64),
+        "进度应含已传部分（开局即半满）"
+    );
+    // 最终内容必须整份一致。
+    assert_eq!(dst.bytes("/big.bin").unwrap(), payload);
+    // 关键：源端从断点（half）起读，没重读前半——min_read_offset 应等于 half。
+    assert_eq!(
+        src.min_read_offset(),
+        half as u64,
+        "续传不应重读已传的前半部分"
+    );
+    // 源端单次读取仍 ≤ CHUNK_SIZE（分块路径没被破坏）。
+    assert!(
+        src.max_chunk() <= 4 * 1024 * 1024,
+        "单块读取不应超过 CHUNK_SIZE，实测 {}",
+        src.max_chunk()
+    );
+    // 收尾仍发生一次。
+    assert_eq!(dst.finalize_calls(), 1);
+}
+
+/// 对照（反向）：不续传时，目标已存在会被 `free_path` 改名，源从 0 重读，
+/// 部分文件原样留着——证明 `resume` 这一项确实改变了行为。
+#[tokio::test]
+async fn non_resume_renames_and_rereads_from_zero() {
+    let payload = vec![0xCDu8; 10 * 1024 * 1024];
+    let src = MemFs::default();
+    src.put("/big.bin", &payload);
+
+    let half = payload.len() / 2;
+    let dst = MemFs::default();
+    dst.put("/big.bin", &payload[..half]); // 部分文件
+
+    // 用 `new`（resume=false）——与续传路径的区别就在这一项。
+    let op = TransferOperation::new(
+        11,
+        Arc::new(src.clone()),
+        Arc::new(dst.clone()),
+        PathBuf::from("/big.bin"),
+        PathBuf::from("/big.bin"),
+        false,
+        "下载",
+    );
+    run_in_blocking(op.clone()).await.expect("常规传输应成功");
+
+    assert_eq!(op.status(), OperationStatus::Completed);
+    // 部分文件原样留着（没被续写、也没被覆盖）。
+    assert_eq!(dst.bytes("/big.bin").unwrap(), &payload[..half]);
+    // 新文件是完整内容，按命名约定改名（`free_path` 用 `format!("{stem} {i}{ext})` → `/big 2.bin`）。
+    assert_eq!(dst.bytes("/big 2.bin").unwrap(), payload);
+    // 源从 0 重读（没走续传）。
+    assert_eq!(src.min_read_offset(), 0, "不续传应从头重读");
 }

@@ -40,7 +40,7 @@ pub use sync::{
     apply as apply_sync_plan, plan as plan_sync, Action as SyncAction,
     ConflictPolicy as SyncConflictPolicy, Plan as SyncPlan, SyncMode, SyncOptions, SyncReport,
 };
-pub use transfer::TransferOperation;
+pub use transfer::{TransferOperation, TransferOpts};
 pub use trash::{Trash, TrashEntry, TrashError};
 pub use trash_op::TrashOperation;
 
