@@ -310,3 +310,15 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **真机验证清单**（人工）：①按住文件拖出 Mo 窗口 → 落到访达 → 应复制进去、
   源文件留着；②拖出后按 Esc → 什么都没发生；③拖到访达**同一卷宗**里看对面给
   的结论（若对面判移动 → 源进 Mo 回收站）。Windows 侧 §25 的同款实测仍欠着。
+
+### §29 订正：起拖闪退（2026-09-29，0ad4b59）
+
+* 用户真机一拖即崩：`- [NSDraggingItem setImageContents:]: unrecognized selector`。
+  根因：起拖把便捷入口拆成了两条消息——`setDraggingFrame:`（只给框）+
+  `setImageContents:`（给图）。**后者不存在**，正确 API 是一条
+  `setDraggingFrame:contents:`，框与图同发。
+* 教训（§29 自己写的「方法漏挂的错要到拖出去那一刻才炸」正好应验在自己头上）：
+  objc 消息**编译期不校验**，冒烟测试不能只核自己注册的类，**我们对系统类发的
+  每个选择器**也要 `instancesRespondToSelector:` 核一遍——测试补了
+  NSDraggingItem（setDraggingFrame:contents: / initWithPasteboardWriter:）与
+  NSWorkspace（iconForFileType:）。
