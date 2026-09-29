@@ -42,6 +42,8 @@ use super::ComGuard;
 ///
 /// 「移动」时调用方必须把源删掉——OLE 的约定是目标只负责在原地放一份，搬走源是
 /// 源端的活（跨盘移动时资源管理器就是只复制、然后回 `DROPEFFECT_MOVE` 让源端删）。
+/// ⚠️ 当前只声明复制（见 `do_drag` 里的注释），`Some(true)` 实际收不到；分支留给
+/// 将来开移动语义。
 ///
 /// ⚠️ `on_done` 在拖拽线程上被调，不在 UI 线程。
 pub fn begin(paths: Vec<PathBuf>, on_done: Box<dyn FnOnce(Option<bool>) + Send>) -> bool {
@@ -70,15 +72,11 @@ fn drag_thread(paths: &[PathBuf]) -> Option<bool> {
 unsafe fn do_drag(paths: &[PathBuf]) -> Option<bool> {
     let data = file_data_object(paths)?;
     let source: IDropSource = DragSource.into();
-    // 允许复制也允许移动，具体走哪个由目标（资源管理器）按 Ctrl / Shift 和
-    // 是否跨盘决定——按键状态 OLE 自己会递过去，比 Mo 在 UI 线程上猜准。
-    let mut effect = DROPEFFECT_MOVE;
-    let hr = DoDragDrop(
-        &data,
-        &source,
-        DROPEFFECT_COPY | DROPEFFECT_MOVE,
-        &mut effect,
-    );
+    // **只声明复制**：与 macOS 侧（`macos.rs` 的 DRAG_MASK）同一决策——拖入通道
+    // （gpui 的 drop）拿不到按键状态、恒按复制收，拖出若允许移动就会「拖出移动、
+    // 拖入复制」不对等。移动语义等将来把按键状态透传进来再一起开。
+    let mut effect = DROPEFFECT_COPY;
+    let hr = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
     // `DRAGDROP_S_DROP` / `DRAGDROP_S_CANCEL` 都是成功段的码（`is_err` 为假），
     // 差别只在含义：一个真落了子，一个被用户取消。
     if hr.is_err() || hr == DRAGDROP_S_CANCEL {

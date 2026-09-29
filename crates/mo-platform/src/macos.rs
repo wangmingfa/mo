@@ -280,8 +280,12 @@ type DragDone = Box<dyn FnOnce(Option<bool>) + Send>;
 /// `NSDragOperation` 里我们关心的两位。
 const DRAG_OP_COPY: usize = 1;
 const DRAG_OP_MOVE: usize = 16;
-/// 复制与移动都声明，选哪个交给**目标**定（与 Windows 侧同一口径）。
-const DRAG_MASK: usize = DRAG_OP_COPY | DRAG_OP_MOVE;
+/// **只声明复制**。曾与 Windows 同口径「复制与移动都声明、目标定」，实测发现
+/// 交互不对等：拖出（同卷）被访达判成移动、拖入（gpui 的 drop 通道拿不到修饰
+/// 键 / 操作码，见 `mo_ui::app::submit_os_drop`）却恒是复制——同一对文件在两个
+/// 方向上下场不同。拖拽语义统一成复制（拖入拖出都一样），移动走剪切粘贴；
+/// `drag_ended` 的 MOVE 分支留着，是给将来接修饰键透传后的移动语义的。
+const DRAG_MASK: usize = DRAG_OP_COPY;
 
 /// 拖拽源类（`NSDraggingSource`）：一次拖拽一个实例，握着把结论递回 UI 的回调。
 ///
