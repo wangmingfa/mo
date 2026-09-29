@@ -829,6 +829,12 @@ const NET_SHARE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 卷宗列表的缓存有效期（见 `AppState::volumes_cache`）。
 const VOLUME_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 远程目录的轮询间隔（见 `AppState::spawn_remote_poll_pump`）。
+///
+/// 一拍一次列目录的网络往返：太密了是持续的无谓流量，太疏了「别的设备传完文件」
+/// 要等半天才看得见。5s 与闲置探活（30s）不在一个量级上，不会互相干扰。
+const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 「首屏」的行数：缓存预填与后台校验的优先区间都按它划。
 ///
 /// 取 200（`INITIAL_WINDOW` 的量级）——一屏通常二三十行，这个数足够覆盖「进目录后
@@ -2299,6 +2305,81 @@ impl AppState {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
+    }
+
+    /// 启动远程目录轮询泵（进程内调用一次即可，与 [`Self::spawn_watcher_pump`]
+    /// 配对）。
+    ///
+    /// 远程协议没有事件推送（FTP / SFTP / WebDAV 都没有 watcher）：另一台设备
+    /// 写入、本进程外的操作，用户停在目录上时是看不见的。这里按固定间隔重读
+    /// **当前远程目录**的列表，与模型里的条目比对——**有差异才整目录重读**：
+    /// 闲着的目录每拍只花一次列目录的网络往返，零 UI 动作；本地目录有
+    /// watcher，一拍都不花。
+    ///
+    /// ⚠️ 比对只看「路径 + 类型」的集合：列表级变化（新增 / 删除 / 改名）能抓到；
+    /// 「原地改写内容」（大小 / mtime 变了、条目集合没变）抓不到——逐条 metadata
+    /// 是每条目一次网络往返，轮询干不起，交给打开 / 手动刷新兜底。
+    pub fn spawn_remote_poll_pump(&self) {
+        let app = self.clone();
+        self.spawn(async move {
+            loop {
+                if app.stopped() {
+                    return;
+                }
+                tokio::time::sleep(REMOTE_POLL_INTERVAL).await;
+                if !app.browsing_remote() {
+                    continue;
+                }
+                app.poll_remote_listing_once().await;
+            }
+        });
+    }
+
+    /// 轮询一轮：重读当前远程目录，与模型比对，**有差异才刷新**。
+    ///
+    /// pub 语义面：泵的节拍在 headless 测试里等不起，测试直接驱动这一轮
+    /// （见 `mo-app/tests/remote_poll.rs`）。
+    pub async fn poll_remote_listing_once(&self) {
+        // 目录还在读（`loading`）时没有可比的稳定快照，这一轮跳过。
+        let (dir_path, seen): (PathBuf, std::collections::BTreeSet<(PathBuf, bool)>) = {
+            let inner = self.inner.read().await;
+            match inner.directory.as_ref() {
+                Some(d) if !d.loading => (
+                    d.path.clone(),
+                    d.entries
+                        .iter()
+                        .map(|e| (e.path.clone(), e.kind.is_dir()))
+                        .collect(),
+                ),
+                _ => return,
+            }
+        };
+        let fs = self.active_fs();
+        let raw = {
+            let dir_path = dir_path.clone();
+            self.spawn_blocking(move || fs.read_dir_blocking(&dir_path))
+                .await
+        };
+        // 读失败（多半是连接断了）这轮就算了：别把一条坏连接刷成报错弹窗，
+        // 自愈与报错都交给下一次真正的导航（`load_path` 的 revive 路径）。
+        let Ok(Ok(raw)) = raw else {
+            return;
+        };
+        let show_hidden = self.show_hidden();
+        let fresh: std::collections::BTreeSet<(PathBuf, bool)> = raw
+            .into_iter()
+            .filter(|r| show_hidden || !r.hidden)
+            .map(|r| (r.path, r.kind.is_dir()))
+            .collect();
+        if fresh == seen {
+            return;
+        }
+        // 快照之后用户切走了：refresh 读的是「现在」的当前目录，别让它白读一趟
+        // （用户刚点进去的目录本来就在读）。
+        if self.current_path().await.as_deref() != Some(dir_path.as_path()) {
+            return;
+        }
+        let _ = self.refresh().await;
     }
 
     /// 把一个监听事件增量应用到目录模型，并通过事件总线广播。

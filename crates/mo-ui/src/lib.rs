@@ -255,6 +255,8 @@ pub fn run() {
     let app = AppState::new();
     // 启动文件监听泵：外部程序增删改文件时做增量更新并广播事件。
     app.spawn_watcher_pump();
+    // 启动远程目录轮询泵：远程协议没有事件推送，按拍比对列表、有差异才重读。
+    app.spawn_remote_poll_pump();
     // 启动刷新泵：把密集的元数据 / 缩略图回填合并成节拍性的 UI 刷新。
     app.spawn_refresh_pump();
     // 启动图标泵：列表行要的系统图标只在渲染路径上「记账」，真去问系统（AppKit +

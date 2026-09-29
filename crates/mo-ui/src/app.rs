@@ -2104,8 +2104,10 @@ impl RootView {
     /// 每个标签页持有独立的 `AppState`：导航栈、选择、滚动位置天然隔离。
     pub(crate) fn new_tab(&mut self, cx: &mut Context<Self>, pane_idx: usize) {
         let app = AppState::new();
-        // 每个 AppState 需要自己的监听泵 / 刷新泵（ watcher 进程级、runtime 共享）。
+        // 每个 AppState 需要自己的监听泵 / 轮询泵 / 刷新泵
+        // （ watcher 进程级、runtime 共享）。
         app.spawn_watcher_pump();
+        app.spawn_remote_poll_pump();
         app.spawn_refresh_pump();
         let Some(pane) = self.panes.get_mut(pane_idx) else {
             return;
@@ -2189,6 +2191,7 @@ impl RootView {
             };
             let app = AppState::new();
             app.spawn_watcher_pump();
+            app.spawn_remote_poll_pump();
             app.spawn_refresh_pump();
             let idx = self.panes.len();
             let ui = self.ui.clone();
@@ -2226,6 +2229,7 @@ impl RootView {
     ) {
         let app = AppState::new();
         app.spawn_watcher_pump();
+        app.spawn_remote_poll_pump();
         app.spawn_refresh_pump();
         let Some(pane) = self.panes.get_mut(pane_idx) else {
             return;
