@@ -44,6 +44,9 @@ winreg = "0.55"
 # 测试里的「假远程后端」要实现 `mo_fs::FileSystem`（该 trait 用 async_trait 宏），
 # 用于验证「本地位置在远程会话下必须走 open_local」，见 tests/remote_local.rs。
 async-trait.workspace = true
+# 排序测试要给临时文件**指定**修改时间（std 没有稳定的设置 mtime 的 API），
+# 见 tests/sort_metadata.rs。已在依赖树里（notify 传递引入），不新增下载。
+filetime = "0.2"
 
 [lints]
 workspace = true

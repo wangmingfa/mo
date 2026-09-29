@@ -2939,6 +2939,14 @@ impl AppState {
                 if let Some(e) = dir.entry_mut(id) {
                     e.metadata = MetadataState::Loaded(meta);
                     self.dirty.store(true, Ordering::Relaxed);
+                    // 回填只改元数据、不动名称：**按大小 / 时间排**时顺序会跟着变，
+                    // 得重排一次（与 `load_path` 里缓存预填后的重排同一判据）。
+                    // 按名称 / 类型排与元数据无关，省掉。没有这条，点「修改日期」
+                    // 表头那一刻回填还没完成的条目，就用旧键站错位置——显示的
+                    // mtime 是新的、位置是旧的（用户报的「按修改日期排序不对」）。
+                    if matches!(dir.view.sort(), SortKey::Size | SortKey::Modified) {
+                        dir.rebuild_view();
+                    }
                 }
             }
         }
@@ -2961,6 +2969,12 @@ impl AppState {
             }
         }
         if changed {
+            // 与 `update_metadata` 同一条判据：按大小 / 时间排时元数据回填会改变
+            // 顺序，一批一次重排（批量已把写锁次数摊薄；重排是 O(n log n) 纯内存
+            // 比较，两万条实测毫秒级，比一次多余的全量重读便宜得多）。
+            if matches!(dir.view.sort(), SortKey::Size | SortKey::Modified) {
+                dir.rebuild_view();
+            }
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
