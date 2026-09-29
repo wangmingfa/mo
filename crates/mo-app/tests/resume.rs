@@ -299,6 +299,18 @@ async fn rename_decision_rereads_to_a_new_name() {
     );
 }
 
+/// `refresh_if_showing`：只刷正在看的目录，看别处不刷（省一次无谓 IO）。
+#[tokio::test]
+async fn refresh_if_showing_only_touches_the_current_directory() {
+    let (app, _src, _dst) = scene();
+    let tmp = std::env::temp_dir();
+    app.open_local(&tmp).await.unwrap();
+    // 正看着 tmp：刷 tmp 应当真刷。
+    assert!(app.refresh_if_showing(&tmp).await);
+    // 看着别的目录时刷别处不动手。
+    assert!(!app.refresh_if_showing(&tmp.join("没有这个目录")).await);
+}
+
 /// 探测一遍拿回请求（各决策用例共用前置）。
 async fn hold(app: &AppState, src: &RecFs, dst: &RecFs) -> PendingResume {
     match app

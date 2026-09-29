@@ -1403,6 +1403,18 @@ impl AppState {
         Ok(())
     }
 
+    /// 仅当**当前正在看 `dir`** 时刷新它，返回是否真的刷了。
+    ///
+    /// 跨端点传输完成后目标端要重读才看得见新文件（远程没有 watcher），但目标
+    /// 窗格可能已经被切去别的目录——那时刷新既白费一次 IO，还会打断用户正在
+    /// 看的内容；等他切回来时本来就会重读。
+    pub async fn refresh_if_showing(&self, dir: &Path) -> bool {
+        match self.current_path().await {
+            Some(p) if p == dir => self.refresh().await.is_ok(),
+            _ => false,
+        }
+    }
+
     // ---- 远程连接 ----
 
     /// 按地址连上远程服务器并进入其根目录。

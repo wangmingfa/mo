@@ -874,6 +874,11 @@ pub struct RootView {
     /// （见那边的注释）：开卡时存进来，决策 / 关卡时取走清空。
     /// `pub(crate)` 仅为测试预置（store pre-seeding 套路）。
     pub(crate) resume_pending: Option<mo_app::PendingResume>,
+    /// 续传决策**提交后**要刷新的目标端（`AppState`, 目标目录）。
+    ///
+    /// 弹确认卡时记下——那时五处传输入口都还拿得到两端；决策提交、整批复传完
+    /// 之后对它 `refresh_if_showing`，让远程目标端立刻冒出新文件。
+    pub(crate) resume_dest: Option<(mo_app::AppState, PathBuf)>,
     /// 命令面板过滤词。
     cmd_query: String,
     /// 命令面板 / 搜索结果的高亮下标。
@@ -1193,6 +1198,7 @@ impl RootView {
             focus: cx.focus_handle(),
             modal: Modal::None,
             resume_pending: None,
+            resume_dest: None,
             cmd_query: String::new(),
             palette_index: 0,
             palette_scroll: ScrollHandle::default(),
@@ -1471,12 +1477,14 @@ impl RootView {
         cx.spawn(async move |_weak, cx| {
             let outcome = app.paste_staged(None, move_).await;
             let empty = outcome.is_started() && outcome.started_ids().is_empty();
+            // 落点 = paste_staged 内部取的当前目录（dest 传 None 时）。
+            let dest = app.current_path().await.unwrap_or_default();
             this.update(cx, |v, cx| {
                 if empty {
                     v.notice("暂存区是空的，或当前目录不可用".to_string(), None, cx);
                 }
                 // 等续传决策的在这里把卡弹出来（粘贴也会命中部分完成的目标）。
-                v.handle_transfer_outcome(outcome, cx);
+                v.handle_transfer_outcome(outcome, app.clone(), app.clone(), dest, cx);
                 cx.notify();
             });
         })
@@ -5216,8 +5224,15 @@ impl RootView {
                     if let Some((paths, cut)) = ext {
                         app.adopt_system_clipboard(paths, cut).await;
                     }
-                    let outcome = app.paste_clipboard(dest).await;
-                    this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
+                    let outcome = app.paste_clipboard(dest.clone()).await;
+                    // 实际落点与 paste_clipboard 内部的 dest.or(current_path) 一致。
+                    let landed = match dest.filter(|p| !p.as_os_str().is_empty()) {
+                        Some(d) => d,
+                        None => app.current_path().await.unwrap_or_default(),
+                    };
+                    this.update(cx, |v, cx| {
+                        v.handle_transfer_outcome(outcome, app.clone(), app.clone(), landed, cx)
+                    });
                 })
                 .detach();
             }
@@ -6710,15 +6725,7 @@ impl RootView {
         let Some(dest) = dest else {
             return;
         };
-        let refresh_app = self.pane_app(pane_idx);
         self.run_transfer(d, pane_idx, dest, alt, cx);
-        // 目标窗格可能没开监听：主动刷一次让新文件立刻出现。
-        if let Some(app) = refresh_app {
-            cx.spawn(async move |_weak, _cx| {
-                let _ = app.refresh().await;
-            })
-            .detach();
-        }
     }
 
     /// 某个窗格**当前标签页**的 `AppState`（分栏拖拽要问目标那一头的后端）。
@@ -6729,17 +6736,34 @@ impl RootView {
             .map(|t| t.app.clone())
     }
 
-    /// 处理一次传输结局：直接提交的不用管；等续传决策的把请求存下、弹确认卡。
+    /// 处理一次传输结局：直接提交的挂「完成即刷新」；等续传决策的把请求存下、
+    /// 弹确认卡，同时记下决策提交后要刷的目标端。
     /// 所有传输入口（拖拽 / 外部拖入 / 粘贴 / 剪贴板）共用这一个收口。
+    ///
+    /// `src_app` 是发起这次传输的 `AppState`（完成事件发在**它的**总线上），
+    /// `dest_app` + `dest` 是落点——远程目标没有 watcher，传输完必须重读才看得见。
     pub(crate) fn handle_transfer_outcome(
         &mut self,
         outcome: mo_app::TransferOutcome,
+        src_app: mo_app::AppState,
+        dest_app: mo_app::AppState,
+        dest: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if let mo_app::TransferOutcome::NeedsResumeConfirmation(p) = outcome {
-            self.resume_pending = Some(*p);
-            self.modal = Modal::ConfirmResume;
-            cx.notify();
+        match outcome {
+            mo_app::TransferOutcome::Started(ids) if !ids.is_empty() => {
+                cx.spawn(async move |_weak, _cx| {
+                    watch_then_refresh_task(src_app, ids, dest_app, dest).await;
+                })
+                .detach();
+            }
+            mo_app::TransferOutcome::Started(_) => {}
+            mo_app::TransferOutcome::NeedsResumeConfirmation(p) => {
+                self.resume_pending = Some(*p);
+                self.resume_dest = Some((dest_app, dest));
+                self.modal = Modal::ConfirmResume;
+                cx.notify();
+            }
         }
     }
 
@@ -6766,11 +6790,14 @@ impl RootView {
         let dest_ep = dest_app.endpoint();
         let paths = d.paths.clone();
         let this = cx.entity().clone();
+        let dest_app_for_refresh = dest_app.clone();
         cx.spawn(async move |_weak, cx| {
             let outcome = src_app
                 .transfer_between(paths, src_ep, &dest, dest_ep, alt)
                 .await;
-            this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
+            this.update(cx, |v, cx| {
+                v.handle_transfer_outcome(outcome, src_app, dest_app_for_refresh, dest, cx)
+            });
         })
         .detach();
         cx.notify();
@@ -6794,7 +6821,6 @@ impl RootView {
         paths: Vec<PathBuf>,
         dest: PathBuf,
         dest_ep: mo_app::Endpoint,
-        refresh: bool,
         cx: &mut Context<Self>,
     ) {
         // 「把目录拖进它自己 / 它的子目录」在资源管理器里也是直接拒绝的：交到底层
@@ -6807,18 +6833,14 @@ impl RootView {
             return;
         }
         let this = cx.entity().clone();
+        let dest_app = app.clone();
         cx.spawn(async move |_weak, cx| {
             let outcome = app
                 .transfer_between(paths, mo_app::Endpoint::Local, &dest, dest_ep, false)
                 .await;
-            let needs_confirm =
-                matches!(outcome, mo_app::TransferOutcome::NeedsResumeConfirmation(_));
-            this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
-            if refresh && !needs_confirm {
-                // 目标窗格可能没开监听：拖进来的文件不会自己冒出来，主动刷一次。
-                // （等续传决策时不刷：这会儿还什么都没传。）
-                let _ = app.refresh().await;
-            }
+            this.update(cx, |v, cx| {
+                v.handle_transfer_outcome(outcome, app, dest_app, dest, cx)
+            });
         })
         .detach();
         cx.notify();
@@ -6842,7 +6864,7 @@ impl RootView {
         };
         // 落点窗格连着谁，目标端就是谁（远程目录 = 上传）。
         let dest_ep = app.endpoint();
-        self.submit_os_drop(app, paths, dest, dest_ep, false, cx);
+        self.submit_os_drop(app, paths, dest, dest_ep, cx);
     }
 
     /// 外部拖放落在窗格空白处：复制进该窗格当前显示的目录。
@@ -6875,7 +6897,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         let app = self.app();
-        self.submit_os_drop(app, paths, dest, mo_app::Endpoint::Local, true, cx);
+        self.submit_os_drop(app, paths, dest, mo_app::Endpoint::Local, cx);
     }
 
     /// 外部拖放落在侧栏「回收站」上：送进回收站（外部拖放没有「移动」语义，
@@ -7330,8 +7352,15 @@ impl RootView {
                     if let Some((paths, cut)) = ext {
                         app.adopt_system_clipboard(paths, cut).await;
                     }
-                    let outcome = app.paste_clipboard(dest).await;
-                    this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
+                    let outcome = app.paste_clipboard(dest.clone()).await;
+                    // 实际落点与 paste_clipboard 内部的 dest.or(current_path) 一致。
+                    let landed = match dest.filter(|p| !p.as_os_str().is_empty()) {
+                        Some(d) => d,
+                        None => app.current_path().await.unwrap_or_default(),
+                    };
+                    this.update(cx, |v, cx| {
+                        v.handle_transfer_outcome(outcome, app.clone(), app.clone(), landed, cx)
+                    });
                 })
                 .detach();
             }
@@ -7475,6 +7504,37 @@ fn home_dir() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(std::env::home_dir)
+}
+
+/// 传输完成后刷新目标端：订阅**发起方**的总线，等这一批操作全部结束
+/// （`OperationFinished` 成败都发）再对目标端 `refresh_if_showing`。
+///
+/// 为什么不提交完就刷：传输是后台任务，提交只代表「排上了」，立刻刷十有八九
+/// 什么都看不到。为什么不在 mo-app 里做：完成事件只发在发起方的总线上，而
+/// 目标端可能是另一个标签页、另一条会话的 `AppState`，只有 UI 同时握着两端。
+///
+/// 独立成不带上下文的任务：直接提交（`handle_transfer_outcome`）与续传决策重提
+/// （`resolve_resume_decision`）两个上下文各 spawn 一份。
+async fn watch_then_refresh_task(
+    src_app: mo_app::AppState,
+    ids: Vec<u64>,
+    dest_app: mo_app::AppState,
+    dest: PathBuf,
+) {
+    let mut rx = src_app.bus().subscribe();
+    let mut remaining: std::collections::HashSet<u64> = ids.into_iter().collect();
+    while !remaining.is_empty() {
+        match rx.recv().await {
+            Ok(mo_core::AppEvent::OperationFinished { id }) => {
+                remaining.remove(&id);
+            }
+            Ok(_) => {}
+            // 掉了几条事件就当齐了：刷新是尽力而为，别为它挂死等待。
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+            Err(_) => return,
+        }
+    }
+    let _ = dest_app.refresh_if_showing(&dest).await;
 }
 
 /// 一个标签页的生命周期任务：按需打开 Home → 首同步 → 订阅事件总线。
@@ -9646,8 +9706,15 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
                 if let Some((paths, cut)) = ext {
                     app.adopt_system_clipboard(paths, cut).await;
                 }
-                let outcome = app.paste_clipboard(dest).await;
-                this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
+                let outcome = app.paste_clipboard(dest.clone()).await;
+                // 实际落点与 paste_clipboard 内部的 dest.or(current_path) 一致。
+                let landed = match dest.filter(|p| !p.as_os_str().is_empty()) {
+                    Some(d) => d,
+                    None => app.current_path().await.unwrap_or_default(),
+                };
+                this.update(cx, |v, cx| {
+                    v.handle_transfer_outcome(outcome, app.clone(), app.clone(), landed, cx)
+                });
             })
             .detach();
             entity.update(cx, |v, cx| {
@@ -12014,14 +12081,20 @@ fn resolve_resume_decision(
         }
         v.modal = Modal::None;
         cx.notify();
-        v.resume_pending.take()
+        v.resume_pending.take().map(|p| (p, v.resume_dest.take()))
     });
-    let Some(pending) = pending else {
+    let Some((pending, refresh_dest)) = pending else {
         return;
     };
     let app = pending.app.clone();
-    cx.spawn(async move |_| {
-        let _ = app.resolve_resume(pending, decision).await;
+    cx.spawn(async move |_cx| {
+        let ids = app.resolve_resume(pending, decision).await;
+        // 重提完成后再刷新目标端（远程没有 watcher，不刷就看不见新文件）。
+        if let Some((dest_app, dest)) = refresh_dest {
+            if !ids.is_empty() {
+                watch_then_refresh_task(app, ids, dest_app, dest).await;
+            }
+        }
     })
     .detach();
 }
