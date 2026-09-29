@@ -22,6 +22,9 @@ struct MemFs {
     /// 记录分块传输里「单次读取请求的最大长度」，用来断言传输真的走了分块路径
     ///（而不是一次整份读）。
     max_chunk: Arc<Mutex<u64>>,
+    /// 记录 `finalize_file_chunk` 被调用次数，用来断言传输循环确实在每块写完后收尾
+    ///（WebDAV 的依赖：不收尾就永远不 PUT）。
+    finalize_calls: Arc<Mutex<u64>>,
 }
 
 #[derive(Default)]
@@ -72,6 +75,11 @@ impl MemFs {
     /// 测试桩访问器：返回分块传输里「单次读取请求的最大长度」。
     fn max_chunk(&self) -> u64 {
         *self.max_chunk.lock().unwrap()
+    }
+
+    /// 测试桩访问器：返回 `finalize_file_chunk` 被调用的次数。
+    fn finalize_calls(&self) -> u64 {
+        *self.finalize_calls.lock().unwrap()
     }
 }
 
@@ -251,6 +259,12 @@ impl FileSystem for MemFs {
             f.resize(start + data.len(), 0);
         }
         f[start..start + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    async fn finalize_file_chunk(&self, _path: &Path) -> Result<(), MoError> {
+        // MemFs 在 write_file_chunk 里就落好了，这里只是记一次调用——断言传输循环真的收尾。
+        *self.finalize_calls.lock().unwrap() += 1;
         Ok(())
     }
 
@@ -493,5 +507,31 @@ async fn large_file_transfer_is_chunked_and_byte_exact() {
         max_chunk <= 4 * 1024 * 1024,
         "单块读取不应超过 CHUNK_SIZE，实测 {max_chunk}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 传输循环对每个目标文件调一次 `finalize_file_chunk`：WebDAV 靠它在收尾时整份 PUT，
+/// 不调就永远不落盘。这里用内存目标端记下调用次数断言（单文件 → 恰好 1 次）。
+#[tokio::test]
+async fn transfer_calls_finalize_once_per_destination_file() {
+    let root = local_tree("finalize");
+    let mem = MemFs::default();
+    let op = TransferOperation::new(
+        9,
+        Arc::new(LocalFileSystem),
+        Arc::new(mem.clone()),
+        root.join("a.txt"),
+        PathBuf::from("/dst/a.txt"),
+        false,
+        "上传",
+    );
+    run_in_blocking(op).await.expect("上传应成功");
+    assert_eq!(
+        mem.finalize_calls(),
+        1,
+        "单文件目标应恰好收尾一次：{:?}",
+        mem.keys()
+    );
+    assert_eq!(mem.bytes("/dst/a.txt").as_deref(), Some(&b"abc"[..]));
     let _ = std::fs::remove_dir_all(&root);
 }

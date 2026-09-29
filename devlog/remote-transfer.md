@@ -63,6 +63,11 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
   （4 MiB）循环 `read_file_chunk` → `write_file_chunk`，进度分母（`total`）在循环前按
   `metadata.size` 定下、`done` 逐块累加。不赌协议自带的服务端 COPY（三家语义各不相同）。
   空文件单独写一块空内容建出。
+* 写侧收尾：`write_file_chunk` 是「落一块」语义，**WebDAV 没有可靠的部分 PUT**——它在
+  `write_file_chunk` 中只把各块攒到本地临时文件（`temp_dir()/mo-webdav-staging`，按远端路径
+  派生文件名），传输循环对每个目标调一次 `finalize_file_chunk` 才整份 PUT 出去（必要时先
+  `truncate` 清旧尾）。本地 / FTP / SFTP 的 `finalize_file_chunk` 是默认空操作（它们逐块就落
+  好了）。`finalize` 在删源之前，保证「目标完整才删源」。
 * ⚠️ `async fn` **不能递归**（编译期要求定长 future）→ `transfer_tree` 走
   `Box::pin` 递归（`type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>`）。
 * ⚠️ `run()` 里拿 `Handle::current()` 再 `block_on`——**只有在 `spawn_blocking` 里才安全**。
@@ -94,11 +99,13 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
 
 ## 待办
 
-* 大文件**整份进内存**已修（2026-09-29）：`FileSystem` 加 `read_file_chunk` /
-  `write_file_chunk`，`TransferOperation` 走分块循环。真正省内存的是 **local（seek 写）
-  + ftp（首块 STOR、后续 APPE 顺序流）**；**sftp / webdav 暂整份缓冲**（无随机写 / 无部分
-  PUT，读侧也走默认整份切片）——这两种后端的超大文件此刻仍整份进内存、写侧 O(n²)，下一轮
-  优化（见下方「待办续」）。**断点续传没做**。
+* 大文件**整份进内存**已修（2026-09-29 起，2026-09-30 收尾四个后端）：`FileSystem` 加
+  `read_file_chunk` / `write_file_chunk`，并加 `finalize_file_chunk`（默认空操作，仅 WebDAV
+  覆写做「攒本地临时文件 → 整份 PUT 一次」）。四个后端写侧都**只按块进内存**（峰值 = 一个
+  CHUNK_SIZE）：**local** seek 写、**ftp** 首块 STOR / 后续 APPE 顺序流、**sftp**
+  `open`+seek+`write_all` 真随机写、**webdav** 各块落本地临时文件 + `finalize` 时单 PUT（不再
+  每块 O(n²) 重传）。读侧 local/sftp/ftp 走 range/整份切片；**webdav 读侧仍整份进内存**（无
+  Range GET，待做）。**断点续传没做**（中断从头重传）。
 * 远程传输的**冲突策略**只做到「目标名去重」，没有冲突对话框 / 覆盖选项。
 * 远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义。
 * 远程目录没有 watcher（改完必须重读），跨端点传输完成后靠调用方主动 `refresh`。

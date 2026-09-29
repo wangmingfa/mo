@@ -35,6 +35,8 @@ use mo_fs::{FileSystem, ReadDirEntry};
 use percent_encoding::percent_decode_str;
 use reqwest_dav::types::list_cmd::{ListProp, ListResponse};
 use reqwest_dav::{Auth, ClientBuilder, DecodeError, Depth, Error as DavError};
+use std::io::SeekFrom;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 
 use crate::{RemoteError, RemoteUrl};
@@ -47,6 +49,23 @@ pub struct WebDavFileSystem {
     /// 底层客户端：`Clone + Send + Sync`，方法都收 `&self`，连接池由 reqwest 自管，
     /// 因此不必像 FTP/SFTP 那样用 Mutex 串起来。
     client: reqwest_dav::Client,
+}
+
+/// 分块写时各块攒到本地的临时文件，最后整份 PUT。临时文件名由远端路径派生——
+/// 同一远端路径串行传输不会撞（传输循环对单目标是顺序的），残留的临时文件在
+/// `finalize_file_chunk` 里删掉，没走到 finalize（中途失败）的会留着等下次覆盖。
+fn webdav_stage_path(remote: &str) -> PathBuf {
+    let name: String = remote
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join("mo-webdav-staging").join(name)
 }
 
 impl WebDavFileSystem {
@@ -425,31 +444,58 @@ impl FileSystem for WebDavFileSystem {
         .await
     }
 
-    // ⚠️ 暂整份模拟（待换「接收临时文件再整份 PUT」）：GET 已有 + 替换区间 + PUT 整份。
-    // WebDAV 没有被广泛支持的部分 PUT，真正分块写需先落本地临时文件；此刻超大文件
-    // 仍整份进内存且是 O(n²)，下一轮优化（见 devlog/remote-transfer.md）。
+    // WebDAV 没有可靠的部分 PUT（各服务端对 `Content-Range` PUT 支持参差），真正分块写
+    // 只能先把各块落到本地临时文件，最后 `finalize_file_chunk` 整份 PUT 一次。这样内存峰值
+    // 只有一个块（4 MiB），网络也只 PUT 一次（不再每块重传整份）。offset==0 时 truncate
+    // 临时文件，清掉上次没走完残留的尾部；offset>0 保留已写好的前块。
     async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let data = data.to_vec();
+        self.dispatch("上传", async move {
+            let tmp = webdav_stage_path(&remote);
+            tokio::fs::create_dir_all(tmp.parent().expect("staging 必有父目录"))
+                .await
+                .map_err(|e| RemoteError::transport("建临时目录", e))?;
+            let mut opt = tokio::fs::OpenOptions::new();
+            opt.write(true).create(true);
+            if offset == 0 {
+                opt.truncate(true);
+            }
+            let mut f = opt
+                .open(&tmp)
+                .await
+                .map_err(|e| RemoteError::transport("开临时文件", e))?;
+            if !data.is_empty() {
+                f.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| RemoteError::transport("定位", e))?;
+                f.write_all(&data)
+                    .await
+                    .map_err(|e| RemoteError::transport("写临时文件", e))?;
+            }
+            f.flush()
+                .await
+                .map_err(|e| RemoteError::transport("刷临时文件", e))?;
+            // drop 关闭；故意不在这里 PUT，避免每块的 O(n²) 重传
+            Ok(())
+        })
+        .await
+    }
+
+    // 收尾：把攒在本地临时文件的整份 PUT 到远端，然后清掉临时文件。仅 WebDAV 需要；
+    // 传输循环对每个目标无条件调一次，本地 / FTP / SFTP 走 trait 默认的空实现。
+    async fn finalize_file_chunk(&self, path: &Path) -> Result<(), MoError> {
+        let remote = Self::remote(path);
         let client = self.client.clone();
         self.dispatch("上传", async move {
-            let existing = match client.get(&remote).await {
-                Ok(r) => r.bytes().await.unwrap_or_default().to_vec(),
-                Err(_) => Vec::new(),
-            };
-            let mut buf = existing;
-            let start = offset as usize;
-            if buf.len() < start {
-                buf.resize(start, 0);
-            }
-            if buf.len() < start + data.len() {
-                buf.resize(start + data.len(), 0);
-            }
-            buf[start..start + data.len()].copy_from_slice(&data);
-            client
-                .put(&remote, buf)
+            let tmp = webdav_stage_path(&remote);
+            let bytes = tokio::fs::read(&tmp).await.unwrap_or_default();
+            let result = client
+                .put(&remote, bytes)
                 .await
-                .map_err(|e| classify("上传", &e))
+                .map_err(|e| classify("上传", &e));
+            let _ = tokio::fs::remove_file(&tmp).await;
+            result
         })
         .await
     }

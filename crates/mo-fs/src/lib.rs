@@ -105,6 +105,16 @@ pub trait FileSystem: Send + Sync {
     /// 起创建（前面填空字节），空文件用 `write_file_chunk(path, 0, &[])` 建出。
     async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError>;
 
+    /// 分块写结束后由调用方调用一次：把「攒在本地临时区的整份」落盘到目标。
+    ///
+    /// 默认实现是空操作——只有 WebDAV 这种「没有广泛支持的部分 PUT、必须先把各块
+    /// 落到本地临时文件、最后整份 PUT」的后端才需要覆写。本地 / FTP / SFTP 在
+    /// `write_file_chunk` 里就逐块落好了，无需收尾。调用方（传输循环）对每个目标
+    /// 无条件调一次即可，多调一次对前三类后端无害（空操作）。
+    async fn finalize_file_chunk(&self, _path: &Path) -> Result<(), MoError> {
+        Ok(())
+    }
+
     /// 删除文件。
     async fn remove_file(&self, path: &Path) -> Result<(), MoError>;
 

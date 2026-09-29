@@ -231,6 +231,9 @@ fn transfer_tree(
                 offset += written;
             }
         }
+        // 收尾：WebDAV 把攒在临时文件的整份 PUT 出去；本地 / FTP / SFTP 是空操作。
+        // 必须在删源之前——传输语义是「先确保目标完整，再删源」。
+        dst_fs.finalize_file_chunk(&dst).await?;
         if remove_source {
             src_fs.remove_file(&src).await?;
         }
