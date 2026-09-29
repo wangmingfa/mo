@@ -1,9 +1,5 @@
-//! P3 验收夹具：一个会说 provider 协议的最小进程（devlog §8 的「example 插件」）。
-//!
-//! **只为测试存在**——它随 `cargo test` 一起构建（集成测试用 `CARGO_BIN_EXE_p3_provider`
-//! 找到它），不随任何发布物出厂。行为由第一个参数选：
-//!
-//! * `ok`（缺省）： initialize / classify（答固定标签）/ preview（答 markdown）都正常。
+//! * `ok`（缺省）： initialize / classify（答固定标签）/ preview（答 markdown）/
+//!   list（答两行：一行带路径 + 副标题、一行只有名字）都正常。
 //! * `hang`：握手正常，`classify` 永不应答（测超时 kill）。
 //! * `crash`：握手正常，第一次 `classify` 直接退出（测崩溃计数）。
 //! * `garbage`：答 `classify` 前先往 stdout 吐一行不成帧的人话（测「跳过垃圾行不炸」）。
@@ -21,7 +17,7 @@ fn main() {
         let id = v["id"].as_u64().unwrap_or(0);
         match v["method"].as_str().unwrap_or("") {
             "initialize" => println!(
-                r#"{{"id":{id},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview"]}}}}"#
+                r#"{{"id":{id},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview","list"]}}}}"#
             ),
             "shutdown" => {
                 println!(r#"{{"id":{id},"result":null}}"#);
@@ -47,6 +43,14 @@ fn main() {
             },
             "preview" => {
                 println!(r##"{{"id":{id},"result":{{"kind":"markdown","text":"# 来自插件"}}}}"##)
+            }
+            // list（P4）：source 原样回显进第一行的 id 里（证明宿主真的传了），
+            // 两行分别覆盖「带路径 + 副标题」与「只有名字」两种形态。
+            "list" => {
+                let source = v["params"]["source"].as_str().unwrap_or("");
+                println!(
+                    r##"{{"id":{id},"result":{{"rows":[{{"id":"r1","name":"第一行 · {source}","path":"/tmp","subtitle":"副标题","icon":"ignored"}},{{"id":"r2","name":"第二行"}}]}}}}"##
+                )
             }
             // 认不出的方法（含插件不该有的反向请求）：走 error 臂。
             other => println!(r#"{{"id":{id},"error":"认不出的方法 {other}"}}"#),

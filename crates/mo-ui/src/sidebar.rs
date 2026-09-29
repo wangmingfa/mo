@@ -413,6 +413,9 @@ fn contributed_sections(entries: &[SidebarEntry]) -> Vec<Section> {
         let (kind, label) = match e {
             SidebarEntry::Command(c) => ("cmd", c.name.as_str()),
             SidebarEntry::Workflow(w) => ("wf", w.name.as_str()),
+            // 列表源（P4）：ID 用 `list-{source_id}`。source_id 在清单内校验过唯一，
+            // 类型段再与命令 / 工作流分开，撞号依旧靠构造排除。
+            SidebarEntry::List { source_id, .. } => ("list", source_id.as_str()),
         };
         let row = Row {
             id: format!("sidebar-ext-{kind}-{label}").into(),
@@ -751,6 +754,14 @@ fn render_row(row: Row, app: &AppState, entity: &Entity<RootView>) -> impl IntoE
                 entity_click.update(cx, |v, cx| match entry {
                     SidebarEntry::Command(cmd) => v.run_user_command(cmd, cx),
                     SidebarEntry::Workflow(wf) => v.run_workflow(wf, cx),
+                    // 列表源（P4）：不是「跑一条命令」，是「打开一个面板」——
+                    // 与回收站面板同语义（进次级视图，不离开次级视图）。
+                    SidebarEntry::List {
+                        ext_id,
+                        source_id,
+                        title,
+                        ..
+                    } => v.open_list_panel(&ext_id, &source_id, &title, cx),
                 });
             }
         }

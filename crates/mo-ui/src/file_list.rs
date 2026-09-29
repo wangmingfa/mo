@@ -337,6 +337,10 @@ pub fn render(
             // provider（P3 classify）的归属表：同样**每帧取一次**、行循环只查表。
             // 有归属的扩展名，行内先问内存表有没有答案，没有就把这行排进派发队列。
             let classify_owners = panel.app.classify_owners();
+            // 颜色标签表：同样**每帧取一次**，行循环里只查表。每行问一次等于每行
+            // 一次 stat（`AppState::tag_table` 有签名缓存，但签名检查也是 IO，
+            // 摊到三十行就是一帧三十次——而答案这一帧内根本不会变）。
+            let tag_colors = panel.app.tag_table();
             let mut want_classify: Vec<Entry> = Vec::new();
             // 只对**真实行**判断窗口覆盖；下标 ≥ count 的补足行没有数据可取，
             // 参与判断会让这条日志每帧都冒出来。
@@ -632,7 +636,11 @@ pub fn render(
                     });
 
                 let app = view.panel_at(pane, tab).map(|p| p.app.clone());
-                let tag_color = app.as_ref().and_then(|a| a.tag_of(&entry.path));
+                // 空串等于没打标签（`AppState::tag_of` 同一条判据）。
+                let tag_color = tag_colors
+                    .get(entry.path.as_path())
+                    .cloned()
+                    .filter(|c| !c.is_empty());
                 // provider 的「种类」答案（P3）：文件且归属表命中才问；内存表没有
                 // 就排进派发队列（每帧重复调是安全的，批内去重在 inflight）。
                 let mut provider_kind: Option<String> = None;

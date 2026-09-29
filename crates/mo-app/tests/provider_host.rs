@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use mo_app::provider::{base64_encode, build_classify_params, CallError, Manager, SpawnSpec};
 
+mod common;
+
 fn exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_p3_provider"))
 }
@@ -67,6 +69,69 @@ fn ok_mode_answers_classify_and_preview() {
         .expect("preview 应当答上来");
     assert_eq!(pv["kind"], "markdown");
     assert_eq!(pv["text"], "# 来自插件");
+}
+
+/// `list` 方法（P4）：ok 模式答两行；宿主把 `source` **原样传给进程**（夹具把它
+/// 回显进第一行的 name 里，传没传一眼可见）；解析侧收 name / path / subtitle，
+/// icon 收下不用不报错。
+#[test]
+fn list_method_returns_rows_with_source_passthrough() {
+    let host = mo_app::provider::Host::new(spec("list", "ok", 2000));
+    let result = host
+        .call("list", &mo_app::provider::list_params("recent"))
+        .expect("list 应当答上来");
+    let rows = mo_app::provider::list_rows_from_result(&result);
+    assert_eq!(rows.len(), 2, "夹具答两行");
+    assert_eq!(
+        rows[0].name, "第一行 · recent",
+        "宿主要把 source 原样传给进程"
+    );
+    assert_eq!(rows[0].subtitle.as_deref(), Some("副标题"));
+    assert_eq!(rows[0].path.as_deref(), Some(Path::new("/tmp")));
+    assert!(rows[1].path.is_none(), "没有路径的行就是「不动的一行」");
+    assert!(
+        !rows[0].is_dir && !rows[1].is_dir,
+        "裸解析不 stat，is_dir 由 Manager::list 补"
+    );
+}
+
+/// Manager 级的 list 端到端（P4）：清单（provider.methods=["list"] + lists 成对声明）
+/// → 宿主 → 调用 → 解析 → **逐行 stat 补 is_dir**。带路径的行指向 /tmp（真目录），
+/// is_dir 必须被标出来——双击导航判「进目录还是开文件」靠它。
+#[test]
+fn manager_list_source_end_to_end() {
+    // ⚠️ 这条会真开 sqlite（`Manager::cache()` / `mo_cache_or_fresh()`），落点是
+    // `MO_CACHE_DIR` 指的那个 `plugin-classify.sqlite`。不隔离就等于跟**别的测试进程**
+    // 抢同一个库文件（进程各自的 env 互不影响，但磁盘上是同一份），表现为概率性的
+    // 「缓存应能打开」失败——并行跑才红、单跑永远绿。
+    common::isolated("p3list", || {
+        let tmp = spec_dir("mgrlist");
+        std::env::set_var("MO_CACHE_DIR", tmp.join("cache"));
+        let config_json = tmp.join("config.json");
+        std::fs::write(&config_json, "{}").unwrap();
+
+        let ext_dir = tmp.join("extensions").join("p4a");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("manifest.json"),
+            format!(
+                r#"{{"id":"p4a","name":"P4夹具","provider":{{"run":["{}","ok"],"methods":["list"]}},"lists":[{{"id":"recent","title":"最近文件"}}]}}"#,
+                exe().display()
+            ),
+        )
+        .unwrap();
+
+        let manager = Manager::new();
+        let rows = manager
+            .list("p4a", "recent", &config_json)
+            .expect("应当答上来");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "第一行 · recent");
+        assert!(rows[0].is_dir, "宿主 stat 后要把 /tmp 标成目录");
+        assert!(rows[1].path.is_none(), "无路径行保持「不动」");
+        assert!(!rows[1].is_dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+    })
 }
 
 /// 认不出的方法（尤其插件不该有的反向请求）：协议级 error，不炸宿主。
@@ -180,78 +245,84 @@ fn unspawnable_argv_counts_toward_backoff() {
 /// 会往开发机的真实缓存里写行。
 #[test]
 fn manager_end_to_end_classifies_stores_and_forgets() {
-    let tmp = spec_dir("mgr");
-    std::env::set_var("MO_CACHE_DIR", tmp.join("cache"));
-    let config_json = tmp.join("config.json");
-    std::fs::write(&config_json, "{}").unwrap();
+    // ⚠️ 这条会真开 sqlite（`Manager::cache()` / `mo_cache_or_fresh()`），落点是
+    // `MO_CACHE_DIR` 指的那个 `plugin-classify.sqlite`。不隔离就等于跟**别的测试进程**
+    // 抢同一个库文件（进程各自的 env 互不影响，但磁盘上是同一份），表现为概率性的
+    // 「缓存应能打开」失败——并行跑才红、单跑永远绿。
+    common::isolated("p3cache", || {
+        let tmp = spec_dir("mgr");
+        std::env::set_var("MO_CACHE_DIR", tmp.join("cache"));
+        let config_json = tmp.join("config.json");
+        std::fs::write(&config_json, "{}").unwrap();
 
-    let ext_dir = tmp.join("extensions").join("p3a");
-    std::fs::create_dir_all(&ext_dir).unwrap();
-    // capabilities 带 read-contents：宿主应把文件头附进 classify 入参（capability
-    // 的执行点在派发侧，夹具进程不管这个字段，但参数里必须看得见）。
-    std::fs::write(
-        ext_dir.join("manifest.json"),
-        format!(
-            r#"{{"id":"p3a","name":"P3夹具","provider":{{"run":["{}","ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
-            exe().display()
-        ),
-    )
-    .unwrap();
-    let file = tmp.join("movie.p3x");
-    std::fs::write(&file, b"P3X-FAKE-CONTENT").unwrap();
+        let ext_dir = tmp.join("extensions").join("p3a");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        // capabilities 带 read-contents：宿主应把文件头附进 classify 入参（capability
+        // 的执行点在派发侧，夹具进程不管这个字段，但参数里必须看得见）。
+        std::fs::write(
+            ext_dir.join("manifest.json"),
+            format!(
+                r#"{{"id":"p3a","name":"P3夹具","provider":{{"run":["{}","ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
+                exe().display()
+            ),
+        )
+        .unwrap();
+        let file = tmp.join("movie.p3x");
+        std::fs::write(&file, b"P3X-FAKE-CONTENT").unwrap();
 
-    let manager = Manager::new();
-    assert_eq!(
-        manager.owner_of(&file, &config_json).as_deref(),
-        Some("p3a"),
-        ".p3x 应归 p3a"
-    );
-    assert!(
-        manager
-            .owner_of(&tmp.join("other.txt"), &config_json)
-            .is_none(),
-        "没归属的扩展名不该有 owner"
-    );
+        let manager = Manager::new();
+        assert_eq!(
+            manager.owner_of(&file, &config_json).as_deref(),
+            Some("p3a"),
+            ".p3x 应归 p3a"
+        );
+        assert!(
+            manager
+                .owner_of(&tmp.join("other.txt"), &config_json)
+                .is_none(),
+            "没归属的扩展名不该有 owner"
+        );
 
-    let host = manager.host("p3a", &config_json).expect("应有宿主");
-    // capability 执行点：授了 read-contents，入参里带 head_b64。
-    let md = std::fs::metadata(&file).unwrap();
-    let head = mo_app::provider::read_head(&file);
-    let params = build_classify_params(&file, md.len(), head.as_deref());
-    assert_eq!(
-        params["head_b64"],
-        serde_json::json!(base64_encode(b"P3X-FAKE-CONTENT")),
-        "授了 read-contents 就要附文件头"
-    );
-    let result = host.call("classify", &params).expect("应当答上来");
-    let label = mo_app::provider::classify_label_of_result(&result).expect("应有标签");
+        let host = manager.host("p3a", &config_json).expect("应有宿主");
+        // capability 执行点：授了 read-contents，入参里带 head_b64。
+        let md = std::fs::metadata(&file).unwrap();
+        let head = mo_app::provider::read_head(&file);
+        let params = build_classify_params(&file, md.len(), head.as_deref());
+        assert_eq!(
+            params["head_b64"],
+            serde_json::json!(base64_encode(b"P3X-FAKE-CONTENT")),
+            "授了 read-contents 就要附文件头"
+        );
+        let result = host.call("classify", &params).expect("应当答上来");
+        let label = mo_app::provider::classify_label_of_result(&result).expect("应有标签");
 
-    // 真实流程里 cache() 先于落账被打开（classify_batch 的第一步）；这里同序。
-    let _cache = manager.cache().expect("缓存应能打开");
-    let mtime: i64 = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    manager.store_labels(&[("p3a".into(), file.clone(), mtime, md.len() as i64, label)]);
-    assert_eq!(
-        manager.classify_label_of(&file).as_deref(),
-        Some("P3测试种类")
-    );
+        // 真实流程里 cache() 先于落账被打开（classify_batch 的第一步）；这里同序。
+        let _cache = manager.cache().expect("缓存应能打开");
+        let mtime: i64 = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        manager.store_labels(&[("p3a".into(), file.clone(), mtime, md.len() as i64, label)]);
+        assert_eq!(
+            manager.classify_label_of(&file).as_deref(),
+            Some("P3测试种类")
+        );
 
-    // sqlite 落盘：换一个连接（模拟重启）从缓存库里还能捞回同一行。
-    let fresh = mo_cache_or_fresh();
-    let row = fresh.get("p3a", &file).expect("查缓存").expect("应命中");
-    assert_eq!(row.label, "P3测试种类");
-    assert_eq!(row.size, md.len() as i64);
+        // sqlite 落盘：换一个连接（模拟重启）从缓存库里还能捞回同一行。
+        let fresh = mo_cache_or_fresh();
+        let row = fresh.get("p3a", &file).expect("查缓存").expect("应命中");
+        assert_eq!(row.label, "P3测试种类");
+        assert_eq!(row.size, md.len() as i64);
 
-    // 卸载清账：宿主、内存表、sqlite 行一起消失。
-    manager.forget_ext("p3a");
-    assert!(manager.classify_label_of(&file).is_none(), "内存表要清");
-    assert!(
-        fresh.get("p3a", &file).expect("查缓存").is_none(),
-        "sqlite 行也要清"
-    );
-    let _ = std::fs::remove_dir_all(&tmp);
+        // 卸载清账：宿主、内存表、sqlite 行一起消失。
+        manager.forget_ext("p3a");
+        assert!(manager.classify_label_of(&file).is_none(), "内存表要清");
+        assert!(
+            fresh.get("p3a", &file).expect("查缓存").is_none(),
+            "sqlite 行也要清"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    })
 }

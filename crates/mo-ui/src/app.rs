@@ -239,6 +239,11 @@ pub(crate) enum Modal {
     /// 携带被改名的条目（落点路径），新名字暂存在 [`RootView::trash_rename_name`]；
     /// Esc / 取消回到面板，Enter 提交。
     TrashRename(Box<TrashEntry>),
+    /// 扩展贡献的只读列表源面板（P4，devlog §5 表格 `list` 那行）。
+    ///
+    /// 状态（标题 / 行 / 加载中 / 错误）放在 [`RootView::list_panel`]，这里只是
+    /// 「现在是列表面板」的标记——与回收站同款（`Modal::Trash` + `trash_entries`）。
+    List,
 }
 
 /// [`Modal::ConfirmTrash`] 携带的待确认动作。
@@ -246,6 +251,26 @@ pub(crate) enum Modal {
 pub(crate) enum TrashConfirm {
     /// 清空回收站（条目数在渲染时从 `trash_entries` 现读，避免快照过期）。
     Empty,
+}
+
+/// [`Modal::List`] 面板的状态（P4，devlog §4.15）。
+///
+/// 第一版**只读**（§9 风险 1 的止损）：没有选中集 / 分组 / 隐藏过滤那套不变量，
+/// 键盘只有一个游标，双击带路径的行走导航。
+#[derive(Debug, Clone)]
+pub(crate) struct ListPanel {
+    ext_id: String,
+    source_id: String,
+    /// 面板标题 = 清单里声明的 `title`（侧栏那一行的同一句话）。
+    title: String,
+    /// 行。加载完成前是空的。
+    rows: Vec<mo_app::provider::ListRow>,
+    /// `true` = 还在等 provider 答（blocking 池里）。
+    loading: bool,
+    /// 拉取失败的那句话（面板正中显示；与 loading 互斥——出错就不会再等）。
+    error: Option<String>,
+    /// 键盘游标（↑↓ 移动 / Enter 打开）。
+    index: usize,
 }
 
 /// 统一设置窗口（[`Modal::Settings`](Modal)）里的标签页。
@@ -862,6 +887,9 @@ pub struct RootView {
     /// 对落点 stat——在后台线程做（性能红线：阻塞 IO 不进主线程），回填后渲染
     /// 只查表。按落点路径键控：还原 / 清空后留下的旧键无害，重进回收站只补缺。
     trash_sizes: HashMap<PathBuf, u64>,
+    /// 扩展贡献的只读列表源面板（P4）。`None` = 没开；开着的时候 `modal` 是
+    /// [`Modal::List`]，两者同进同出（`close_modal` / Esc 各自清）。
+    list_panel: Option<ListPanel>,
     /// 全局搜索过滤词。
     search_query: String,
     /// 全局搜索结果。
@@ -1198,6 +1226,7 @@ impl RootView {
             trash_body_h: 0.0,
             trash_view_mode: ViewMode::List,
             trash_sizes: HashMap::new(),
+            list_panel: None,
             diff_cache: None,
             form_index: 0,
             prop: None,
@@ -1855,6 +1884,126 @@ impl RootView {
         let a = self.trash_anchor.unwrap_or(i);
         let (lo, hi) = if a <= i { (a, i) } else { (i, a) };
         self.trash_selected = (lo..=hi).collect();
+    }
+
+    /// 打开一个扩展贡献的只读列表面板（P4，侧栏列表源行的落点）。
+    ///
+    /// 与 [`Self::open_trash_panel`] 同款：进次级视图（`Modal::List`）、**不**「离开
+    /// 次级视图」（它本身就是进次级视图）。取数走 blocking 池（`AppState::list_rows`
+    /// 是阻塞调用），先画「正在加载」，答案回来整块回填——§2「插件不在热路径上被
+    /// 等待」在这里的形态。
+    pub(crate) fn open_list_panel(
+        &mut self,
+        ext_id: &str,
+        source_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_panel = Some(ListPanel {
+            ext_id: ext_id.to_string(),
+            source_id: source_id.to_string(),
+            title: title.to_string(),
+            rows: Vec::new(),
+            loading: true,
+            error: None,
+            index: 0,
+        });
+        self.modal = Modal::List;
+        cx.notify();
+
+        let app = self.app();
+        let app2 = app.clone();
+        let ext_id = ext_id.to_string();
+        let source_id = source_id.to_string();
+        cx.spawn(async move |this, cx| {
+            // blocking 池里调进程 + 逐行 stat；失败折成一句话回填。
+            let result = app.spawn_blocking(move || app2.list_rows(&ext_id, &source_id));
+            let result = result.await.unwrap_or_else(|e| Err(format!("{e}")));
+            this.update(cx, |v, cx| {
+                let Some(p) = v.list_panel.as_mut() else {
+                    return; // 面板已经被关了（Esc）：答案迟到就丢弃，别把面板复活。
+                };
+                p.loading = false;
+                match result {
+                    Ok(rows) => p.rows = rows,
+                    Err(e) => p.error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 关掉列表面板（Esc / 渲染层关闭按钮共用）。
+    fn close_list_panel(&mut self, cx: &mut Context<Self>) {
+        self.list_panel = None;
+        if self.modal == Modal::List {
+            self.modal = Modal::None;
+        }
+        cx.notify();
+    }
+
+    /// 重取当前列表面板（失败态的「重试」按钮用）：同一份声明重新走一遍
+    /// [`Self::open_list_panel`]——它本来就是「重置状态 + 后台取数」的原语。
+    fn refresh_list_panel(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.list_panel.as_ref() else {
+            return;
+        };
+        let ext_id = p.ext_id.clone();
+        let source_id = p.source_id.clone();
+        let title = p.title.clone();
+        self.open_list_panel(&ext_id, &source_id, &title, cx);
+    }
+
+    /// 列表面板里**双击**一行的落点：有路径的行走导航（目录进入并关面板——浏览替代
+    /// 查看，与回收站双击目录同语义；文件交系统默认应用），没路径的行无事发生
+    /// （「不动的一行」，devlog §5 的第一版约束）。
+    ///
+    /// 落点走**本地入口**纪律（`open_local`）：provider 进程在本机跑，它给的路径
+    /// 就是本机视角的路径（远程挂载点对它来说也是本地目录），绝不能拿去问远程后端。
+    fn open_list_row(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(p) = self.list_panel.as_ref() else {
+            return;
+        };
+        let Some(row) = p.rows.get(i) else {
+            return;
+        };
+        let Some(path) = row.path.clone() else {
+            return;
+        };
+        if row.is_dir {
+            self.close_list_panel(cx);
+            let app = self.app();
+            cx.spawn(async move |_weak, _cx| {
+                if let Err(e) = app.open_local(&path).await {
+                    tracing::warn!("打开列表源目录 {path:?} 失败：{e}");
+                }
+            })
+            .detach();
+        } else {
+            let app = self.app();
+            cx.spawn(async move |_weak, _cx| {
+                if let Err(e) = app.open_with_system(&path).await {
+                    tracing::warn!("打开列表源文件 {path:?} 失败：{e}");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// 列表面板的 ↑↓ 移动游标 / Enter 打开（与回收站同一套手感，但没有多选——
+    /// 只读面板没有「对选中集做动作」这回事）。
+    fn list_move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(p) = self.list_panel.as_mut() else {
+            return;
+        };
+        let n = p.rows.len();
+        if n == 0 {
+            return;
+        }
+        p.index = (p.index as isize + delta).clamp(0, n as isize - 1) as usize;
+        cx.notify();
     }
 
     /// 回收站 ↑↓ 移动游标：普通移动 = 单选替换（锚点跟过去）；
@@ -4004,6 +4153,153 @@ impl RootView {
         self.modal = Modal::None;
         self.wf_report = None;
         cx.notify();
+    }
+
+    /// 只读列表面板（P4，devlog §4.15）。
+    ///
+    /// 行为半径刻意小：一行 = name（+ 可选灰色 subtitle），双击有路径的行才动；
+    /// 没有 / 不画选中集、分组、隐藏过滤、右键菜单——那套不变量是 §9 风险 1 点名
+    /// 别撞的。加载中 / 失败各有正中的一句话，不留白屏。
+    fn render_list_panel(&self, entity: &Entity<RootView>) -> Div {
+        let Some(p) = self.list_panel.as_ref() else {
+            // 理论到不了（modal 与状态同进同出）；兜底画个空壳别 panic。
+            return central_view("列表", "", div(), "Esc 关闭");
+        };
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px(px(16.0))
+            .py(px(8.0))
+            .gap(px(2.0));
+
+        if p.loading {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("正在从扩展拉取列表…".to_string())),
+            );
+            return central_view(&p.title, "", body, "Esc 关闭");
+        }
+        if let Some(err) = &p.error {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!(format!("拉取失败：{err}"))),
+            );
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .text_size(px(11.5))
+                    .child(text!(
+                        "进程的输出在扩展的 host.log 里（扩展管理器 → 该扩展）".to_string()
+                    )),
+            );
+            // 「重试」：同一份声明重走一遍打开流程。退避是自愈的（几分钟内自动
+            // 恢复），但用户不该盯着一句错误猜「要不要重开面板」。
+            let retry = entity.clone();
+            let mut btn = div()
+                .id("list-retry")
+                .debug_selector(|| "mo-list-retry".to_string())
+                .flex()
+                .items_center()
+                .mt(px(8.0))
+                .px(px(10.0))
+                .h(px(26.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme::separator())
+                .bg(theme::surface())
+                .text_size(px(12.0))
+                .text_color(theme::muted())
+                .hover(|s| s.text_color(theme::text()))
+                .child(text!("重试".to_string()));
+            btn.interactivity().on_click(move |_, _window, cx| {
+                retry.update(cx, |v, cx| v.refresh_list_panel(cx));
+            });
+            body = body.child(btn.test_support());
+            return central_view(&p.title, "", body, "Esc 关闭");
+        }
+        if p.rows.is_empty() {
+            body = body.child(
+                div()
+                    .text_color(theme::muted())
+                    .child(text!("（扩展说这里什么都没有）".to_string())),
+            );
+            return central_view(&p.title, "", body, "Esc 关闭");
+        }
+
+        for (i, row) in p.rows.iter().enumerate() {
+            let cursor = i == p.index;
+            let fg = if cursor {
+                theme::selected_text()
+            } else {
+                theme::text()
+            };
+            let openable = row.path.is_some();
+            // 单击移游标 / 双击打开（有路径的行）。无路径的行是「不动的一行」：
+            // 照画，双击无事发生。⚠️ 元素 ID 必须有（无 ID 的裸 div on_click 不触发），
+            // 选择器从 ID 派生（§4.4 那条纪律，两边不可能分叉）。
+            let id = format!("mo-list-row-{i}");
+            let entity_click = entity.clone();
+            let mut line = div()
+                .id(id.clone())
+                .debug_selector(move || id.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .w_full()
+                .h(px(24.0))
+                .px(px(6.0))
+                .rounded(px(4.0))
+                .text_color(fg);
+            if cursor {
+                line = line.bg(theme::selected_bg());
+            }
+            line = line.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.5))
+                    .child(text!(row.name.clone())),
+            );
+            if let Some(sub) = &row.subtitle {
+                line = line.child(
+                    div()
+                        .text_color(theme::muted())
+                        .text_size(px(11.0))
+                        .child(text!(sub.clone())),
+                );
+            }
+            // 有路径的行尾画一个「↗」提示可点；没路径的行什么都没有（不画锁、
+            // 不画灰——「不动」就是不动，不解释）。
+            if openable {
+                line = line.child(
+                    div()
+                        .text_color(theme::muted())
+                        .text_size(px(11.0))
+                        .child(text!("↗".to_string())),
+                );
+            }
+            line.interactivity().on_click(move |ev, _window, cx| {
+                let i = i;
+                if ev.click_count() >= 2 {
+                    entity_click.update(cx, |v, cx| v.open_list_row(i, cx));
+                    return;
+                }
+                entity_click.update(cx, |v, cx| {
+                    if let Some(p) = v.list_panel.as_mut() {
+                        p.index = i;
+                        cx.notify();
+                    }
+                });
+            });
+            body = body.child(line.test_support());
+        }
+        central_view(&p.title, "", body, "双击打开有 ↗ 的行 · Esc 关闭")
     }
 
     fn render_workflow(&self) -> Div {
@@ -7433,6 +7729,7 @@ impl Render for RootView {
             }
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::Workflow => self.render_workflow(),
+            Modal::List => self.render_list_panel(&entity),
             Modal::Sync => self.render_sync(&entity),
         };
 
@@ -8667,6 +8964,18 @@ fn handle_modal_key(
                 entity.update(cx, |v, cx| v.workflow_dismiss(cx));
             }
         }
+        // 只读列表面板（P4）：Esc 关、↑↓ 移游标、Enter 打开游标行。不绑 Delete /
+        // ⌘A——只读面板没有「对选中集做动作」这回事，绑了只会教人误触。
+        Modal::List => match key {
+            "escape" => entity.update(cx, |v, cx| v.close_list_panel(cx)),
+            "up" | "arrowup" => entity.update(cx, |v, cx| v.list_move_cursor(-1, cx)),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| v.list_move_cursor(1, cx)),
+            "enter" => entity.update(cx, |v, cx| {
+                let i = v.list_panel.as_ref().map(|p| p.index).unwrap_or(0);
+                v.open_list_row(i, cx);
+            }),
+            _ => {}
+        },
         Modal::Sync => {
             if key == "escape" {
                 close_modal(entity, cx);
@@ -8887,6 +9196,9 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
         v.palette_index = 0;
         v.trash_selected.clear();
         v.trash_anchor = None;
+        // 列表面板（P4）的状态与 modal 同进同出：点遮罩关掉也要清，否则下次开
+        // 另一个列表源会闪出旧行。
+        v.list_panel = None;
         // 选择器的壳借的是命令面板：一起收掉，否则下次打开面板还是「打开方式」。
         v.app_picker = None;
         cx.notify();
@@ -11515,6 +11827,9 @@ fn contribution_line(c: &mo_app::extensions::Contribution) -> String {
         C::TypeLabel { exts, label } => {
             format!("类型：{} 在「种类」列显示为「{label}」", exts.join(" / "))
         }
+        C::ListSource { title } => {
+            format!("列表源「{title}」进 侧栏；只读面板，数据由进程的 list 方法供")
+        }
         C::Provider {
             methods,
             capabilities,
@@ -13648,6 +13963,15 @@ mod tests {
         };
         assert_eq!(offset_y(cx), 0.0, "开场应停在列表顶部");
 
+        // 先空按一次 ↓：面板刚开那一拍的按键在 headless 下**偶发不生效**——进到了
+        // 处理分支、行数也对、闭包里确实 +1 了，但这一次 `entity.update` 的写入随后
+        // 被视图状态建立盖掉（实测：全量跑约 50% 概率丢，加打印就不复现，是竞态）。
+        //
+        // 判据：丢了这一次的表现是「整段慢一拍」（末行停在 n-2）；不是 Mo 的逻辑
+        // 问题——`palette_index` 没有任何一处被写回 0，实体 id 也自始至终只有一个。
+        // 真机不受影响（人不可能在面板开出的同一帧里按键），所以消化掉这一拍即可，
+        // 不断言它：两种情况下再按 n-1 次都该停在最后一行，断言强度不变。
+        cx.simulate_keystrokes("down");
         for _ in 0..n - 1 {
             cx.simulate_keystrokes("down");
         }
@@ -13944,6 +14268,111 @@ mod tests {
             ),
         }
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 列表源端到端（P4，devlog §4.15）：清单 `lists` 声明 → 侧栏行 → 点开面板 →
+    /// 种子行渲染 → Enter 打开游标行（`is_dir=true` → `open_local` 导航 + 面板关闭）。
+    ///
+    /// provider 走**测试种子**（headless 不起真进程）；「清单 → 进程 → 解析 → stat」
+    /// 那半条链路由 mo-app 的 `provider_host::manager_list_source_end_to_end` 用真进程
+    /// 钉住——两半拼起来才是整条链，谁也不许假装对方已经验过。
+    #[test]
+    fn list_source_panel_shows_rows_and_opens_a_path() {
+        let config = crate::isolate_user_dirs_for_tests();
+        let dir = config.join("extensions").join("p4list");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p4list",
+  "name": "列表源P4",
+  "provider": { "run": ["/no/such/p4"], "methods": ["list"] },
+  "lists": [{ "id": "recent", "title": "最近文件" }]
+}"#,
+        )
+        .unwrap();
+        // 「打开」的真实落点：一个真目录（导航走 `open_local`，本地入口纪律）。
+        let target = std::env::temp_dir().join(format!("mo-p4target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+
+        let mut cx = TestAppContext::single();
+        // 面板取数与导航都走 blocking 池 + 真线程：不开豁免，await 外部线程完成
+        // 会把 headless 执行器挂死（memory 里的老坑，实测就是「测试跑了 60 秒+」）。
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        app.test_seed_list_rows(
+            "p4list",
+            "recent",
+            vec![
+                mo_app::provider::ListRow {
+                    id: "r1".into(),
+                    name: "最近一".into(),
+                    path: Some(target.clone()),
+                    is_dir: true,
+                    subtitle: Some("副标题".into()),
+                },
+                mo_app::provider::ListRow {
+                    id: "r2".into(),
+                    name: "无路径行".into(),
+                    path: None,
+                    is_dir: false,
+                    subtitle: None,
+                },
+            ],
+        );
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+        assert_eq!(modal_of(cx), Modal::None, "起点：没有模态挡着");
+
+        // 段1：声明 → 侧栏行。ID 从声明派生（`sidebar-ext-list-{source_id}`），
+        // 这句选择器就是声明本身。
+        const SELECTOR: &str = "mo-sidebar-ext-list-recent";
+        cx.debug_bounds(SELECTOR)
+            .unwrap_or_else(|| panic!("列表源的侧栏行没出现在渲染帧里（{SELECTOR}）"));
+
+        // 段2：点击 → 面板打开、行渲染。取数在 blocking 池（种子只是让结果现成，
+        // 任务还是走那条线程），`run_until_parked` 不等它——轮询到行真的画出来。
+        cx.update(|window, cx| window.click("sidebar-ext-list-recent", cx));
+        let mut rows_visible = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+            if cx.debug_bounds("mo-list-row-0").is_some()
+                && cx.debug_bounds("mo-list-row-1").is_some()
+            {
+                rows_visible = true;
+                break;
+            }
+        }
+        assert!(rows_visible, "面板行没渲染出来（mo-list-row-0/1）");
+        assert_eq!(modal_of(cx), Modal::List);
+
+        // 段3：Enter 打开游标行（缺省游标 0，is_dir=true）→ 导航进 target +
+        // 面板关闭（浏览替代查看，与回收站双击目录同语义）。导航同样是异步真 IO，
+        // 轮询等路径到位。
+        cx.simulate_keystrokes("enter");
+        let mut navigated = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let path = cx.update(|_w, cx| root.update(cx, |v, _cx| v.panel().path.clone()));
+            if path.as_deref() == Some(target.as_path()) {
+                navigated = true;
+                break;
+            }
+        }
+        assert!(navigated, "Enter 打开目录行后应当导航到该目录");
+        assert_eq!(modal_of(cx), Modal::None, "进了目录就该关面板");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     /// 三类贡献各一句话的**措辞**（P2-6 的展开区与确认卡共用同一批句子）。

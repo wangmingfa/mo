@@ -264,7 +264,39 @@ pub struct AppState {
     /// 顺带把「重名」那几条 `tracing::warn!` 刷成每帧一条（热路径纪律见
     /// devlog/plugin-system.md §2）。
     sidebar_entries: Arc<std::sync::Mutex<extensions::SidebarCache>>,
+    /// 颜色标签表（`config.tags` 的进程内快照）：`(上次配置签名, 表)`，`None` = 还没读过。
+    ///
+    /// 与 [`AppState::type_labels`] 同一条理由，而这一条更直白：行渲染**每行**都要问
+    /// 一次「这个路径有没有色点」，而 [`AppState::config`] 是读盘 + 解析 JSON（实测
+    /// 0.07ms/次，三十行就是一帧 2ms）。作废判据不是时间而是 [`ConfigSignature`]：
+    /// 用户手改 `config.json`、或另一个标签页打了标签，下一帧就是新表，不必重启。
+    tag_table: Arc<std::sync::Mutex<TagTableCache>>,
 }
+
+/// [`AppState::tag_table`] 的缓存：`(上次配置签名, 表)`，`None` = 还没读过。
+type TagTableCache = Option<(
+    ConfigSignature,
+    Arc<std::collections::HashMap<PathBuf, String>>,
+)>;
+
+/// `config.json` 的签名：本进程写过多少次 + 文件长度 + 修改时间。
+///
+/// 三个都要。只用长度会撞（`red` 改 `tan` 字节数一样）；只用 mtime 会漏——某些文件
+/// 系统的 mtime 只有秒级精度，一秒内连着两次改标签看不出变化；而 [`CONFIG_WRITES`]
+/// 补的正是同一个进程里「别处刚写过、文件 mtime 还没变」那一格。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConfigSignature {
+    writes: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// 本进程写过多少次配置（[`AppState::save_config`] 每次成功写盘后 +1）。
+///
+/// 进程级而不是 `AppState` 级：每个标签页各有一份 `AppState`、也就各有一份缓存，
+/// 标签页 A 打了标签，B 那份靠 mtime 未必看得出（见 [`ConfigSignature`]），
+/// 有这个计数就一定看得出。
+static CONFIG_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// 把「正在打开某个目录」置位，离开作用域自动收尾。
 ///
@@ -894,6 +926,7 @@ impl AppState {
             )),
             type_labels: Arc::new(std::sync::Mutex::new(None)),
             sidebar_entries: Arc::new(std::sync::Mutex::new(None)),
+            tag_table: Arc::new(std::sync::Mutex::new(None)),
             providers: Arc::new(provider::Manager::new()),
         }
     }
@@ -4132,6 +4165,21 @@ impl AppState {
     fn save_config(&self, cfg: &mo_config::Config) {
         if let Err(e) = cfg.save(&Self::config_path()) {
             tracing::warn!("配置保存失败：{e}");
+            return;
+        }
+        // 让所有标签页的标签表缓存作废（判据见 [`CONFIG_WRITES`]）。
+        CONFIG_WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 配置文件此刻的签名（文件不存在时就是「空配置」的签名）。
+    fn config_signature() -> ConfigSignature {
+        let (len, modified) = std::fs::metadata(Self::config_path())
+            .map(|m| (m.len(), m.modified().ok()))
+            .unwrap_or((0, None));
+        ConfigSignature {
+            writes: CONFIG_WRITES.load(Ordering::Relaxed),
+            len,
+            modified,
         }
     }
 
@@ -4455,6 +4503,35 @@ impl AppState {
         self.providers().seed_label_for_tests(path, label);
     }
 
+    /// 调一个扩展的 `list` 方法取一页行（P4）。
+    ///
+    /// **阻塞**（进程 IO + 每行一次 stat）——只许在 blocking 池里调
+    /// （`spawn_blocking(move || app.list_rows(..))`），与 `request_classify` 同一条
+    /// 红线。错误折成人话由这一层负责：面板上显示的是这句，不是 Debug。
+    pub fn list_rows(
+        &self,
+        ext_id: &str,
+        source_id: &str,
+    ) -> Result<Vec<provider::ListRow>, String> {
+        self.providers()
+            .list(ext_id, source_id, &Self::config_path())
+            .map_err(|e| match e {
+                provider::CallError::Timeout => "调用超时（进程已被强制结束）".to_string(),
+                provider::CallError::Crashed(m) => format!("进程崩溃：{m}"),
+                provider::CallError::Protocol(m) => m,
+                provider::CallError::Backoff => {
+                    "provider 已停用（连续失败，退避中）——稍后再试".to_string()
+                }
+            })
+    }
+
+    /// 测试钩子：直接种一个列表源的应答（headless 测试不起真进程）。
+    #[doc(hidden)]
+    pub fn test_seed_list_rows(&self, ext_id: &str, source: &str, rows: Vec<provider::ListRow>) {
+        self.providers()
+            .seed_list_rows_for_tests(ext_id, source, rows);
+    }
+
     /// 该出现在侧栏里的那些贡献项（清单或配置里写了 `menu: ["sidebar"]` 的那几条）。
     ///
     /// 缓存的必要性见 [`AppState::sidebar_entries`] 字段那段。返回 `Arc` 而不是
@@ -4472,11 +4549,28 @@ impl AppState {
             None => true,
         };
         if stale {
+            // 列表源行（P4）：**启停过滤在这里**——它没有 `flatten` 那条通路，
+            // 与命令的启停语义同源（停用的扩展什么都不投）。
+            let mut lists: Vec<extensions::SidebarEntry> = Vec::new();
+            for e in self.extensions() {
+                if !e.manifest.enabled {
+                    continue;
+                }
+                for l in &e.manifest.lists {
+                    lists.push(extensions::SidebarEntry::List {
+                        ext_id: e.manifest.id.clone(),
+                        source_id: l.id.clone(),
+                        title: l.title.clone(),
+                        group: e.manifest.name.clone(),
+                    });
+                }
+            }
             *g = Some((
                 fp,
                 Arc::new(extensions::sidebar_entries_of(
                     &self.user_commands(&[]),
                     &self.workflows(),
+                    &lists,
                 )),
             ));
         }
@@ -4561,20 +4655,37 @@ impl AppState {
 
     /// 全部标签：`路径 → 颜色名`。
     pub fn tags(&self) -> std::collections::HashMap<PathBuf, String> {
-        self.config()
-            .tags
-            .iter()
-            .map(|(k, v)| (PathBuf::from(k), v.clone()))
-            .collect()
+        self.tag_table().as_ref().clone()
+    }
+
+    /// 颜色标签表：**每帧取一次**、行循环里只查表（`mo_ui::file_list` 就是这么用的），
+    /// 不是每行取一次——见 [`AppState::tag_table`] 字段那段。
+    ///
+    /// 键是 `PathBuf` 而不是配置里的字符串：行里已经拿着 `PathBuf`，直接查表零分配
+    /// （走 `tag_of` 则每行一次 `to_string_lossy`）。
+    pub fn tag_table(&self) -> Arc<std::collections::HashMap<PathBuf, String>> {
+        let sig = Self::config_signature();
+        let mut g = self.tag_table.lock().unwrap();
+        match &mut *g {
+            Some((seen, _)) if *seen == sig => {}
+            _ => {
+                let table = self
+                    .config()
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (PathBuf::from(k), v.clone()))
+                    .collect();
+                *g = Some((sig, Arc::new(table)));
+            }
+        }
+        g.as_ref().map(|(_, t)| t.clone()).unwrap_or_default()
     }
 
     /// 给一个路径设置颜色标签；颜色名为空表示清除标签。
     /// 查某个路径的颜色标签（没有则 `None`），供列表渲染色点。
     pub fn tag_of(&self, path: &Path) -> Option<String> {
-        let key = path.to_string_lossy().to_string();
-        self.config()
-            .tags
-            .get(&key)
+        self.tag_table()
+            .get(path)
             .cloned()
             .filter(|c| !c.is_empty())
     }

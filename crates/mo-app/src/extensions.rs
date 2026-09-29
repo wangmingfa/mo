@@ -88,8 +88,23 @@ pub struct ProviderSpec {
     pub call_timeout_ms: Option<u64>,
 }
 
-/// 本轮承认的 provider 方法。`list` 属于 P4，故意不在表里。
-pub const PROVIDER_METHODS: &[&str] = &["classify", "preview"];
+/// 本轮承认的 provider 方法（P4 起 `list` 也在内）。
+pub const PROVIDER_METHODS: &[&str] = &["classify", "preview", "list"];
+
+/// 清单 `lists` 的一条（P4，devlog §5 表格 `list` 那行）：声明一个**只读列表源**。
+///
+/// 第一版刻意只收 `id` + `title`：`source` 是宿主调 `list` 方法时原样带给进程的键，
+/// `title` 是侧栏那一行与面板标题的文案。§3 草案里没有这个字段——草案把入口想成
+/// 「命令 + provider」，但命令的语义是「跑一条 shell」，把「打开一个列表」塞进命令
+/// 就是两个语义挤一个壳（点击臂得先问进程「你是要跑还是要列表」，荒唐）。独立声明
+/// 之后两侧各自成立：命令归命令，列表源归列表源。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListSource {
+    /// 源的键：宿主调 `list` 时作为 `source` 参数原样传给进程。一个扩展可以有多个源。
+    pub id: String,
+    /// 侧栏行的文案与面板标题，如「最近文件」。
+    pub title: String,
+}
 
 /// 清单 `capabilities` 认的四把钥匙（devlog §6）。`read-names` 缺省就给，不必写。
 pub const CAPABILITIES: &[&str] = &["read-names", "read-contents", "write", "net"];
@@ -127,6 +142,9 @@ pub struct Manifest {
     /// 反向请求，进程拿不到入参以外的东西），收进来只为在确认卡上说清楚。
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 只读列表源声明（P4）。非空 ⇒ provider 必须声明 `list` 方法（`validate` 把关）。
+    #[serde(default)]
+    pub lists: Vec<ListSource>,
 }
 
 fn default_true() -> bool {
@@ -210,8 +228,8 @@ fn validate_types(m: &Manifest) -> Option<String> {
 /// * `capabilities` 没有执行点检查它们的唯一前提是有 provider 进程（`read-contents`
 ///   的执行点是 `classify` 入参附不附文件头；`write` / `net` 的执行点是进程本身）。
 ///   声明层扩展写它们 = 永远没人读，拒。
-/// * `methods` 写了 `list`：P4 还没实现，本轮没人会调它——「写了、校验过了、界面上
-///   永远看不见」的组合正是 `when_ext` + 侧栏那条被拒的理由。
+/// * `methods` 写了 `list` 却没声明任何列表源（或反过来）：两个半句各自都「写了、
+///   校验过了、界面上永远看不见」，成对声明才收（P4）。
 /// * 超时写 0 / 负意义的值：0 ms 的超时等于进程永远不可用，这不是配置是自杀。
 fn validate_provider(m: &Manifest) -> Option<String> {
     let caps = &m.capabilities;
@@ -240,16 +258,51 @@ fn validate_provider(m: &Manifest) -> Option<String> {
     }
     for method in &p.methods {
         if !PROVIDER_METHODS.contains(&method.as_str()) {
-            let hint = if method == "list" {
-                "（list 是列表源，排在 P4，本轮还没实现——先别写）"
-            } else {
-                ""
-            };
             return Some(format!(
-                "扩展「{}」的 provider.methods 写了认不出的方法「{method}」{hint}，本轮只认 classify / preview",
+                "扩展「{}」的 provider.methods 写了认不出的方法「{method}」，只认 classify / preview / list",
                 m.id
             ));
         }
+    }
+    // 列表源与方法必须**成对声明**（同一判据的两面，都是「写了、校验过了、界面上
+    // 永远看不见」的组合）：
+    // * methods 写了 `list` 却没声明任何源 → 进程会答一个没人问的问题；
+    // * 声明了源却没写 `list` → 侧栏有一行，点下去宿主不调进程，面板永远空着。
+    let declares_list = p.methods.iter().any(|m| m == "list");
+    if declares_list && m.lists.is_empty() {
+        return Some(format!(
+            "扩展「{}」的 provider.methods 写了 list 却没声明任何列表源（lists）——进程会答一个没人问的问题；要么补 lists，要么从 methods 里删掉 list",
+            m.id
+        ));
+    }
+    if !m.lists.is_empty() && !declares_list {
+        return Some(format!(
+            "扩展「{}」声明了列表源（{}）但 provider.methods 没写 list——侧栏会有这么一行，点下去却永远拉不到数据；要么在 methods 里补 list，要么删掉 lists",
+            m.id,
+            m.lists.iter().map(|l| l.title.as_str()).collect::<Vec<_>>().join("、")
+        ));
+    }
+    let mut seen_sources: Vec<String> = Vec::new();
+    for l in &m.lists {
+        if l.id.trim().is_empty() {
+            return Some(format!(
+                "扩展「{}」的 lists 条目「{}」没写 id——id 是宿主调 list 时传给进程的 source 键，空了进程就不知道该答哪一份",
+                m.id, l.title
+            ));
+        }
+        if l.title.trim().is_empty() {
+            return Some(format!(
+                "扩展「{}」的 lists 条目「{}」没写 title——侧栏那一行与面板标题都靠它，空白标题在界面上是一颗看不见的按钮",
+                m.id, l.id
+            ));
+        }
+        if seen_sources.contains(&l.id) {
+            return Some(format!(
+                "扩展「{}」的 lists 里 id「{}」重复——两行点下去是同一个 source，界面上却像两个功能，这不是配置是欺骗",
+                m.id, l.id
+            ));
+        }
+        seen_sources.push(l.id.clone());
     }
     for (field, ms) in [
         ("startup_timeout_ms", p.startup_timeout_ms),
@@ -781,6 +834,9 @@ pub enum Contribution {
     },
     /// 一条类型知识：这些扩展名在「种类」列上会被改叫什么（P2-3 那条投递）。
     TypeLabel { exts: Vec<String>, label: String },
+    /// 一个只读列表源（P4）：侧栏会多一行「title」，点开是一个由 provider 的
+    /// `list` 方法供数的只读面板。
+    ListSource { title: String },
     /// provider 进程（P3）：声明的方法与申请的能力。确认卡要让用户看见的是
     /// 「它要起一个进程、这个进程会拿到什么」——能力说的就是这件事。
     Provider {
@@ -791,8 +847,8 @@ pub enum Contribution {
 
 /// 把一份清单摊成「它会改动界面上的哪些地方」。
 ///
-/// 顺序恒为 命令 → 工作流 → 类型标签 → provider（与命令面板里那批贡献项同一口径：
-/// 命令在前；进程是「会跑代码的」那一级，放最后）。
+/// 顺序恒为 命令 → 工作流 → 类型标签 → 列表源 → provider（与命令面板里那批贡献项同一口径：
+/// 命令在前；进程是「会跑代码的」那一级，放最后，列表源靠它供数所以贴在它前面）。
 /// 不看 `enabled`：停用中的扩展也要能预览「启用后会发生什么」——这正是确认卡的用法。
 pub fn contributions(m: &Manifest) -> Vec<Contribution> {
     let mut out: Vec<Contribution> = m
@@ -826,6 +882,9 @@ pub fn contributions(m: &Manifest) -> Vec<Contribution> {
             exts,
             label: t.label.clone(),
         })
+    }));
+    out.extend(m.lists.iter().map(|l| Contribution::ListSource {
+        title: l.title.clone(),
     }));
     if let Some(p) = &m.provider {
         // `read-names` 缺省就给，不劳作者自己写；这里报的是**实际生效**的能力集合，
@@ -944,6 +1003,17 @@ pub fn fingerprint(root: &Path) -> u64 {
 pub enum SidebarEntry {
     Command(UserCommand),
     Workflow(mo_config::Workflow),
+    /// 一个只读列表源（P4）：点开是只读面板，由 provider 的 `list` 方法供数。
+    ///
+    /// 载荷带的是**激活所需的全部身份**（`ext_id` / `source_id`），不是「侧栏第几行」
+    /// ——侧栏每帧重取这批数据，同 §4.2「载荷带声明本体」的纪律。`group` 在构造处
+    /// 预先算好（扩展名），与命令的 category 缺省填扩展名是同一条答案。
+    List {
+        ext_id: String,
+        source_id: String,
+        title: String,
+        group: String,
+    },
 }
 
 impl SidebarEntry {
@@ -952,6 +1022,7 @@ impl SidebarEntry {
         match self {
             Self::Command(c) => &c.name,
             Self::Workflow(w) => &w.name,
+            Self::List { title, .. } => title,
         }
     }
     /// 落在侧栏的哪个分区（判据与命令面板的分组名同一句，见 `UserCommand::group`）。
@@ -959,20 +1030,23 @@ impl SidebarEntry {
         match self {
             Self::Command(c) => c.group().to_string(),
             Self::Workflow(w) => w.group().to_string(),
+            Self::List { group, .. } => group.clone(),
         }
     }
 }
 
-/// 从「这一批命令 + 这一批工作流」里挑出投给侧栏的那些。
+/// 从「这一批命令 + 这一批工作流 + 这一批列表源」里挑出投给侧栏的那些。
 ///
 /// 纯函数、不碰磁盘，所以它可以被单测直接喂数据，也可以被
 /// [`AppState::sidebar_entries`](crate::AppState::sidebar_entries) 缓存起来复用。
-/// 顺序：命令在前、工作流在后，与命令面板那张注册表（`mo_ui::actions::contributed`）
-/// 同一条顺序（界面在两处的同一批动作，相对顺序应当一致，否则「第三行」在两处指不同
-/// 的东西）。
+/// 顺序：命令在前、工作流在后，列表源殿后（与 `mo_ui::actions::contributed` 那张
+/// 注册表「命令在前」的口径一致；列表源不开命令面板，不存在两处排序分叉的问题）。
+/// `lists` 由调用方预构建并**过滤好 `enabled`**——命令那两侧的启停过滤发生在
+/// `flatten` / `workflows()` 里，列表源的清单没有那条通路，谁调谁过滤。
 pub fn sidebar_entries_of(
     commands: &[UserCommand],
     workflows: &[mo_config::Workflow],
+    lists: &[SidebarEntry],
 ) -> Vec<SidebarEntry> {
     let mut out: Vec<SidebarEntry> = commands
         .iter()
@@ -987,6 +1061,7 @@ pub fn sidebar_entries_of(
             .cloned()
             .map(SidebarEntry::Workflow),
     );
+    out.extend(lists.iter().cloned());
     out
 }
 
@@ -1064,11 +1139,12 @@ mod tests {
             types: Vec::new(),
             provider: None,
             capabilities: Vec::new(),
+            lists: Vec::new(),
         }
     }
 
     /// provider 段的写坏法都要被拒：capabilities 没有 provider、methods 空 / 认不出、
-    /// run 空、超时写 0。合法的写法（含 list 被拒的措辞）各钉一条。
+    /// run 空、超时写 0、list 方法与 lists 声明不成对。合法的写法各钉一条。
     #[test]
     fn validates_provider_and_capabilities() {
         let spec = |methods: &[&str]| ProviderSpec {
@@ -1089,11 +1165,51 @@ mod tests {
         let err = validate(&m2, Some("a")).expect("capabilities 无 provider 应被拒");
         assert!(err.contains("没有 provider"), "{err}");
 
-        // methods 写 list → 拒，且要指出「P4」。
+        // list 方法与 lists 声明**成对**才收：
+        // * methods 写了 list、lists 空 → 拒（进程会答没人问的问题）。
         let mut m3 = manifest("a");
         m3.provider = Some(spec(&["classify", "list"]));
-        let err = validate(&m3, Some("a")).expect("list 应被拒");
-        assert!(err.contains("P4"), "{err}");
+        let err = validate(&m3, Some("a")).expect("list 无 lists 应被拒");
+        assert!(err.contains("lists"), "{err}");
+        // * 合法：成对声明。
+        m3.lists = vec![ListSource {
+            id: "recent".into(),
+            title: "最近文件".into(),
+        }];
+        assert!(validate(&m3, Some("a")).is_none(), "成对声明应放行");
+        // * 声明了源、methods 没写 list → 拒（点下去永远拉不到数据）。
+        let mut m3b = manifest("a");
+        m3b.provider = Some(spec(&["classify"]));
+        m3b.lists = m3.lists.clone();
+        let err = validate(&m3b, Some("a")).expect("lists 无 list 方法应被拒");
+        assert!(err.contains("list"), "{err}");
+        // * id / title 空白、id 重复。
+        let mut m3c = manifest("a");
+        m3c.provider = Some(spec(&["list"]));
+        m3c.lists = vec![ListSource {
+            id: "  ".into(),
+            title: "x".into(),
+        }];
+        let err = validate(&m3c, Some("a")).expect("空白 id 应被拒");
+        assert!(err.contains("id"), "{err}");
+        m3c.lists = vec![
+            ListSource {
+                id: "a".into(),
+                title: "甲".into(),
+            },
+            ListSource {
+                id: "a".into(),
+                title: "乙".into(),
+            },
+        ];
+        let err = validate(&m3c, Some("a")).expect("重复 id 应被拒");
+        assert!(err.contains("重复"), "{err}");
+        m3c.lists = vec![ListSource {
+            id: "a".into(),
+            title: String::new(),
+        }];
+        let err = validate(&m3c, Some("a")).expect("空白 title 应被拒");
+        assert!(err.contains("title"), "{err}");
 
         // methods 空 / run 空 / 认不出的方法。
         let mut m4 = manifest("a");
@@ -1128,7 +1244,8 @@ mod tests {
     }
 
     /// 贡献表：provider 扩展多一条 `Provider`，能力集合**始终含缺省的 read-names**
-    /// （作者不写也在），且排最前——确认卡按这条念。
+    /// （作者不写也在），且排最前——确认卡按这条念。列表源各投一条 `ListSource`，
+    /// 排在 provider 前面。
     #[test]
     fn contributions_include_provider_methods_and_capabilities() {
         let mut m = manifest("a");
@@ -1147,6 +1264,36 @@ mod tests {
                 capabilities: vec!["read-names".into(), "read-contents".into(), "net".into()],
             },
             "read-names 是缺省能力，不用写也在；顺序：缺省在前、声明按清单序"
+        );
+
+        // 列表源：每条一份，靠在 provider 前。
+        m.provider.as_mut().unwrap().methods.push("list".into());
+        m.lists = vec![
+            ListSource {
+                id: "recent".into(),
+                title: "最近文件".into(),
+            },
+            ListSource {
+                id: "starred".into(),
+                title: "收藏".into(),
+            },
+        ];
+        let cs = contributions(&m);
+        let provider_pos = cs
+            .iter()
+            .position(|c| matches!(c, Contribution::Provider { .. }))
+            .expect("provider 在");
+        assert_eq!(
+            &cs[provider_pos - 2..provider_pos],
+            &[
+                Contribution::ListSource {
+                    title: "最近文件".into()
+                },
+                Contribution::ListSource {
+                    title: "收藏".into()
+                },
+            ],
+            "列表源按清单序排在 provider 前面"
         );
     }
 
@@ -1757,6 +1904,7 @@ mod tests {
                 cmd("写错的界面名", &["siderbar"]),
             ],
             &[wf("也要进侧栏", &["sidebar"]), wf("打包", &[])],
+            &[],
         );
         let names: Vec<&str> = got.iter().map(|e| e.label()).collect();
         // 只有声明了 sidebar 的两条；工作流排在所有命令之后（与命令面板同一条顺序）。
@@ -1765,7 +1913,21 @@ mod tests {
         assert_eq!(got[0].group(), "字幕");
         assert_eq!(got[1].group(), "工作流");
         // 什么都没声明 → 空列表（侧栏一个区都不多出）。
-        assert!(sidebar_entries_of(&[cmd("只进面板", &[])], &[wf("打包", &[])]).is_empty());
+        assert!(sidebar_entries_of(&[cmd("只进面板", &[])], &[wf("打包", &[])], &[]).is_empty());
+        // 列表源（P4）：殿后于命令与工作流，文案是 title、分区是调用方给好的 group。
+        let lists = vec![SidebarEntry::List {
+            ext_id: "p4".into(),
+            source_id: "recent".into(),
+            title: "最近文件".into(),
+            group: "字幕工具".into(),
+        }];
+        let got = sidebar_entries_of(&[cmd("进侧栏", &["sidebar"])], &[], &lists);
+        assert_eq!(
+            got.iter().map(|e| e.label()).collect::<Vec<_>>(),
+            ["进侧栏", "最近文件"],
+            "列表源殿后"
+        );
+        assert_eq!(got[1].group(), "字幕工具");
     }
 
     /// `when_ext` 约束下的命令不能投侧栏（与快捷键同一条判据）。

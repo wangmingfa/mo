@@ -97,6 +97,10 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "ico",
 ] }
+# 只用来做一件事：JPEG 的**缩放解码**（`Decoder::scale` 让解码器按 1/8 / 1/4 / 1/2
+# 直接解出小图）。`image` 那条路是「整图解出来再缩」——4000×3000 的照片光解码就
+# 25ms、再缩一遍 12ms。同样是 image-rs 组织维护的 crate（image 的上一代 JPEG 后端）。
+jpeg-decoder = "0.3"
 
 # 基准测试（仅 dev-dependencies 使用）
 criterion = "0.5"
@@ -141,6 +145,10 @@ lto = "thin"
 opt-level = 3
 
 [profile.dev.package.zune-jpeg]
+opt-level = 3
+
+# 同上：JPEG 缩放解码走的那个 crate，debug 下同样是几十倍的差距。
+[profile.dev.package.jpeg-decoder]
 opt-level = 3
 
 # 本地补丁：block 0.1.6 上游（SSheldon/rust-block）已停止维护，其 extern static

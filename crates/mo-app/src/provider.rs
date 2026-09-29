@@ -572,6 +572,8 @@ struct ManagerInner {
     inflight: HashSet<PathBuf>,
     /// sqlite 缓存。打开失败降级为 None（功能退化为不落盘，不影响正确性）。
     cache: Option<Arc<mo_cache::ClassifyCache>>,
+    /// list 行的测试种子（headless 不起真进程）。键 `(扩展 id, source)`。
+    list_seeds: HashMap<(String, String), Vec<ListRow>>,
 }
 
 /// [`Manager`] 的签名缓存行：`(扩展目录签名, 规格表, 扩展名归属表)`。
@@ -596,6 +598,7 @@ impl Default for Manager {
                 labels: HashMap::new(),
                 inflight: HashSet::new(),
                 cache: None,
+                list_seeds: HashMap::new(),
             }),
         }
     }
@@ -776,6 +779,51 @@ impl Manager {
             .labels
             .insert(path.to_path_buf(), ("test".to_string(), label.to_string()));
     }
+
+    /// 调一个扩展的 `list` 方法取一页行。**阻塞**（进程 IO + 每行一次 stat）——
+    /// 只许在 blocking 池里调，渲染路径上出现就是事故（模块头那条红线）。
+    ///
+    /// stat 的两重用意：一是「双击行不用再判目录文件」（点击是渲染路径上的事件，
+    /// 那时再 stat 就迟了）；二是顺手把死路径筛成「点开失败有提示」而不是静默。
+    /// 没有落盘缓存——列表是动态的（「最近文件」这类），第一版每次开面板拉一次，
+    /// 够快也不说谎。
+    pub fn list(
+        &self,
+        ext_id: &str,
+        source: &str,
+        config_json: &Path,
+    ) -> Result<Vec<ListRow>, CallError> {
+        // 测试种子优先（见 `seed_list_rows_for_tests`）。
+        if let Some(rows) = self
+            .inner
+            .lock()
+            .unwrap()
+            .list_seeds
+            .get(&(ext_id.to_string(), source.to_string()))
+        {
+            return Ok(rows.clone());
+        }
+        let host = self
+            .host(ext_id, config_json)
+            .ok_or_else(|| CallError::Protocol(format!("扩展「{ext_id}」没有可用的 provider")))?;
+        let result = host.call("list", &list_params(source))?;
+        let mut rows = list_rows_from_result(&result);
+        for r in &mut rows {
+            if let Some(p) = &r.path {
+                r.is_dir = p.is_dir();
+            }
+        }
+        Ok(rows)
+    }
+
+    /// 测试钩子：直接种一个列表源的应答（headless 测试不起真进程，见 P3 同款）。
+    pub fn seed_list_rows_for_tests(&self, ext_id: &str, source: &str, rows: Vec<ListRow>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .list_seeds
+            .insert((ext_id.to_string(), source.to_string()), rows);
+    }
 }
 
 // ---------- 派发 ----------
@@ -901,6 +949,69 @@ pub fn preview_from_result(result: &serde_json::Value, size: u64) -> Option<mo_p
             None
         }
     }
+}
+
+// ---------- list 列表源（P4，devlog §5 表格最后一行） ----------
+
+/// `list` 应答里的一行。
+///
+/// 第一版**只读**（devlog §9 风险 1 的止损）：收 `id` / `name` / `path` / `subtitle`；
+/// `icon` 不收（没有可信图标表，§4.7 同一条「写了界面上没有」的纪律）；`next`
+/// （翻页游标）不消费——分页正是 §9 点名的不变量之一，「不动的列表」先把第一页画稳。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListRow {
+    /// 行标识（协议要求必填）。
+    pub id: String,
+    /// 主文案。
+    pub name: String,
+    /// 可选落点：有路径的行**双击**走 Mo 的导航（目录进入 / 文件交系统默认应用），
+    /// 没有路径的行就是「不动的一行」。进程在本机跑，它给的路径就是本机视角的路径
+    /// （远程挂载点对它来说也是本机目录）——所以落点走**本地入口**纪律（`open_local`）。
+    pub path: Option<PathBuf>,
+    /// 宿主 stat 补上的（见 [`Manager::list`]）；stat 失败按文件处理——点开失败
+    /// 会有提示，不静默。
+    pub is_dir: bool,
+    /// 灰色副文案（可选）。
+    pub subtitle: Option<String>,
+}
+
+/// `list` 入参：第一版只带 `source`（`query` / `cursor` 是协议字段，宿主暂时不发）。
+pub fn list_params(source: &str) -> serde_json::Value {
+    serde_json::json!({ "source": source })
+}
+
+/// 把 list 应答折成行。缺 `rows` / 不是数组 → 空表（调用方按「没答上来」处理）。
+/// 单行缺 `id` / `name`：跳过这一行并 warn——成形的行照常收，一颗老鼠屎不倒一锅粥。
+pub fn list_rows_from_result(result: &serde_json::Value) -> Vec<ListRow> {
+    let Some(rows) = result.get("rows").and_then(|r| r.as_array()) else {
+        tracing::warn!(target: "mo_provider", "list 应答里没有 rows 数组");
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|r| {
+            let parse_str = |key: &str| -> Option<String> {
+                r.get(key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            let Some(id) = parse_str("id") else {
+                tracing::warn!(target: "mo_provider", "list 有一行没写 id，跳过：{r:.80}");
+                return None;
+            };
+            let Some(name) = parse_str("name") else {
+                tracing::warn!(target: "mo_provider", "list 行「{id}」没写 name，跳过");
+                return None;
+            };
+            Some(ListRow {
+                id,
+                name,
+                path: parse_str("path").map(PathBuf::from),
+                is_dir: false,
+                subtitle: parse_str("subtitle"),
+            })
+        })
+        .collect()
 }
 
 // ---------- 批量派发（blocking 池专用，见 AppState::request_classify） ----------
@@ -1116,6 +1227,40 @@ mod tests {
                 "{kind} 应回落内置预览"
             );
         }
+    }
+
+    /// list 应答的解析（P4）：成形的行照收；缺 id / name 的行跳过（不倒一锅粥）；
+    /// path / subtitle 空白串按「没给」处理；icon 字段收下不用（协议天然忽略）。
+    /// 变异靶子：解析侧把跳过改成整表放弃 / 把空白串照收。
+    #[test]
+    fn list_rows_parse_skips_malformed_rows() {
+        let result = serde_json::json!({
+            "rows": [
+                { "id": "r1", "name": "行一", "subtitle": "副标题", "icon": "star" },
+                { "id": "  ", "name": "空白id" },
+                { "id": "r3", "name": "" },
+                { "name": "没有id" },
+                { "id": "r5", "name": "行五", "path": "/tmp/x.p4x", "subtitle": "  " }
+            ]
+        });
+        let rows = list_rows_from_result(&result);
+        assert_eq!(rows.len(), 2, "5 行进 2 行出：3 行坏的跳过");
+        assert_eq!(rows[0].id, "r1");
+        assert_eq!(rows[0].name, "行一");
+        assert_eq!(rows[0].subtitle.as_deref(), Some("副标题"));
+        assert!(rows[0].path.is_none());
+        assert_eq!(rows[1].id, "r5");
+        assert_eq!(rows[1].path, Some(PathBuf::from("/tmp/x.p4x")));
+        assert!(rows[1].subtitle.is_none(), "空白 subtitle 按没给处理");
+
+        // 缺 rows / rows 不是数组 → 空表。
+        assert!(list_rows_from_result(&serde_json::json!({})).is_empty());
+        assert!(list_rows_from_result(&serde_json::json!({ "rows": "nope" })).is_empty());
+        // 入参只带 source（query / cursor 本轮不发）。
+        assert_eq!(
+            list_params("recent"),
+            serde_json::json!({ "source": "recent" })
+        );
     }
 
     /// capability 执行点（门函数）：授了 read-contents 才读；没授权时文件就在那儿

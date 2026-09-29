@@ -281,7 +281,15 @@ impl Panel {
     }
 
     /// 窗口快照是否完整覆盖 `[start, end)`。
+    ///
+    /// 空区间平凡成立：没有要覆盖的数据，就谈不上「未覆盖」。否则空目录会
+    /// 永远不满足——快照回填 0 行后 `window` 恒空，渲染那一帧照样带着
+    /// `need = 0..0` 来问，这里答 false → 每帧重发一次 fetch，无限循环
+    /// （headless 测试里就是 `run_until_parked` 永不返回）。
     pub fn covered(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return true;
+        }
         !self.window.is_empty()
             && start >= self.window_start
             && end <= self.window_start + self.window.len()

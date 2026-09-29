@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use image::ImageFormat;
+use image::{DynamicImage, GrayImage, ImageFormat, RgbImage};
 use mo_core::FileId;
 
 /// 缩略图生成失败的原因。
@@ -208,6 +208,53 @@ impl Default for ThumbnailCache {
     }
 }
 
+/// JPEG 的**缩放解码**：让解码器按 1/8 / 1/4 / 1/2 直接解出一张小图。
+///
+/// `image` 那条路是「先把整图解出来、再缩到 `size`」——4000×3000 的照片光解码就
+/// ~25ms，再缩一遍 ~12ms（本机 release 实测）。而 JPEG 的 DCT 允许只解低频部分：
+/// 给解码器一个目标尺寸，它自己挑最小的那一档出图，解码与随后的重采样一起省掉。
+///
+/// ⚠️ `None` 的语义是「这条路上不适用这张图」，**不是失败**：非 JPEG、CMYK / 16 位
+/// 灰度这类我们不打算猜颜色转换的、以及「本来就不比缩略图大多少」的，都返回 `None`
+/// 让调用方回落到整图解码。宁可慢一点也不静默产出色偏的缩略图。
+///
+/// 只接 8 位的灰度与 RGB（与 `image` 的常规输出同形状）；缩放档位保证的是
+/// 「至少一个轴 ≥ 请求尺寸」，所以末尾还要按老规矩 `thumbnail` 收到框内。
+fn scaled_jpeg(src: &Path, size: u32) -> Option<DynamicImage> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if !matches!(ext.as_deref(), Some("jpg") | Some("jpeg")) {
+        return None;
+    }
+
+    let file = std::fs::File::open(src).ok()?;
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::BufReader::new(file));
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    if !matches!(
+        info.pixel_format,
+        jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::RGB24
+    ) {
+        return None;
+    }
+    // 小图不值得：省不了多少，还白付一次解码尝试和一次与整图路径的像素差异。
+    if info.width.max(info.height) as u32 <= size.saturating_mul(2) {
+        return None;
+    }
+
+    let want = size.min(u16::MAX as u32) as u16;
+    let (w, h) = decoder.scale(want, want).ok()?;
+    let pixels = decoder.decode().ok()?;
+    let img = if info.pixel_format == jpeg_decoder::PixelFormat::L8 {
+        DynamicImage::ImageLuma8(GrayImage::from_raw(w as u32, h as u32, pixels)?)
+    } else {
+        DynamicImage::ImageRgb8(RgbImage::from_raw(w as u32, h as u32, pixels)?)
+    };
+    Some(img.thumbnail(size, size))
+}
+
 /// 解码 `src` 并生成边长为 `size` 的缩略图，写入 `dst`。
 ///
 /// 先写临时文件再 `rename`，避免进程被杀时留下半张损坏的 PNG。
@@ -217,11 +264,6 @@ pub fn generate_to_with(
     size: u32,
     enc: Encoded,
 ) -> Result<PathBuf, ThumbnailError> {
-    let reader = image::ImageReader::open(src)
-        .map_err(|e| ThumbnailError::Io(e.to_string()))?
-        .with_guessed_format()
-        .map_err(|e| ThumbnailError::Io(e.to_string()))?;
-
     // 这道门和 `entry::supports_thumbnail` 必须问同一份解码集合
     // （`mo_core::types::THUMBNAIL_DECODABLE_EXTS`），否则 `.tiff` 这种「类型上是图、
     // 解码器解不动」的后缀会白跑一次取图任务（devlog/engine-testing.md §7）。
@@ -237,10 +279,20 @@ pub fn generate_to_with(
         return Err(ThumbnailError::Unsupported(src.display().to_string()));
     }
 
-    let img = reader
-        .decode()
-        .map_err(|e| ThumbnailError::Decode(e.to_string()))?;
-    let thumb = img.thumbnail(size, size);
+    // 大 JPEG 走缩放解码，其余（含「缩放解码不接」的那些 JPEG）回到整图解码。
+    let thumb = match scaled_jpeg(src, size) {
+        Some(small) => small,
+        None => {
+            let reader = image::ImageReader::open(src)
+                .map_err(|e| ThumbnailError::Io(e.to_string()))?
+                .with_guessed_format()
+                .map_err(|e| ThumbnailError::Io(e.to_string()))?;
+            reader
+                .decode()
+                .map_err(|e| ThumbnailError::Decode(e.to_string()))?
+                .thumbnail(size, size)
+        }
+    };
 
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ThumbnailError::Io(e.to_string()))?;
@@ -382,4 +434,107 @@ pub fn preview_scaled_in(root: &Path, src: &Path, max_edge: u32) -> Option<PathB
 /// 同上，使用默认预览缓存目录 `<用户缓存目录>/mo/preview`。
 pub fn preview_scaled(src: &Path, max_edge: u32) -> Option<PathBuf> {
     preview_scaled_in(&default_preview_root(), src, max_edge)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一张测试 JPEG（灰度或彩色），内容是可预测的渐变。
+    fn write_jpeg(dir: &Path, name: &str, w: u32, h: u32, gray: bool) -> PathBuf {
+        let p = dir.join(name);
+        if gray {
+            let img = image::GrayImage::from_fn(w, h, |x, y| image::Luma([((x + y) % 255) as u8]));
+            img.save_with_format(&p, ImageFormat::Jpeg)
+                .expect("写灰度 JPEG");
+        } else {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                image::Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8])
+            });
+            img.save_with_format(&p, ImageFormat::Jpeg)
+                .expect("写彩色 JPEG");
+        }
+        p
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mo-thumb-scaled-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        dir
+    }
+
+    /// 两张图的平均通道差（0–255），用来判「颜色有没有跑偏」。
+    fn mean_abs_diff(a: &DynamicImage, b: &DynamicImage) -> f64 {
+        let (a, b) = (a.to_rgb8(), b.to_rgb8());
+        let (w, h) = (a.width().min(b.width()), a.height().min(b.height()));
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                let (pa, pb) = (a.get_pixel(x, y), b.get_pixel(x, y));
+                for c in 0..3 {
+                    sum += (pa[c] as i32 - pb[c] as i32).unsigned_abs() as u64;
+                    n += 1;
+                }
+            }
+        }
+        sum as f64 / n.max(1) as f64
+    }
+
+    /// 大 JPEG 必须走缩放解码，而且产物不能与「整图解出来再缩」的差太多——
+    /// 通道顺序或色彩空间搞错的话，这个差值会大到几十。
+    #[test]
+    fn big_jpeg_is_decoded_at_a_reduced_scale() {
+        let dir = tmp("big");
+        let src = write_jpeg(&dir, "big.jpg", 1200, 900, false);
+        let got = scaled_jpeg(&src, 128).expect("大 JPEG 应当走缩放解码");
+        assert!(
+            got.width() <= 128 && got.height() <= 128 && got.width() > 0,
+            "产物应落在 128 的框内，实际 {}x{}",
+            got.width(),
+            got.height()
+        );
+
+        let full = image::ImageReader::open(&src)
+            .expect("open")
+            .decode()
+            .expect("decode")
+            .thumbnail(128, 128);
+        let diff = mean_abs_diff(&got, &full);
+        assert!(
+            diff < 12.0,
+            "缩放解码的产物与整图缩略图差 {diff}（阈值 12）——通道或色彩空间多半搞错了"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 灰度 JPEG 也能走（L8 分支）：别把灰度当 RGB 解，那会直接解不出来。
+    #[test]
+    fn gray_jpeg_is_decoded_at_a_reduced_scale() {
+        let dir = tmp("gray");
+        let src = write_jpeg(&dir, "gray.jpg", 1200, 900, true);
+        let got = scaled_jpeg(&src, 128).expect("灰度大 JPEG 也该走缩放解码");
+        assert!(got.width() <= 128 && got.height() <= 128 && got.width() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 本来就比缩略图大不了多少的，不该走这条路——省不了什么，还多一份像素差异。
+    #[test]
+    fn small_jpeg_keeps_the_plain_path() {
+        let dir = tmp("small");
+        let src = write_jpeg(&dir, "small.jpg", 120, 90, false);
+        assert!(
+            scaled_jpeg(&src, 128).is_none(),
+            "比缩略图还小的图应回落到整图解码"
+        );
+        // 非 JPEG 也一律回落（PNG 没有 DCT 缩放这一说）。
+        let png = dir.join("small.png");
+        image::RgbImage::from_fn(1200, 900, |x, y| image::Rgb([x as u8, y as u8, 96]))
+            .save_with_format(&png, ImageFormat::Png)
+            .expect("写 PNG");
+        assert!(scaled_jpeg(&png, 128).is_none(), "PNG 不该走 JPEG 那条路");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
