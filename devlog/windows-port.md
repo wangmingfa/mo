@@ -337,3 +337,22 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * 留口子：`drag_ended` 的 MOVE 分支、`finish_file_drag` 的移动收尾（源走
   回收站）都留着——将来接修饰键透传（Windows `IDropTarget::Drop` 的
   keyState / macOS 平台层自接 `NSDraggingDestination`）后一起开移动语义。
+
+### §30：诊断日志在 Windows 上不可见（2026-09-29，1628603）
+
+* 现象：`$env:RUST_LOG="mo_ui=debug"; cargo run` 一条日志不出。根因：`main.rs`
+  顶部 `windows_subsystem = "windows"`（§「修法」那条）把 exe 链成 GUI 子系统，
+  被终端拉起时进程**没有** stdio——`GetStdHandle` 是空句柄，tracing 写 stderr
+  石沉大海。macOS 是控制台子系统，所以那边一直好好的。
+* 修法：`mo_platform::attach_parent_console()`——`AttachConsole(ATTACH_PARENT_PROCESS)`
+  挂回父进程（cargo / PowerShell）的控制台；⚠️ 它**不设置**标准句柄（与
+  `AllocConsole` 不同），要自己开 `CONOUT$` 再 `SetStdHandle` 补 STDOUT/STDERR。
+  调用点在 `init_tracing` 最前面、std 首次用 stderr 之前（std 会缓存首次句柄，
+  晚了接不上）。只在设了 `RUST_LOG`（= 要诊断）时调：双击启动父进程是资源
+  管理器、没有控制台，AttachConsole 失败返回 false，GUI 行为分毫不变。
+* windows 0.58 的 API 位置：`AttachConsole` / `SetStdHandle` / `STD_HANDLE`
+  （结构体型枚举，含 `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE` 关联常量）都在
+  `Win32::System::Console`，feature `Win32_System_Console`。
+* 验证：本机装了 `x86_64-pc-windows-msvc` target 后
+  `cargo check -p mo-platform --target x86_64-pc-windows-msvc` 能在 mac 上
+  **编译期**验 Windows FFI 代码的签名——以后改 windows.rs 都可以先这么过一遍。
