@@ -356,3 +356,22 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * 验证：本机装了 `x86_64-pc-windows-msvc` target 后
   `cargo check -p mo-platform --target x86_64-pc-windows-msvc` 能在 mac 上
   **编译期**验 Windows FFI 代码的签名——以后改 windows.rs 都可以先这么过一遍。
+
+### §31：地址栏无盘符根归一（2026-09-29，3a2df49，方案 A）
+
+* 用户复测：输 `/` 跳到 F:\ 根，面包屑「此电脑 › Mac」。两层根因：①`/` 解析成
+  `\`（RootDir 无前缀），std 语义落**进程 cwd 所在盘**——从哪启动就哪盘，与正在
+  看哪个盘无关；②`toolbar::segments()` 的 RootDir 分支硬编码「Mac」（unix 根标
+  签），Windows 走到就泄漏。
+* 修法（用户选 A，对齐资源管理器）：`resolve_address_input` 增加 `current`（本机
+  浏览态当前目录，`Panel::path` clone 进去——**match scrutinee 的临时借用会横跨
+  所有分支**，与分支里的 `&mut self` 打架，必须先 clone），Windows 上经
+  `absolutize_drive_root` 归一：正在看 `D:\foo` → `\` 到 `D:\`；停在「此电脑」
+  退回进程 cwd 所在盘；带盘符 / 相对路径原样。归一拼路径靠 `PathBuf::join` 的
+  文档行为（「有根无前缀的路径保留 base 的前缀、替换其余」）。
+* `segments()` RootDir 分支 Windows 上显示分隔符本身，不再出「Mac」（正常走不到，
+  历史 / 书签兜底）。
+* 验证边界：mo-ui 交叉 `cargo check --target x86_64-pc-windows-msvc` 卡在
+  aws-lc-sys 的 C 构建脚本（要 Windows C 工具链），**cfg(windows) 代码本机验不了**
+  ——靠用户侧编译 + `driveless_root_uses_the_browsed_drive_on_windows`（cwd 落点
+  用同一 API 算期望值，不写死盘符）兜。
