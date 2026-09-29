@@ -329,7 +329,7 @@ pub fn clipboard_files_are_cut() -> bool {
 
 /// 这个平台能不能把**文件**写进系统剪贴板（让别的应用粘得出这些文件）。
 pub fn supports_file_clipboard() -> bool {
-    cfg!(target_os = "windows")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 /// 把一批本机文件写进系统剪贴板：`cut` 决定别处粘出去时是**搬走**还是留一份。
@@ -341,11 +341,15 @@ pub fn supports_file_clipboard() -> bool {
 /// 只在支持的平台有效；不支持 / 做不到返回错误，上层**不该**因此报「复制失败」——
 /// 应用内粘贴走的是自己的那份剪贴板，跟这里成没成都没关系。
 pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::write_file_clipboard(paths, cut)
+    }
     #[cfg(target_os = "windows")]
     {
         windows::write_file_clipboard(paths, cut)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (paths, cut);
         Err(PlatformError::Unsupported("把文件写进系统剪贴板"))

@@ -78,8 +78,8 @@ fn system_file_clipboard(cx: &App) -> Option<(Vec<PathBuf>, bool)> {
 /// 把刚复制／剪切的那批文件也写进**系统**剪贴板，让别的应用粘得出来。
 ///
 /// 为什么不走 gpui：它写 `ClipboardEntry::ExternalPaths` 是**静默丢弃**的（两个
-/// 平台的后端都明写着 `=> {}`），所以这一手得平台层自己做——目前只有 Windows
-/// 实现了（`mo_platform::write_file_clipboard`）。
+/// 平台的后端都明写着 `=> {}`），所以这一手得平台层自己做（
+/// `mo_platform::write_file_clipboard`，macOS / Windows 都已实现）。
 ///
 /// 只在「这批路径在本地盘上」时做：远程会话里的路径是**服务器上**的路径，写进本机
 /// 剪贴板等于给别的应用一个它自己打不开的文件。

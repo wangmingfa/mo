@@ -191,6 +191,55 @@ pub fn reveal(path: &Path) -> Result<(), PlatformError> {
     })
 }
 
+/// 把一批本机文件写进系统剪贴板（`NSPasteboard` + `NSURL` 数组）。
+///
+/// ⚠️ 这条**不进单元测试**：它会覆盖开发者机器上真实的剪贴板（与 Windows 侧
+/// `write_file_clipboard` 同一条红线）。真发出去那一步用
+/// `cargo run -p mo-platform --example clipboard_probe -- <路径>...` 在真机上验。
+///
+/// `cut` 参数收下但**只能按复制处理**：Finder 的「剪切」记在一条私有 pasteboard
+/// 标记里（读侧 §19 同款判据：公开可读 / 可写的类型里没有这一位），写不出来。
+/// 与「猜错方向会把用户的文件搬走」同一立场——宁可让对方粘出一份复制。
+pub fn write_file_clipboard(paths: &[PathBuf], _cut: bool) -> Result<(), PlatformError> {
+    if paths.is_empty() {
+        return Err(PlatformError::Failed("没有要写进剪贴板的文件".to_string()));
+    }
+    let owned = paths.to_vec();
+    on_main_thread(move || {
+        let pasteboard: *mut Object =
+            unsafe { msg_send![class("NSPasteboard")?, generalPasteboard] };
+        if pasteboard.is_null() {
+            return Err(PlatformError::Failed("拿不到系统剪贴板".to_string()));
+        }
+        unsafe {
+            // `clearContents` 是 `writeObjects:` 的前置——它返回新的 changeCount，
+            // 0 表示失败。跳过它直接写是老式 `setData:` 的混用，会被 AppKit 拒。
+            let change_count: isize = msg_send![pasteboard, clearContents];
+            if change_count == 0 {
+                return Err(PlatformError::Failed("清空系统剪贴板失败".to_string()));
+            }
+            let array: *mut Object =
+                msg_send![class("NSMutableArray")?, arrayWithCapacity: owned.len()];
+            for p in &owned {
+                let Some(url) = nsurl_for(p) else {
+                    return Err(PlatformError::Failed(format!(
+                        "无法把路径交给剪贴板：{}",
+                        p.display()
+                    )));
+                };
+                let _: () = msg_send![array, addObject: url];
+            }
+            // NSURL 自己遵守 NSPasteboardWriting，会写出 `public.file-url`；
+            // 访达与其它应用按这个类型粘出文件。
+            let ok: bool = msg_send![pasteboard, writeObjects: array];
+            if !ok {
+                return Err(PlatformError::Failed("写系统剪贴板失败".to_string()));
+            }
+        }
+        Ok(())
+    })
+}
+
 /// 原生目录选择框（`NSOpenPanel`，只选目录）。
 ///
 /// `runModal` 在主线程上跑模态循环，所以走 [`on_main_thread`]；用户点「取消」
