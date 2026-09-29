@@ -511,6 +511,13 @@ fn segments(path: &Path) -> Vec<(String, PathBuf)> {
             // unix 根：保持历史行为（根 = Mac）。
             std::path::Component::RootDir => {
                 prefix.push("/");
+                // Windows 正常走不到这里：盘符路径在 Prefix 分支合并掉了，无盘符根
+                // 也已在 `resolve_address_input` 归一成「正在看的盘」。万一真走到
+                // （历史 / 书签里存了无盘符路径），显示分隔符本身，别把 macOS 的
+                // 「Mac」泄漏过来（2026-09-29 用户截图里的「此电脑 › Mac」就是它）。
+                #[cfg(target_os = "windows")]
+                out.push(("\\".to_string(), prefix.clone()));
+                #[cfg(not(target_os = "windows"))]
                 out.push(("Mac".to_string(), prefix.clone()));
             }
             _ => {

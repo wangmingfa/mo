@@ -48,11 +48,21 @@ pub(crate) enum AddressInput {
     RemotePath(PathBuf),
     /// 本机路径。`D:/a/b` 与 `D:\a\b` 解析出的目标是**同一个** `PathBuf`：
     /// std 在 Windows 上按分量解析，`/` 与 `\` 同为分隔符（单测钉住）。
+    /// 无盘符的根（`\`、`/`）在 Windows 上已按「正在看的盘」归一——见
+    /// [`resolve_address_input`] 与 `absolutize_drive_root`。
     LocalPath(PathBuf),
 }
 
 /// 把地址栏文本解析成导航目标。只做字符串层的事，不碰文件系统。
-pub(crate) fn resolve_address_input(text: &str, browsing_remote: bool) -> AddressInput {
+///
+/// `current` 是**本机浏览态**下当前已显示的目录（停在「此电脑」或远程时给
+/// `None` / 空路径）——Windows 上拿它把无盘符根归一到「正在看的盘」
+/// （见 [`absolutize_drive_root`]），别的平台用不上。
+pub(crate) fn resolve_address_input(
+    text: &str,
+    browsing_remote: bool,
+    current: Option<&std::path::Path>,
+) -> AddressInput {
     let text = text.trim();
     if text.is_empty() {
         return AddressInput::Empty;
@@ -64,7 +74,50 @@ pub(crate) fn resolve_address_input(text: &str, browsing_remote: bool) -> Addres
     if browsing_remote {
         AddressInput::RemotePath(target)
     } else {
+        #[cfg(not(target_os = "windows"))]
+        let _ = current;
+        #[cfg(target_os = "windows")]
+        let target = absolutize_drive_root(target, current);
         AddressInput::LocalPath(target)
+    }
+}
+
+/// Windows：`\`、`/` 这种「无盘符的绝对路径」按 std 语义落到**进程 cwd 所在
+/// 盘**——从哪个目录启动就哪个盘，与正在看哪个盘无关，落点成了玄学
+/// （2026-09-29 实测：从 `F:\shared\mo` 启动，输 `/` 跳到 F:\，面包屑还显示成
+/// macOS 根标签「Mac」）。资源管理器的约定是「**正在看的文件夹**所在盘」，
+/// 这里对齐它：
+///
+/// * 正在看 `D:\foo`，输 `\` 或 `/` → `D:\`；
+/// * 停在「此电脑」（current 为 None / 空路径）→ 退回进程 cwd 所在盘；
+/// * 带盘符的路径、相对路径一律原样（std 自己的 cwd 语义）。
+#[cfg(target_os = "windows")]
+fn absolutize_drive_root(target: PathBuf, current: Option<&std::path::Path>) -> PathBuf {
+    use std::path::Component;
+    // 「无盘符的绝对路径」= 首分量是 RootDir 且全程没有 Prefix（`C:` / UNC）。
+    let starts_at_root = matches!(target.components().next(), Some(Component::RootDir))
+        && !target
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_)));
+    if !starts_at_root {
+        return target;
+    }
+    let base = current
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    // 取 base 的盘符前缀补上根分隔符成 `D:\`，再 join：join 的目标是「有根无
+    // 前缀」的路径（`\foo`），std 会**保留 base 的前缀、替换其余** → `D:\foo`；
+    // 目标本身就是 `\` 时得 `D:\`。
+    match base.as_deref().and_then(std::path::Path::components).next() {
+        Some(Component::Prefix(p)) => {
+            let mut full = PathBuf::from(p.as_os_str());
+            full.push(std::path::MAIN_SEPARATOR.to_string());
+            full.join(target)
+        }
+        // 连 cwd 都没有盘符前缀（映射目录之类）——原样退回，让 is_dir /
+        // open_directory 按 std 自己的语义走，别瞎猜。
+        _ => target,
     }
 }
 
@@ -3235,7 +3288,11 @@ impl RootView {
         // 地址栏导航同样要离开次级视图（回收站 / 全局搜索）：填了新地址 = 要去那边。
         self.leave_secondary_view(cx);
 
-        match resolve_address_input(&text, app.browsing_remote()) {
+        // 「正在看的目录」给纯函数用：Windows 上把无盘符根归一到这个盘。
+        // 先 clone 出来——match 的 scrutinee 临时借用会横跨所有分支，与分支里
+        // 的 &mut self 打架。
+        let current = self.panel().path.clone();
+        match resolve_address_input(&text, app.browsing_remote(), current.as_deref()) {
             AddressInput::Empty => {
                 cx.notify();
             }
@@ -12992,21 +13049,31 @@ mod tests {
 
     /// 地址栏解析：字符串层收口（见 `resolve_address_input` 的注释——Windows 上
     /// 报过「两种斜杠都停在盘根」），这里把每个分支钉住。
+    ///
+    /// `current` 在非 Windows 上不起作用、Windows 上只影响无盘符根——这里统一给
+    /// `None`，Windows 专属的归一行为另有一条测试。
     #[test]
     fn address_input_resolution_branches() {
-        assert_eq!(resolve_address_input("", false), AddressInput::Empty);
-        assert_eq!(resolve_address_input("   ", false), AddressInput::Empty);
+        use std::path::Path;
         assert_eq!(
-            resolve_address_input("  ftp://host/pub  ", false),
+            resolve_address_input("", false, None::<&Path>),
+            AddressInput::Empty
+        );
+        assert_eq!(
+            resolve_address_input("   ", false, None::<&Path>),
+            AddressInput::Empty
+        );
+        assert_eq!(
+            resolve_address_input("  ftp://host/pub  ", false, None::<&Path>),
             AddressInput::RemoteUrl("ftp://host/pub".to_string())
         );
         assert_eq!(
-            resolve_address_input("/pub/incoming", true),
+            resolve_address_input("/pub/incoming", true, None::<&Path>),
             AddressInput::RemotePath(PathBuf::from("/pub/incoming"))
         );
         // 本机路径照原样构造——两种斜杠在 Windows 上由 std 分量级解析归一（下面那条）。
         assert_eq!(
-            resolve_address_input("/Users/me/下载", false),
+            resolve_address_input("/Users/me/下载", false, None::<&Path>),
             AddressInput::LocalPath(PathBuf::from("/Users/me/下载"))
         );
     }
@@ -13017,10 +13084,59 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn address_input_accepts_both_slash_forms_on_windows() {
-        let fwd = resolve_address_input("D:/tmp-clip/moside", false);
-        let back = resolve_address_input(r"D:\tmp-clip\moside", false);
+        use std::path::Path;
+        let fwd = resolve_address_input("D:/tmp-clip/moside", false, None::<&Path>);
+        let back = resolve_address_input(r"D:\tmp-clip\moside", false, None::<&Path>);
         assert_eq!(fwd, back, "两种斜杠形态必须解析出同一个目标");
         assert!(matches!(fwd, AddressInput::LocalPath(_)));
+    }
+
+    /// Windows：无盘符根（`\`、`/`）按**正在看的盘**归一（资源管理器语义），
+    /// 不再落「进程启动目录所在盘」。只在 Windows 跑——别的平台 `/` 本来就是
+    /// 文件系统根，不该动。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn driveless_root_uses_the_browsed_drive_on_windows() {
+        use std::path::Path;
+        let d_root = || AddressInput::LocalPath(PathBuf::from(r"D:\"));
+        // 正在看 D:\foo → `\` 与 `/` 都到 D:\。
+        assert_eq!(
+            resolve_address_input("/", false, Some(Path::new(r"D:\foo"))),
+            d_root()
+        );
+        assert_eq!(
+            resolve_address_input(r"\", false, Some(Path::new(r"D:\foo"))),
+            d_root()
+        );
+        // 停在「此电脑」（空路径）→ 退回进程 cwd 所在盘：期望值用同一个 API 算，
+        // 不写死盘符（这台机器从哪个盘启动只有启动方知道）。
+        let expected_cwd_drive = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| {
+                cwd.components().next().map(|p| {
+                    let mut full = PathBuf::from(p.as_os_str());
+                    full.push(std::path::MAIN_SEPARATOR.to_string());
+                    AddressInput::LocalPath(full)
+                })
+            })
+            .expect("测试进程总该有 cwd");
+        assert_eq!(
+            resolve_address_input("/", false, None::<&Path>),
+            expected_cwd_drive
+        );
+        assert_eq!(
+            resolve_address_input("/", false, Some(Path::new(""))),
+            expected_cwd_drive
+        );
+        // 带盘符与相对路径不受归一影响。
+        assert_eq!(
+            resolve_address_input("D:/tmp", false, Some(Path::new(r"D:\foo"))),
+            AddressInput::LocalPath(PathBuf::from("D:/tmp"))
+        );
+        assert_eq!(
+            resolve_address_input("abc", false, Some(Path::new(r"D:\foo"))),
+            AddressInput::LocalPath(PathBuf::from("abc"))
+        );
     }
 
     /// 橡皮筋 y → 行区间的折算：行带按顶边对齐（floor），与渲染出的行一一对应。
