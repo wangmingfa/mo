@@ -162,6 +162,9 @@ pub enum TransferOutcome {
     /// 有可续传的部分文件，等用户决策（此时**什么都没提交**）。
     /// Box 压枚举尺寸（clippy::large_enum_variant：多数结局是 Started）。
     NeedsResumeConfirmation(Box<PendingResume>),
+    /// 有目标端已存在的同名条目，等用户选覆盖 / 改名 / 跳过（什么都没提交）。
+    /// 冲突优先于续传：一批里两种都有时只弹冲突卡。
+    NeedsConflictConfirmation(Box<PendingConflict>),
 }
 
 impl TransferOutcome {
@@ -169,7 +172,8 @@ impl TransferOutcome {
     pub fn started_ids(&self) -> &[u64] {
         match self {
             TransferOutcome::Started(ids) => ids,
-            TransferOutcome::NeedsResumeConfirmation(_) => &[],
+            TransferOutcome::NeedsResumeConfirmation(_)
+            | TransferOutcome::NeedsConflictConfirmation(_) => &[],
         }
     }
 
@@ -211,6 +215,46 @@ pub enum ResumeDecision {
     Rename,
     /// 跳过：部分完成的那些不提交，其余照常。
     Skip,
+}
+
+/// [`TransferOutcome::NeedsConflictConfirmation`] 携带的重提请求（形状与
+/// [`PendingResume`] 同源，多一份冲突清单）。冲突优先于续传：一批里既有重名
+/// 又有部分完成时只弹冲突卡，非冲突文件在决策提交时仍按续传判据走。
+#[derive(Clone)]
+pub struct PendingConflict {
+    /// 发起传输的那份 `AppState`（决策回调用它提交）。
+    pub app: AppState,
+    /// 原样带回的传输请求。
+    pub paths: Vec<PathBuf>,
+    pub src_ep: Endpoint,
+    pub dest: PathBuf,
+    pub dest_ep: Endpoint,
+    pub move_: bool,
+    /// 目标端已存在的同名条目（`dest` 下的完整路径）——确认卡问的那几个。
+    pub conflicts: Vec<PathBuf>,
+    /// 决策提交完后要不要清暂存区（语义同 [`PendingResume::clear_staging_on_resolve`]）。
+    pub clear_staging_on_resolve: bool,
+}
+
+/// 冲突确认卡上用户的三选一（取消 = 直接丢弃请求，什么都不提交）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictDecision {
+    /// 覆盖：冲突的那些照原名重写（首块 TRUNCATE），目录合并。
+    Overwrite,
+    /// 改名：冲突的那些按 `a 2.ext` 约定改名，两边都留。
+    Rename,
+    /// 跳过：冲突的那些不提交，其余照常。
+    Skip,
+}
+
+/// 提交单个条目的写法（`submit_transfer_entry` 用，压参数个数）。
+/// 实际用到的组合只有三种：普通（重名走 `free_path` 改名）、续传（`can_resume`
+/// 判据兜底，不满足自动退回改名）、覆盖（冲突卡选定后照原名重写）。
+#[derive(Clone, Copy)]
+enum SubmitMode {
+    Normal,
+    Resume,
+    Overwrite,
 }
 
 /// 方向表：两端谁读谁写，以及进度条上那个动词。原是 `transfer_between` 里
@@ -3855,9 +3899,12 @@ impl AppState {
     ) -> TransferOutcome {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
 
-        // 第一遍只探测、不提交：一批里只要有可续传的，就整批交给用户决策——
+        // 第一遍只探测、不提交：一批里只要有冲突或可续传的，就整批交给用户决策——
         // 要是先把没冲突的传了，用户选「跳过」时已经动过的那些就收不回来了。
+        // 同一条目二者只居其一：部分完成（0 < 已传 < 源大小）算续传候选，
+        // 其余已存在（完整同名 / 目录 / 空文件）算冲突。冲突优先弹卡。
         let mut partial: Vec<PathBuf> = Vec::new();
+        let mut conflicts: Vec<PathBuf> = Vec::new();
         for src in &paths {
             let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
                 continue;
@@ -3866,13 +3913,27 @@ impl AppState {
             let Some((src_fs, dst_fs, _)) = resolve_transfer_leg(&src_ep, &dest_ep, &local) else {
                 continue;
             };
-            // 任一头问不到大小（探测失败）就当没有：宁可多传一遍，不可误判成可续。
+            // 任一头问不到（探测失败）就当没有：宁可多传一遍，不可误判。
             let (Ok(s), Ok(d)) = (src_fs.metadata(src).await, dst_fs.metadata(&to).await) else {
                 continue;
             };
             if d.size > 0 && d.size < s.size {
                 partial.push(to);
+            } else {
+                conflicts.push(to);
             }
+        }
+        if !conflicts.is_empty() {
+            return TransferOutcome::NeedsConflictConfirmation(Box::new(PendingConflict {
+                app: self.clone(),
+                paths,
+                src_ep,
+                dest: dest.to_path_buf(),
+                dest_ep,
+                move_,
+                conflicts,
+                clear_staging_on_resolve: false,
+            }));
         }
         if !partial.is_empty() {
             return TransferOutcome::NeedsResumeConfirmation(Box::new(PendingResume {
@@ -3896,7 +3957,7 @@ impl AppState {
             let to = dest.join(&name);
             let leg = resolve_transfer_leg(&src_ep, &dest_ep, &local);
             let hid = self
-                .submit_transfer_entry(src, &to, dest, leg, move_, false)
+                .submit_transfer_entry(src, &to, dest, leg, move_, SubmitMode::Normal)
                 .await;
             ids.push(hid);
         }
@@ -3928,9 +3989,55 @@ impl AppState {
                 continue;
             }
             let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
-            let resume = is_partial && decision == ResumeDecision::Resume;
+            let mode = if is_partial && decision == ResumeDecision::Resume {
+                SubmitMode::Resume
+            } else {
+                SubmitMode::Normal
+            };
             let hid = self
-                .submit_transfer_entry(src, &to, &pending.dest, leg, pending.move_, resume)
+                .submit_transfer_entry(src, &to, &pending.dest, leg, pending.move_, mode)
+                .await;
+            ids.push(hid);
+        }
+        if pending.clear_staging_on_resolve && pending.move_ {
+            self.clear_staged();
+        }
+        ids
+    }
+
+    /// 冲突确认卡上用户选定后重提：冲突的按决策（覆盖 / 改名 / 跳过），
+    /// 非冲突的照常提交（`resume = true` 让批里可能并存的部分完成文件仍可续写——
+    /// `transfer_tree` 的 `can_resume` 判据会兜底，不满足就改名重传）。
+    pub async fn resolve_conflict(
+        &self,
+        pending: PendingConflict,
+        decision: ConflictDecision,
+    ) -> Vec<u64> {
+        let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
+        let mut ids = Vec::new();
+        for src in &pending.paths {
+            let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let to = pending.dest.join(&name);
+            let is_conflict = pending.conflicts.iter().any(|p| p == &to);
+            if is_conflict && decision == ConflictDecision::Skip {
+                continue;
+            }
+            let mode = if is_conflict {
+                match decision {
+                    ConflictDecision::Overwrite => SubmitMode::Overwrite,
+                    // 改名：冲突文件走普通路径（free_path 改名，两边都留）。
+                    _ => SubmitMode::Normal,
+                }
+            } else {
+                // 非冲突文件挂续传：批里并存的部分完成文件仍可从断点续写，
+                // 引擎侧 can_resume 判据兜底（不满足自动退回改名）。
+                SubmitMode::Resume
+            };
+            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
+            let hid = self
+                .submit_transfer_entry(src, &to, &pending.dest, leg, pending.move_, mode)
                 .await;
             ids.push(hid);
         }
@@ -3950,11 +4057,16 @@ impl AppState {
         dest_dir: &Path,
         leg: Option<TransferLeg>,
         move_: bool,
-        resume: bool,
+        mode: SubmitMode,
     ) -> u64 {
+        let (resume, overwrite) = match mode {
+            SubmitMode::Normal => (false, false),
+            SubmitMode::Resume => (true, false),
+            SubmitMode::Overwrite => (false, true),
+        };
         if let Some((src_fs, dst_fs, label)) = leg {
             let id = self.ops.lock().await.next_id();
-            let op = if resume {
+            let op = if resume || overwrite {
                 TransferOperation::with_resume(
                     id,
                     src_fs,
@@ -3964,7 +4076,8 @@ impl AppState {
                     TransferOpts {
                         remove_source: move_,
                         label: if move_ { "移动" } else { label },
-                        resume: true,
+                        resume,
+                        overwrite,
                     },
                 )
             } else {

@@ -246,6 +246,12 @@ pub(crate) enum Modal {
     /// 带 `AppState` 的结构体进不了枚举，这里只是「现在是续传确认卡」的标记。
     /// Esc / 取消 / 点遮罩 = **什么都不提交**（卡与请求一起清掉）。
     ConfirmResume,
+    /// 「目标已有同名文件」冲突确认卡（覆盖 / 改名 / 跳过）。
+    ///
+    /// 同 [`Modal::ConfirmResume`] 的套路：载荷（[`mo_app::PendingConflict`]）
+    /// 放 [`RootView::conflict_pending`]，枚举里只是标记。Esc / 取消 / 点遮罩
+    /// = **什么都不提交**。
+    ConfirmConflict,
     /// 扩展贡献的只读列表源面板（P4，devlog §5 表格 `list` 那行）。
     ///
     /// 状态（标题 / 行 / 加载中 / 错误）放在 [`RootView::list_panel`]，这里只是
@@ -874,6 +880,9 @@ pub struct RootView {
     /// （见那边的注释）：开卡时存进来，决策 / 关卡时取走清空。
     /// `pub(crate)` 仅为测试预置（store pre-seeding 套路）。
     pub(crate) resume_pending: Option<mo_app::PendingResume>,
+    /// 冲突确认卡（[`Modal::ConfirmConflict`]）的重提请求，套路同
+    /// [`RootView::resume_pending`]（载荷带 `AppState` 进不了 Modal 枚举）。
+    pub(crate) conflict_pending: Option<mo_app::PendingConflict>,
     /// 续传决策**提交后**要刷新的目标端（`AppState`, 目标目录）。
     ///
     /// 弹确认卡时记下——那时五处传输入口都还拿得到两端；决策提交、整批复传完
@@ -1198,6 +1207,7 @@ impl RootView {
             focus: cx.focus_handle(),
             modal: Modal::None,
             resume_pending: None,
+            conflict_pending: None,
             resume_dest: None,
             cmd_query: String::new(),
             palette_index: 0,
@@ -6764,6 +6774,12 @@ impl RootView {
                 self.modal = Modal::ConfirmResume;
                 cx.notify();
             }
+            mo_app::TransferOutcome::NeedsConflictConfirmation(p) => {
+                self.conflict_pending = Some(*p);
+                self.resume_dest = Some((dest_app, dest));
+                self.modal = Modal::ConfirmConflict;
+                cx.notify();
+            }
         }
     }
 
@@ -7747,6 +7763,7 @@ impl Render for RootView {
             | Modal::Tags
             | Modal::Settings
             | Modal::ConfirmResume
+            | Modal::ConfirmConflict
             | Modal::CommandPalette => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
@@ -8171,6 +8188,7 @@ impl Render for RootView {
                 root = root.child(dialogs::trash_rename(self, entry, &entity));
             }
             Modal::ConfirmResume => root = root.child(render_resume_confirm(self, &entity)),
+            Modal::ConfirmConflict => root = root.child(render_conflict_confirm(self, &entity)),
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
             Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
             Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
@@ -8777,6 +8795,12 @@ fn handle_modal_key(
         Modal::ConfirmResume => match key {
             "escape" => dismiss_resume_confirm(entity, cx),
             "enter" => resolve_resume_decision(entity, mo_app::ResumeDecision::Resume, cx),
+            _ => {}
+        },
+        // 冲突确认卡：Esc 收卡不提交；Enter 给「改名」（批级决策里最安全的主行动）。
+        Modal::ConfirmConflict => match key {
+            "escape" => dismiss_conflict_confirm(entity, cx),
+            "enter" => resolve_conflict_decision(entity, mo_app::ConflictDecision::Rename, cx),
             _ => {}
         },
         Modal::TrashRename(_) => match key {
@@ -11765,6 +11789,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_resume_confirm(entity, cx);
         return;
     }
+    // 冲突确认卡同理：点遮罩 = 什么都不提交。
+    if matches!(entity.read(cx).modal, Modal::ConfirmConflict) {
+        dismiss_conflict_confirm(entity, cx);
+        return;
+    }
     close_modal(entity, cx);
 }
 
@@ -12090,6 +12119,208 @@ fn resolve_resume_decision(
     cx.spawn(async move |_cx| {
         let ids = app.resolve_resume(pending, decision).await;
         // 重提完成后再刷新目标端（远程没有 watcher，不刷就看不见新文件）。
+        if let Some((dest_app, dest)) = refresh_dest {
+            if !ids.is_empty() {
+                watch_then_refresh_task(app, ids, dest_app, dest).await;
+            }
+        }
+    })
+    .detach();
+}
+
+// ---------- 冲突确认卡（Modal::ConfirmConflict） ----------
+
+/// 冲突确认卡：目标里已有同名文件，覆盖（照原名重写）/ 改名（两边都留）/
+/// 跳过（那几个不传）三选一。
+///
+/// 与 [`render_resume_confirm`] 同一外壳与交互（Esc / 取消 / 点遮罩 =
+/// **什么都不提交**）；按钮顺序把最危险的「覆盖」放最右、主色给安全的「改名」。
+fn render_conflict_confirm(v: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
+    let (count, names) = match v.conflict_pending.as_ref() {
+        Some(p) => (
+            p.conflicts.len(),
+            p.conflicts
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect::<Vec<_>>(),
+        ),
+        None => (0, Vec::new()),
+    };
+    let mut message = if count == 0 {
+        "没有冲突的文件。".to_string()
+    } else {
+        format!("目标位置已有 {count} 个同名文件。要覆盖、改名保留两者，还是跳过？")
+    };
+    // 文件名最多列 5 个，余下的折成一行——弹窗不是清单页（与续传卡同一约定）。
+    const MAX_NAMES: usize = 5;
+    let mut listing = String::new();
+    for (i, name) in names.iter().enumerate() {
+        if i == MAX_NAMES {
+            listing.push_str(&format!("……等 {} 个文件", count));
+            break;
+        }
+        listing.push_str(name);
+        listing.push('\n');
+    }
+    if count > 0 {
+        message.push_str("\n\n");
+        message.push_str(listing.trim_end());
+    }
+
+    let overwrite = entity.clone();
+    let rename = entity.clone();
+    let skip = entity.clone();
+    let cancel = entity.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(theme::text())
+                        .child(text!("目标已有同名文件")),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme::muted())
+                        .child(text!(message)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                // 跳过：中性描边按钮。
+                .child(
+                    div()
+                        .id("conflict-skip")
+                        .test_support()
+                        .debug_selector(|| "conflict-skip".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_conflict_decision(&skip, mo_app::ConflictDecision::Skip, cx)
+                        })
+                        .child(text!("跳过")),
+                )
+                // 取消：什么都不提交。
+                .child(
+                    div()
+                        .id("conflict-cancel")
+                        .test_support()
+                        .debug_selector(|| "conflict-cancel".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| dismiss_conflict_confirm(&cancel, cx))
+                        .child(text!("取消")),
+                )
+                // 覆盖：危险动作放最右，但不给主色——主色留给安全的「改名」。
+                .child(
+                    div()
+                        .id("conflict-overwrite")
+                        .test_support()
+                        .debug_selector(|| "conflict-overwrite".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_conflict_decision(
+                                &overwrite,
+                                mo_app::ConflictDecision::Overwrite,
+                                cx,
+                            )
+                        })
+                        .child(text!("覆盖")),
+                )
+                // 改名：主色按钮（安全的默认主行动，Enter 也走这里）。
+                .child(
+                    div()
+                        .id("conflict-rename")
+                        .test_support()
+                        .debug_selector(|| "conflict-rename".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(theme::selected_bg())
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_conflict_decision(&rename, mo_app::ConflictDecision::Rename, cx)
+                        })
+                        .child(text!("改名")),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 关掉冲突确认卡**不提交任何东西**（Esc / 取消 / 点遮罩）。
+fn dismiss_conflict_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if v.modal == Modal::ConfirmConflict {
+            v.modal = Modal::None;
+            v.conflict_pending = None;
+            cx.notify();
+        }
+    });
+}
+
+/// 冲突确认卡上选定后的提交：取走请求 → 关卡 → 交回**发起那次传输的**
+/// `AppState`（请求里带着）在后台重提，完成后刷新目标端（同续传卡）。
+fn resolve_conflict_decision(
+    entity: &Entity<RootView>,
+    decision: mo_app::ConflictDecision,
+    cx: &mut App,
+) {
+    let pending = entity.update(cx, |v, cx| {
+        if v.modal != Modal::ConfirmConflict {
+            return None;
+        }
+        v.modal = Modal::None;
+        cx.notify();
+        v.conflict_pending.take().map(|p| (p, v.resume_dest.take()))
+    });
+    let Some((pending, refresh_dest)) = pending else {
+        return;
+    };
+    let app = pending.app.clone();
+    cx.spawn(async move |_cx| {
+        let ids = app.resolve_conflict(pending, decision).await;
         if let Some((dest_app, dest)) = refresh_dest {
             if !ids.is_empty() {
                 watch_then_refresh_task(app, ids, dest_app, dest).await;
@@ -13203,6 +13434,94 @@ mod tests {
         seed(&root, &app, cx);
         cx.update(|window, cx| window.render_frame(cx));
         cx.update(|window, cx| window.click("resume-skip", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            card_state(&root, cx),
+            (false, false),
+            "跳过后卡与请求都该清掉"
+        );
+    }
+
+    /// 冲突确认卡（`Modal::ConfirmConflict`）：预置请求后四颗按钮齐全；取消只
+    /// 收卡清请求（跳过对「全是冲突文件」的一批也不提交任何东西，headless 里
+    /// 零 IO）；覆盖 / 改名会真提交操作（blocking 池 IO），headless 不点——
+    /// 那两条链由 mo-app 的 conflict 用例钉住。
+    #[test]
+    fn conflict_confirm_dialog_closes_and_clears_without_submitting() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app.clone(), cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        fn seed(root: &Entity<RootView>, app: &AppState, cx: &mut gpui_kit::VisualTestContext) {
+            let pending = mo_app::PendingConflict {
+                app: app.clone(),
+                paths: vec![PathBuf::from("/src/a.bin")],
+                src_ep: mo_app::Endpoint::Local,
+                dest: PathBuf::from("/dst"),
+                dest_ep: mo_app::Endpoint::Local,
+                move_: false,
+                conflicts: vec![PathBuf::from("/dst/a.bin")],
+                clear_staging_on_resolve: false,
+            };
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.conflict_pending = Some(pending);
+                    v.modal = Modal::ConfirmConflict;
+                    cx.notify();
+                });
+            });
+        }
+        let card_state = |root: &Entity<RootView>, cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| {
+                root.update(cx, |v, _cx| {
+                    (
+                        v.modal == Modal::ConfirmConflict,
+                        v.conflict_pending.is_some(),
+                    )
+                })
+            })
+        };
+
+        seed(&root, &app, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        // B 类浮层：浏览区保留在遮罩后面，卡与四颗按钮都画出来。
+        assert!(
+            cx.debug_bounds("mo-file-list").is_some(),
+            "冲突卡是浮层，浏览区应当保留"
+        );
+        assert!(
+            cx.debug_bounds("mo-dialog-overlay").is_some(),
+            "冲突卡应当用带遮罩的浮层"
+        );
+        for id in [
+            "conflict-overwrite",
+            "conflict-rename",
+            "conflict-skip",
+            "conflict-cancel",
+        ] {
+            assert!(
+                cx.debug_bounds(id).is_some(),
+                "冲突卡的按钮 {id} 应当渲染出来"
+            );
+        }
+
+        // 取消：收卡 + 清请求，什么都不提交。
+        cx.update(|window, cx| window.click("conflict-cancel", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            card_state(&root, cx),
+            (false, false),
+            "取消后卡与请求都该清掉"
+        );
+
+        // 跳过：收卡清请求（这批全是冲突文件 → 不提交任何操作，零 IO）。
+        seed(&root, &app, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|window, cx| window.click("conflict-skip", cx));
         cx.update(|window, cx| window.render_frame(cx));
         assert_eq!(
             card_state(&root, cx),

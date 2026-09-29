@@ -38,17 +38,15 @@ pub struct TransferOperation {
     dst_fs: Arc<dyn FileSystem>,
     src: PathBuf,
     dst: PathBuf,
-    /// 传完删源（「移动」语义）。
-    remove_source: bool,
-    /// 断点续传：true 时 `transfer_tree` 跳过 `free_path`、按目标已传字节续写（见下）。
-    resume: bool,
+    /// 递归搬运的三个开关（删源 / 续传 / 覆盖）。
+    flags: TreeFlags,
     /// 描述里用的动作词（上传 / 下载 / 复制 / 移动），由调用方按方向给出。
     label: &'static str,
     state: Arc<Mutex<OpInner>>,
 }
 
 /// 构造 `TransferOperation` 时一次性给出的选项，用来把构造函数压在 clippy 的
-/// 7 参数上限以内（`remove_source` / `label` / `resume` 三者一组）。
+/// 7 参数上限以内（`remove_source` / `label` / `resume` / `overwrite` 一组）。
 pub struct TransferOpts {
     /// 传完删源（「移动」语义）。
     pub remove_source: bool,
@@ -56,6 +54,18 @@ pub struct TransferOpts {
     pub label: &'static str,
     /// 断点续传：true 时 `transfer_tree` 跳过 `free_path`、按目标已传字节续写。
     pub resume: bool,
+    /// 冲突卡上用户选了「覆盖」：目标存在也照原名写（`write_file_chunk` 首块
+    /// TRUNCATE，不 `free_path` 改名）。目录则是合并语义（往同名目录里传）。
+    pub overwrite: bool,
+}
+
+/// 递归搬运用的三个开关，收成一个 Copy 结构体把 `transfer_tree` 压在
+/// clippy 的 7 参数上限以内。
+#[derive(Clone, Copy)]
+struct TreeFlags {
+    remove_source: bool,
+    resume: bool,
+    overwrite: bool,
 }
 
 impl TransferOperation {
@@ -82,12 +92,13 @@ impl TransferOperation {
                 remove_source,
                 label,
                 resume: false,
+                overwrite: false,
             },
         )
     }
 
-    /// 断点续传版本：`opts.resume = true` 时 `transfer_tree` 跳过 `free_path`、按目标已传
-    /// 字节续写（仅当目标是「部分完成」才真续，见 `transfer_tree` 的 `can_resume` 判据）。
+    /// 选项版本：`opts.resume` / `opts.overwrite` 分别控制续传与覆盖（见
+    /// [`TransferOpts`] 与 `transfer_tree` 的判据）。
     pub fn with_resume(
         id: u64,
         src_fs: Arc<dyn FileSystem>,
@@ -102,8 +113,11 @@ impl TransferOperation {
             dst_fs,
             src,
             dst,
-            remove_source: opts.remove_source,
-            resume: opts.resume,
+            flags: TreeFlags {
+                remove_source: opts.remove_source,
+                resume: opts.resume,
+                overwrite: opts.overwrite,
+            },
             label: opts.label,
             state: Arc::new(Mutex::new(OpInner::new())),
         })
@@ -167,8 +181,7 @@ impl Operation for TransferOperation {
             self.dst_fs.clone(),
             self.src.clone(),
             self.dst.clone(),
-            self.remove_source,
-            self.resume,
+            self.flags,
             self.state.clone(),
         ));
 
@@ -201,8 +214,7 @@ fn transfer_tree(
     dst_fs: Arc<dyn FileSystem>,
     src: PathBuf,
     dst: PathBuf,
-    remove_source: bool,
-    resume: bool,
+    flags: TreeFlags,
     state: Arc<Mutex<OpInner>>,
 ) -> BoxFut<Result<(), MoError>> {
     Box::pin(async move {
@@ -211,13 +223,20 @@ fn transfer_tree(
         }
 
         if src_fs.is_dir(&src).await {
-            // 续传时目录不改名（直接用原目标路径），子项各自判断能否续写。
-            let dst = if resume {
+            // 续传 / 覆盖时目录不改名（直接用原目标路径），子项各自判断。
+            let dst = if flags.resume || flags.overwrite {
                 dst
             } else {
                 free_path(&dst_fs, &dst).await
             };
-            dst_fs.create_dir(&dst).await?;
+            // 覆盖时同名目录已存在（合并语义）：create_dir 报错但目标确实在，
+            // 就当建好了继续往里传；其它失败（权限等）原样上报。
+            if let Err(e) = dst_fs.create_dir(&dst).await {
+                let exists = flags.overwrite && dst_fs.metadata(&dst).await.is_ok();
+                if !exists {
+                    return Err(e);
+                }
+            }
             // 名字排一下序：递归顺序稳定，进度推进与「哪几个文件在传」都可复现。
             let mut children = src_fs.read_dir(&src).await?;
             children.sort_by(|a, b| a.name.cmp(&b.name));
@@ -227,13 +246,12 @@ fn transfer_tree(
                     dst_fs.clone(),
                     child.path.clone(),
                     dst.join(&child.name),
-                    remove_source,
-                    resume,
+                    flags,
                     state.clone(),
                 )
                 .await?;
             }
-            if remove_source {
+            if flags.remove_source {
                 src_fs.remove_dir(&src).await?;
             }
             return Ok(());
@@ -244,13 +262,14 @@ fn transfer_tree(
         // 断点续传：仅当目标是「部分完成」（0 < 已传 < 源大小）才跳过 free_path 直接
         // 续写；否则退回常规行为（free_path 改名）。这样 Foreign/更大的文件绝不会被我们
         // 就地续写，避免旧尾部污染（与「永不静默覆盖」同一原则）。
-        let dst_size = if resume {
+        // 覆盖（冲突卡选了「覆盖」）也跳过 free_path：首块 TRUNCATE 照原名重写。
+        let dst_size = if flags.resume {
             dst_fs.metadata(&dst).await.map(|m| m.size).ok()
         } else {
             None
         };
-        let can_resume = resume && matches!(dst_size, Some(s) if s > 0 && s < size);
-        let dst = if can_resume {
+        let can_resume = flags.resume && matches!(dst_size, Some(s) if s > 0 && s < size);
+        let dst = if can_resume || flags.overwrite {
             dst
         } else {
             free_path(&dst_fs, &dst).await
@@ -296,7 +315,7 @@ fn transfer_tree(
         // 收尾：WebDAV 把攒在临时文件的整份 PUT 出去；本地 / FTP / SFTP 是空操作。
         // 必须在删源之前——传输语义是「先确保目标完整，再删源」。
         dst_fs.finalize_file_chunk(&dst).await?;
-        if remove_source {
+        if flags.remove_source {
             src_fs.remove_file(&src).await?;
         }
         Ok(())

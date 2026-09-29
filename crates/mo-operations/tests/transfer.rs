@@ -581,6 +581,7 @@ async fn resume_continues_a_partial_destination() {
             remove_source: false,
             label: "下载",
             resume: true,
+            overwrite: false,
         },
     );
     run_in_blocking(op.clone()).await.expect("续传应成功");
