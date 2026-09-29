@@ -322,3 +322,18 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   每个选择器**也要 `instancesRespondToSelector:` 核一遍——测试补了
   NSDraggingItem（setDraggingFrame:contents: / initWithPasteboardWriter:）与
   NSWorkspace（iconForFileType:）。
+
+### §29 订正二：拖拽语义统一成复制（2026-09-29，3a9b811）
+
+* 用户实测发现交互**不对等**：Mo 拖出到访达（同卷）被目标判成移动（源进
+  回收站），反向从访达拖进 Mo 却恒是复制。根源在接收侧：gpui 的外部 drop
+  通道拿不到修饰键（`FileDropEvent::Submit` 翻成 MouseUp 时清成
+  `Modifiers::default()`）、也回不了操作码（不是原生 `NSDraggingDestination`）
+  ——拖入想做移动既没有意图信号也没有协议位；而拖出「复制与移动都声明、
+  目标定」就让目标（访达同卷）选了移动。
+* 决策：**拖拽语义统一成复制**。拖出两侧（macOS `DRAG_MASK`、Windows
+  `do_drag` 的 `DROPEFFECT`）都只声明 Copy，目标只能回复制；两端方向一致、
+  最可预期，移动走剪切粘贴。
+* 留口子：`drag_ended` 的 MOVE 分支、`finish_file_drag` 的移动收尾（源走
+  回收站）都留着——将来接修饰键透传（Windows `IDropTarget::Drop` 的
+  keyState / macOS 平台层自接 `NSDraggingDestination`）后一起开移动语义。
