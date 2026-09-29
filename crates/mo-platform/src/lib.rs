@@ -356,6 +356,25 @@ pub fn write_file_clipboard(paths: &[PathBuf], cut: bool) -> Result<(), Platform
     }
 }
 
+// -------------------------------------------------------------- 诊断控制台
+
+/// 诊断用：把父进程的终端控制台接回来（Windows 专属，见
+/// `windows::attach_parent_console` 的文档——GUI 子系统的 exe 在 `cargo run`
+/// 下 stderr 是断的，`RUST_LOG` 看不见日志）。
+///
+/// 其它平台 stdio 天生是通的，返回 `false`（调用方只拿返回值记一条日志，
+/// 不拿它分支逻辑）。双击启动 = 父进程没有控制台 = 返回 `false`，无副作用。
+pub fn attach_parent_console() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::attach_parent_console()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 // -------------------------------------------------------------- 拖出到系统
 
 /// 这个平台能不能把文件**拖出**到别的应用（资源管理器 / 访达 / 其它程序的落点）。

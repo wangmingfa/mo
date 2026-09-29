@@ -1420,6 +1420,55 @@ fn failed(action: &str, path: &Path, e: windows::core::Error) -> PlatformError {
     PlatformError::Failed(format!("{action}失败：{}（{e}）", path.display()))
 }
 
+// ---- 诊断控制台：GUI 子系统下把父进程的终端接回来 ----
+
+/// 把**父进程**的控制台接回自己，返回接上了没有。
+///
+/// 为什么需要它：本 crate 的 exe 在 Windows 上按 `windows_subsystem = "windows"`
+/// 链接成 GUI 子系统（双击不弹黑框，见 `mo-ui/src/main.rs`）。代价是——被终端
+/// `cargo run` 拉起时进程**没有** stdio：`GetStdHandle` 拿到的是空句柄，tracing
+/// 写 stderr 全部石沉大海，`RUST_LOG=mo_ui=debug` 一条日志都看不见（2026-09-29
+/// 复测地址栏时实测）。
+///
+/// 修法：`AttachConsole(ATTACH_PARENT_PROCESS)` 挂回父进程（cargo / PowerShell）
+/// 的控制台。⚠️ 它**不设置**标准句柄（这一点与 `AllocConsole` 不同），要自己开
+/// `CONOUT$` 再 `SetStdHandle` 补上；而且必须在 std 第一次用 stderr **之前**调
+/// （Rust 的 std 会把首次取到的句柄缓存住，晚了就接不上了）——调用点在
+/// `mo_ui::init_tracing` 的最前面。
+///
+/// 双击启动时父进程是资源管理器、没有控制台，`AttachConsole` 失败，安静返回
+/// `false`，GUI 行为分毫不变。只在设了 `RUST_LOG`（= 要诊断）时才调用。
+pub fn attach_parent_console() -> bool {
+    use windows::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+        return false;
+    }
+    // `CONOUT$` 是当前控制台的屏幕缓冲设备，`GENERIC_WRITE` + 共享读写打开即可。
+    // STDOUT 一并补上：eprintln 之外万一有 println 诊断也别丢。
+    let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+    for slot in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                0x4000_0000,                                // GENERIC_WRITE
+                FILE_SHARE_MODE(0x0000_0001 | 0x0000_0002), // READ | WRITE
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        };
+        if let Ok(handle) = handle {
+            unsafe {
+                let _ = SetStdHandle(slot, handle);
+            }
+        }
+    }
+    true
+}
+
 /// 测试用：把**当前线程**的键盘布局临时换成指定 KLID， Drop 时换回原来那个。
 ///
 /// `ActivateKeyboardLayout` 默认只作用于调用线程，而 [`unshifted_key`] 问的正是

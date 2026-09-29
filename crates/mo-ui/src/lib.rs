@@ -39,7 +39,14 @@ use mo_app::AppState;
 
 /// 初始化日志：默认 info 级别输出到 stderr，可用 `RUST_LOG` 覆盖
 /// （如 `RUST_LOG=mo_ui=debug` 诊断窗口懒加载）。需重定向时 `2> /tmp/mo.log`。
+///
+/// ⚠️ Windows 的 exe 是 GUI 子系统（`main.rs` 顶上那句），被终端拉起时 stderr
+/// 天生是断的——所以设了 `RUST_LOG`（= 有人要诊断）就先把父进程的控制台接回来，
+/// 而且必须赶在下面第一次写 stderr 之前（std 会缓存首次拿到的句柄）。
 fn init_tracing() {
+    if std::env::var_os("RUST_LOG").is_some() && mo_platform::attach_parent_console() {
+        eprintln!("已接回父进程控制台，RUST_LOG 诊断日志生效");
+    }
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
