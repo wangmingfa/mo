@@ -837,10 +837,17 @@ fn render_trailing(
                     PowerAction::Unmount(path) => {
                         let path = path.clone();
                         cx.spawn(async move |cx| {
-                            if let Err(e) = app.unmount_share(path).await {
-                                entity.update(cx, |v, cx| {
-                                    v.notice(format!("卸载失败：{e}"), None, cx);
-                                });
+                            match app.unmount_share(path.clone()).await {
+                                Err(e) => {
+                                    entity.update(cx, |v, cx| {
+                                        v.notice(format!("卸载失败：{e}"), None, cx);
+                                    });
+                                }
+                                Ok(()) => {
+                                    // 卸载成功：正在看这块盘里的页面跟着走（不在
+                                    // 盘里就是空操作），别留一张死路径的快照。
+                                    let _ = app.leave_ejected_volume(&path).await;
+                                }
                             }
                             entity.update(cx, |_, cx| cx.notify());
                         })
@@ -849,13 +856,19 @@ fn render_trailing(
                     PowerAction::Eject(path) => {
                         let path = path.clone();
                         cx.spawn(async move |cx| {
-                            if let Err(e) = app.eject_volume(path).await {
-                                entity.update(cx, |v, cx| {
-                                    // 原样显示：`eject_volume` 交回来的已经是一句完整的话
-                                    // （平台的否决理由形如「推出失败：E:\（被 xxx 占用）」），
-                                    // 这里再加前缀就成了「推出失败：推出失败：…」。
-                                    v.notice(e.to_string(), None, cx);
-                                });
+                            match app.eject_volume(path.clone()).await {
+                                Err(e) => {
+                                    entity.update(cx, |v, cx| {
+                                        // 原样显示：`eject_volume` 交回来的已经是一句完整的话
+                                        // （平台的否决理由形如「推出失败：E:\（被 xxx 占用）」），
+                                        // 这里再加前缀就成了「推出失败：推出失败：…」。
+                                        v.notice(e.to_string(), None, cx);
+                                    });
+                                }
+                                Ok(()) => {
+                                    // 推出成功：同上，卷里的页面跟着走。
+                                    let _ = app.leave_ejected_volume(&path).await;
+                                }
                             }
                             entity.update(cx, |_, cx| cx.notify());
                         })

@@ -76,3 +76,77 @@ fn refresh_does_not_pollute_history() {
     );
     assert_eq!(outcome.2, Some(a), "刷新后仍停留在同一目录");
 }
+
+/// 推出卷宗后，正在看卷里的页面要被带走（回到卷的父目录）。
+///
+/// 用户报的现象：推出「/Volumes/TraeWork CN」后地址栏与文件列表还停在原处——
+/// 卷已经没了，往后随便一按（排序、刷新、双击）全是错。
+#[test]
+fn ejecting_a_volume_navigates_to_its_parent() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let app = common::isolated("eject-leave", AppState::new);
+    let base = std::env::temp_dir().join(format!("mo-eject-{}", std::process::id()));
+    let volume = base.join("TraeWork CN");
+    let inside = volume.join("子目录");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&inside).unwrap();
+
+    let outcome = rt.block_on(async {
+        app.open_local(&inside).await.expect("打开卷里的目录");
+        assert_eq!(app.current_path().await, Some(inside.clone()));
+        let navigated = app.leave_ejected_volume(&volume).await;
+        (navigated, app.current_path().await)
+    });
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(outcome.0, "在卷里：应当导航");
+    assert_eq!(
+        outcome.1,
+        Some(volume.parent().unwrap().to_path_buf()),
+        "落点是卷的父目录"
+    );
+}
+
+/// 看的不是卷里（别的目录 / 名字相近的**兄弟**卷）就是空操作。
+///
+/// 名字相近那条钉住分量级比较：`/Volumes/X2` 不在 `/Volumes/X` 里——
+/// `Path::starts_with` 按分量比，字符串前缀就会误判。
+#[test]
+fn eject_leaves_other_locations_alone() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let app = common::isolated("eject-stay", AppState::new);
+    let base = std::env::temp_dir().join(format!("mo-eject-stay-{}", std::process::id()));
+    let volume = base.join("vol");
+    let sibling = base.join("vol2");
+    let elsewhere = base.join("elsewhere");
+    let _ = std::fs::remove_dir_all(&base);
+    for d in [&volume, &sibling, &elsewhere] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let outcome = rt.block_on(async {
+        // 名字相近的兄弟卷。
+        app.open_local(&sibling).await.expect("打开 vol2");
+        let sibling_case = (
+            app.leave_ejected_volume(&volume).await,
+            app.current_path().await,
+        );
+        // 完全不相干的目录。
+        app.open_local(&elsewhere).await.expect("打开 elsewhere");
+        let unrelated_case = (
+            app.leave_ejected_volume(&volume).await,
+            app.current_path().await,
+        );
+        (sibling_case, unrelated_case)
+    });
+
+    drop(app);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(!outcome.0 .0, "兄弟卷不算在里面");
+    assert_eq!(outcome.0 .1, Some(sibling), "不该被带走");
+    assert!(!outcome.1 .0, "别的目录不算在里面");
+    assert_eq!(outcome.1 .1, Some(elsewhere), "不该被带走");
+}

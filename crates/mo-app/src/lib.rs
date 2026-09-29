@@ -1783,6 +1783,33 @@ impl AppState {
         r
     }
 
+    /// 推出 / 卸载成功后，把「正在看这个卷里面」的页面带走。
+    ///
+    /// 卷没了，列表与地址栏还停在原路径：列表是快照（推出不动模型），地址栏读的
+    /// 也是它——不导航的话用户看到的是一块已经不存在的盘的内容，往后随便一按
+    /// （排序、刷新、双击）全是错。落点选卷的**父目录**（`/Volumes` 一类）：卷没了
+    /// 那里依然存在，与 Finder「推出后回到上一级」的体感一致。断开远程连接的
+    /// 同款处理见 [`Self::disconnect_connection`]（那边落主目录）。
+    ///
+    /// 返回是否真的导航了。当前不在卷里（看的是本地其它目录 / 远程）就是空操作。
+    pub async fn leave_ejected_volume(&self, volume: &Path) -> bool {
+        // `Path::starts_with` 按分量比较：`/Volumes/X2` 不会误判成在 `/Volumes/X`
+        // 里（字符串前缀就会）。
+        let inside = self
+            .current_path()
+            .await
+            .is_some_and(|cur| cur.starts_with(volume));
+        if !inside {
+            return false;
+        }
+        let parent = volume
+            .parent()
+            .map(|p| p.to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.open_local(&parent).await.is_ok()
+    }
+
     /// 取一个文件在**系统**里的图标（macOS 走 `NSWorkspace.iconForFile:`）。
     ///
     /// 返回的是**解码好的内存位图**（BGRA）——UI 侧包成 `RenderImage` 后用
