@@ -265,3 +265,87 @@ fn hidden_by_attributes(attributes: u32) -> bool {
     const SYSTEM: u32 = 0x4;
     attributes & (HIDDEN | SYSTEM) != 0
 }
+
+// -------------------------------------------------------------- 测试卫生
+
+/// 清掉**别的**测试进程留下的临时目录（按前缀匹配 `std::env::temp_dir()` 下的条目）。
+///
+/// 为什么在这里：本仓库的测试隔离目录（mo-ui 的 `mo-test-{config,cache}-*`、
+/// mo-app 的 `mo-app-store-*` / `mo-trash-*`）都建在 TEMP 里且**只进不出**——
+/// 测试进程被 kill / panic 时没机会自清，而 Rust 测试二进制没有可靠的退出钩子
+/// （libtest 直接 `exit`）。所以放弃「退出时清」，改成**下一次测试跑起来时扫**：
+/// 各自的隔离助手在建自己目录的顺手调一次本函数，TTL 给 24 小时——活着的并行
+/// 测试进程的目录都是新鲜的，碰不到。
+///
+/// 规则（保守优先，宁留勿误删）：
+///
+/// * 只删 `prefixes` 之一**开头**的目录；
+/// * 跳过本进程自己的隔离目录：目录名以 `-{当前pid}` 结尾（TTL=0 的测试会把
+///   同进程并行的其它测试抽地板，这条守卫兜住它）；
+/// * 只删**目录**且修改时间早于 `ttl`；读不出时间（时钟怪 / 平台不支持）→
+///   当新鲜的，不碰；
+/// * 删除失败安静放过（可能正被并行进程占着，下次再清）。
+pub fn sweep_stale_temp_dirs(prefixes: &[&str], ttl: std::time::Duration) {
+    let own_suffix = format!("-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // 先把 OsString 绑出来：`entry.file_name().to_str()` 链在 let-else 里
+        // 临时值活不过本条语句（E0716）。
+        let raw_name = entry.file_name();
+        let Some(name) = raw_name.to_str() else {
+            continue;
+        };
+        if !prefixes.iter().any(|p| name.starts_with(p)) || name.ends_with(&own_suffix) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < ttl)
+            .unwrap_or(true);
+        if fresh {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::sweep_stale_temp_dirs;
+
+    /// TTL=0：我们的前缀必删、前缀不匹配不碰、本进程正牌目录（`-{pid}` 结尾）不碰。
+    #[test]
+    fn sweep_removes_only_prefixed_stale_dirs() {
+        // 时间戳进目录名：与并行测试进程 / 上一次跑的残留互不撞名。
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("时钟不该倒退到 Unix 纪元前")
+                .as_nanos()
+        );
+        let ours = std::env::temp_dir().join(format!("mo-sweepfix-a-{stamp}"));
+        let decoy = std::env::temp_dir().join(format!("other-sweepfix-a-{stamp}"));
+        // 本进程「正牌」隔离目录的命名（isolate / store 都以 pid 结尾）。
+        let own = std::env::temp_dir().join(format!("mo-sweepfix-b-{}", std::process::id()));
+        std::fs::create_dir_all(&ours).expect("建得出");
+        std::fs::create_dir_all(&decoy).expect("建得出");
+        std::fs::create_dir_all(&own).expect("建得出");
+        sweep_stale_temp_dirs(&["mo-sweepfix-"], std::time::Duration::ZERO);
+        assert!(!ours.exists(), "我们的前缀该被清掉");
+        assert!(decoy.exists(), "前缀不匹配的目录不该被碰");
+        assert!(own.exists(), "本进程自己的隔离目录不该被扫");
+        let _ = std::fs::remove_dir_all(&decoy);
+        let _ = std::fs::remove_dir_all(&own);
+    }
+}

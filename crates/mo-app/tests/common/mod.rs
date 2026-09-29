@@ -29,6 +29,16 @@ fn env_lock() -> MutexGuard<'static, ()> {
 
 /// `tag` 那一档的隔离目录。配置与缓存合成同一个根：少一个变量就少一处漏钉。
 fn store(tag: &str) -> PathBuf {
+    // 进程级一次：顺手清掉**别的**测试进程留下的过期目录（含 `mo-trash-*`）。
+    // 规则与守卫见 `mo_fs::sweep_stale_temp_dirs`；本进程自己的目录以 `-{pid}`
+    // 结尾，清扫自己不会碰到。
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SWEPT.get_or_init(|| {
+        mo_fs::sweep_stale_temp_dirs(
+            &["mo-app-store-", "mo-trash-"],
+            std::time::Duration::from_secs(24 * 60 * 60),
+        );
+    });
     let dir = std::env::temp_dir().join(format!("mo-app-store-{tag}-{}", std::process::id()));
     // 先清一遍：同名目录可能是上一次跑（同 pid 复用）留下的索引，读脏了会看错。
     let _ = std::fs::remove_dir_all(&dir);
