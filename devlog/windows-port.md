@@ -271,3 +271,4 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   * 读回用 JXA：`readObjectsForClassesOptions`（多段选择器连写，不是
     `ForClassesForOptions`）+ **空字典**作 options——传 `null` 会被桥成 NSNull，
     炸 `unrecognized selector count`。
+* **真机验证通过**（2026-09-29 用户亲测）：Mo 里复制几个文件 → 访达 ⌘V，粘得出。
