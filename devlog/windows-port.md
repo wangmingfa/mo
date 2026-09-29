@@ -246,3 +246,28 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * 地址栏不认 `/`：`D:/tmp-clip/moside` 与 `D:\tmp-clip\moside` 两种写法敲进去都停在 `D:` 根（2026-09-26 实测，未查因）。
 * 测试留下的临时目录在 TEMP 里没人删：回收站那些 `mo-trash-<pid>-<seq>`（§21 的 `remove_dir_all` 只挡 pid 复用带来的读脏，不解决堆积），以及 §26 之后每个用例各自的 `mo-app-store-<tag>-<pid>`（一次全量 `cargo test -p mo-app` 留下 400 多个）。隔离目录必须活到进程结束，所以要删得在最后统一收，而「最后」在 crash / ctrl-C 时到不了——真正干净的做法是给 `isolated` 挂一个进程退出时的清理，或用带 TTL 的目录名让下一次跑顺手清掉上一次的。
 
+
+## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
+
+* §20 只做了 Windows 方向：`supports_file_clipboard()` 在 mac 上恒假，Mo 里
+  Ctrl+C 之后去别的程序粘贴什么都没有。补上 AppKit 那条：
+  `macos::write_file_clipboard` = `NSPasteboard.generalPasteboard` 上
+  `clearContents`（`writeObjects:` 的前置，返回新 changeCount，0 = 失败）+
+  `NSMutableArray<NSURL>` + `writeObjects:`。NSURL 自己遵守 `NSPasteboardWriting`，
+  写出 `public.file-url` / `NSFilenamesPboardType`——正是访达读写的那几个类型；
+  百分号编码（中文、空格）由 NSURL 处理，不自己拼 `file://` 字符串。
+* `cut` 参数收下但按**复制**处理：Finder 的「剪切」记在私有 pasteboard 标记里
+  （读侧 §19 同款判据），公开 API 写不出剪切语义——宁可让对方粘出一份复制，
+  与「猜错方向会把用户的文件搬走」同一立场。
+* 走 `on_main_thread`（复制在 `spawn_blocking` 里发起）；`supports_file_clipboard()`
+  翻成 mac/win 都真，mo-ui 的门控自然接上，失败只记日志不报错（§20 那条纪律不变）。
+* **真机验证记两条**（`examples/clipboard_probe.rs`，写三条路径含中文+空格，
+  JXA 跨进程读回三条 URL 全对）：
+  * `writeObjects` 是**惰性**的：数据提供者是本进程里的 NSURL 对象，别的应用
+    来读时剪贴板服务进程回头找写方要数据——写完立刻退出的进程什么都留不下
+    （探针第一版就是这么「空」的）。探针要保活几秒；Mo 本体长驻无此问题，且
+    剪贴板服务进程会在写方终止时接管数据——实测探针退出 4 秒后读回仍在，
+    退出 Mo 后粘贴不丢。
+  * 读回用 JXA：`readObjectsForClassesOptions`（多段选择器连写，不是
+    `ForClassesForOptions`）+ **空字典**作 options——传 `null` 会被桥成 NSNull，
+    炸 `unrecognized selector count`。
