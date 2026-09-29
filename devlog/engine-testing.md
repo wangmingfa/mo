@@ -223,3 +223,22 @@ for _ in 0..n - 1 { cx.simulate_keystrokes("down"); }
 
 （顺带排除掉的错误猜测：给 sqlite 加 `busy_timeout` 并不治这条——而且 `MetadataCache`
 的打开在热路径上，等锁会有卡主线程的风险，别顺手加。）
+
+## 测试隔离目录的 TTL 清扫（2026-09-29，a2581f4）
+
+* **现象**：TEMP 里 `mo-test-config-*` / `mo-test-cache-*` 堆到 400+ 个——测试
+  进程被 kill / panic / 断电时没机会自清，而 Rust 测试二进制没有可靠的退出钩子
+  （libtest 直接 `exit`，析构不保证跑）。
+* **修法**：放弃「退出时清」，改成**下一次测试跑起来时扫**——
+  `isolate_user_dirs_for_tests` 首次建目录时顺手 `sweep_stale_isolated_dirs`：
+  只认自己的两个前缀、只删修改时间早于 **24h** 的（活着的并行测试进程的目录
+  都是新鲜的，碰不到；读不出 mtime 的一律当新鲜，宁留勿误删）。
+* **两个坑（首跑 CI 全抓到）**：
+  1. sweep 测试 TTL=0 会把**本进程**正牌隔离目录（`-{pid}` 结尾）也删掉——同一
+     测试二进制里并行跑的其它测试被抽地板。守卫：目录名以 `-{当前pid}` 结尾的一
+     律跳过（测试里钉住）。
+  2. `entry.file_name().to_str()` 链在 let-else 里：OsString 临时值活不过本条
+     语句（E0716），先 `let raw_name = entry.file_name();` 绑出来。
+* **守卫**：`isolate_sweep_tests::sweep_removes_only_mo_test_prefixed_dirs`——
+  TTL=0 下我们的前缀必删、前缀不匹配不碰、本进程目录不碰。
+* 残留的存量目录不用手动清：24h 前的下一次测试跑起来就扫掉了。
