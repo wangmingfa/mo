@@ -109,7 +109,7 @@ fn absolutize_drive_root(target: PathBuf, current: Option<&std::path::Path>) -> 
     // 取 base 的盘符前缀补上根分隔符成 `D:\`，再 join：join 的目标是「有根无
     // 前缀」的路径（`\foo`），std 会**保留 base 的前缀、替换其余** → `D:\foo`；
     // 目标本身就是 `\` 时得 `D:\`。
-    match base.as_deref().and_then(std::path::Path::components).next() {
+    match base.as_deref().and_then(|p| p.components().next()) {
         Some(Component::Prefix(p)) => {
             let mut full = PathBuf::from(p.as_os_str());
             full.push(std::path::MAIN_SEPARATOR.to_string());
