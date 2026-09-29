@@ -77,11 +77,59 @@ pub fn isolate_user_dirs_for_tests() -> std::path::PathBuf {
         let cache = std::env::temp_dir().join(format!("mo-test-cache-{pid}"));
         let _ = std::fs::create_dir_all(&config);
         let _ = std::fs::create_dir_all(&cache);
+        // 顺手扫掉历史测试进程留下的过期目录（见 `sweep_stale_isolated_dirs`）：
+        // 进程级只做一次，读一遍 TEMP 的成本可忽略。
+        sweep_stale_isolated_dirs();
         (config, cache)
     });
     std::env::set_var("MO_CONFIG_DIR", config);
     std::env::set_var("MO_CACHE_DIR", cache);
     config.clone()
+}
+
+/// 清掉**别的**测试进程留下的隔离目录（`mo-test-config-*` / `mo-test-cache-*`）。
+///
+/// 为什么需要：测试进程被 kill / panic / 断电时没机会自清，这些目录只进不出
+/// （2026-09-29 在 TEMP 里清点出 400+ 个）。而 Rust 的测试二进制没有可靠的
+/// 「退出钩子」可挂（libtest 直接 `exit`），所以改成**下一次测试跑起来时扫**：
+/// 只认自己的两个前缀，且只删修改时间早于 24 小时前的——活着的并行测试进程
+/// 的目录都是新鲜的，碰不到。
+fn sweep_stale_isolated_dirs() {
+    sweep_with_ttl(std::time::Duration::from_secs(24 * 60 * 60));
+}
+
+/// [`sweep_stale_isolated_dirs`] 的可测版本：TTL 当参数（测试用 0 秒钉行为）。
+fn sweep_with_ttl(ttl: std::time::Duration) {
+    const PREFIXES: [&str; 2] = ["mo-test-config-", "mo-test-cache-"];
+    // 本进程自己的隔离目录一律跳过：目录名以 `-{pid}` 结尾。测试里 TTL=0 时
+    // 没有这条守卫，同进程并行跑的其它测试会在半路被抽掉地板（首跑 CI 实测）。
+    let own_suffix = format!("-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // 先把 OsString 绑出来：`entry.file_name().to_str()` 链在 let-else 里
+        // 临时值活不过本条语句（E0716）。
+        let raw_name = entry.file_name();
+        let Some(name) = raw_name.to_str() else {
+            continue;
+        };
+        if !PREFIXES.iter().any(|p| name.starts_with(p)) || name.ends_with(&own_suffix) {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < ttl)
+            // 读不出修改时间（时钟怪 / 平台不支持）→ 当新鲜的，宁留勿误删。
+            .unwrap_or(true);
+        if fresh {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 /// 测试专用：向**当前标签页**注入假的操作快照（传输小块 / 浮层的数据源）。
@@ -317,4 +365,36 @@ pub fn run() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod isolate_sweep_tests {
+    use super::sweep_with_ttl;
+
+    /// TTL=0 时：只删我们两个前缀的目录，前缀不匹配的（哪怕只差一个词）不碰。
+    #[test]
+    fn sweep_removes_only_mo_test_prefixed_dirs() {
+        // 时间戳进目录名：与并行测试进程 / 上一次跑的残留互不撞名。
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("时钟不该倒退到 Unix 纪元前")
+                .as_nanos()
+        );
+        let ours = std::env::temp_dir().join(format!("mo-test-config-sweepfix-{stamp}"));
+        let decoy = std::env::temp_dir().join(format!("other-test-config-sweepfix-{stamp}"));
+        // 本进程「正牌」隔离目录（isolate 的命名）：TTL=0 也必须活着，否则同
+        // 进程并行的其它测试会被抽掉地板。
+        let own = std::env::temp_dir().join(format!("mo-test-config-{}", std::process::id()));
+        std::fs::create_dir_all(&ours).expect("建得出");
+        std::fs::create_dir_all(&decoy).expect("建得出");
+        std::fs::create_dir_all(&own).expect("建得出");
+        sweep_with_ttl(std::time::Duration::ZERO);
+        assert!(!ours.exists(), "我们的前缀该被清掉");
+        assert!(decoy.exists(), "前缀不匹配的目录不该被碰");
+        assert!(own.exists(), "本进程自己的隔离目录不该被扫");
+        let _ = std::fs::remove_dir_all(&decoy);
+    }
 }
