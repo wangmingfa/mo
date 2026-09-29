@@ -82,6 +82,21 @@ impl FileSystem for LocalFileSystem {
         std::fs::read(path).map_err(MoError::Io)
     }
 
+    async fn read_file_chunk(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, MoError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(path).map_err(MoError::Io)?;
+        f.seek(SeekFrom::Start(offset)).map_err(MoError::Io)?;
+        let mut buf = vec![0u8; len as usize];
+        let n = f.read(&mut buf).map_err(MoError::Io)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     async fn is_dir(&self, path: &Path) -> bool {
         // 跟随软链（与列目录的语义一致：软链指向目录就当目录）。
         std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
@@ -95,6 +110,20 @@ impl FileSystem for LocalFileSystem {
             .open(path)
             .map_err(MoError::Io)?;
         f.write_all(contents).map_err(MoError::Io)
+    }
+
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
+        use std::io::{Seek, SeekFrom, Write};
+        // 覆盖写语义（与 `write_file` 的 create_new 不同）：打开已存在的文件续写、
+        // 不存在则从 `offset` 起创建（前面填空字节）。
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(MoError::Io)?;
+        f.seek(SeekFrom::Start(offset)).map_err(MoError::Io)?;
+        f.write_all(data).map_err(MoError::Io)
     }
 
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {

@@ -171,6 +171,16 @@ impl FileSystem for FakeRemoteFs {
     ///
     /// 用来验证「当前列表翻不到那一页时，判重会去问后端」这条兜底路径。
     async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError> {
+        // 与 `read_file` 同判据：marker 路径是「能读内容的远程文件」，给真实大小，
+        // 让分块传输能据 size 循环（否则 metadata 返回 Err 会让整次传输失败）。
+        if path == Path::new(&format!("/{}", self.marker)) {
+            return Ok(FileMetadata {
+                size: b"from-remote".len() as u64,
+                modified: None,
+                created: None,
+                permissions: mo_core::Permissions::default(),
+            });
+        }
         let wanted = path.to_string_lossy().to_string();
         let known = self.log.lock().unwrap().iter().any(|op| {
             matches!(op.strip_prefix("create_dir:"), Some(p) if p == wanted.as_str())
@@ -201,6 +211,19 @@ impl FileSystem for FakeRemoteFs {
             .lock()
             .unwrap()
             .push(format!("write_file:{}", path.display()));
+        Ok(())
+    }
+
+    async fn write_file_chunk(
+        &self,
+        path: &Path,
+        _offset: u64,
+        _data: &[u8],
+    ) -> Result<(), MoError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("write_file_chunk:{}", path.display()));
         Ok(())
     }
 
@@ -1199,7 +1222,7 @@ fn copying_into_the_current_remote_dir_goes_through_the_backend() {
             .await;
 
         let written = format!(
-            "write_file:{}",
+            "write_file_chunk:{}",
             Path::new("/pub").join("remote.txt").display()
         );
         let mut seen = false;
@@ -1281,7 +1304,7 @@ fn uploading_to_a_remote_endpoint_writes_through_the_backend() {
         app.transfer_between(vec![src.clone()], Endpoint::Local, &dest, remote, false)
             .await;
 
-        let written = format!("write_file:{}", dest.join("local.txt").display());
+        let written = format!("write_file_chunk:{}", dest.join("local.txt").display());
         let mut seen = false;
         for _ in 0..200 {
             if log.lock().unwrap().contains(&written) {

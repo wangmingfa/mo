@@ -57,6 +57,26 @@ pub trait FileSystem: Send + Sync {
         )))
     }
 
+    /// 从 `offset` 起读取最多 `len` 字节（跨文件系统分块传输用它代替整份 `read_file`）。
+    ///
+    /// 默认实现读整份再切片——对内存本就整份的后端无害，且没有「默认分块读却退化为
+    /// 逐块打整份」的陷阱；真能 seek / range 的后端（本地、SFTP、WebDAV、FTP）覆写以
+    /// 让**源端**不再把整份堆进内存。读超出文件末尾返回空；`len == 0` 也返回空（不报错）。
+    async fn read_file_chunk(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, MoError> {
+        let data = self.read_file(path).await?;
+        let start = offset as usize;
+        if start >= data.len() {
+            return Ok(Vec::new());
+        }
+        let end = (start + len as usize).min(data.len());
+        Ok(data[start..end].to_vec())
+    }
+
     /// 这个路径是不是目录（跨文件系统传输按它分流「递归」还是「读字节」）。
     ///
     /// 默认实现用「能不能列目录」探：本地与 SFTP 直接读 `metadata` 更准，
@@ -73,6 +93,17 @@ pub trait FileSystem: Send + Sync {
     /// 目标已存在时必须**失败而不是覆盖**（底层用 `create_new`）：新建文件是
     /// 数据丢失的入口之一，去重是调用方的责任（见 `mo_operations::unique_path`）。
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError>;
+
+    /// 在 `offset` 处写入这一块（跨文件系统分块传输用它代替整份 `write_file`）。
+    ///
+    /// **没有默认实现**：覆盖写原语各后端不同（本地 seek、SFTP/WebDAV 整份 PUT、
+    /// FTP 首块 STOR 后续 APPE），且「默认整份读-改-写回」对新文件是 O(n²) 且仍整份
+    /// 内存，不能当兜底。每个后端必须自己给出覆盖写语义。
+    ///
+    /// 语义与 `write_file` **不同**：允许覆盖 / 扩展目标文件的指定区间（这是传输内部的
+    /// 块写，不是用户新建文件），因此**不是** `create_new` 语义。目标不存在时从 `offset`
+    /// 起创建（前面填空字节），空文件用 `write_file_chunk(path, 0, &[])` 建出。
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError>;
 
     /// 删除文件。
     async fn remove_file(&self, path: &Path) -> Result<(), MoError>;

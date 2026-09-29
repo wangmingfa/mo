@@ -19,6 +19,9 @@ use mo_operations::{Operation, OperationStatus, TransferOperation};
 #[derive(Clone, Default)]
 struct MemFs {
     inner: Arc<Mutex<Mem>>,
+    /// 记录分块传输里「单次读取请求的最大长度」，用来断言传输真的走了分块路径
+    ///（而不是一次整份读）。
+    max_chunk: Arc<Mutex<u64>>,
 }
 
 #[derive(Default)]
@@ -64,6 +67,11 @@ impl MemFs {
             .iter()
             .map(|p| p.display().to_string().replace('\\', "/"))
             .collect()
+    }
+
+    /// 测试桩访问器：返回分块传输里「单次读取请求的最大长度」。
+    fn max_chunk(&self) -> u64 {
+        *self.max_chunk.lock().unwrap()
     }
 }
 
@@ -202,6 +210,48 @@ impl FileSystem for MemFs {
             .get(path)
             .cloned()
             .ok_or_else(|| MoError::Other(format!("不是文件：{}", path.display())))
+    }
+
+    async fn read_file_chunk(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, MoError> {
+        {
+            let mut m = self.max_chunk.lock().unwrap();
+            if len > *m {
+                *m = len;
+            }
+        }
+        let m = self.inner.lock().unwrap();
+        match m.files.get(path) {
+            Some(f) => {
+                let start = offset as usize;
+                if start >= f.len() {
+                    return Ok(Vec::new());
+                }
+                let end = (start + len as usize).min(f.len());
+                Ok(f[start..end].to_vec())
+            }
+            None => Err(MoError::Other(format!("不是文件：{}", path.display()))),
+        }
+    }
+
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
+        // 区间替换（覆盖写语义，与传输块写一致）；MemFs 本来就是整份在内存，
+        // 这里不省内存但行为正确，且让分块路径有可断言的落点。
+        let mut m = self.inner.lock().unwrap();
+        let f = m.files.entry(path.to_path_buf()).or_default();
+        let start = offset as usize;
+        if f.len() < start {
+            f.resize(start, 0);
+        }
+        if f.len() < start + data.len() {
+            f.resize(start + data.len(), 0);
+        }
+        f[start..start + data.len()].copy_from_slice(data);
+        Ok(())
     }
 
     async fn is_dir(&self, path: &Path) -> bool {
@@ -402,5 +452,46 @@ async fn download_writes_into_local_tree() {
     run_in_blocking(op).await.expect("下载应成功");
 
     assert_eq!(std::fs::read(root.join("hello.txt")).unwrap(), b"hello");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 大文件（超过两个分块）走分块读写：内容字节完全一致，且源端单次读取不超过
+/// `CHUNK_SIZE`（证明没整份读进内存）。`CHUNK_SIZE` 是 `mo_operations::transfer` 的
+/// 私有常量（4 MiB），这里用同一字面量断言。
+#[tokio::test]
+async fn large_file_transfer_is_chunked_and_byte_exact() {
+    let payload = vec![0xABu8; 10 * 1024 * 1024];
+    let mem = MemFs::default();
+    // 源端用内存桩：便于在 src 上记录「单次读取请求的最大长度」，断言分块路径真被走。
+    mem.put("/big.bin", &payload);
+
+    let root = local_tree("chunked-dst");
+    let dst = root.join("big.bin");
+
+    let op = TransferOperation::new(
+        7,
+        Arc::new(mem.clone()),
+        Arc::new(LocalFileSystem),
+        PathBuf::from("/big.bin"),
+        dst.clone(),
+        false,
+        "下载",
+    );
+    run_in_blocking(op.clone()).await.expect("下载应成功");
+
+    assert_eq!(op.status(), OperationStatus::Completed);
+    assert_eq!(
+        op.progress(),
+        (payload.len() as u64, payload.len() as u64),
+        "10 MiB 应全部计入进度"
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), payload);
+    // 分块路径真的被走：源端没一次整份读，单块上限 = CHUNK_SIZE（4 MiB，10 MiB 触发 4+4+2 三片）。
+    let max_chunk = mem.max_chunk();
+    assert!(max_chunk > 0, "传输应当走分块读");
+    assert!(
+        max_chunk <= 4 * 1024 * 1024,
+        "单块读取不应超过 CHUNK_SIZE，实测 {max_chunk}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

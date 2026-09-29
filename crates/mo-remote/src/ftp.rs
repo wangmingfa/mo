@@ -351,6 +351,26 @@ impl FileSystem for FtpFileSystem {
         .await
     }
 
+    // 顺序流：FTP 没有随机写，只能按 offset 递增顺序写。首块（offset 0）用 STOR 整份
+    // 创建，后续块用 APPE 顺序追加——源端边读边写，不把整份堆在内存里。调用方
+    // （TransferOperation）正是递增写，因此走通。
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let mut cursor = Cursor::new(data.to_vec());
+        let conn = self.conn.clone();
+        self.run(async move {
+            let mut conn = conn.lock().await;
+            if offset == 0 {
+                conn.put_file(&remote, &mut cursor).await
+            } else {
+                conn.append_file(&remote, &mut cursor).await
+            }
+            .map_err(|e| MoError::from(transport_error("上传", e)))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let conn = self.conn.clone();

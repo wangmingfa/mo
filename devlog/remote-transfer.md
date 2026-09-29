@@ -59,8 +59,10 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
 
 * 一次传输 = 一对 `(src_fs, dst_fs)` + 两个路径 + `remove_source`。方向只影响两端谁读谁写
   与进度条上那个动词（上传 / 下载 / 复制），操作本身一视同仁。
-* **逐文件整份读写**：目录先 `create_dir` 再按名字排序递归子项；文件 `read_file` →
-  `write_file`。不赌协议自带的服务端 COPY（三家语义各不相同）。
+* **逐文件分块流式**：目录先 `create_dir` 再按名字排序递归子项；文件按 `CHUNK_SIZE`
+  （4 MiB）循环 `read_file_chunk` → `write_file_chunk`，进度分母（`total`）在循环前按
+  `metadata.size` 定下、`done` 逐块累加。不赌协议自带的服务端 COPY（三家语义各不相同）。
+  空文件单独写一块空内容建出。
 * ⚠️ `async fn` **不能递归**（编译期要求定长 future）→ `transfer_tree` 走
   `Box::pin` 递归（`type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>`）。
 * ⚠️ `run()` 里拿 `Handle::current()` 再 `block_on`——**只有在 `spawn_blocking` 里才安全**。
@@ -92,8 +94,11 @@ async fn is_dir(&self, path: &Path) -> bool                          // 默认�
 
 ## 待办
 
-* 大文件是**整份进内存**的（`read_file` / `write_file` 都是 `Vec<u8>`）：分块流式 + 断点续传
-  还没做；超大文件目前会顶内存。
+* 大文件**整份进内存**已修（2026-09-29）：`FileSystem` 加 `read_file_chunk` /
+  `write_file_chunk`，`TransferOperation` 走分块循环。真正省内存的是 **local（seek 写）
+  + ftp（首块 STOR、后续 APPE 顺序流）**；**sftp / webdav 暂整份缓冲**（无随机写 / 无部分
+  PUT，读侧也走默认整份切片）——这两种后端的超大文件此刻仍整份进内存、写侧 O(n²)，下一轮
+  优化（见下方「待办续」）。**断点续传没做**。
 * 远程传输的**冲突策略**只做到「目标名去重」，没有冲突对话框 / 覆盖选项。
 * 远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义。
 * 远程目录没有 watcher（改完必须重读），跨端点传输完成后靠调用方主动 `refresh`。

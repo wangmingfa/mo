@@ -299,6 +299,32 @@ impl FileSystem for SftpFileSystem {
         .await
     }
 
+    // ⚠️ 暂整份模拟（待换随机写）：读已有整份 + 替换区间 + 整份写回。SFTP 配合
+    // `open` + `write_at` 可真正分块，但跨调用持句柄不便，先走回退；超大文件此刻
+    // 仍整份进内存且是 O(n²)，下一轮优化（见 devlog/remote-transfer.md）。
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let data = data.to_vec();
+        let sftp = self.sftp.clone();
+        self.run(async move {
+            let s = sftp.lock().await;
+            let existing = s.read(remote.clone()).await.unwrap_or_default();
+            let mut buf = existing;
+            let start = offset as usize;
+            if buf.len() < start {
+                buf.resize(start, 0);
+            }
+            if buf.len() < start + data.len() {
+                buf.resize(start + data.len(), 0);
+            }
+            buf[start..start + data.len()].copy_from_slice(&data);
+            s.write(remote, &buf)
+                .await
+                .map_err(|e| MoError::from(transport_error("上传", e)))
+        })
+        .await
+    }
+
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let sftp = self.sftp.clone();

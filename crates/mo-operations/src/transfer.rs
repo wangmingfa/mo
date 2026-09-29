@@ -27,6 +27,10 @@ use crate::{OpInner, Operation, OperationStatus};
 /// 装箱的递归 future（`async fn` 递归自身编译不过，只能手写 `Box::pin`）。
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// 传输时的分块大小（4 MiB）。整份读写会大文件整份进内存，分块后内存峰值降到这一档；
+/// 进度也按块累加，估算速度仍然平滑。
+const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
 /// 跨文件系统的传输操作（上传 / 下载 / 远程间复制）。
 pub struct TransferOperation {
     id: u64,
@@ -189,7 +193,8 @@ fn transfer_tree(
             return Ok(());
         }
 
-        // 文件：先把总数记上（进度条的分母在写之前就该定下来），再整份读、整份写。
+        // 文件：先按 size 把分母定下来（进度条的分母在写之前就该定），再分块读 /
+        // 分块写，进度逐块累加——大文件不再整份进内存。
         let dst = free_path(&dst_fs, &dst).await;
         if let Some(parent) = dst.parent() {
             if !parent.as_os_str().is_empty() {
@@ -197,15 +202,34 @@ fn transfer_tree(
                 dst_fs.create_dir(parent).await?;
             }
         }
-        let data = src_fs.read_file(&src).await?;
+        let size = src_fs.metadata(&src).await?.size;
         {
             let mut s = state.lock();
-            s.total += data.len() as u64;
+            s.total += size;
         }
-        dst_fs.write_file(&dst, &data).await?;
-        {
-            let mut s = state.lock();
-            s.done += data.len() as u64;
+        if size == 0 {
+            // 空文件：写一块空内容把（改名后的）目标建出来。
+            dst_fs.write_file_chunk(&dst, 0, &[]).await?;
+        } else {
+            let mut offset: u64 = 0;
+            while offset < size {
+                if wait_if_paused(&state) {
+                    return Err(MoError::Cancelled);
+                }
+                let want = (size - offset).min(CHUNK_SIZE);
+                let chunk = src_fs.read_file_chunk(&src, offset, want).await?;
+                if chunk.is_empty() {
+                    // 源端返回的块比预期短（不该发生，防御一下避免死循环）。
+                    break;
+                }
+                dst_fs.write_file_chunk(&dst, offset, &chunk).await?;
+                let written = chunk.len() as u64;
+                {
+                    let mut s = state.lock();
+                    s.done += written;
+                }
+                offset += written;
+            }
         }
         if remove_source {
             src_fs.remove_file(&src).await?;

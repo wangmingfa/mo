@@ -425,6 +425,35 @@ impl FileSystem for WebDavFileSystem {
         .await
     }
 
+    // ⚠️ 暂整份模拟（待换「接收临时文件再整份 PUT」）：GET 已有 + 替换区间 + PUT 整份。
+    // WebDAV 没有被广泛支持的部分 PUT，真正分块写需先落本地临时文件；此刻超大文件
+    // 仍整份进内存且是 O(n²)，下一轮优化（见 devlog/remote-transfer.md）。
+    async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
+        let remote = Self::remote(path);
+        let data = data.to_vec();
+        let client = self.client.clone();
+        self.dispatch("上传", async move {
+            let existing = match client.get(&remote).await {
+                Ok(r) => r.bytes().await.unwrap_or_default().to_vec(),
+                Err(_) => Vec::new(),
+            };
+            let mut buf = existing;
+            let start = offset as usize;
+            if buf.len() < start {
+                buf.resize(start, 0);
+            }
+            if buf.len() < start + data.len() {
+                buf.resize(start + data.len(), 0);
+            }
+            buf[start..start + data.len()].copy_from_slice(&data);
+            client
+                .put(&remote, buf)
+                .await
+                .map_err(|e| classify("上传", &e))
+        })
+        .await
+    }
+
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let client = self.client.clone();
