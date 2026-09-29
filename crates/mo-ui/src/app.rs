@@ -32,6 +32,42 @@ const SIDEBAR_WIDTH: f32 = 188.0;
 /// 地址栏编辑态的占位文字（空输入时显示）。
 pub(crate) const ADDRESS_PLACEHOLDER: &str = "输入路径，回车跳转";
 
+/// 地址栏输入的解析结果（[`RootView::submit_address`] 的纯函数部分）。
+///
+/// 抽成纯函数的理由：地址栏在 Windows 上报过「`D:/a/b` 与 `D:\a\b` 都停在盘根」
+/// （2026-09-26 实测，未查因）。把字符串层解析收口到这里配跨平台单测，把 IO
+/// （`is_dir` / 连接）留在调用方——下次复测时一开 `RUST_LOG=debug` 就能看出
+/// 「卡在解析、卡在判定、还是卡在导航」哪一段。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AddressInput {
+    /// 空输入（回车等于没敲）。
+    Empty,
+    /// 形如 `scheme://...` 的远程连接地址。
+    RemoteUrl(String),
+    /// 正在看远程时敲的远程绝对路径（交给当前远程后端导航）。
+    RemotePath(PathBuf),
+    /// 本机路径。`D:/a/b` 与 `D:\a\b` 解析出的目标是**同一个** `PathBuf`：
+    /// std 在 Windows 上按分量解析，`/` 与 `\` 同为分隔符（单测钉住）。
+    LocalPath(PathBuf),
+}
+
+/// 把地址栏文本解析成导航目标。只做字符串层的事，不碰文件系统。
+pub(crate) fn resolve_address_input(text: &str, browsing_remote: bool) -> AddressInput {
+    let text = text.trim();
+    if text.is_empty() {
+        return AddressInput::Empty;
+    }
+    if text.contains("://") {
+        return AddressInput::RemoteUrl(text.to_string());
+    }
+    let target = PathBuf::from(text);
+    if browsing_remote {
+        AddressInput::RemotePath(target)
+    } else {
+        AddressInput::LocalPath(target)
+    }
+}
+
 /// 「连接到服务器」地址框的占位文字（空输入时显示）。
 ///
 /// 回答两件事：现在支持哪些协议、长什么样。写全 scheme 名（含 `davs`）——
@@ -3189,77 +3225,88 @@ impl RootView {
         self.panel_mut().address_editing = false;
         window.focus(&self.focus, cx);
 
-        if text.is_empty() {
-            cx.notify();
-            return;
-        }
+        tracing::debug!(
+            target: "mo_ui::app",
+            text = %text,
+            browsing_remote = app.browsing_remote(),
+            "address submit"
+        );
 
         // 地址栏导航同样要离开次级视图（回收站 / 全局搜索）：填了新地址 = 要去那边。
         self.leave_secondary_view(cx);
 
-        // 形如 `scheme://...` 的地址 → 当成远程连接（协议是否支持由连接逻辑判定）。
-        if text.contains("://") {
-            cx.notify();
-            cx.spawn(async move |weak, cx| {
-                let outcome = app.connect_remote(&text).await;
-                let _ = weak.update(cx, |v, cx| match outcome {
-                    Ok(()) => v.remember_active_server(cx),
-                    // 地址栏这条路没有对话框，但「需要登录」的处置一样——直接弹
-                    // 认证框（`on_connect_result` 负责把用户名带进去）。
-                    Err(failure @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
-                        v.on_connect_result(Err(failure), cx);
-                    }
-                    // 其余失败走信息提示：地址栏那边没有可以留在原地显示错误的
-                    // 对话框。
-                    Err(mo_app::ConnectFailure::Message(msg)) => {
-                        v.notice(format!("连接失败：{msg}"), None, cx);
-                    }
-                });
-            })
-            .detach();
-            return;
-        }
-
-        // 正在看远程时，地址栏里填的是远程绝对路径（如 /pub/incoming）：
-        // 跳过本地 is_dir 判定，直接交给当前后端导航。
-        if app.browsing_remote() {
-            let target = PathBuf::from(&text);
-            cx.notify();
-            cx.spawn(async move |weak, cx| {
-                if let Err(e) = app.open_directory(&target).await {
-                    let _ = weak.update(cx, |v, cx| {
-                        v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
-                    });
-                }
-            })
-            .detach();
-            return;
-        }
-
-        let target = PathBuf::from(&text);
-
-        // 先同步判定：路径不存在 / 不是文件夹 → 弹窗提示，且不发起导航
-        // （open_directory 会先把路径写进历史再读盘失败，提前拦下可免污染历史）。
-        if !target.is_dir() {
-            let msg = if target.exists() {
-                format!("「{text}」不是一个文件夹。")
-            } else {
-                format!("找不到「{text}」，请检查路径是否正确。")
-            };
-            self.notice(msg, None, cx);
-            return;
-        }
-
-        cx.notify();
-        cx.spawn(async move |weak, cx| {
-            // 竞态兜底：判定通过后、真正读盘前被删除 / 无权限等，仍弹窗提示。
-            if let Err(e) = app.open_directory(&target).await {
-                let _ = weak.update(cx, |v, cx| {
-                    v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
-                });
+        match resolve_address_input(&text, app.browsing_remote()) {
+            AddressInput::Empty => {
+                cx.notify();
             }
-        })
-        .detach();
+
+            // 形如 `scheme://...` 的地址 → 当成远程连接（协议是否支持由连接逻辑判定）。
+            AddressInput::RemoteUrl(url) => {
+                cx.notify();
+                cx.spawn(async move |weak, cx| {
+                    let outcome = app.connect_remote(&url).await;
+                    let _ = weak.update(cx, |v, cx| match outcome {
+                        Ok(()) => v.remember_active_server(cx),
+                        // 地址栏这条路没有对话框，但「需要登录」的处置一样——直接弹
+                        // 认证框（`on_connect_result` 负责把用户名带进去）。
+                        Err(failure @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
+                            v.on_connect_result(Err(failure), cx);
+                        }
+                        // 其余失败走信息提示：地址栏那边没有可以留在原地显示错误的
+                        // 对话框。
+                        Err(mo_app::ConnectFailure::Message(msg)) => {
+                            v.notice(format!("连接失败：{msg}"), None, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+
+            // 正在看远程时，地址栏里填的是远程绝对路径（如 /pub/incoming）：
+            // 跳过本地 is_dir 判定，直接交给当前后端导航。
+            AddressInput::RemotePath(target) => {
+                cx.notify();
+                cx.spawn(async move |weak, cx| {
+                    if let Err(e) = app.open_directory(&target).await {
+                        let _ = weak.update(cx, |v, cx| {
+                            v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+
+            AddressInput::LocalPath(target) => {
+                // 先同步判定：路径不存在 / 不是文件夹 → 弹窗提示，且不发起导航
+                // （open_directory 会先把路径写进历史再读盘失败，提前拦下可免污染历史）。
+                if !target.is_dir() {
+                    let msg = if target.exists() {
+                        format!("「{text}」不是一个文件夹。")
+                    } else {
+                        format!("找不到「{text}」，请检查路径是否正确。")
+                    };
+                    tracing::debug!(
+                        target: "mo_ui::app",
+                        exists = target.exists(),
+                        is_dir = false,
+                        "address submit: local path rejected"
+                    );
+                    self.notice(msg, None, cx);
+                    return;
+                }
+
+                cx.notify();
+                cx.spawn(async move |weak, cx| {
+                    // 竞态兜底：判定通过后、真正读盘前被删除 / 无权限等，仍弹窗提示。
+                    if let Err(e) = app.open_directory(&target).await {
+                        let _ = weak.update(cx, |v, cx| {
+                            v.notice(format!("打开「{}」失败：{e}", target.display()), None, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
     }
 
     /// 命令面板当前列表的长度——借给「选择其他应用…」时是应用列表。
@@ -12937,11 +12984,44 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, contribution_line, filtered_apps, located_row, slot_word,
-        type_ahead_repeats_one_char, ConnectAuthState, Modal, OperationHandle, RootView,
-        SettingsTab,
+        box_row_range, contribution_line, filtered_apps, located_row, resolve_address_input,
+        slot_word, type_ahead_repeats_one_char, AddressInput, ConnectAuthState, Modal,
+        OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
+
+    /// 地址栏解析：字符串层收口（见 `resolve_address_input` 的注释——Windows 上
+    /// 报过「两种斜杠都停在盘根」），这里把每个分支钉住。
+    #[test]
+    fn address_input_resolution_branches() {
+        assert_eq!(resolve_address_input("", false), AddressInput::Empty);
+        assert_eq!(resolve_address_input("   ", false), AddressInput::Empty);
+        assert_eq!(
+            resolve_address_input("  ftp://host/pub  ", false),
+            AddressInput::RemoteUrl("ftp://host/pub".to_string())
+        );
+        assert_eq!(
+            resolve_address_input("/pub/incoming", true),
+            AddressInput::RemotePath(PathBuf::from("/pub/incoming"))
+        );
+        // 本机路径照原样构造——两种斜杠在 Windows 上由 std 分量级解析归一（下面那条）。
+        assert_eq!(
+            resolve_address_input("/Users/me/下载", false),
+            AddressInput::LocalPath(PathBuf::from("/Users/me/下载"))
+        );
+    }
+
+    /// Windows 的关键钉子：正斜杠与反斜杠两种写法必须解析出**同一个** `PathBuf`
+    /// （std 在 Windows 上把 `/` 也当分隔符）。在非 Windows 上 `\` 不是分隔符，
+    /// 两条写法本来就不该相等，所以这条只在 Windows 跑。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn address_input_accepts_both_slash_forms_on_windows() {
+        let fwd = resolve_address_input("D:/tmp-clip/moside", false);
+        let back = resolve_address_input(r"D:\tmp-clip\moside", false);
+        assert_eq!(fwd, back, "两种斜杠形态必须解析出同一个目标");
+        assert!(matches!(fwd, AddressInput::LocalPath(_)));
+    }
 
     /// 橡皮筋 y → 行区间的折算：行带按顶边对齐（floor），与渲染出的行一一对应。
     ///
