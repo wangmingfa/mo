@@ -35,7 +35,8 @@
 //!    东西：粘贴到当前目录时 `dest` 自己不是列表里的行，分栏拖拽时目标那一头根本
 //!    不在源 `AppState` 的列表里。所以两端走 [`Endpoint`]（本地 / 那条会话），
 //!    UI 侧源窗格与落点窗格各问各的。远程有一端时走 `TransferOperation`，
-//!    并**刻意不**记可逆项（撤销模型里的路径都是本地路径）。
+//!    并记**远程**可逆项（捕获两端后端；撤销/重做按捕获的后端执行，见
+//!    `undo_remote.rs`）。
 //!
 //! 为什么守卫落在 `mo-app` 而不是 UI 层：headless 的 GPUI 测试调度器会把「后台
 //! tokio 线程唤醒测试任务」判成不确定性直接 panic（点击回调最终 `await` 到
@@ -264,20 +265,25 @@ impl FileSystem for FakeRemoteFs {
 }
 
 impl FakeRemoteFs {
-    /// 让列表反映已经发生的改动：删掉的不再列出，改名的按新名列出。
+    /// 让列表反映已经发生的改动：改名按**顺序重放**（改名回退也能还原），
+    /// 最终路径被删掉的不列出。
     fn apply_log(entries: Vec<ReadDirEntry>, log: &[String]) -> Vec<ReadDirEntry> {
+        // 顺序重放 rename：撤销重命名（to → from）会把链再走回去，
+        // 只看「最后一次」的话回退就还原不了。
+        let mut paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+        for op in log {
+            if let Some(rest) = op.strip_prefix("rename:") {
+                if let Some((from, to)) = rest.split_once("->") {
+                    for p in &mut paths {
+                        if p.to_string_lossy() == from {
+                            *p = PathBuf::from(to);
+                        }
+                    }
+                }
+            }
+        }
         let mut out = Vec::new();
-        for e in entries {
-            // 改名：以**最后一次** rename 为准。
-            let renamed = log.iter().rev().find_map(|op| {
-                let rest = op.strip_prefix("rename:")?;
-                let (from, to) = rest.split_once("->")?;
-                (from == e.path.to_string_lossy()).then(|| to.to_string())
-            });
-            let path = match renamed {
-                Some(to) => PathBuf::from(to),
-                None => e.path.clone(),
-            };
+        for (e, path) in entries.into_iter().zip(paths) {
             let gone = log.iter().any(|op| {
                 matches!(op.strip_prefix("remove_file:"), Some(p) if p == path.to_string_lossy())
                     || matches!(op.strip_prefix("remove_dir:"), Some(p) if p == path.to_string_lossy())
@@ -1009,7 +1015,91 @@ fn renaming_a_remote_entry_uses_the_backend() {
                 .any(|e| e.path == Path::new("/renamed.txt")),
             "重读之后列表里应当是新名字"
         );
+
+        // 撤销：改回去。走的是撤销记录里捕获的那条会话后端（同一连接）。
+        app.undo();
+        for _ in 0..200 {
+            if log
+                .lock()
+                .unwrap()
+                .contains(&"rename:/renamed.txt->/remote.txt".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"rename:/renamed.txt->/remote.txt".to_string()),
+            "撤销重命名必须把新名改回旧名（发给远程后端）"
+        );
+        for _ in 0..200 {
+            if app
+                .current_entries()
+                .await
+                .iter()
+                .any(|e| e.path == Path::new("/remote.txt"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            app.current_entries()
+                .await
+                .iter()
+                .any(|e| e.path == Path::new("/remote.txt")),
+            "撤销后重读，列表里应当回到旧名字"
+        );
     });
+}
+
+/// 远程重命名的撤销在**切走之后**依然有效。
+///
+/// 撤销记录捕获的是操作发生时那条会话的后端；判据若靠 `goes_through_remote`
+/// （「现在这一页在不在远程」），用户切回本地再 ⌘Z 就会掉进本机管线——
+/// 「成功」地什么都不做。
+#[test]
+fn undoing_a_remote_rename_after_switching_to_local_still_works() {
+    let dir = local_tree("remote-undo-switch");
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, log) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+        app.rename_many(vec![(
+            PathBuf::from("/remote.txt"),
+            PathBuf::from("/renamed.txt"),
+        )])
+        .await
+        .expect("远程重命名成功");
+
+        // 切回本地：此刻 goes_through_remote 对 /renamed.txt 必然说「不是」。
+        app.open_local(&dir).await.expect("切回本地");
+
+        app.undo();
+        for _ in 0..200 {
+            if log
+                .lock()
+                .unwrap()
+                .contains(&"rename:/renamed.txt->/remote.txt".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"rename:/renamed.txt->/remote.txt".to_string()),
+            "切到本地之后撤销，仍应把改名发给远程后端"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 在远程目录里新建文件夹：`create_dir` 发给远程后端，且名字**不与列表里的重名**。
@@ -1322,9 +1412,23 @@ fn uploading_to_a_remote_endpoint_writes_through_the_backend() {
             "不该落到本机磁盘：端点判错时文件会出现在这个真实存在的目录里"
         );
         assert!(
-            !app.can_undo(),
-            "远程传输刻意不记可逆项——撤销模型里的路径都是本地路径"
+            app.can_undo(),
+            "远程上传现在记**远程**可逆项（撤销 = 删掉远端那份），应可撤销"
         );
+
+        // 撤销：把远端刚传的那份删掉，本地源不动。
+        app.undo();
+        let removed = format!("remove_file:{}", dest.join("local.txt").display());
+        let mut undone = false;
+        for _ in 0..200 {
+            if log.lock().unwrap().contains(&removed) {
+                undone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(undone, "撤销上传应向后端发 remove_file");
+        assert!(!dest.join("local.txt").exists(), "本地源文件不该被撤销动过");
     });
 
     let _ = std::fs::remove_dir_all(&dir);

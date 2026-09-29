@@ -275,6 +275,47 @@ fn resolve_transfer_leg(
     }
 }
 
+/// 删掉远程后端上的一个条目：目录走 `remove_dir`（trait 约定递归），文件走
+/// `remove_file`。撤销「远程复制」用它。
+async fn remote_remove(fs: &Arc<dyn FileSystem>, path: &Path) -> Result<(), MoError> {
+    if fs.is_dir(path).await {
+        fs.remove_dir(path).await
+    } else {
+        fs.remove_file(path).await
+    }
+}
+
+/// 远程落点的预去重：与引擎侧 `free_path`（mo-operations/src/transfer.rs）**同一套**
+/// `stem N.ext` 命名、同一个「先探原名」的顺序。
+///
+/// 为什么要镜像一份：撤销记录必须写**真实落点**，而 `TransferOperation` 是在
+/// `run()` 时才去重的——提交方拿不到它最终落在哪。这里先探一遍，普通提交传进去
+/// 的就是已去重的名字（引擎再探一次发现不冲突，原样采用）；否则冲突卡选「改名」
+/// 后，撤销记录会指着那个被顶掉的原名，⌘Z 就要删错文件了。
+async fn unique_remote_path(dst_fs: &Arc<dyn FileSystem>, dst: &Path) -> PathBuf {
+    if dst_fs.metadata(dst).await.is_err() {
+        return dst.to_path_buf();
+    }
+    let Some(parent) = dst.parent() else {
+        return dst.to_path_buf();
+    };
+    let stem = dst
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = dst
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 2..10_000 {
+        let candidate = parent.join(format!("{stem} {i}{ext}"));
+        if dst_fs.metadata(&candidate).await.is_err() {
+            return candidate;
+        }
+    }
+    dst.to_path_buf()
+}
+
 /// 应用可变状态（全部放在 RwLock 内，便于 UI 与后台任务并发访问）。
 pub struct AppStateInner {
     pub navigation: NavigationState,
@@ -3882,7 +3923,9 @@ impl AppState {
     ///
     /// 两端都在本地时仍走本机管线（`CopyOperation` / `MoveOperation`）并记可逆项；
     /// 只要有一端在远程就走 [`TransferOperation`]（逐文件分块读写，不赌协议的
-    /// COPY 命令），并**刻意不**记可逆项——撤销模型里的路径都是本地路径。
+    /// COPY 命令），并记**远程**可逆项（见 [`Reversible::RemoteCopy`] /
+    /// [`Reversible::RemoteMove`]；续传 / 覆盖两档不记，见
+    /// [`AppState::submit_transfer_entry`]）。
     ///
     /// 提交前先探测：远程 leg 的目标里若有「部分完成」的文件（上次传输被取消
     /// 留下的，`0 < 已传 < 源大小`），**整批不提交**，交回
@@ -4065,14 +4108,22 @@ impl AppState {
             SubmitMode::Overwrite => (false, true),
         };
         if let Some((src_fs, dst_fs, label)) = leg {
+            // 普通提交先预去重，拿**真实落点**：撤销记录必须指向实际写出的那个
+            // 名字（见 `unique_remote_path`）。续传 / 覆盖引擎侧不走 free_path，
+            // 原名即落点。
+            let real_to = if matches!(mode, SubmitMode::Normal) {
+                unique_remote_path(&dst_fs, to).await
+            } else {
+                to.to_path_buf()
+            };
             let id = self.ops.lock().await.next_id();
             let op = if resume || overwrite {
                 TransferOperation::with_resume(
                     id,
-                    src_fs,
-                    dst_fs,
+                    src_fs.clone(),
+                    dst_fs.clone(),
                     src.to_path_buf(),
-                    to.to_path_buf(),
+                    real_to.clone(),
                     TransferOpts {
                         remove_source: move_,
                         label: if move_ { "移动" } else { label },
@@ -4083,10 +4134,10 @@ impl AppState {
             } else {
                 TransferOperation::new(
                     id,
-                    src_fs,
-                    dst_fs,
+                    src_fs.clone(),
+                    dst_fs.clone(),
                     src.to_path_buf(),
-                    to.to_path_buf(),
+                    real_to.clone(),
                     move_,
                     if move_ { "移动" } else { label },
                 )
@@ -4097,9 +4148,28 @@ impl AppState {
                 vec![src.to_path_buf()],
                 Some(dest_dir.to_path_buf()),
             );
-            // ⚠️ 刻意**不** push 可逆项：撤销模型里的路径都是本地路径
-            // （`Reversible::Copy { dest }` 的撤销 = 删掉 dest），对远程端点
-            // 既删不动也删不对，宁可让「撤销」对这一步无效，也不做错事。
+            // 记远程可逆项，但只记**普通**提交：续传 / 覆盖的落点在本次操作之前
+            // 就存在——部分文件是上次取消留下的、被覆盖的旧内容已经没了——撤销
+            // 把它们删掉或退回去，会把不是这次产生的东西一并抹掉。宁可让 ⌘Z 对
+            // 这两档无效，也不做错事。
+            if matches!(mode, SubmitMode::Normal) {
+                self.push_reversible(if move_ {
+                    Reversible::RemoteMove {
+                        src_fs: src_fs.clone(),
+                        src: src.to_path_buf(),
+                        dst_fs: dst_fs.clone(),
+                        dst: real_to,
+                    }
+                } else {
+                    Reversible::RemoteCopy {
+                        src_fs: src_fs.clone(),
+                        src: src.to_path_buf(),
+                        dst_fs: dst_fs.clone(),
+                        dest: real_to,
+                        label,
+                    }
+                });
+            }
             return hid;
         }
 
@@ -4308,26 +4378,96 @@ impl AppState {
         Ok(updated)
     }
 
-    /// 执行一条可逆操作的正向（inverse=false）或逆向（inverse=true）版本，提交到操作队列。
+    /// 执行一条可逆操作的正向（inverse=false）或逆向（inverse=true）版本。
+    ///
+    /// 本地变体走操作队列（回收站 / 本机管线）；远程变体拿**捕获时的后端**直接
+    /// 执行——不经 `goes_through_remote`（那只答得「这一页现在看的是哪边」，撤销
+    /// 往往发生在切走之后），也不经本机操作队列里那些 `std::fs` 实现。
     async fn apply_reversible(&self, r: &Reversible, inverse: bool) {
-        // 「移动」这条逆操作在**远程**条目上是反向 `rename`（`MoveOperation` 是本机
-        // 管线，拿来撤销一次远程重命名会静默什么都不做）。
-        if let Reversible::Move { from, to } = r {
-            let (a, b) = if inverse {
-                (to.clone(), from.clone())
-            } else {
-                (from.clone(), to.clone())
-            };
-            if self.goes_through_remote(&a).await {
+        // ---- 远程变体 ----
+        match r {
+            Reversible::RemoteRename { fs, from, to } => {
+                let (a, b) = if inverse { (to, from) } else { (from, to) };
                 // 撤销 / 重做这条路不返回结果（与本机管线一致），失败只能记日志；
                 // 但**必须重读**：远端改名成没成，只有列表说了算。
-                if let Err(e) = self.active_fs().rename(&a, &b).await {
+                if let Err(e) = fs.rename(a, b).await {
                     tracing::warn!("远程撤销重命名失败 {} → {}：{e}", a.display(), b.display());
                 }
-                let _ = self.refresh().await;
+                if let Some(dir) = a.parent() {
+                    let _ = self.refresh_if_showing(dir).await;
+                }
                 return;
             }
+            Reversible::RemoteCopy {
+                src_fs,
+                src,
+                dst_fs,
+                dest,
+                label,
+            } => {
+                if inverse {
+                    // 撤销复制 = 删掉目标侧副本（目录递归，与 delete_remote 同一套
+                    // 直连做法——删除本来就没有进度面板）。
+                    if let Err(e) = remote_remove(dst_fs, dest).await {
+                        tracing::warn!("远程撤销复制失败（删副本 {}）：{e}", dest.display());
+                    }
+                    if let Some(dir) = dest.parent() {
+                        let _ = self.refresh_if_showing(dir).await;
+                    }
+                } else {
+                    // 重做 = 原样再传一遍，完成后刷新落点。
+                    let id = self.ops.lock().await.next_id();
+                    let op = TransferOperation::new(
+                        id,
+                        src_fs.clone(),
+                        dst_fs.clone(),
+                        src.clone(),
+                        dest.clone(),
+                        false,
+                        label,
+                    );
+                    self.submit_operation(op).await;
+                    self.watch_remote_undo_refresh(
+                        vec![dest.parent().map(|p| p.to_path_buf()).unwrap_or_default()],
+                        vec![id],
+                    );
+                }
+                return;
+            }
+            // 撤销与重做都是「反向再移一遍」：undo 把 dst 移回 src，redo 移回去。
+            Reversible::RemoteMove {
+                src_fs,
+                src,
+                dst_fs,
+                dst,
+            } => {
+                let (from_fs, from, to_fs, to) = if inverse {
+                    (dst_fs, dst, src_fs, src)
+                } else {
+                    (src_fs, src, dst_fs, dst)
+                };
+                let id = self.ops.lock().await.next_id();
+                let op = TransferOperation::new(
+                    id,
+                    from_fs.clone(),
+                    to_fs.clone(),
+                    from.clone(),
+                    to.clone(),
+                    true,
+                    "移动",
+                );
+                self.submit_operation(op).await;
+                let parents = [from, to]
+                    .iter()
+                    .map(|p| p.parent().map(|d| d.to_path_buf()).unwrap_or_default())
+                    .collect();
+                self.watch_remote_undo_refresh(parents, vec![id]);
+                return;
+            }
+            _ => {}
         }
+
+        // ---- 本地变体：走操作队列（回收站 / 本机管线）----
         let id = self.ops.lock().await.next_id();
         let op: SharedOperation = match r {
             Reversible::Move { from, to } => {
@@ -4352,15 +4492,56 @@ impl AppState {
                     TrashOperation::new(id, original.clone(), self.trash.clone())
                 }
             }
+            // 远程变体在上面已经 return 了。
+            Reversible::RemoteRename { .. }
+            | Reversible::RemoteCopy { .. }
+            | Reversible::RemoteMove { .. } => unreachable!("远程变体不应走到本地队列"),
         };
         self.submit_operation(op).await;
+    }
+
+    /// 撤销 / 重做提交的远程传输完成后刷新受影响的目录（哪端正在看就刷哪端）。
+    ///
+    /// 与 UI 层 `watch_then_refresh_task` 同套路，但撤销只发生在发起方这一个
+    /// `AppState` 里，这里直接订阅自己的总线就够了。掉队按「齐了」处理：
+    /// 刷新是尽力而为，别为它挂死等待。
+    fn watch_remote_undo_refresh(&self, dirs: Vec<PathBuf>, ids: Vec<u64>) {
+        let app = self.clone();
+        let mut rx = self.bus.subscribe();
+        let mut remaining: std::collections::HashSet<u64> = ids.into_iter().collect();
+        self.spawn(async move {
+            while !remaining.is_empty() {
+                match rx.recv().await {
+                    Ok(AppEvent::OperationFinished { id }) => {
+                        remaining.remove(&id);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(_) => return,
+                }
+            }
+            for dir in dirs {
+                let _ = app.refresh_if_showing(&dir).await;
+            }
+        });
     }
 }
 
 /// 一条「可撤销操作」的描述。只保存路径，运行时再据其构造正 / 逆操作。
 ///
 /// 这样无论撤销 / 重做多少次，都无需持有已移入回收站的 `TrashEntry` 生命周期。
-#[derive(Debug, Clone)]
+///
+/// 本地变体（[`Reversible::Move`] / [`Reversible::Copy`] / [`Reversible::Delete`]）
+/// 的路径都是本机路径，撤销走操作队列与本机回收站。远程变体
+/// （[`Reversible::RemoteRename`] / [`Reversible::RemoteCopy`] /
+/// [`Reversible::RemoteMove`]）在**操作发生时**就把那一端的后端捕获进来——
+/// `Arc` 的克隆只是引用计数，连接对象归 [`SessionRegistry`] 所有，这里不延长
+/// 会话的生命周期，只保证「撤销时用的还是当初那个后端」：用户切去本地再 ⌘Z，
+/// 照样改得回去（判据不能靠 `goes_through_remote`，那只答得当前这一页）。
+///
+/// 远程**删除**没有对应变体：服务端没有回收站，删掉的内容无处还原——删除照旧
+/// 不可撤销（见 [`AppState::delete_remote`]）。
+#[derive(Clone)]
 pub enum Reversible {
     /// 移动：from → to。逆操作为 to → from。
     Move { from: PathBuf, to: PathBuf },
@@ -4368,15 +4549,78 @@ pub enum Reversible {
     Copy { src: PathBuf, dest: PathBuf },
     /// 删除（已入回收站）：original。逆操作为按原路径从回收站还原。
     Delete { original: PathBuf },
+    /// 远程重命名：`fs` 上 from → to 已发生。正逆都是同一后端上的 `rename`。
+    RemoteRename {
+        fs: Arc<dyn FileSystem>,
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// 远程复制：src_fs 的 src → dst_fs 的 dest（dest 是改名去重后的**真实落点**）。
+    /// 逆操作为删掉 dst_fs 上的 dest 子树；重做为原样再传一遍。
+    RemoteCopy {
+        src_fs: Arc<dyn FileSystem>,
+        src: PathBuf,
+        dst_fs: Arc<dyn FileSystem>,
+        dest: PathBuf,
+        /// 进度条上的动词（上传 / 下载 / 复制），随捕获时的方向走。
+        label: &'static str,
+    },
+    /// 远程移动（含跨端点）：src_fs 的 src → dst_fs 的 dst，源已删。
+    /// 正逆都是「反向再移一遍」——撤销把 dst 移回 src（并删掉 dst 侧副本），
+    /// 重做把 src 再移回 dst；走 [`TransferOperation`]，进度与取消白拿。
+    RemoteMove {
+        src_fs: Arc<dyn FileSystem>,
+        src: PathBuf,
+        dst_fs: Arc<dyn FileSystem>,
+        dst: PathBuf,
+    },
+}
+
+impl std::fmt::Debug for Reversible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 后端对象没有 Debug 也没有可读信息，只记路径。
+        match self {
+            Reversible::Move { from, to } => f
+                .debug_struct("Move")
+                .field("from", from)
+                .field("to", to)
+                .finish(),
+            Reversible::Copy { src, dest } => f
+                .debug_struct("Copy")
+                .field("src", src)
+                .field("dest", dest)
+                .finish(),
+            Reversible::Delete { original } => f
+                .debug_struct("Delete")
+                .field("original", original)
+                .finish(),
+            Reversible::RemoteRename { from, to, .. } => f
+                .debug_struct("RemoteRename")
+                .field("from", from)
+                .field("to", to)
+                .finish(),
+            Reversible::RemoteCopy { src, dest, .. } => f
+                .debug_struct("RemoteCopy")
+                .field("src", src)
+                .field("dest", dest)
+                .finish(),
+            Reversible::RemoteMove { src, dst, .. } => f
+                .debug_struct("RemoteMove")
+                .field("src", src)
+                .field("dst", dst)
+                .finish(),
+        }
+    }
 }
 
 impl Reversible {
     /// 操作类型的中文标签（用于 UI 提示）。
     pub fn kind_label(&self) -> &'static str {
         match self {
-            Reversible::Move { .. } => "移动",
-            Reversible::Copy { .. } => "复制",
+            Reversible::Move { .. } | Reversible::RemoteMove { .. } => "移动",
+            Reversible::Copy { .. } | Reversible::RemoteCopy { .. } => "复制",
             Reversible::Delete { .. } => "删除",
+            Reversible::RemoteRename { .. } => "重命名",
         }
     }
 }
@@ -5441,8 +5685,9 @@ impl AppState {
     /// 本地条目走操作队列——重命名一条远程路径若交给本机管线，只会「成功」地
     /// 什么都不做（那个路径在本机不存在）。
     ///
-    /// 逆操作是「把新名改回旧名」，因此每一种情况都能被 ⌘Z 撤销
-    /// （撤销同样按路径分流，见 [`AppState::apply_reversible`]）。
+    /// 撤销记录一律按**正向**存（from=旧名，to=新名；逆操作由
+    /// [`AppState::apply_reversible`] 按需反转）。远程分支多存一条捕获的会话
+    /// 后端：切去本地再 ⌘Z，用的仍是当初那条连接。
     pub async fn rename_many(&self, pairs: Vec<(PathBuf, PathBuf)>) -> Result<Vec<u64>, MoError> {
         let mut ids = Vec::new();
         let mut touched_remote = false;
@@ -5451,11 +5696,13 @@ impl AppState {
                 continue;
             }
             if self.goes_through_remote(&from).await {
-                self.active_fs().rename(&from, &to).await?;
+                let fs = self.active_fs();
+                fs.rename(&from, &to).await?;
                 self.record_history("重命名", vec![from.clone()], Some(to.clone()));
-                self.push_reversible(Reversible::Move {
-                    from: to.clone(),
-                    to: from.clone(),
+                self.push_reversible(Reversible::RemoteRename {
+                    fs,
+                    from: from.clone(),
+                    to: to.clone(),
                 });
                 touched_remote = true;
                 continue;
@@ -5465,8 +5712,8 @@ impl AppState {
             ids.push(self.submit_operation(op).await);
             self.record_history("重命名", vec![from.clone()], Some(to.clone()));
             self.push_reversible(Reversible::Move {
-                from: to.clone(),
-                to: from.clone(),
+                from: from.clone(),
+                to: to.clone(),
             });
         }
         // 远程没有 watcher：改完名得重读一次，否则列表里还是旧名字。

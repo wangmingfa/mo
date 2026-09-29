@@ -276,6 +276,38 @@ fn undo_reverts_a_move() {
     let _ = std::fs::remove_dir_all(&trash);
 }
 
+/// 撤销一次重命名：新名改回旧名。
+///
+/// 这条钉的是推送方向：可逆项必须按**正向**存（from=旧名，to=新名），撤销时由
+/// `apply_reversible` 反转。曾经推反过（存成 from=新名 / to=旧名），撤销做的
+/// 恰是正向改名——旧名早就不存在，rename 静默失败，⌘Z 看上去什么都不做。
+#[test]
+fn undo_reverts_a_rename() {
+    let base = tree("undo-rename");
+    let trash = trash_root("undo-rename");
+    let src = base.join("alpha.txt");
+    let renamed = base.join("alpha-renamed.txt");
+
+    let app = common::isolated("undo-rename", || AppState::with_trash(trash.clone()));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+
+        app.rename_many(vec![(src.clone(), renamed.clone())])
+            .await
+            .expect("重命名应当成功");
+        wait_for(|| renamed.exists()).await;
+        assert!(!src.exists(), "改名后旧名应消失");
+
+        assert!(app.can_undo(), "重命名后应可撤销");
+        app.undo();
+        wait_for(|| src.exists() && !renamed.exists()).await;
+        assert!(src.exists() && !renamed.exists(), "撤销应把新名改回旧名");
+    });
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&trash);
+}
+
 /// 键盘 ↑↓ 移动焦点：单步移动是单选，Shift（extend=true）是连选。
 #[test]
 fn move_cursor_moves_focus_and_extends_selection() {
