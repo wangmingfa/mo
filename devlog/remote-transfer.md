@@ -131,6 +131,22 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 **已知边界**：探测对整批各多两次 `metadata`（远程 = 网络往返），大批量时有感
 知成本；决策期间目标被别人动过 → `can_resume` 自动退回改名重传，不会续坏。
 
+## 6. 传输完成自动刷新（2026-09-29，8d67d31）
+
+跨端点传输完成后，远程目标端没有 watcher，等用户手动刷新才看得见新文件；原先两处
+「提交完立刻 `refresh`」时机又太早（大文件还在传）。收口到 `handle_transfer_outcome`：
+
+* `watch_then_refresh_task(src_app, ids, dest_app, dest)`：订阅**发起方**总线，等这批
+  op 全部 `OperationFinished`（成败都发，lib.rs 的 `submit_operation` 发布）后对目标端
+  `AppState::refresh_if_showing(&dest)`——只刷「当前目录 == 落点」的那一端，用户已切走
+  就不白费 IO（切回来时本来就会重读）。为什么在 UI 层做：完成事件只发在发起方总线，
+  目标端可能是另一条会话的 `AppState`，只有 UI 同时握着两端。
+* 续传决策重提同款：弹卡时把 `(dest_app, dest)` 记进 `RootView::resume_dest`，
+  `resolve_resume_decision` 拿到 `resolve_resume` 返回的 ids 后挂同一任务（跳过决策
+  ids 为空则不刷）。
+* 拖拽 / 外部拖入原先散落的 refresh 收编，`submit_os_drop` 的 `refresh` 参数删除。
+* Lagged（广播掉队）按「齐了」处理——刷新是尽力而为，别为它挂死等待。
+
 ## 待办
 
 * 大文件**整份进内存**已修（2026-09-29 起，2026-09-30 收尾四个后端）：`FileSystem` 加
@@ -143,6 +159,7 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   整份，按区间切出、行为仍正确但内存退回整份——服务器限制）。断点续传已做（§5，重提弹确认卡，无 journal、靠磁盘上的部分文件判断，进程内 / 重启后都能续）。
 * 远程传输的**冲突策略**只做到「目标名去重」，没有冲突对话框 / 覆盖选项。
 * 远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义。
-* 远程目录没有 watcher（改完必须重读），跨端点传输完成后靠调用方主动 `refresh`。
+* 远程目录没有 watcher（改完必须重读）——传输完成的自动刷新已做（§6），但**其它**改动
+  （另一台设备写入、本进程外部的操作）仍要用户手动刷新或重进目录。
 * SMB / NFS 仍走系统挂载（`mo_remote::mount`），挂载点对 `mo-fs` 来说就是本地路径，
   不需要 `TransferOperation` 这条链。
