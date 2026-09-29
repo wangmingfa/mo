@@ -26,9 +26,10 @@ pub(crate) fn last_segment(path: &Path) -> String {
 
 /// 目录的显示名：已知文件夹用侧边栏那套中文名，其余退回 [`last_segment`]。
 ///
-/// 面包屑与标签页原来直接抄目录名，于是 Windows 上侧栏写「桌面」、地址栏写
-/// `Desktop`（`D:\Users\wmf12\Desktop` 的真实名字）。标签表在
-/// [`mo_app::known_folder_labels`]，两边同源，不会再各写一份。
+/// 标签表在 [`mo_app::known_folder_labels`]，与侧边栏同源，不会再各写一份。
+/// 现在的使用方是**侧栏书签 / 列头 / 标签页**——面包屑（地址栏）不在此列：
+/// 2026-09-29 用户决定地址栏一律显示磁盘上的**原样目录名**（「文件夹是什么
+/// 名字就显示什么」），见 `toolbar.rs` 的 `segments` 与钉住它的测试。
 pub(crate) fn folder_label(path: &Path) -> String {
     match known_folder_label(path) {
         Some(label) => label.to_string(),

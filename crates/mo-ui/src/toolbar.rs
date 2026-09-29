@@ -515,8 +515,9 @@ fn segments(path: &Path) -> Vec<(String, PathBuf)> {
             }
             _ => {
                 prefix.push(comp);
-                // 已知文件夹那几级显示中文名（「桌面」而不是 `Desktop`），其余照抄目录名。
-                let label = crate::path_label::folder_label(&prefix);
+                // 照抄磁盘上的目录名。2026-09-29 用户决定：地址栏显示**原样名字**
+                //（「主目录」这类中文标签只留给侧边栏），是什么文件夹就显示什么。
+                let label = crate::path_label::last_segment(&prefix);
                 out.push((label, prefix.clone()));
             }
         }
@@ -743,7 +744,7 @@ mod tests {
     // 显式列出，不能用 `use super::*`：那会把 `gpui_kit::*` 一并引进来，
     // 其中的 `test` 模块会让 `#[test]` 属性解析成它自己…… 报
     // “recursion limit reached while expanding #[test]”。
-    use super::{titlebar_action, TitlebarAction};
+    use super::{segments, titlebar_action, TitlebarAction};
 
     /// Mac 自营标题栏：单击拖窗口，双击缩放（补回 AppKit 原本管的双击语义）。
     #[test]
@@ -758,5 +759,26 @@ mod tests {
     fn windows_hands_everything_to_the_system() {
         assert_eq!(titlebar_action(true, 1), TitlebarAction::System);
         assert_eq!(titlebar_action(true, 2), TitlebarAction::System);
+    }
+
+    /// 面包屑显示磁盘上的**原样目录名**：已知文件夹（主目录 / 桌面…）不再换成
+    /// 侧栏那套中文标签——2026-09-29 用户决定，地址栏里「是什么名字就显示什么」。
+    #[test]
+    fn breadcrumbs_show_the_real_folder_name() {
+        // 拿真机的已知文件夹表问，不写死路径（桌面在有的机器上被重定向到别的盘）。
+        for (path, label) in mo_app::known_folder_labels() {
+            let segs = segments(path);
+            let (last, _) = segs.last().expect("非空路径至少有一段");
+            assert_ne!(
+                last.as_str(),
+                *label,
+                "{path:?} 的面包屑不该再显示中文标签「{label}」"
+            );
+            assert_eq!(
+                last.as_str(),
+                crate::path_label::last_segment(path),
+                "{path:?} 的面包屑应显示目录本名"
+            );
+        }
     }
 }
