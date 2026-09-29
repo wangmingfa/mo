@@ -104,7 +104,7 @@ async fn copying_keeps_the_list_for_another_destination() {
 
     app.open_directory(&dst).await.expect("打开目标目录失败");
     let ids = app.paste_staged(None, false).await;
-    assert_eq!(ids.len(), 2, "两条各提交一个操作");
+    assert_eq!(ids.started_ids().len(), 2, "两条各提交一个操作");
     assert!(
         wait_exists(&dst.join("a.txt")).await && wait_exists(&dst.join("b.txt")).await,
         "暂存区的两个文件都应落到目标目录"

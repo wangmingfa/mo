@@ -239,6 +239,13 @@ pub(crate) enum Modal {
     /// 携带被改名的条目（落点路径），新名字暂存在 [`RootView::trash_rename_name`]；
     /// Esc / 取消回到面板，Enter 提交。
     TrashRename(Box<TrashEntry>),
+    /// 「目标里有上次没传完的文件」续传确认卡（继续 / 重传 / 跳过）。
+    ///
+    /// 载荷（[`mo_app::PendingResume`]，内含发起传输的 `AppState`）放在
+    /// [`RootView::resume_pending`]——`Modal` 要 derive `PartialEq, Eq`，
+    /// 带 `AppState` 的结构体进不了枚举，这里只是「现在是续传确认卡」的标记。
+    /// Esc / 取消 / 点遮罩 = **什么都不提交**（卡与请求一起清掉）。
+    ConfirmResume,
     /// 扩展贡献的只读列表源面板（P4，devlog §5 表格 `list` 那行）。
     ///
     /// 状态（标题 / 行 / 加载中 / 错误）放在 [`RootView::list_panel`]，这里只是
@@ -863,6 +870,10 @@ pub struct RootView {
     ///
     /// `pub(crate)` 仅为测试注入（见 `crate::inject_usage_tree_for_tests`）。
     pub(crate) modal: Modal,
+    /// 续传确认卡（[`Modal::ConfirmResume`]）的重提请求。载荷不进 Modal 枚举
+    /// （见那边的注释）：开卡时存进来，决策 / 关卡时取走清空。
+    /// `pub(crate)` 仅为测试预置（store pre-seeding 套路）。
+    pub(crate) resume_pending: Option<mo_app::PendingResume>,
     /// 命令面板过滤词。
     cmd_query: String,
     /// 命令面板 / 搜索结果的高亮下标。
@@ -1181,6 +1192,7 @@ impl RootView {
             split: false,
             focus: cx.focus_handle(),
             modal: Modal::None,
+            resume_pending: None,
             cmd_query: String::new(),
             palette_index: 0,
             palette_scroll: ScrollHandle::default(),
@@ -1457,11 +1469,14 @@ impl RootView {
         let app = self.app();
         let this = cx.entity().clone();
         cx.spawn(async move |_weak, cx| {
-            let ids = app.paste_staged(None, move_).await;
+            let outcome = app.paste_staged(None, move_).await;
+            let empty = outcome.is_started() && outcome.started_ids().is_empty();
             this.update(cx, |v, cx| {
-                if ids.is_empty() {
+                if empty {
                     v.notice("暂存区是空的，或当前目录不可用".to_string(), None, cx);
                 }
+                // 等续传决策的在这里把卡弹出来（粘贴也会命中部分完成的目标）。
+                v.handle_transfer_outcome(outcome, cx);
                 cx.notify();
             });
         })
@@ -5196,11 +5211,13 @@ impl RootView {
                 // 先采纳系统剪贴板里的文件（资源管理器复制的那批），再粘：两步必须
                 // 在同一个任务里连着做，分开 spawn 就成了赛跑，粘的可能是上一批。
                 let ext = system_file_clipboard(cx);
-                cx.spawn(async move |_weak, _cx| {
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
                     if let Some((paths, cut)) = ext {
                         app.adopt_system_clipboard(paths, cut).await;
                     }
-                    let _ = app.paste_clipboard(dest).await;
+                    let outcome = app.paste_clipboard(dest).await;
+                    this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
                 })
                 .detach();
             }
@@ -6712,6 +6729,20 @@ impl RootView {
             .map(|t| t.app.clone())
     }
 
+    /// 处理一次传输结局：直接提交的不用管；等续传决策的把请求存下、弹确认卡。
+    /// 所有传输入口（拖拽 / 外部拖入 / 粘贴 / 剪贴板）共用这一个收口。
+    pub(crate) fn handle_transfer_outcome(
+        &mut self,
+        outcome: mo_app::TransferOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        if let mo_app::TransferOutcome::NeedsResumeConfirmation(p) = outcome {
+            self.resume_pending = Some(*p);
+            self.modal = Modal::ConfirmResume;
+            cx.notify();
+        }
+    }
+
     /// 真正提交复制 / 移动：按住 ⌥ 是移动，否则复制。
     ///
     /// 源端取**拖拽来源窗格**的 `AppState`，目标端取**落点窗格**的——分栏时两个窗格
@@ -6734,10 +6765,12 @@ impl RootView {
         let src_ep = src_app.endpoint();
         let dest_ep = dest_app.endpoint();
         let paths = d.paths.clone();
-        cx.spawn(async move |_weak, _cx| {
-            let _ = src_app
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let outcome = src_app
                 .transfer_between(paths, src_ep, &dest, dest_ep, alt)
                 .await;
+            this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
         })
         .detach();
         cx.notify();
@@ -6773,12 +6806,17 @@ impl RootView {
         if paths.is_empty() {
             return;
         }
-        cx.spawn(async move |_weak, _cx| {
-            let _ = app
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let outcome = app
                 .transfer_between(paths, mo_app::Endpoint::Local, &dest, dest_ep, false)
                 .await;
-            if refresh {
+            let needs_confirm =
+                matches!(outcome, mo_app::TransferOutcome::NeedsResumeConfirmation(_));
+            this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
+            if refresh && !needs_confirm {
                 // 目标窗格可能没开监听：拖进来的文件不会自己冒出来，主动刷一次。
+                // （等续传决策时不刷：这会儿还什么都没传。）
                 let _ = app.refresh().await;
             }
         })
@@ -7287,11 +7325,13 @@ impl RootView {
                 let dest = self.panel().path.clone();
                 let app = self.app();
                 let ext = system_file_clipboard(cx);
-                cx.spawn(async move |_weak, _cx| {
+                let this = cx.entity().clone();
+                cx.spawn(async move |_weak, cx| {
                     if let Some((paths, cut)) = ext {
                         app.adopt_system_clipboard(paths, cut).await;
                     }
-                    let _ = app.paste_clipboard(dest).await;
+                    let outcome = app.paste_clipboard(dest).await;
+                    this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
                 })
                 .detach();
             }
@@ -7646,6 +7686,7 @@ impl Render for RootView {
             | Modal::Archive
             | Modal::Tags
             | Modal::Settings
+            | Modal::ConfirmResume
             | Modal::CommandPalette => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
@@ -8069,6 +8110,7 @@ impl Render for RootView {
             Modal::TrashRename(entry) => {
                 root = root.child(dialogs::trash_rename(self, entry, &entity));
             }
+            Modal::ConfirmResume => root = root.child(render_resume_confirm(self, &entity)),
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
             Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
             Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
@@ -8669,6 +8711,12 @@ fn handle_modal_key(
         Modal::ConfirmTrash(_) => match key {
             "escape" => dismiss_trash_confirm(entity, cx),
             "enter" => confirm_trash_action(entity, cx),
+            _ => {}
+        },
+        // 续传确认卡：Esc 收卡不提交；Enter 走主行动「继续」（与主按钮同一收口）。
+        Modal::ConfirmResume => match key {
+            "escape" => dismiss_resume_confirm(entity, cx),
+            "enter" => resolve_resume_decision(entity, mo_app::ResumeDecision::Resume, cx),
             _ => {}
         },
         Modal::TrashRename(_) => match key {
@@ -9593,11 +9641,13 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         Some(CommandId::PasteClipboard) => {
             let dest = entity.update(cx, |v, _cx| v.panel().path.clone());
             let ext = system_file_clipboard(cx);
-            cx.spawn(async move |_cx| {
+            let this = entity.clone();
+            cx.spawn(async move |cx| {
                 if let Some((paths, cut)) = ext {
                     app.adopt_system_clipboard(paths, cut).await;
                 }
-                let _ = app.paste_clipboard(dest).await;
+                let outcome = app.paste_clipboard(dest).await;
+                this.update(cx, |v, cx| v.handle_transfer_outcome(outcome, cx));
             })
             .detach();
             entity.update(cx, |v, cx| {
@@ -11643,6 +11693,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_uninstall_confirm(entity, cx);
         return;
     }
+    // 续传确认卡同理：点遮罩 = **什么都不提交**（那批文件原样不动）。
+    if matches!(entity.read(cx).modal, Modal::ConfirmResume) {
+        dismiss_resume_confirm(entity, cx);
+        return;
+    }
     close_modal(entity, cx);
 }
 
@@ -11772,6 +11827,203 @@ fn render_trash_confirm(
                 ),
         );
     dialog_overlay(entity, "", "", body, "")
+}
+
+// ---------- 续传确认卡（Modal::ConfirmResume） ----------
+
+/// 续传确认卡：目标里有上次没传完的文件，继续（从断点接着写）/ 重传（改名整份
+/// 重传）/ 跳过（那几个不传）三选一。
+///
+/// 与 [`render_trash_confirm`] 共用 [`dialog_overlay`] 外壳；Esc / 取消 / 点遮罩
+/// = **什么都不提交**。请求不在了（竞态：卡开着的时候被别处清掉）就画一句兜底
+/// 文案——`impl IntoElement` 的多个 return 必须同型，不能一半有卡一半没有。
+fn render_resume_confirm(v: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
+    let (count, names) = match v.resume_pending.as_ref() {
+        Some(p) => (
+            p.partial.len(),
+            p.partial
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect::<Vec<_>>(),
+        ),
+        None => (0, Vec::new()),
+    };
+    let mut message = if count == 0 {
+        "没有可续传的文件。".to_string()
+    } else {
+        format!(
+            "目标位置已有 {count} 个文件的部分内容（上次传输未完成）。从断点继续，还是整份重传？"
+        )
+    };
+    // 文件名最多列 5 个，余下的折成一行「……等 N 个」——弹窗不是清单页。
+    const MAX_NAMES: usize = 5;
+    let mut listing = String::new();
+    for (i, name) in names.iter().enumerate() {
+        if i == MAX_NAMES {
+            listing.push_str(&format!("……等 {} 个文件", count));
+            break;
+        }
+        listing.push_str(name);
+        listing.push('\n');
+    }
+    if count > 0 {
+        message.push_str("\n\n");
+        message.push_str(listing.trim_end());
+    }
+
+    let resume = entity.clone();
+    let rename = entity.clone();
+    let skip = entity.clone();
+    let cancel = entity.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(theme::text())
+                        .child(text!("部分文件可续传")),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme::muted())
+                        .child(text!(message)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                // 跳过：中性描边按钮。
+                .child(
+                    div()
+                        .id("resume-skip")
+                        .test_support()
+                        .debug_selector(|| "resume-skip".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_resume_decision(&skip, mo_app::ResumeDecision::Skip, cx)
+                        })
+                        .child(text!("跳过")),
+                )
+                // 重传：中性描边按钮。
+                .child(
+                    div()
+                        .id("resume-rename")
+                        .test_support()
+                        .debug_selector(|| "resume-rename".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_resume_decision(&rename, mo_app::ResumeDecision::Rename, cx)
+                        })
+                        .child(text!("重传")),
+                )
+                // 取消：什么都不提交。
+                .child(
+                    div()
+                        .id("resume-cancel")
+                        .test_support()
+                        .debug_selector(|| "resume-cancel".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| dismiss_resume_confirm(&cancel, cx))
+                        .child(text!("取消")),
+                )
+                // 继续：主色按钮（品牌蓝，`accent` 角色在本主题里是灰）。
+                .child(
+                    div()
+                        .id("resume-continue")
+                        .test_support()
+                        .debug_selector(|| "resume-continue".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(theme::selected_bg())
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            resolve_resume_decision(&resume, mo_app::ResumeDecision::Resume, cx)
+                        })
+                        .child(text!("继续")),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 关掉续传确认卡**不提交任何东西**（Esc / 取消 / 点遮罩）。
+fn dismiss_resume_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if v.modal == Modal::ConfirmResume {
+            v.modal = Modal::None;
+            v.resume_pending = None;
+            cx.notify();
+        }
+    });
+}
+
+/// 续传确认卡上选定后的提交：取走请求 → 关卡 → 交回**发起那次传输的**
+/// `AppState`（请求里带着）在后台重提。操作管理器按标签页各一份，交回错了
+/// 进度面板就对不上号。
+fn resolve_resume_decision(
+    entity: &Entity<RootView>,
+    decision: mo_app::ResumeDecision,
+    cx: &mut App,
+) {
+    let pending = entity.update(cx, |v, cx| {
+        if v.modal != Modal::ConfirmResume {
+            return None;
+        }
+        v.modal = Modal::None;
+        cx.notify();
+        v.resume_pending.take()
+    });
+    let Some(pending) = pending else {
+        return;
+    };
+    let app = pending.app.clone();
+    cx.spawn(async move |_| {
+        let _ = app.resolve_resume(pending, decision).await;
+    })
+    .detach();
 }
 
 // ---------- 「启用扩展」确认卡（P2-6） ----------
@@ -12369,7 +12621,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, Context, TestAppContext};
+    use gpui_kit::{px, Context, Entity, TestAppContext};
     use mo_app::AppState;
 
     use super::{
@@ -12799,6 +13051,91 @@ mod tests {
                 "「{name}」关闭后浏览区没有回来"
             );
         }
+    }
+
+    /// 续传确认卡（`Modal::ConfirmResume`）：预置请求后四颗按钮齐全；取消 / 跳过
+    /// 都只收卡清请求（跳过对「全是部分文件」的一批不提交任何东西，headless 里
+    /// 零 IO）；「继续」会真提交操作（blocking 池 IO），headless 不点它——那条
+    /// 链的行为由 mo-operations 的续传用例与 mo-app 的 resolve 用例钉住。
+    #[test]
+    fn resume_confirm_dialog_closes_and_clears_without_submitting() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app.clone(), cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        fn seed(root: &Entity<RootView>, app: &AppState, cx: &mut gpui_kit::VisualTestContext) {
+            let pending = mo_app::PendingResume {
+                app: app.clone(),
+                paths: vec![PathBuf::from("/src/a.bin")],
+                src_ep: mo_app::Endpoint::Local,
+                dest: PathBuf::from("/dst"),
+                dest_ep: mo_app::Endpoint::Local,
+                move_: false,
+                partial: vec![PathBuf::from("/dst/a.bin")],
+                clear_staging_on_resolve: false,
+            };
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.resume_pending = Some(pending);
+                    v.modal = Modal::ConfirmResume;
+                    cx.notify();
+                });
+            });
+        }
+        let card_state = |root: &Entity<RootView>, cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| {
+                root.update(cx, |v, _cx| {
+                    (v.modal == Modal::ConfirmResume, v.resume_pending.is_some())
+                })
+            })
+        };
+
+        seed(&root, &app, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        // B 类浮层：浏览区保留在遮罩后面，卡与四颗按钮都画出来。
+        assert!(
+            cx.debug_bounds("mo-file-list").is_some(),
+            "续传卡是浮层，浏览区应当保留"
+        );
+        assert!(
+            cx.debug_bounds("mo-dialog-overlay").is_some(),
+            "续传卡应当用带遮罩的浮层"
+        );
+        for id in [
+            "resume-continue",
+            "resume-rename",
+            "resume-skip",
+            "resume-cancel",
+        ] {
+            assert!(
+                cx.debug_bounds(id).is_some(),
+                "续传卡的按钮 {id} 应当渲染出来"
+            );
+        }
+
+        // 取消：收卡 + 清请求，什么都不提交。
+        cx.update(|window, cx| window.click("resume-cancel", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            card_state(&root, cx),
+            (false, false),
+            "取消后卡与请求都该清掉"
+        );
+
+        // 跳过：收卡清请求（这批只有部分文件 → 不提交任何操作，零 IO）。
+        seed(&root, &app, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|window, cx| window.click("resume-skip", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            card_state(&root, cx),
+            (false, false),
+            "跳过后卡与请求都该清掉"
+        );
     }
 
     /// 「连接到服务器」的地址框是**真实输入框**：⌘A 选中框里的内容，不是后面的文件列表。

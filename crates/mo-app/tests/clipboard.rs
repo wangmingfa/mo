@@ -57,7 +57,10 @@ async fn copy_survives_the_selection_changing_underneath_it() {
     app.select_all_visible().await;
 
     let ids = app.paste_clipboard(None).await;
-    assert!(!ids.is_empty(), "剪贴板里有两条，粘贴不该空手而归");
+    assert!(
+        !ids.started_ids().is_empty(),
+        "剪贴板里有两条，粘贴不该空手而归"
+    );
     assert!(
         wait_exists(&dst.join("a.txt")).await && wait_exists(&dst.join("b.txt")).await,
         "复制的必须是剪贴板里那批，而不是当前选区"
@@ -89,7 +92,7 @@ async fn a_cut_is_consumed_by_the_first_paste() {
     );
     assert!(!src.join("only.txt").exists(), "剪切是移动，原处该空掉");
     assert!(
-        app.paste_clipboard(None).await.is_empty(),
+        app.paste_clipboard(None).await.started_ids().is_empty(),
         "剪切是一次性消耗品，第二次粘应当无事发生"
     );
 }

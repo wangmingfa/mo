@@ -70,8 +70,8 @@ use mo_core::{
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
     CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle, OperationManager,
-    RenameOperation, RestoreOperation, SharedOperation, TransferOperation, Trash, TrashEntry,
-    TrashError, TrashOperation,
+    RenameOperation, RestoreOperation, SharedOperation, TransferOperation, TransferOpts, Trash,
+    TrashEntry, TrashError, TrashOperation,
 };
 use mo_preview::Preview;
 use mo_remote::RemoteUrl;
@@ -148,6 +148,88 @@ pub enum Endpoint {
 /// 抽出来只为压掉 `clippy::type_complexity`；语义就是 [`AppState::transfer_between`]
 /// 里那张方向表的行。
 type TransferLeg = (Arc<dyn FileSystem>, Arc<dyn FileSystem>, &'static str);
+
+/// 一次跨端点传输的结局。
+///
+/// 目标位置存在「部分完成」的文件（上一次传输被取消留下的）时**不直接提交**，
+/// 交回 [`TransferOutcome::NeedsResumeConfirmation`] 让 UI 弹续传确认卡
+/// （继续 / 重传 / 跳过）——这是断点续传的用户入口；没有可续传目标时照常
+/// 提交并回报 [`TransferOutcome::Started`]。
+#[derive(Clone)]
+pub enum TransferOutcome {
+    /// 已直接提交，携带各操作的 handle id（原有行为的形状）。
+    Started(Vec<u64>),
+    /// 有可续传的部分文件，等用户决策（此时**什么都没提交**）。
+    /// Box 压枚举尺寸（clippy::large_enum_variant：多数结局是 Started）。
+    NeedsResumeConfirmation(Box<PendingResume>),
+}
+
+impl TransferOutcome {
+    /// 已提交操作的 id；还在等续传决策时是空的。
+    pub fn started_ids(&self) -> &[u64] {
+        match self {
+            TransferOutcome::Started(ids) => ids,
+            TransferOutcome::NeedsResumeConfirmation(_) => &[],
+        }
+    }
+
+    /// 是否直接提交了（等决策 = false）。
+    pub fn is_started(&self) -> bool {
+        matches!(self, TransferOutcome::Started(_))
+    }
+}
+
+/// [`TransferOutcome::NeedsResumeConfirmation`] 携带的重提请求。
+///
+/// 字段是重提所需的全部信息（与 [`AppState::transfer_between`] 的入参同源），
+/// 用户在确认卡上选定后由 [`AppState::resolve_resume`] 据此重建并提交。
+/// `app` 记着**发起那次传输的** `AppState`——操作管理器按标签页各一份，
+/// 决策必须交回原来那一份，进度面板才对得上。
+#[derive(Clone)]
+pub struct PendingResume {
+    /// 发起传输的那份 `AppState`（决策回调用它提交）。
+    pub app: AppState,
+    /// 原样带回的传输请求。
+    pub paths: Vec<PathBuf>,
+    pub src_ep: Endpoint,
+    pub dest: PathBuf,
+    pub dest_ep: Endpoint,
+    pub move_: bool,
+    /// 部分完成的目标（`dest` 下的完整路径），即确认卡问的那几个文件。
+    pub partial: Vec<PathBuf>,
+    /// 决策提交完后要不要清暂存区（`move_` 的粘贴链路置位：源已经不在了，
+    /// 留着只会让下一次「粘贴」变成一堆失败）。拖拽链路不置位——暂存区跟它无关。
+    pub clear_staging_on_resolve: bool,
+}
+
+/// 续传确认卡上用户的三选一。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDecision {
+    /// 继续：部分完成的目标从断点续写，其余照常。
+    Resume,
+    /// 重传：全部照常（目标已存在会被改名，整份重传一遍）。
+    Rename,
+    /// 跳过：部分完成的那些不提交，其余照常。
+    Skip,
+}
+
+/// 方向表：两端谁读谁写，以及进度条上那个动词。原是 `transfer_between` 里
+/// 内联的 match，探测与提交两遍都要用，抽出来保证判据不会各改各的。
+fn resolve_transfer_leg(
+    src_ep: &Endpoint,
+    dest_ep: &Endpoint,
+    local: &Arc<dyn FileSystem>,
+) -> Option<TransferLeg> {
+    match (src_ep, dest_ep) {
+        (Endpoint::Local, Endpoint::Local) => None,
+        // 远程之间（同一会话内复制）。
+        (Endpoint::Remote(f), Endpoint::Remote(g)) => Some((f.clone(), g.clone(), "复制")),
+        // 远程 → 本地：下载。
+        (Endpoint::Remote(f), Endpoint::Local) => Some((f.clone(), local.clone(), "下载")),
+        // 本地 → 远程：上传。
+        (Endpoint::Local, Endpoint::Remote(f)) => Some((local.clone(), f.clone(), "上传")),
+    }
+}
 
 /// 应用可变状态（全部放在 RwLock 内，便于 UI 与后台任务并发访问）。
 pub struct AppStateInner {
@@ -3645,16 +3727,16 @@ impl AppState {
     }
 
     /// 复制选中到 `dest` 目录（每个源按原名落到 dest 下）。
-    pub async fn copy_selection(&self, dest: &Path) -> Vec<u64> {
+    pub async fn copy_selection(&self, dest: &Path) -> TransferOutcome {
         self.duplicate_selection(dest, false).await
     }
 
     /// 移动选中到 `dest` 目录。
-    pub async fn move_selection(&self, dest: &Path) -> Vec<u64> {
+    pub async fn move_selection(&self, dest: &Path) -> TransferOutcome {
         self.duplicate_selection(dest, true).await
     }
 
-    async fn duplicate_selection(&self, dest: &Path, move_: bool) -> Vec<u64> {
+    async fn duplicate_selection(&self, dest: &Path, move_: bool) -> TransferOutcome {
         let paths = self.selection_paths().await;
         self.transfer(paths, dest, move_).await
     }
@@ -3724,7 +3806,7 @@ impl AppState {
     /// 两端都按 `self` 当前所在的后端算：粘贴、同窗格内拖拽时源与目标同属一页，
     /// 这是对的。分栏跨窗格（尤其「本地窗格 → 远程窗格」）必须走
     /// [`AppState::transfer_between`]——那一头的后端不在 `self` 身上。
-    pub async fn transfer(&self, paths: Vec<PathBuf>, dest: &Path, move_: bool) -> Vec<u64> {
+    pub async fn transfer(&self, paths: Vec<PathBuf>, dest: &Path, move_: bool) -> TransferOutcome {
         let here = self.endpoint();
         self.transfer_between(paths, here.clone(), dest, here, move_)
             .await
@@ -3743,8 +3825,14 @@ impl AppState {
     /// 跨端点传输：两端由调用方给定（见 [`Endpoint`] 的注释：照路径猜不出来）。
     ///
     /// 两端都在本地时仍走本机管线（`CopyOperation` / `MoveOperation`）并记可逆项；
-    /// 只要有一端在远程就走 [`TransferOperation`]（逐文件读整份 / 写整份，不赌协议的
+    /// 只要有一端在远程就走 [`TransferOperation`]（逐文件分块读写，不赌协议的
     /// COPY 命令），并**刻意不**记可逆项——撤销模型里的路径都是本地路径。
+    ///
+    /// 提交前先探测：远程 leg 的目标里若有「部分完成」的文件（上次传输被取消
+    /// 留下的，`0 < 已传 < 源大小`），**整批不提交**，交回
+    /// [`TransferOutcome::NeedsResumeConfirmation`] 让 UI 弹确认卡；用户选定后
+    /// 走 [`AppState::resolve_resume`]。探测只对远程 leg 做——本地对的同名冲突
+    /// 由 `ConflictPolicy` 处理，与续传无关。
     pub async fn transfer_between(
         &self,
         paths: Vec<PathBuf>,
@@ -3752,77 +3840,168 @@ impl AppState {
         dest: &Path,
         dest_ep: Endpoint,
         move_: bool,
-    ) -> Vec<u64> {
-        let mut ids = Vec::new();
+    ) -> TransferOutcome {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
-        for src in paths {
+
+        // 第一遍只探测、不提交：一批里只要有可续传的，就整批交给用户决策——
+        // 要是先把没冲突的传了，用户选「跳过」时已经动过的那些就收不回来了。
+        let mut partial: Vec<PathBuf> = Vec::new();
+        for src in &paths {
+            let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let to = dest.join(&name);
+            let Some((src_fs, dst_fs, _)) = resolve_transfer_leg(&src_ep, &dest_ep, &local) else {
+                continue;
+            };
+            // 任一头问不到大小（探测失败）就当没有：宁可多传一遍，不可误判成可续。
+            let (Ok(s), Ok(d)) = (src_fs.metadata(src).await, dst_fs.metadata(&to).await) else {
+                continue;
+            };
+            if d.size > 0 && d.size < s.size {
+                partial.push(to);
+            }
+        }
+        if !partial.is_empty() {
+            return TransferOutcome::NeedsResumeConfirmation(Box::new(PendingResume {
+                app: self.clone(),
+                paths,
+                src_ep,
+                dest: dest.to_path_buf(),
+                dest_ep,
+                move_,
+                partial,
+                clear_staging_on_resolve: false,
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for src in &paths {
             let name = src
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let to = dest.join(name);
+            let to = dest.join(&name);
+            let leg = resolve_transfer_leg(&src_ep, &dest_ep, &local);
+            let hid = self
+                .submit_transfer_entry(src, &to, dest, leg, move_, false)
+                .await;
+            ids.push(hid);
+        }
+        TransferOutcome::Started(ids)
+    }
 
-            // 方向决定两端谁读谁写，以及进度条上那个动词怎么说。
-            let remote: Option<TransferLeg> = match (&src_ep, &dest_ep) {
-                (Endpoint::Local, Endpoint::Local) => None,
-                // 远程之间（同一会话内复制）：读整份再写整份。
-                (Endpoint::Remote(f), Endpoint::Remote(g)) => Some((f.clone(), g.clone(), "复制")),
-                // 远程 → 本地：下载。
-                (Endpoint::Remote(f), Endpoint::Local) => Some((f.clone(), local.clone(), "下载")),
-                // 本地 → 远程：上传。
-                (Endpoint::Local, Endpoint::Remote(f)) => Some((local.clone(), f.clone(), "上传")),
+    /// 用户在续传确认卡上选定后的提交入口（见
+    /// [`TransferOutcome::NeedsResumeConfirmation`]）。
+    ///
+    /// * [`ResumeDecision::Resume`]：部分完成的目标走断点续传（是否真续仍由
+    ///   `transfer_tree` 的 `can_resume` 判据把守：目标在两次询问之间被别人
+    ///   动过，就退回改名重传），其余照常；
+    /// * [`ResumeDecision::Rename`]：全部照常——目标已存在会被改名，整份重传；
+    /// * [`ResumeDecision::Skip`]：部分完成的那些**不提交**，其余照常。
+    pub async fn resolve_resume(
+        &self,
+        pending: PendingResume,
+        decision: ResumeDecision,
+    ) -> Vec<u64> {
+        let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
+        let mut ids = Vec::new();
+        for src in &pending.paths {
+            let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
             };
+            let to = pending.dest.join(&name);
+            let is_partial = pending.partial.iter().any(|p| p == &to);
+            if is_partial && decision == ResumeDecision::Skip {
+                continue;
+            }
+            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
+            let resume = is_partial && decision == ResumeDecision::Resume;
+            let hid = self
+                .submit_transfer_entry(src, &to, &pending.dest, leg, pending.move_, resume)
+                .await;
+            ids.push(hid);
+        }
+        if pending.clear_staging_on_resolve && pending.move_ {
+            self.clear_staged();
+        }
+        ids
+    }
 
-            if let Some((src_fs, dst_fs, label)) = remote {
-                let id = self.ops.lock().await.next_id();
-                let op = TransferOperation::new(
+    /// 提交单个条目的传输（远程 leg 走 [`TransferOperation`]，本地对走
+    /// `CopyOperation` / `MoveOperation`）——[`Self::transfer_between`] 与
+    /// [`Self::resolve_resume`] 共用的落点。
+    async fn submit_transfer_entry(
+        &self,
+        src: &Path,
+        to: &Path,
+        dest_dir: &Path,
+        leg: Option<TransferLeg>,
+        move_: bool,
+        resume: bool,
+    ) -> u64 {
+        if let Some((src_fs, dst_fs, label)) = leg {
+            let id = self.ops.lock().await.next_id();
+            let op = if resume {
+                TransferOperation::with_resume(
                     id,
                     src_fs,
                     dst_fs,
-                    src.clone(),
-                    to.clone(),
+                    src.to_path_buf(),
+                    to.to_path_buf(),
+                    TransferOpts {
+                        remove_source: move_,
+                        label: if move_ { "移动" } else { label },
+                        resume: true,
+                    },
+                )
+            } else {
+                TransferOperation::new(
+                    id,
+                    src_fs,
+                    dst_fs,
+                    src.to_path_buf(),
+                    to.to_path_buf(),
                     move_,
                     if move_ { "移动" } else { label },
-                );
-                let hid = self.submit_operation(op).await;
-                self.record_history(
-                    if move_ { "移动" } else { label },
-                    vec![src.clone()],
-                    Some(dest.to_path_buf()),
-                );
-                // ⚠️ 刻意**不** push 可逆项：撤销模型里的路径都是本地路径
-                // （`Reversible::Copy { dest }` 的撤销 = 删掉 dest），对远程端点
-                // 既删不动也删不对，宁可让「撤销」对这一步无效，也不做错事。
-                ids.push(hid);
-                continue;
-            }
-
-            let id = self.ops.lock().await.next_id();
-            let op: SharedOperation = if move_ {
-                MoveOperation::new(id, src.clone(), to.clone())
-            } else {
-                CopyOperation::new(id, src.clone(), to.clone())
+                )
             };
             let hid = self.submit_operation(op).await;
             self.record_history(
-                if move_ { "移动" } else { "复制" },
-                vec![src.clone()],
-                Some(dest.to_path_buf()),
+                if move_ { "移动" } else { label },
+                vec![src.to_path_buf()],
+                Some(dest_dir.to_path_buf()),
             );
-            self.push_reversible(if move_ {
-                Reversible::Move {
-                    from: src,
-                    to: to.clone(),
-                }
-            } else {
-                Reversible::Copy {
-                    src,
-                    dest: to.clone(),
-                }
-            });
-            ids.push(hid);
+            // ⚠️ 刻意**不** push 可逆项：撤销模型里的路径都是本地路径
+            // （`Reversible::Copy { dest }` 的撤销 = 删掉 dest），对远程端点
+            // 既删不动也删不对，宁可让「撤销」对这一步无效，也不做错事。
+            return hid;
         }
-        ids
+
+        let id = self.ops.lock().await.next_id();
+        let op: SharedOperation = if move_ {
+            MoveOperation::new(id, src.to_path_buf(), to.to_path_buf())
+        } else {
+            CopyOperation::new(id, src.to_path_buf(), to.to_path_buf())
+        };
+        let hid = self.submit_operation(op).await;
+        self.record_history(
+            if move_ { "移动" } else { "复制" },
+            vec![src.to_path_buf()],
+            Some(dest_dir.to_path_buf()),
+        );
+        self.push_reversible(if move_ {
+            Reversible::Move {
+                from: src.to_path_buf(),
+                to: to.to_path_buf(),
+            }
+        } else {
+            Reversible::Copy {
+                src: src.to_path_buf(),
+                dest: to.to_path_buf(),
+            }
+        });
+        hid
     }
 
     // ---- 操作历史 ----
@@ -4836,28 +5015,29 @@ impl AppState {
     }
 
     /// 粘贴：`dest` 为空时粘贴到当前目录。
-    pub async fn paste_clipboard(&self, dest: Option<PathBuf>) -> Vec<u64> {
+    pub async fn paste_clipboard(&self, dest: Option<PathBuf>) -> TransferOutcome {
         let clip = self.clipboard.lock().await.clone();
         let Some(clip) = clip else {
-            return Vec::new();
+            return TransferOutcome::Started(Vec::new());
         };
         let dest = match dest.or(self.current_path().await) {
             Some(d) => d,
-            None => return Vec::new(),
+            None => return TransferOutcome::Started(Vec::new()),
         };
         // 粘的是**剪贴板里那批**，与「此刻选中的那批」无关：复制后换了目录、
         // 或者只点了一行，拿 selection 就会粘出错的东西（甚至粘出 0 项）。
         // 源端点同样取自剪贴板（见 [`Clipboard::src`]），目标才是当前浏览的那一端。
         // 剪切走 `transfer_between` 的本地分支：历史与可逆项照记，⌘Z 仍然撤销得动。
         let here = self.endpoint();
-        let ids = self
+        let outcome = self
             .transfer_between(clip.paths, clip.src, &dest, here, clip.cut)
             .await;
-        // 剪切是一次性消耗品：粘贴后清空，避免二次粘贴重复执行。
+        // 剪切是一次性消耗品：粘贴后清空，避免二次粘贴重复执行。等续传决策也照清——
+        // 决策重提走 `pending.paths` 的快照，不再回头看剪贴板。
         if clip.cut {
             *self.clipboard.lock().await = None;
         }
-        ids
+        outcome
     }
 
     // ---------------------------------------------------------------- 暂存区
@@ -4917,7 +5097,7 @@ impl AppState {
     /// `move_` 为真的会在提交后清空清单——源已经不在原处了，留着一批指不到
     /// 文件的条目只会让下一次「粘贴」变成一堆失败。复制则**保留**：往好几个
     /// 目录各放一份正是它的用法。
-    pub async fn paste_staged(&self, dest: Option<PathBuf>, move_: bool) -> Vec<u64> {
+    pub async fn paste_staged(&self, dest: Option<PathBuf>, move_: bool) -> TransferOutcome {
         let paths: Vec<PathBuf> = self
             .staging
             .lock()
@@ -4926,17 +5106,23 @@ impl AppState {
             .map(|e| e.path.clone())
             .collect();
         if paths.is_empty() {
-            return Vec::new();
+            return TransferOutcome::Started(Vec::new());
         }
         let dest = match dest.or(self.current_path().await) {
             Some(d) => d,
-            None => return Vec::new(),
+            None => return TransferOutcome::Started(Vec::new()),
         };
-        let ids = self.transfer(paths, &dest, move_).await;
-        if move_ {
+        let mut outcome = self.transfer(paths, &dest, move_).await;
+        if let TransferOutcome::NeedsResumeConfirmation(p) = &mut outcome {
+            // 等决策期间暂存区先留着（决策要从 pending.paths 重提）；置位让
+            // `resolve_resume` 在提交后清掉——移动的源已经不在了，留着只会让
+            // 下一次「粘贴」变成一堆失败。
+            p.clear_staging_on_resolve = true;
+        }
+        if move_ && outcome.is_started() {
             self.clear_staged();
         }
-        ids
+        outcome
     }
 
     /// 磁盘用量分析：统计 `root` 的**每个直接子目录**的递归大小。
