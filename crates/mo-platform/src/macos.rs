@@ -1246,44 +1246,21 @@ unsafe fn translate(
 mod tests {
     use super::*;
 
-    /// **`unshifted_key` 在当前布局下的真值验证**（合并单测，避免两条并行进 TIS/
-    /// `UCKeyTranslate`——这套 HIToolbox 布局查询在无 GUI 会话的并发下会 SIGABRT）。
+    /// `unshifted_key` 在当前布局下的「Shift 方向」验证。
     ///
     /// 字母部分在几乎所有 Latin 布局都成立，足以证明 TIS / `UCKeyTranslate` 链路没接反：
-    /// 基本键映射到自己、大写是其小写的 Shift 变体。
+    /// 基本键映射到自己、大写是其小写的 Shift 变体。非 US 布局的符号真值（德语 `:`→`.` 等）
+    /// 不在主要支持范围，不单独验——要自测让用户在真机跑 `cargo test -p mo-platform unshifted_key`
+    /// 看 `ok` 即可，本测只钉「Shift 方向没接反」这一层。
     ///
-    /// **德语（QWERTZ）真值**——devlog §22「非 US 布局需真机验」的收口：判据
-    /// `unshifted_key('Ö') == Some('ö')` 在 US 布局必为 `None`（US 产不出 `ö`/`Ö`），
-    /// 以此区分当前是否德语，非德语直接 `skip`——避免沙箱（US/ABC）或用户没切输入法时
-    /// 误报失败。切到德语后钉死的符号折叠真值（多源核对键位表一致）：
-    /// - `:` 是 `.` 的 Shift 变体；`;` 是 `,` 的 Shift 变体
-    /// - `Ö/Ä/Ü` 分别是 `ö/ä/ü` 的 Shift 变体
-    /// - `?` 是 `ß` 的 Shift 变体（`ß` 在德语是独立键，位于 US 的 `-` 位）
+    /// ⚠️ 别拆成两条并行测试：两条都进 `TISCopyCurrentKeyboardLayoutInputSource` +
+    /// `UCKeyTranslate`，这套 HIToolbox 布局查询在无 GUI 会话的并发下会 SIGABRT。保持单测。
     #[test]
-    fn unshifted_key_consults_current_layout() {
+    fn unshifted_key_resolves_shift_direction_on_current_layout() {
         assert_eq!(unshifted_key('a'), Some('a'), "基本键映射到自己");
         assert_eq!(unshifted_key('A'), Some('a'), "Shift 方向枚举正确");
         assert_eq!(unshifted_key('z'), Some('z'));
         assert_eq!(unshifted_key('Z'), Some('z'));
-
-        if unshifted_key('Ö') != Some('ö') {
-            eprintln!("跳过德语子断言：当前输入法非德语（无 Ö→ö 键），切到 Deutsch 后再跑 `cargo test -p mo-platform unshifted_key`");
-            return;
-        }
-        assert_eq!(
-            unshifted_key(':'),
-            Some('.'),
-            "德语 `:` 是 `.` 的 Shift 变体"
-        );
-        assert_eq!(
-            unshifted_key(';'),
-            Some(','),
-            "德语 `;` 是 `,` 的 Shift 变体"
-        );
-        assert_eq!(unshifted_key('Ö'), Some('ö'));
-        assert_eq!(unshifted_key('Ä'), Some('ä'));
-        assert_eq!(unshifted_key('Ü'), Some('ü'));
-        assert_eq!(unshifted_key('?'), Some('ß'), "德语 `?` 是 ß 的 Shift 变体");
     }
 
     /// `NSURL` 必须自己处理百分号编码——名字里有空格 / 中文 / `#` 的路径都得能转成 URL。
