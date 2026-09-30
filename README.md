@@ -223,13 +223,13 @@ notes.md
 
 #### 🆚 双栏差异着色
 
-开了分栏（双窗格）后，`⌘⌥C` 比对两侧目录，差异直接**染在各自的列表行上**而不是生成一份中立报告：
+开了分栏（双窗格）后，`⌘⌥D` 比对两侧目录，差异直接**染在各自的列表行上**而不是生成一份中立报告：
 
 * 仅某一侧有 → 蓝色（只染那一侧，另一侧根本没这一行，不凭空造记录）
 * 两侧都有但内容不同 → 橙色（两侧都染）
 * 相同 → 不染（否则整屏都涂满反而看不见差异）
 
-`⌘⌥↓` / `⌘⌥↑` 在差异间跳转，图例条常驻状态栏上方、可一键关闭。
+`⌘⇧↓` / `⌘⇧↑` 在差异间跳转，图例条常驻状态栏上方、可一键关闭。
 
 #### 🔎 内容搜索（grep）
 
@@ -509,10 +509,11 @@ Mo 只有一个「废纸篓」。无论从哪里删除——⌘⌫、右键「�
 | 平台 | 删除后的落点 | 还原由谁负责 |
 |---|---|---|
 | macOS | 系统废纸篓（`~/.Trash`；外接卷 / 网络盘就地进该卷自己的废纸篓，不搬回本机） | Mo 的删除账本 |
-| Windows / Linux | 系统回收站（计划中，见 Roadmap 第五阶段） | 系统本身 |
+| Windows | 系统回收站（`IFileOperation`，落点各卷 `$Recycle.Bin\<SID>\$R<名>`，配对 `$I` 元数据由 Mo 一并维护） | Mo 的删除账本 |
+| Linux | Mo 自管回收站（系统回收站暂未接入，见 Roadmap 第五阶段） | Mo 本身（含账本） |
 
-macOS 上的工作方式：删除时由**系统**把文件搬进废纸篓（重名自动改名、跨卷
-落点都按系统语义处理），Mo 在旁边记一笔账——文件现在在哪、原来在哪。所以：
+macOS / Windows 上的工作方式：删除时由**系统**把文件搬进废纸篓（重名自动改名、
+跨卷落点都按系统语义处理），Mo 在旁边记一笔账——文件现在在哪、原来在哪。所以：
 
 * 在 Finder 的废纸篓里能看到 Mo 删的文件，Finder 的「清倒废纸篓」也照常
   生效（对应条目的磁盘空间被释放）；
@@ -597,7 +598,7 @@ Mo 提供完整的快捷键系统，但不会要求用户遵循某一种特定�
 | 任意字母 / 数字      | 在当前目录即时过滤       |
 | `Backspace`      | 删除过滤词最后一个字符    |
 | `Esc`            | 清除过滤 / 关闭面板     |
-| `Delete`         | 删除选中项           |
+| `⌘⌫`（macOS）/ `Delete`（Win / Linux） | 移到废纸篓（裸 ⌫ 永不删除） |
 
 所有快捷键最终都应该支持自定义。
 
@@ -607,9 +608,9 @@ Mo 提供完整的快捷键系统，但不会要求用户遵循某一种特定�
 
 | 平台      | 状态     |
 | ------- | ------ |
-| Windows | 🚧 开发中 |
-| macOS   | 🚧 开发中 |
-| Linux   | 🚧 开发中 |
+| macOS   | 🚧 开发中（平台层已落地：系统废纸篓 / 在访达中显示 / 推出卷宗 / 系统图标 / 文件剪贴板 / 拖出） |
+| Windows | 🚧 开发中（平台层大部分落地：系统回收站 / 在资源管理器中显示 / 拖入拖出 / 文件剪贴板，见 [devlog/windows-port.md](devlog/windows-port.md)） |
+| Linux   | 🚧 开发中（可构建运行；平台集成少，回收站等退回 Mo 自管实现） |
 
 ---
 
@@ -620,8 +621,8 @@ Mo 采用面向性能的原生架构。
 | 部分    | 技术       |
 | ----- | -------- |
 | 核心语言  | Rust     |
-| UI    | GPUI     |
-| 异步运行时 | Tokio    |
+| UI    | GPUI（自有执行器） |
+| 异步运行时 | Tokio（后台阻塞 IO） |
 | 数据库   | SQLite   |
 | 搜索    | 待定       |
 | 文件监听  | 平台原生 API |
@@ -661,8 +662,11 @@ cargo build
 ### 运行
 
 ```bash
-cargo run
+cargo run --bin mo
 ```
+
+> 仓库根是 virtual workspace，直接 `cargo run` 会报「could not determine which
+> binary to run」——可执行目标名为 `mo`（`crates/mo-ui`）。
 
 ### 测试与基准
 
@@ -701,7 +705,7 @@ cargo bench                # 性能基准（criterion）
 * [x] ✨ 文件 / 文件夹属性与权限编辑（⌘I：名称 + 九位权限位）
 * [x] ✨ 回收站（移到废纸篓，而非永久删除）
 * [x] ✨ 批量重命名（查找替换 / 前后缀 / 序号，带实时预览）
-* [x] ✨ 压缩 / 解压（zip / tar / tar.gz 创建与解压；7z 不自带编码器，未支持）
+* [x] ✨ 压缩 / 解压（zip / tar / tar.gz 创建与解压；7z / rar / tar.bz2 / tar.xz 解压走外部工具 `7z` / `tar`，缺失时提示安装，不内置编码器）
 
 ### 第二阶段：性能
 
@@ -745,10 +749,11 @@ cargo bench                # 性能基准（criterion）
 
 ### 第五阶段：完善
 
-* [ ] Windows
+* [ ] Windows（已落地大量平台层：系统回收站 / 拖入拖出 / 剪贴板 / 键盘布局，见
+      [devlog/windows-port.md](devlog/windows-port.md)；安装包等收尾未做）
 * [ ] macOS（已落地：`mo-platform`——系统废纸篓 / 在访达中显示 / 推出卷宗，见
-      [devlog/macOS 平台层](devlog/macos-platform.md) §7–9）
-* [ ] Linux
+      [devlog/macos-platform.md](devlog/macos-platform.md) §7–9）
+* [ ] Linux（可构建运行、headless 测试三平台跑过；系统回收站等平台集成未做）
 * [ ] 性能优化
 * [ ] 无障碍支持
 * [ ] 完整文档
@@ -762,10 +767,16 @@ cargo bench                # 性能基准（criterion）
 
 * [GPUI 布局与交互](devlog/gpui-layout-and-interaction.md)——flex 布局、uniform_list、元素 ID 与点击、双击、快捷键等
 * [macOS 平台层](devlog/macos-platform.md)——红绿灯定位、⌘Q、Dock 图标、objc FFI
+* [Windows 移植](devlog/windows-port.md)——IFileOperation 回收站、拖入拖出、CREATE_NO_WINDOW、键盘布局
+* [远程传输](devlog/remote-transfer.md)——跨后端复制/移动、冲突对话框、断点续传
+* [统一回收站](devlog/trash-unify.md)——系统废纸篓 + Mo 账本双模式、`$I` 元数据维护
 * [构建与依赖](devlog/build-and-lints.md)——future-incompat 补丁、workspace lints
 * [异步与运行时](devlog/async-runtime.md)——后台任务洪泛饿死 UI、取数落地前的有效性校验
 * [引擎逻辑与测试方法](devlog/engine-testing.md)——headless 布局测试、通用算法陷阱
 * [自定义系统](devlog/customization.md)——配置文件 BOM 静默失效、主题取色的全局槽位、深色档语义色
+
+其余主题（搜索、选择、分组、图标管线、预览、传输角标、工作流、插件系统等）见
+[devlog/](devlog/) 目录与其 [README.md](devlog/README.md)。
 
 这类结论从零调试一遍往往要花掉几小时，但写下来只需几分钟——无论是后来的贡献者还是几个月后的自己，遇到同类问题时都可以直接查证。修好新的坑请随手追加到对应主题文件（格式见 [devlog/README.md](devlog/README.md)）。
 
