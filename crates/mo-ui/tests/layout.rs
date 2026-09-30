@@ -453,13 +453,16 @@ fn seed_ops_until_visible<O: mo_operations::Operation + Clone + 'static>(
     cx: &mut TestAppContext,
     ops: &[O],
 ) {
-    for _ in 0..20 {
+    // 每轮之间让出 5ms：与 wait_for_panel_rows 同一个教训——不 sleep 的重试
+    // 在并行负载下毫秒级烧完，事件泵还没被 OS 排上。
+    for _ in 0..60 {
         seed_ops(window, cx, ops.to_vec());
         vcx.run_until_parked();
         vcx.update(|window, cx| window.render_frame(cx));
         if vcx.debug_bounds("mo-ops-badge").is_some() {
             return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     panic!("种入操作后任务卡片始终没有出现（事件丢失且重试无效）");
 }
@@ -825,9 +828,20 @@ fn clicking_a_sidebar_bookmark_opens_that_folder(cx: &mut TestAppContext) {
 
     bounds(&mut vcx, "mo-sidebar-bm-0");
 
-    vcx.update(|window, cx| window.click("sidebar-bm-0", cx));
+    // 点书签 → 等 ≈1s → 没切过去就再点。单颗点击偶尔会整颗丢掉：down 与 up
+    // 之间后台泵（图标 / 刷新）notify 触发行回流，up 落到行外——gpui 的 click
+    // 语义要求 down/up 同元素。真机键盘不存在这种时序，测试工具的合成事件会
+    // 撞上；重试即可，干等是没用的（那是「点了但没导航」不是「导航还没回来」）。
+    let mut ok = false;
+    for _ in 0..5 {
+        vcx.update(|window, cx| window.click("sidebar-bm-0", cx));
+        if wait_for_panel_rows_within(&mut vcx, &window, cx, 3, 200) {
+            ok = true;
+            break;
+        }
+    }
     assert!(
-        wait_for_panel_rows(&mut vcx, &window, cx, 3),
+        ok,
         "点了书签行，那 3 个文件没画出来：要么这行点不到，要么导航没生效"
     );
     // 行数相等不够——Home 恰好也是 3 行的话就白过了。落点必须是书签本身。
@@ -880,14 +894,29 @@ fn selection_count(window: &WindowHandle<RootView>, cx: &mut TestAppContext) -> 
 /// 4. 还没就绪就 `sleep` 让出 CPU——并行负载下那条 spawn_blocking 线程被 worker 池饿死，
 ///    `run_until_parked` 会瞬间空转返回；让 OS 先跑完真读盘，下一轮才能查到（原先 100 轮
 ///    在几百个并行测试抢线程时毫秒级空转完、真 IO 还没回来，于是假红）。
-/// 5. 轮数提到 600（≈3s 真实等待上限），给足被饿 IO 的时间。
+/// 5. **自适应退避**：前 200 轮 5ms（≈1s，健康路径的常态预算），之后每轮 20ms、
+///    再给 1400 轮（≈28s 尾部预算）——被饿 IO 在重负载下可能要好几秒才轮到，
+///    3s 的旧上限就是假红的来源（实测 1/5）；健康路径完全不受影响。
 fn wait_for_panel_rows(
     vcx: &mut VisualTestContext,
     window: &WindowHandle<RootView>,
     cx: &mut TestAppContext,
     want_rows: usize,
 ) -> bool {
-    for _ in 0..600 {
+    wait_for_panel_rows_within(vcx, window, cx, want_rows, 1600)
+}
+
+/// [`wait_for_panel_rows`] 的可调预算版：短预算（≈1s）给「点击后可能要重试」
+/// 的调用方——点击偶尔会整颗丢掉（down 与 up 之间后台泵 notify 触发行回流，
+/// up 落到了行外），干等是无用的，得重新点。失败时打印现场诊断。
+fn wait_for_panel_rows_within(
+    vcx: &mut VisualTestContext,
+    window: &WindowHandle<RootView>,
+    cx: &mut TestAppContext,
+    want_rows: usize,
+    iters: usize,
+) -> bool {
+    for i in 0..iters {
         vcx.run_until_parked();
         vcx.update(|window, cx| window.render_frame(cx));
         vcx.run_until_parked();
@@ -899,14 +928,15 @@ fn wait_for_panel_rows(
         if ready {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let backoff = std::time::Duration::from_millis(if i < 200 { 5 } else { 20 });
+        std::thread::sleep(backoff);
     }
     let diag = window
         .update(cx, |root, _window, _cx| {
             mo_ui::panel_readiness_debug_for_tests(root, want_rows)
         })
         .unwrap_or_else(|_| "window-handle-closed".to_string());
-    eprintln!("[wait_for_panel_rows] TIMEOUT after 600 iters (~3s): {diag}");
+    eprintln!("[wait_for_panel_rows] TIMEOUT after {iters} iters: {diag}");
     false
 }
 
@@ -1481,15 +1511,16 @@ fn trash_zebra_fill_requests_its_own_second_frame(cx: &mut TestAppContext) {
 /// 见 devlog/engine-testing.md §9）。
 ///
 /// 每轮同样在 `render_frame` 后多 `run_until_parked` 一次，且没就绪就 `sleep` 让出 CPU
-/// （并行负载下真磁盘读被 worker 池饿死，`run_until_parked` 会瞬间空转返回）；轮数提到
-/// 600 给足被饿 IO 的时间。返回值交给调用方断言，失败时能报出实际看到什么。
+/// （并行负载下真磁盘读被 worker 池饿死，`run_until_parked` 会瞬间空转返回）；
+/// 与 [`wait_for_panel_rows`] 同一套自适应退避——前 200 轮 5ms、尾部 20ms×1400，
+/// 健康路径不变、被饿 IO 有 ~29s 预算。返回值交给调用方断言，失败时能报出实际看到什么。
 fn wait_for_trash_state(
     vcx: &mut VisualTestContext,
     window: &WindowHandle<RootView>,
     want: (usize, bool),
 ) -> (usize, bool) {
     let mut last = (0, false);
-    for _ in 0..600 {
+    for i in 0..1600 {
         vcx.run_until_parked();
         vcx.update(|window, cx| window.render_frame(cx));
         vcx.run_until_parked();
@@ -1501,7 +1532,8 @@ fn wait_for_trash_state(
         if last == want {
             return last;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let backoff = std::time::Duration::from_millis(if i < 200 { 5 } else { 20 });
+        std::thread::sleep(backoff);
     }
     last
 }

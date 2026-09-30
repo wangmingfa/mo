@@ -3597,13 +3597,16 @@ impl RootView {
             .debug_selector(|| "mo-connect-field".to_string());
         if let Some(state) = &self.connect_input {
             field = field.child(
+                // 自然高 slot：Input 保持 24px 原始高，由 28px 外框的 items_center
+                // 垂直居中（上下各留 2px）。之前这里是 h_full——Input 若被拉满，
+                // 文字按它自己的行盒画在顶部（真机 5px 偏移，命令面板搜索框同
+                // 根因）。带 selector 是给 headless 量「上下留白对称」用。
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                    .debug_selector(|| "mo-connect-input-box".to_string())
                     .flex_1()
                     .min_w(px(0.0))
-                    .h_full()
+                    .flex()
+                    .items_center()
                     .child(
                         Input::new(state)
                             .appearance(false)
@@ -3991,14 +3994,14 @@ impl RootView {
             // 测试用（release no-op）：定位用户名 / 密码框。
             .debug_selector(move || id.to_string());
         if let Some(state) = state {
+            // 自然高 slot：与 [`Self::render_connect`] 的地址框同一套居中纪律。
             field = field.child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                    .debug_selector(move || format!("{id}-box"))
                     .flex_1()
                     .min_w(px(0.0))
-                    .h_full()
+                    .flex()
+                    .items_center()
                     .child(
                         Input::new(state)
                             .appearance(false)
@@ -14266,7 +14269,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, Context, Entity, Focusable as _, TestAppContext};
+    use gpui_kit::{px, Context, Entity, Focusable as _, TestAppContext, VisualTestContext};
     use mo_app::AppState;
 
     use super::{
@@ -15357,6 +15360,71 @@ mod tests {
                  排到地址后面了？"
             );
         }
+    }
+
+    /// 地址框里的文字要**垂直居中**：Input 保持 24px 自然高、由 28px 外框的
+    /// items_center 居中（上下各留 2px）——被 h_full 拉满时文字按它自己的行盒
+    /// 画在顶部（真机 5px 偏移，与命令面板搜索框同根因）。文本字形不进
+    /// `painted_quads()`，headless 直接量自然高 slot 的落位：上下留白必须对称。
+    /// 认证弹窗的两个框共用 [`Self::auth_field`]，同一套断言。
+    #[test]
+    fn connect_field_text_is_vertically_centered() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_connect_dialog(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_input_box_centered(cx, "mo-connect-field", "mo-connect-input-box");
+
+        // 认证弹窗两个框同一套纪律（生产路径见 `on_connect_result`，直接摆好
+        // 「服务器要凭据」那一刻的状态）。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.connect_auth = Some(ConnectAuthState::new(
+                    "ftp://example.com:2121".to_string(),
+                    None,
+                    "",
+                ));
+                v.modal = Modal::ConnectAuth;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_input_box_centered(cx, "mo-connect-user", "mo-connect-user-box");
+        assert_input_box_centered(cx, "mo-connect-pass", "mo-connect-pass-box");
+    }
+
+    /// 断言一个「28px 外框 + 24px 自然高输入 slot」的上下留白对称（各 2px）。
+    /// 上 0 下 4 就是 slot 被拉满/贴顶——文字会画在行盒顶部。
+    fn assert_input_box_centered(
+        vcx: &mut VisualTestContext,
+        field_sel: &'static str,
+        box_sel: &'static str,
+    ) {
+        let field = vcx
+            .debug_bounds(field_sel)
+            .unwrap_or_else(|| panic!("{field_sel} 没有渲染出来"));
+        let b = vcx
+            .debug_bounds(box_sel)
+            .unwrap_or_else(|| panic!("{box_sel} 没有渲染出来"));
+        let fh = f32::from(field.size.height);
+        let bh = f32::from(b.size.height);
+        // 输入框保持自然高，没被拉满。
+        assert!(
+            bh < fh - 1.0,
+            "{box_sel} 被拉满了（{bh} ≈ 框高 {fh}）——Input 会把文字画在行盒顶部"
+        );
+        let top = f32::from(b.origin.y) - f32::from(field.origin.y);
+        let bottom = (f32::from(field.origin.y) + fh) - (f32::from(b.origin.y) + bh);
+        assert!(
+            (top - bottom).abs() <= 0.75 && top > 0.0,
+            "{box_sel} 上下留白不对称：上 {top} / 下 {bottom}——文字不居中\
+             （贴顶时上≈0、下≈4）"
+        );
     }
 
     /// 「使用说明」默认折叠，点一下展开各协议写法（再点一下收起）。
