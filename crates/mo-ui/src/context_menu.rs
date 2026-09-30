@@ -836,11 +836,13 @@ mod tests {
             let p = format!("/tmp/{name}");
             assert!(looks_like_archive(Path::new(&p)), "{name} 应当被识别为归档");
         }
+        // 这些现在归外部工具家族（7z / tar），`is_extractable` 该认——菜单给
+        // 「解压」，工具没装时由 `extract_archive` 当场说人话（见 archive.rs）。
         for name in ["x.tar.bz2", "x.tar.xz", "x.7z", "x.rar"] {
             let p = format!("/tmp/{name}");
             assert!(
-                !looks_like_archive(Path::new(&p)),
-                "{name} 解不开，不该给「解压」这一项"
+                looks_like_archive(Path::new(&p)),
+                "{name} 现在可经外部工具解压，应当给「解压」这一项"
             );
         }
     }

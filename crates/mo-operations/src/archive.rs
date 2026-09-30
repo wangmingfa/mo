@@ -1,7 +1,9 @@
 //! archive：压缩与解压。
 //!
-//! 支持 zip（deflate）、tar、tar.gz；7z / rar 等由外部工具负责，
-//! 这里只做**不引入额外 native 依赖**就能覆盖的格式。
+//! 内置（无额外 native 依赖）覆盖 zip（deflate）、tar、tar.gz；
+//! 7z / rar / tar.bz2 / tar.xz 等交给外部工具（7-Zip / 系统 tar），
+//! 见 [`extract_external`]。`is_extractable` 对这两类都返回 `true`，
+//! 工具不存在时由 `extract_archive` 当场说人话（指明装哪个）。
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -36,6 +38,55 @@ impl ArchiveFormat {
             ArchiveFormat::TarGz => "tar.gz",
         }
     }
+}
+
+/// 需要**外部工具**才能解的格式（Rust 原生库覆盖不到）。
+///
+/// 与 [`ArchiveFormat`]（内置）是两条判据，按扩展名分派，不探测工具是否存在——
+/// 探测放在真正解压时（`extract_external`），这样菜单该不该给「解压」不随用户
+/// 有没有装 7z 而闪烁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalFormat {
+    /// 7z / rar 等：交给 7-Zip（`7z` / `7za`）。
+    SevenZip,
+    /// tar.bz2 / tar.xz 等：交给系统 `tar`（libarchive 通常已支持 bz2/xz）。
+    Bsdtar,
+}
+
+impl ExternalFormat {
+    /// 该格式在哪些候选二进制名下能解（按优先级试）。
+    pub fn binaries(&self) -> &'static [&'static str] {
+        match self {
+            ExternalFormat::SevenZip => &["7z", "7za"],
+            ExternalFormat::Bsdtar => &["tar"],
+        }
+    }
+
+    /// 没装工具时，提示用户去装哪一个（说人话，别只报退出码）。
+    pub fn tool_hint(&self) -> &'static str {
+        match self {
+            ExternalFormat::SevenZip => "7-Zip（命令 `7z` / `7za`）",
+            ExternalFormat::Bsdtar => "系统 `tar`（libarchive 版）",
+        }
+    }
+}
+
+/// 按扩展名判断一个归档是否**需要外部工具**解（不看内容、不探测工具是否存在）。
+pub fn external_extract_format(path: &Path) -> Option<ExternalFormat> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())?;
+    if name.ends_with(".7z") || name.ends_with(".rar") {
+        return Some(ExternalFormat::SevenZip);
+    }
+    if name.ends_with(".tar.bz2")
+        || name.ends_with(".tbz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".txz")
+    {
+        return Some(ExternalFormat::Bsdtar);
+    }
+    None
 }
 
 /// 把 `sources` 打包进 `dest`。
@@ -140,9 +191,10 @@ pub fn extract_format(path: &Path) -> Option<ArchiveFormat> {
     None
 }
 
-/// 右键菜单 / 命令面板「要不要给解压这一项」用同一条判据（[`extract_format`]）。
+/// 右键菜单 / 命令面板「要不要给解压这一项」用同一条判据（[`extract_format`] +
+/// [`external_extract_format`]）：内置解得开、或外部工具解得开的格式都给这一项。
 pub fn is_extractable(path: &Path) -> bool {
-    extract_format(path).is_some()
+    extract_format(path).is_some() || external_extract_format(path).is_some()
 }
 
 /// 报错里要指名道姓「是哪个格式」——只说「不支持」等于没说。
@@ -160,23 +212,27 @@ fn archive_suffix(path: &Path) -> String {
     name.rsplit('.').next().unwrap_or(&name).to_string()
 }
 
-/// 解压 `archive` 到 `dest`（自动识别 zip / tar / tar.gz）。
+/// 解压 `archive` 到 `dest`。
 ///
-/// 认不出的格式**当场报错**（列出支持的那些），不往下试：往下试只会拿到底层
-/// 库的一句「不是 tar / 不是 zip」，用户看不懂也不知道该怎么办。
+/// 先认内置格式（zip / tar / tar.gz），再认外部工具格式（7z / rar / tar.bz2 /
+/// tar.xz），都不中才**当场报错**（列出支持的那些）。不往下试内置库：把 `.7z`
+/// 丢给 tar 只会得到一句看不懂的「不是 tar」（2026-09-29 用户报的胡话）。
 pub fn extract_archive(archive: &Path, dest: &Path) -> Result<usize, MoError> {
-    let Some(fmt) = extract_format(archive) else {
-        return Err(MoError::Other(format!(
-            "暂不支持解压 {}（目前支持 zip / tar / tar.gz / tgz）",
-            archive_suffix(archive)
-        )));
-    };
-    std::fs::create_dir_all(dest).map_err(MoError::Io)?;
-    match fmt {
-        ArchiveFormat::Zip => extract_zip(archive, dest),
-        ArchiveFormat::Tar => extract_tar(archive, dest, false),
-        ArchiveFormat::TarGz => extract_tar(archive, dest, true),
+    if let Some(fmt) = extract_format(archive) {
+        std::fs::create_dir_all(dest).map_err(MoError::Io)?;
+        return match fmt {
+            ArchiveFormat::Zip => extract_zip(archive, dest),
+            ArchiveFormat::Tar => extract_tar(archive, dest, false),
+            ArchiveFormat::TarGz => extract_tar(archive, dest, true),
+        };
     }
+    if let Some(fmt) = external_extract_format(archive) {
+        return extract_external(archive, dest, fmt);
+    }
+    Err(MoError::Other(format!(
+        "暂不支持解压 {}（目前支持 zip / tar / tar.gz / tgz，以及 7z / rar / tar.bz2 / tar.xz（需安装外部工具））",
+        archive_suffix(archive)
+    )))
 }
 
 fn extract_zip(archive: &Path, dest: &Path) -> Result<usize, MoError> {
@@ -221,6 +277,69 @@ fn extract_tar(archive: &Path, dest: &Path, gzip: bool) -> Result<usize, MoError
     Ok(count)
 }
 
+/// 借外部工具解压（7z / rar / tar.bz2 / tar.xz 等 Rust 库覆盖不到的格式）。
+///
+/// 安全：归档路径与目标目录都是 `Command` 的**独立参数**（OsString），绝不拼进
+/// shell——路径含空格、中文也安全，且无命令注入风险。调用方在 `spawn_blocking`
+/// 里跑，不阻塞 GPUI 执行器。Windows 上加 `CREATE_NO_WINDOW` 避免 GUI 应用弹出
+/// 黑框（见 `windows-port.md` §11）。
+fn extract_external(archive: &Path, dest: &Path, fmt: ExternalFormat) -> Result<usize, MoError> {
+    std::fs::create_dir_all(dest).map_err(MoError::Io)?;
+    for bin in fmt.binaries() {
+        let mut cmd = std::process::Command::new(bin);
+        match fmt {
+            ExternalFormat::SevenZip => {
+                // `x` = 按归档内结构解压（不套一层根目录）；`-y` = 全部确认；
+                // `-o` 与路径**紧挨无空格**（7z 语法）。
+                cmd.arg("x")
+                    .arg(archive)
+                    .arg(format!("-o{}", dest.display()))
+                    .arg("-y");
+            }
+            ExternalFormat::Bsdtar => {
+                cmd.arg("-xf").arg(archive).arg("-C").arg(dest);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => return Ok(1),
+            Ok(out) => {
+                let msg = String::from_utf8_lossy(&out.stderr);
+                return Err(MoError::Other(format!(
+                    "用 {} 解压 {} 失败（退出码 {}）：{}",
+                    bin,
+                    archive.display(),
+                    out.status,
+                    first_lines(&msg, 3)
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue; // 试下一个候选二进制（如 7z 不在就试 7za）
+            }
+            Err(e) => return Err(MoError::Other(format!("启动 {} 失败：{e}", bin))),
+        }
+    }
+    Err(MoError::Other(format!(
+        "找不到能解压 {} 的工具 {}。请先安装 {}，再重试这一操作（内置只覆盖 zip/tar/tar.gz/tgz）。",
+        archive_suffix(archive),
+        fmt.tool_hint(),
+        fmt.tool_hint()
+    )))
+}
+
+/// 取一段报错文本的前几行，避免把外部工具的一大坨 stderr 全塞进界面提示。
+fn first_lines(s: &str, n: usize) -> String {
+    s.lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 归档内的相对名（相对于打包条目的父目录）。
 fn relative_name(path: &Path, base: &Path) -> String {
     path.strip_prefix(base)
@@ -260,32 +379,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
     }
 
-    /// 解不开的格式要**指名道姓**地说，不能拿底层库那句「不是 tar」糊弄过去
-    /// （用户报的胡话：`.7z` / `.tar.bz2` 原先都掉进 tar 分支）。
+    /// 外部工具格式（7z / rar / tar.bz2 / tar.xz）现在归可解家族：菜单该给
+    /// 「解压」，且按扩展名分派到正确的工具（不探测可用性，避免菜单闪烁）。
     #[test]
-    fn unsupported_formats_say_which_one() {
-        let dir = fixture("unsupported");
-        for (name, want) in [
-            ("pack.7z", "7z"),
-            ("pack.rar", "rar"),
-            ("pack.tar.bz2", "tar.bz2"),
-            ("pack.tar.xz", "tar.xz"),
-        ] {
-            let p = dir.join(name);
-            std::fs::write(&p, b"not really an archive").unwrap();
-            assert!(!is_extractable(&p), "{name} 不该被当成解得开的");
-            let err = extract_archive(&p, &dir.join("out"))
-                .expect_err("{name} 该报错")
-                .to_string();
+    fn external_formats_are_now_recognized() {
+        assert_eq!(
+            external_extract_format(Path::new("a.7z")),
+            Some(ExternalFormat::SevenZip)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.rar")),
+            Some(ExternalFormat::SevenZip)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.tar.bz2")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.tbz2")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.tar.xz")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.txz")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        assert_eq!(
+            external_extract_format(Path::new("a.zip")),
+            None,
+            "内置格式不走外部分支"
+        );
+        for name in ["a.7z", "a.rar", "a.tar.bz2", "a.tar.xz", "a.tbz2", "a.txz"] {
             assert!(
-                err.contains(want),
-                "报错要写明是哪个格式：{want} 不在「{err}」里"
-            );
-            assert!(
-                err.contains("zip / tar / tar.gz / tgz"),
-                "报错要列出支持的格式：{err}"
+                is_extractable(Path::new(name)),
+                "{name} 现在该经外部工具解压"
             );
         }
+    }
+
+    /// 真正不认识的格式仍要**指名道姓**地说（§33 的反向验证精神保留）：
+    /// `.7z` 等已经改走外部工具，这里用 `.zzz` 守「完全不认识」这一支。
+    #[test]
+    fn truly_unknown_format_still_says_which_one() {
+        let dir = fixture("unknown");
+        let p = dir.join("pack.zzz");
+        std::fs::write(&p, b"not really an archive").unwrap();
+        assert!(!is_extractable(&p), "完全不认识的格式不该给解压");
+        let err = extract_archive(&p, &dir.join("out"))
+            .expect_err("该报错")
+            .to_string();
+        assert!(err.contains("zzz"), "报错要写明是哪个格式：{err}");
+        assert!(
+            err.contains("zip / tar / tar.gz / tgz"),
+            "报错要列出支持的格式：{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

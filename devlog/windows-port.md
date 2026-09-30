@@ -403,3 +403,32 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   `is_extractable`（解不开就不给这一项），`extract_archive` 认不出就当场报错
   并列出支持的格式；UI 的解压结果带上失败原因。
 * 要不要真接外部工具（`7z` / `bsdtar`）另说——那是新依赖 + 进程调用，不在这一刀里。
+
+### §34：压缩接外部工具解 7z / rar / tar.bz2 / tar.xz（2026-09-30）
+
+* **现象**：§33 把 `.7z` / `.rar` / `.tar.bz2` / `.tar.xz` 一律报「暂不支持」，右键
+  菜单也不给「解压」。用户选「功能补全」把这个缺口补上——Rust 原生库覆盖不到的
+  格式交给外部工具（7-Zip / 系统 tar）。仍**不引新依赖**：`std::process::Command` 足矣。
+* **判据收口（三条解压判据，不合并）**：`extract_format`（内置 zip/tar/tar.gz/tgz）
+  与新增的 `external_extract_format`（7z/rar→`ExternalFormat::SevenZip`；tar.bz2/
+  tar.xz→`ExternalFormat::Bsdtar`）是独立两条，都汇进 `is_extractable`。打包那侧
+  的 `ArchiveFormat::from_path` 仍是第三条、不掺和（§33 的纪律不变）。
+* **`extract_external` 的写法**：`Command` 的 **args 数组**（归档路径与目标目录都是
+  独立 `OsString`，绝不拼进 shell）——路径含空格、中文安全，且无命令注入。7z 用
+  `x <归档> -o<目标> -y`（`-o` 与路径紧挨无空格）；tar 用 `-xf <归档> -C <目标>`。
+  Windows 加 `CREATE_NO_WINDOW` 防 GUI 应用弹黑框（§11 同一条）。整条落在
+  `AppState::extract_archive` 的 `spawn_blocking` 里，不碰 GPUI 执行器。
+* **工具不在怎么办**：候选二进制逐个试（`7z`→`7za`；`tar`），`spawn` 报 `NotFound` 就
+  试下一个；全找不到才报错，且**指名道姓**——「找不到能解压 tar.xz 的工具
+  系统 \`tar\`（libarchive 版），请先安装 …」（不复活底层退出码那句天书）。退出非 0
+  取 stderr 前 3 行夹进提示，不把整坨输出塞进界面。
+* **`is_extractable` 不探测工具存在**：基于扩展名判，菜单该不该给「解压」不随用户
+  有没有装 7z 而闪烁；真解不开时由 `extract_archive` 当场说人话（上面那条）。
+* **测试**：`mo-operations` 34 单测全绿——`external_formats_are_now_recognized`
+  （外部家族映射正确、现可被识别）+ `truly_unknown_format_still_says_which_one`
+  （`.zzz` 这种完全不认识的仍报错列格式，守 §33 反向验证精神）；`mo-ui` 的
+  `context_menu` 15 测试绿（`.7z`/`.tar.bz2` 等现给「解压」）。临时真实解压测试
+  （造 .tar.xz 真调 `extract_archive`）跑通后已删，不污染套件。
+* **仍欠（已知，非漏做）**：7z/rar 的真机验证要用户机器装了 7z（本机未装，只验了
+  tar 路径命令形态 + Rust 外部分支对 .tar.xz 真解压）；Windows 的 `CREATE_NO_WINDOW`
+  是编译期 cfg，端到端没在 Windows 跑过黑框验证。
