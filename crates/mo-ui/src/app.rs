@@ -12332,7 +12332,14 @@ fn central_view_inner(
         .flex_row()
         .items_center()
         .gap(px(10.0))
-        .child(div().text_size(px(14.0)).child(text!(title.to_string())));
+        // 标题不许被挤：旁边的提示行一长，flex 会先把标题压瘪甚至让两行文字
+        // 叠在一起（扩展管理器独立窗口真机截图：标题「扩展」被提示行压住）。
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(14.0))
+                .child(text!(title.to_string())),
+        );
     if !input.is_empty() {
         head = head.child(
             div()
@@ -12374,9 +12381,18 @@ fn central_view_inner(
                         .justify_end()
                         .gap(px(10.0))
                         .child(action)
-                        .text_size(px(12.0))
-                        .text_color(theme::muted())
-                        .child(text!(hint.to_string())),
+                        // ⚠️ 提示行不换行，容器装不下时 justify_end 会让溢出**向左**
+                        // 蔓延、整行压到标题上（扩展管理器独立窗口真机截图）。
+                        // `.truncate()` 必须落在**直接包 text 的那层 div**（与
+                        // 路径标签同一套；overflow_hidden 在这个 fork 不裁文本）。
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(theme::muted())
+                                .child(text!(hint.to_string())),
+                        ),
                 ),
         )
         .child({
@@ -12626,14 +12642,23 @@ fn palette_search_row(state: &Entity<InputState>) -> Div {
             theme::muted(),
         ))
         .child(
-            div().flex_1().min_w_0().h_full().child(
-                Input::new(state)
-                    .appearance(false)
-                    .bordered(false)
-                    .small()
-                    .text_size(px(13.5))
-                    .p(px(0.0)),
-            ),
+            // ⚠️ 必须自己是居中 flex：Input 若被 h_full 拉满整行高，文字按它自己
+            // 的行盒画在顶部（真机截图：占位符明显偏上）。让 Input 保持自然高、
+            // 由这里垂直居中，光标与占位符才落在行的中线上。
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(
+                    Input::new(state)
+                        .appearance(false)
+                        .bordered(false)
+                        .small()
+                        .text_size(px(13.5))
+                        .p(px(0.0)),
+                ),
         )
 }
 
