@@ -103,7 +103,9 @@ pub fn create_archive(dest: &Path, sources: &[PathBuf]) -> Result<(), MoError> {
 fn write_zip(dest: &Path, sources: &[PathBuf]) -> Result<(), MoError> {
     let file = File::create(dest).map_err(MoError::Io)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::FileOptions::default()
+    // zip 8：FileOptions 带生命周期/压缩泛型参数，default() 推不出具体类型；
+    // SimpleFileOptions 是「无注释 + 静态生命周期」的现成别名。
+    let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
     for src in sources {

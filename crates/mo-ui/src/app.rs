@@ -17288,7 +17288,7 @@ mod tests {
             use std::io::Write;
             let file = std::fs::File::create(&archive).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("p28zip/manifest.json", opts).unwrap();
             zw.write_all(

@@ -113,7 +113,7 @@ fn partial_hash(path: &std::path::Path) -> std::io::Result<Option<String>> {
         f.read_exact(&mut tail)?;
         h.update(&tail);
     }
-    Ok(Some(format!("{:x}", h.finalize())))
+    Ok(Some(crate::hash::hex(h.finalize())))
 }
 
 /// 整体哈希（流式，不把文件整个读进内存）。
@@ -128,7 +128,7 @@ fn full_hash(path: &std::path::Path) -> std::io::Result<Option<String>> {
         }
         h.update(&buf[..n]);
     }
-    Ok(Some(format!("{:x}", h.finalize())))
+    Ok(Some(crate::hash::hex(h.finalize())))
 }
 
 /// 在若干根目录下查找重复文件。

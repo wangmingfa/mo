@@ -97,7 +97,8 @@ impl FileIndex {
                 p,
                 name,
                 name_lower,
-                size,
+                // rusqlite 0.40 起不再为 u64 实现 ToSql（有损映射被移除），显式收窄。
+                size as i64,
                 modified.unwrap_or(0) as i64,
                 is_dir as i32
             ],

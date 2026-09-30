@@ -83,7 +83,7 @@ pub fn compute_hashes(
     Ok(out)
 }
 
-fn hex(d: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex(d: impl AsRef<[u8]>) -> String {
     let mut s = String::with_capacity(d.as_ref().len() * 2);
     for b in d.as_ref() {
         s.push_str(&format!("{b:02x}"));

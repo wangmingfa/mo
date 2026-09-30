@@ -744,10 +744,22 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 
 fn sha256_file(path: &Path) -> Result<String, String> {
     use sha2::Digest;
+    use std::io::Read;
     let mut f =
         std::fs::File::open(path).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
     let mut h = sha2::Sha256::new();
-    std::io::copy(&mut f, &mut h).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    // digest 0.11 起不再为 hasher 实现 io::Write（io::copy 写哈希的捷径没了），
+    // 回到普通的分块读 + update。
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -2023,7 +2035,7 @@ mod tests {
         {
             let file = std::fs::File::create(&archive).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("p28/manifest.json", opts).unwrap();
             zw.write_all(
@@ -2063,7 +2075,7 @@ mod tests {
         {
             let file = std::fs::File::create(&archive).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("manifest.json", opts).unwrap();
             zw.write_all(r#"{"id":"flat42","name":"顶层清单扩展"}"#.as_bytes())
@@ -2091,7 +2103,7 @@ mod tests {
         {
             let file = std::fs::File::create(&archive).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("readme.txt", opts).unwrap();
             zw.write_all(b"no manifest here").unwrap();
