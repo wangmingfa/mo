@@ -46,6 +46,7 @@ fn session_round_trips_through_the_isolated_dir() {
             active_tabs: vec![0, 1],
             active_pane: 1,
             split: true,
+            ..Session::default()
         };
         app.save_session(&s);
         assert_eq!(app.load_session(), s, "往返要一致（含远程端点与远端路径）");
@@ -70,6 +71,7 @@ fn session_does_not_disturb_the_settings_file() {
             active_tabs: vec![0],
             active_pane: 0,
             split: false,
+            ..Session::default()
         });
 
         assert_eq!(app.ui_prefs(), ui, "写会话不该把界面偏好抹回去");

@@ -928,21 +928,59 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
 }
 
 /// 按查询串过滤命令（大小写不敏感子串匹配）。
+/// 命令的**稳定键**（使用账目落 `session.json` 用）。
+///
+/// * 内建命令 = 变体名（`format!("{id:?}")`）——重命名变体等于换一条命令，
+///   账目归零，与「改标题不清账」同尺度；
+/// * 自定义命令 = `user:<名字>`、工作流 = `workflow:<名字>`——名字在配置里就是
+///   唯一键（§4.2 的身份纪律），改名账目归零，可接受；带下标的 `CommandId::User(i)`
+///   绝不直接当键：用户增删一条自定义命令，后面的下标全体前移，按位置认账会把
+///   别人的次数认走。
+fn command_key_of(
+    id: &CommandId,
+    users: &[mo_app::UserCommand],
+    workflows: &[mo_app::Workflow],
+) -> String {
+    match id {
+        CommandId::User(i) => users
+            .get(*i)
+            .map(|c| format!("user:{}", c.name))
+            .unwrap_or_else(|| format!("{id:?}")),
+        CommandId::Workflow(i) => workflows
+            .get(*i)
+            .map(|w| format!("workflow:{}", w.name))
+            .unwrap_or_else(|| format!("{id:?}")),
+        other => format!("{other:?}"),
+    }
+}
+
 fn filtered_commands_in(
     q: &str,
     users: &[mo_app::UserCommand],
     workflows: &[mo_app::Workflow],
+    usage: &HashMap<String, mo_app::CommandUsage>,
 ) -> Vec<CommandId> {
     let q = q.trim().to_lowercase();
-    commands_in(users, workflows)
+    let mut out: Vec<(CommandId, u64, u64)> = commands_in(users, workflows)
         .into_iter()
         .filter(|c| {
             q.is_empty()
                 || c.title.to_lowercase().contains(&q)
                 || c.category.to_lowercase().contains(&q)
         })
-        .map(|c| c.id)
-        .collect()
+        .map(|c| {
+            let u = usage.get(&command_key_of(&c.id, users, workflows));
+            (
+                c.id,
+                u.map(|u| u.count).unwrap_or(0),
+                u.map(|u| u.last_used_ms).unwrap_or(0),
+            )
+        })
+        .collect();
+    // 频次降序，其次最近用过的在前；**stable sort**——两样都一样的保持声明序，
+    // 列表才不会一次抖一下。空查询与带词过滤同一条序。
+    out.sort_by_key(|(_, count, last)| (std::cmp::Reverse(*count), std::cmp::Reverse(*last)));
+    out.into_iter().map(|(id, _, _)| id).collect()
 }
 
 /// 「选择其他应用…」的选择器：复用命令面板的那层壳（输入即过滤 + ↑↓ + Enter），
@@ -1076,6 +1114,9 @@ pub struct RootView {
     keys_capturing: Option<&'static str>,
     /// 用户自定义命令快照（打开命令面板时刷新；下标即 CommandId::User 的参数）。
     user_commands: Vec<mo_app::UserCommand>,
+    /// 命令面板使用账目（`session.json` 的 `command_usage`：频次排序与
+    /// 「最近使用」标记）。执行命令时在内存里涨账，落盘随 `save_session` 去抖。
+    cmd_usage: HashMap<String, mo_app::CommandUsage>,
     /// 已加载的扩展快照（打开扩展管理器时刷新；独立窗口借渲染，故对兄弟模块开放）。
     pub(crate) extensions: Vec<mo_app::extensions::Extension>,
     /// 工作流快照（打开命令面板时刷新；下标即 CommandId::Workflow 的参数）。
@@ -1372,6 +1413,8 @@ impl RootView {
             keys_index: 0,
             keys_capturing: None,
             user_commands: Vec::new(),
+            // 使用账目与布局快照同源同目录（`session.json`）；读不到就空账起家。
+            cmd_usage: app.load_session().command_usage,
             extensions: Vec::new(),
             broken_exts: Vec::new(),
             history: Vec::new(),
@@ -2327,6 +2370,7 @@ impl RootView {
             active_tabs,
             active_pane: self.active_pane,
             split: self.split,
+            command_usage: self.cmd_usage.clone(),
         }
     }
 
@@ -3817,10 +3861,36 @@ impl RootView {
     fn palette_len(&self) -> usize {
         match &self.app_picker {
             Some(p) => filtered_apps(&self.cmd_query, &p.apps).len(),
-            None => {
-                filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows).len()
-            }
+            None => filtered_commands_in(
+                &self.cmd_query,
+                &self.user_commands,
+                &self.workflows,
+                &self.cmd_usage,
+            )
+            .len(),
         }
+    }
+
+    /// 执行了一条命令：次数 +1、记下时刻（键的稳定规则见 [`command_key_of`]）。
+    fn bump_command_usage(&mut self, id: CommandId) {
+        let key = command_key_of(&id, &self.user_commands, &self.workflows);
+        let entry = self.cmd_usage.entry(key).or_default();
+        entry.count += 1;
+        entry.last_used_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+    }
+
+    /// 「最近使用」标记该挂给哪条命令：账目里 `last_used_ms` 最大的那一个
+    /// （从未用过 → 没有标记）。与 VS Code 同款——只标**一条**，满屏标记
+    /// 等于没有标记。
+    fn recent_command_key(&self) -> Option<String> {
+        self.cmd_usage
+            .iter()
+            .filter(|(_, u)| u.last_used_ms > 0)
+            .max_by_key(|(_, u)| u.last_used_ms)
+            .map(|(k, _)| k.clone())
     }
 
     /// 选中行变化后（上下键、过滤词增删），把高亮行滚进可视区。
@@ -10245,9 +10315,14 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
     }
 
     let (id, app) = entity.update(cx, |v, _cx| {
-        let id = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows)
+        let id = filtered_commands_in(&v.cmd_query, &v.user_commands, &v.workflows, &v.cmd_usage)
             .get(v.palette_index)
             .copied();
+        // 执行即涨账（次数 + 最近时刻）。只动内存；落盘随布局快照同一个
+        // `save_session` 去抖，崩溃丢最近几条账可接受。
+        if let Some(id) = id {
+            v.bump_command_usage(id);
+        }
         (id, v.app())
     });
     match id {
@@ -11301,7 +11376,13 @@ impl RootView {
         if let Some(picker) = &self.app_picker {
             return self.render_app_picker(entity, picker);
         }
-        let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
+        let list = filtered_commands_in(
+            &self.cmd_query,
+            &self.user_commands,
+            &self.workflows,
+            &self.cmd_usage,
+        );
+        let recent = self.recent_command_key();
         let idx = self.palette_index;
         let mut body = div().flex().flex_col();
         body = body.child(match &self.cmd_input {
@@ -11330,12 +11411,18 @@ impl RootView {
                 .find(|c| c.id == *id)
                 .unwrap();
             let selected = i == idx;
+            let is_recent = recent.as_deref()
+                == Some(command_key_of(id, &self.user_commands, &self.workflows).as_str());
             // 分类放右侧胶囊：左缘是对齐的命令名，扫读时不必先跳过一串分类词。
-            rows_area = rows_area.child(
-                picker_row(&format!("cmd-row-{i}"), selected, &def.title)
-                    .flex_none()
-                    .child(tag_pill(&def.category, selected)),
-            );
+            let mut row = picker_row(&format!("cmd-row-{i}"), selected, &def.title)
+                .flex_none()
+                .child(tag_pill(&def.category, selected));
+            // 「最近使用」标记（账目里最近执行过的那一条，与排序一致地
+            // 由 session.json 跨次启动记住）。
+            if is_recent {
+                row = row.child(recent_pill(selected));
+            }
+            rows_area = rows_area.child(row);
         }
         if list.is_empty() {
             rows_area = rows_area.child(dialog_empty_row("无匹配命令"));
@@ -12573,6 +12660,32 @@ fn tag_pill(label: &str, selected: bool) -> Div {
             theme::muted()
         })
         .child(text!(label.to_string()))
+}
+
+/// 「最近使用」标记（命令面板行右侧，VS Code 同款位置）：比分类胶囊更淡，
+/// 只是低声说一句「这条你刚用过」，不与选中色争抢。
+fn recent_pill(selected: bool) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(18.0))
+        .px(px(6.0))
+        .rounded(px(5.0))
+        .border_1()
+        .border_color(if selected {
+            theme::selected_text()
+        } else {
+            theme::separator()
+        })
+        .text_size(px(10.5))
+        .text_color(if selected {
+            theme::selected_text()
+        } else {
+            theme::muted()
+        })
+        .child(text!("最近使用".to_string()))
+        .debug_selector(|| "mo-cmd-recent".to_string())
 }
 
 /// 对话框里的整行可选项（设置三页的行、命令面板的行同一副骨架）：
@@ -13871,9 +13984,9 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, contribution_line, filtered_apps, located_row, merge_history,
-        resolve_address_input, slot_word, type_ahead_repeats_one_char, AddressInput,
-        ConnectAuthState, Modal, OperationHandle, RootView, SettingsTab,
+        box_row_range, contribution_line, filtered_apps, filtered_commands_in, located_row,
+        merge_history, resolve_address_input, slot_word, type_ahead_repeats_one_char, AddressInput,
+        CommandId, ConnectAuthState, Modal, OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -15798,6 +15911,138 @@ mod tests {
             row0_h,
             Some(34.0),
             "child_bounds[0] 应是第一行（34px），滚动条层混进来了"
+        );
+    }
+
+    /// 频次排序：用过的浮上去，平局保持声明序（stable），自定义命令按**名字**
+    /// 认账而不是下标。纯函数测试——排序规则在这里钉死，UI 那侧只验接线。
+    #[test]
+    fn command_palette_orders_by_usage_count() {
+        crate::isolate_user_dirs_for_tests();
+        let users: Vec<mo_app::UserCommand> = vec![mo_app::UserCommand {
+            name: "统计字数".to_string(),
+            category: String::new(),
+            shell: "wc -w {file}".to_string(),
+            source: None,
+            menu: Vec::new(),
+            key: String::new(),
+        }];
+        let workflows: Vec<mo_app::Workflow> = Vec::new();
+
+        // 起点：没有账目 = 声明序，第一条是清单里的第一个内建命令。
+        let base = filtered_commands_in("", &users, &workflows, &HashMap::new());
+        assert_eq!(base[0], CommandId::OpenGlobalSearch);
+        assert!(
+            base.contains(&CommandId::User(0)),
+            "自定义命令（menu 为空 = 只进面板）应当在清单里"
+        );
+
+        // QuickLook 用过 5 次 → 浮到最前；没用的全局搜索让位。
+        let mut usage = HashMap::new();
+        usage.insert(
+            "QuickLook".to_string(),
+            mo_app::CommandUsage {
+                count: 5,
+                last_used_ms: 100,
+            },
+        );
+        let sorted = filtered_commands_in("", &users, &workflows, &usage);
+        assert_eq!(sorted[0], CommandId::QuickLook, "最常用的要浮到最上面");
+
+        // 平局靠「最近用过」破：OpenTrash 与 QuickLook 次数相同，后者更近 → 在前。
+        usage.insert(
+            "OpenTrash".to_string(),
+            mo_app::CommandUsage {
+                count: 5,
+                last_used_ms: 50,
+            },
+        );
+        let sorted = filtered_commands_in("", &users, &workflows, &usage);
+        let pos = |c: CommandId| sorted.iter().position(|x| *x == c).unwrap();
+        assert!(
+            pos(CommandId::QuickLook) < pos(CommandId::OpenTrash),
+            "次数打平，最近用过的应当在前"
+        );
+
+        // 自定义命令按名字记账（`user:<名字>`），下标只是运行期定位：
+        // 改配置增删别人的命令时，账不能认到别人头上。
+        usage.insert(
+            "user:统计字数".to_string(),
+            mo_app::CommandUsage {
+                count: 99,
+                last_used_ms: 1,
+            },
+        );
+        let sorted = filtered_commands_in("", &users, &workflows, &usage);
+        assert_eq!(
+            sorted[0],
+            CommandId::User(0),
+            "用得最狠的自定义命令要排第一"
+        );
+    }
+
+    /// 「最近使用」标记：种了账目后，最近执行过的那一条在面板里带胶囊；
+    /// 没有账目时谁都不带（满屏标记等于没有标记）。
+    #[test]
+    fn recently_used_command_carries_the_marker() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        let main = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let open_palette = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.simulate_keystrokes(&format!("{main}-shift-p"));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+        };
+
+        // 起点：零账目 → 谁都不带标记。
+        open_palette(cx);
+        assert!(
+            cx.debug_bounds("mo-cmd-recent").is_none(),
+            "没用过任何命令，不该有「最近使用」标记"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        // 种一条账（QuickLook 用过 3 次），重开面板：标记出现，且那一行排到最前
+        // ——标记行的 y 不得低于头几行，命令多了以后排序是否生效一眼可辨。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                v.cmd_usage.insert(
+                    "QuickLook".to_string(),
+                    mo_app::CommandUsage {
+                        count: 3,
+                        last_used_ms: 42,
+                    },
+                );
+            });
+        });
+        open_palette(cx);
+        let badge_y = cx
+            .debug_bounds("mo-cmd-recent")
+            .expect("最近使用过的命令该带「最近使用」标记")
+            .origin
+            .y;
+        // 带标记的那行必须**就是**列表第一行：拿标记的 y 与滚动容器第 0 行的
+        // y 对位（不硬编码对话框几何——窗口尺寸变了断言不许跟着碎）。
+        let row0 = cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                v.palette_scroll.bounds_for_item(0).map(|b| b.origin.y)
+            })
+        });
+        let row0 = row0.expect("面板行存在");
+        assert!(
+            badge_y >= row0 && badge_y < row0 + px(34.0),
+            "带标记的行应当就是第一行（频次排序没生效？）badge_y={badge_y:?} row0={row0:?}"
         );
     }
 

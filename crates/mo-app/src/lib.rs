@@ -49,8 +49,8 @@ pub use treemap::{Rect, Tile, UsageTree};
 // `MenuSlot` 一起出去：注册表面板的行与右键菜单的行是**同一条声明**翻译出来的，
 // 各翻一份就会出现「面板里名字对得上、菜单里对不上」。
 pub use mo_config::{
-    clamp_icon_scale, ColumnPrefs, Config, MenuSlot, SavedServer, SavedTab, Session, ThemeColors,
-    UiPrefs, UserCommand, Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
+    clamp_icon_scale, ColumnPrefs, CommandUsage, Config, MenuSlot, SavedServer, SavedTab, Session,
+    ThemeColors, UiPrefs, UserCommand, Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
 };
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};

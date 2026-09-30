@@ -46,6 +46,24 @@ pub struct Session {
     /// 是否分栏。
     #[serde(default)]
     pub split: bool,
+    /// 命令面板的使用账目（命令稳定键 → 次数与最近一次时刻）。
+    ///
+    /// 面板按频次排序、「最近使用」标记都从这里读；键的稳定规则见
+    /// `mo_ui` 的 `command_key_of`（内建命令 = 变体名，自定义命令 = `user:<名字>`，
+    /// 工作流 = `workflow:<名字>`——名字改了账目就归零，可接受）。
+    #[serde(default)]
+    pub command_usage: HashMap<String, CommandUsage>,
+}
+
+/// 一条命令的使用账目。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CommandUsage {
+    /// 累计执行次数（面板排序的依据）。
+    #[serde(default)]
+    pub count: u64,
+    /// 最近一次执行的 Unix 毫秒时刻（「最近使用」标记的依据）。
+    #[serde(default)]
+    pub last_used_ms: u64,
 }
 
 /// 一个恢复出来的标签页。
@@ -565,6 +583,7 @@ mod tests {
             active_tabs: vec![0, 0],
             active_pane: 1,
             split: true,
+            ..Session::default()
         };
         s.save(&path).expect("写得出");
         let back = Session::load(&path);

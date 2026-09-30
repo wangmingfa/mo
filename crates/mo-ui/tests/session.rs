@@ -66,6 +66,7 @@ fn restore_brings_back_every_saved_tab(cx: &mut TestAppContext) {
             active_tabs: vec![1],
             active_pane: 0,
             split: false,
+            ..Session::default()
         },
         cx,
     );
