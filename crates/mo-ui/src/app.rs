@@ -4339,12 +4339,26 @@ impl RootView {
     /// 来源必须由用户当面指认——没有命令行参数、没有配置项入口，那等于给陌生
     /// 扩展开一条静默安装的门。选择框是模态的且只能在 UI 线程跑
     /// （`mo_platform::pick_folder`）；用户取消（`Ok(None)`）不是错误，什么都不发生。
+    ///
+    /// ⚠️ 选择框**不能**在本回调里同步跑（真机闪退实测）：`runModal` 是嵌套
+    /// run loop，而此刻 gpui 的 App RefCell 还借在 `on_click → update` 手里，
+    /// 模态循环每派发一个事件都要再借一次 → 「RefCell already borrowed」刷屏
+    /// → 借用冲突 panic。spawn 到前台执行器：本轮 update 收尾、借用放掉之后
+    /// 才轮询到任务体（仍在主线程，`on_main_thread` 原地执行）；先 `await`
+    /// 一个零长定时器，保证悬在 update 之外。
     fn install_extension_from_disk(&mut self, cx: &mut Context<Self>) {
-        match mo_platform::pick_folder("选择含 manifest.json 的扩展目录") {
-            Ok(Some(dir)) => self.install_extension_from(&dir, cx),
-            Ok(None) => {}
-            Err(e) => self.notice(format!("打不开目录选择框：{e}"), None, cx),
-        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::ZERO)
+                .await;
+            let picked = mo_platform::pick_folder("选择含 manifest.json 的扩展目录");
+            let _ = this.update(cx, |v, cx| match picked {
+                Ok(Some(dir)) => v.install_extension_from(&dir, cx),
+                Ok(None) => {}
+                Err(e) => v.notice(format!("打不开目录选择框：{e}"), None, cx),
+            });
+        })
+        .detach();
     }
 
     /// 安装的后半段（选完目录之后）：装、刷新面板、选中新行。
@@ -4375,12 +4389,22 @@ impl RootView {
     /// 与 [`Self::install_extension_from_disk`] 同一条纪律——来源必须由用户当面指认
     /// （`mo_platform::pick_file` 模态、UI 线程、取消折成 `Ok(None)`），不给陌生扩展
     /// 开静默安装的口子。后半段走 [`Self::install_extension_from_zip`]。
+    ///
+    /// 与 [`Self::install_extension_from_disk`] 同一个闪退坑：模态选择框不能在
+    /// update 借用未放时同步跑，同样 spawn 出去（见那边注释）。
     fn install_extension_from_zip_disk(&mut self, cx: &mut Context<Self>) {
-        match mo_platform::pick_file("选择 .moext 扩展包（zip）") {
-            Ok(Some(path)) => self.install_extension_from_zip(&path, cx),
-            Ok(None) => {}
-            Err(e) => self.notice(format!("打不开文件选择框：{e}"), None, cx),
-        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::ZERO)
+                .await;
+            let picked = mo_platform::pick_file("选择 .moext 扩展包（zip）");
+            let _ = this.update(cx, |v, cx| match picked {
+                Ok(Some(path)) => v.install_extension_from_zip(&path, cx),
+                Ok(None) => {}
+                Err(e) => v.notice(format!("打不开文件选择框：{e}"), None, cx),
+            });
+        })
+        .detach();
     }
 
     /// 「从 .moext 安装」的后半段（选完文件之后）：解压、装、刷新面板、选中新行。
