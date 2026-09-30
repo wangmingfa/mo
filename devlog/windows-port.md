@@ -175,7 +175,16 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **两条不明显的规则**：
     * 布局**答了就不再退表**，哪怕答的是数字或字母（德语上 `"`→`2`）：表里那条 `"`→`'` 在这一列是错的，拿它兜底就把两个不相干的键又并到一起。
     * 「基本键也得是符号键」这条规则从「表里不记数字」改成了真判据（`is_symbol_char`），因为布局会给回数字（`!`→`1`）——视图模式占着 `cmd+1`~`cmd+4`，不判就白送一次误触。
-* **macOS 仍是 US 表**：gpui 的 `Keystroke` 只给字符、不给虚拟键码，那边问不出布局。`unshifted_key` 在非 Windows 直接答 `None`，调用方退表——已知缺口，不是漏判。
+* **macOS 已补（2026-09-30）：macOS 上 gpui 的 `Keystroke` 也只给字符、不给虚拟键码，
+  不能直接 `VkKeyScanExW` 反查键码，于是反过来——`TISCopyCurrentKeyboardLayoutInputSource`
+  拿当前布局的 `uchr` 表，枚举 128 个虚拟键码（不带 Shift / 带 Shift 各一次），用
+  `UCKeyTranslate` 解「基本键 → Shift 变体」映射，再把 `ch` 折回去（`macos::unshifted_key`）。
+  ⚠️ **坑**：`UCKeyTranslate` 的 `modifierKeyState` 用的是 `uchr` 自己的 `UCKeyModifiers`
+  修饰位表，**Shift 位是 `0x0002`（bit 1），不是** EventRecord 的 `shiftKey`(0x0200)——
+  后者在本 API 下完全不生效（实测所有键 `base == shift`，正是这个坑；`0x0004` 是 caps-lock，
+  只移字母不移数字，用来交叉确认）。语义与 Windows 版对齐，非 US 布局的 mac 用户不再串键。
+  单测 `unshifted_key_resolves_shift_direction_on_current_layout` 验「大写 → 小写」方向正确
+  （这一层才证明 Shift 位没接反）；德语真值由用户在真机验（同本节 Windows 那条，需德语布局）。
 * **单测不碰真布局**：`fold_typographic_shift` 在 `#[cfg(test)]` 下把查询退化成 `None`（开发机插什么键盘不该决定断言红绿，与 §16/§21 同一类卫生）；非 US 的行为由 `fold_with` 那组测试喂**假布局**覆盖。`mo-platform` 侧按 KLID 显式 `ActivateKeyboardLayout` 后实测 US 与德语两列答案，装不上布局的机器跳过并 `eprintln!`。
 * **实机验证撞到的两件事**（记下来，免得下一个人重踩）：
     * gpui 算字符走 `ToUnicode(vk, lParam 高字节的扫描码, state)`，它只看**当前线程**的布局。而 `SetForegroundWindow` 一激活窗口，Windows 就把该线程的布局打回这个窗口登记的输入语言（本机是 `0x0804` 中文）；`WM_INPUTLANGCHANGEREQUEST` 想切德语（`00000407`）也不落地——不在用户「输入语言列表」里的布局，Shell 不给切。所以**没能让 Mo 的线程真变成德语键盘**，GUI 上的德语端到端这一轮没验成。

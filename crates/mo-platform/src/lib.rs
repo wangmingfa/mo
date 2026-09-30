@@ -430,15 +430,21 @@ pub fn begin_file_drag(
 /// 而 `?` 与 `/` 在两个完全不同的键上。折错了就是**动作串键**：用户按下的键触发另一个
 /// 功能，默认键位反倒按不出来。
 ///
-/// 只有 Windows 问得出（`VkKeyScanExW` + `MapVirtualKeyExW`，见 `windows::unshifted_key`）。
-/// macOS 拿不到虚拟键码——gpui 的 `Keystroke` 只给字符，所以那边答 `None`，调用方继续用
-/// 自己的 US 表（已知缺口，见 devlog 的 §15）。
+/// Windows 用 `VkKeyScanExW` + `MapVirtualKeyExW`（`windows::unshifted_key`），macOS 用
+/// `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` 反查当前布局
+///（`macos::unshifted_key`）——gpui 的 `Keystroke` 只给字符、不给虚拟键码，macOS 不能
+/// 像 Windows 那样直接反查键码，所以反过来枚举键码建表再查字符。两者语义对齐；其余
+/// 平台答 `None`，调用方继续用自己的 US 表。
 pub fn unshifted_key(ch: char) -> Option<char> {
     #[cfg(target_os = "windows")]
     {
         windows::unshifted_key(ch)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::unshifted_key(ch)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = ch;
         None

@@ -55,10 +55,10 @@ pub const fn has_command_key() -> bool {
 /// 而同一个窗口里 Ctrl+Shift+P（字母键）是好的。
 ///
 /// ⚠️ 「哪个符号是哪个键的 Shift 变体」是**键盘布局**的事，不是常理：`SYMBOL_PAIRS`
-/// 那张表只描述 US 布局。所以 Windows 上先**问当前布局**（[`mo_platform::unshifted_key`]，
-/// 实测德语布局上 `:` 才是 `.` 的变体、`?` 与 `/` 在两个不相干的键上），问不到才退到表。
-/// macOS 问不了——gpui 的 `Keystroke` 只给字符、不给虚拟键码，于是那边仍按 US 表折
-/// （已知缺口，非 US 布局的 mac 用户会串键；见 devlog §15 的这条尾巴）。
+/// 那张表只描述 US 布局。所以先**问当前布局**（`[`mo_platform::unshifted_key`]`：
+/// Windows 用 `VkKeyScanExW` + `MapVirtualKeyExW`、macOS 用 TIS + `UCKeyTranslate`
+/// 反查当前布局——实测德语布局上 `:` 才是 `.` 的变体、`?` 与 `/` 在两个不相干的键上），
+/// 问不到才退到表。非 US 布局的 mac / win 用户都不再串键（devlog §22）。
 fn fold_typographic_shift(key: &str, shift: bool) -> (String, bool) {
     // 单测里布局查询退化成「都问不到」→ 只走 US 表：开发机装什么键盘布局不该决定
     // 断言的红绿（与钉 `MO_CONFIG_DIR` 同一类测试卫生）。布局相关的行为由 `fold_with`

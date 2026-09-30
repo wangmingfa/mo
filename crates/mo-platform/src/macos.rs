@@ -1123,9 +1123,140 @@ pub fn pdf_page_raster(path: &Path, max_edge: u32) -> Option<IconRaster> {
     }
 }
 
+// ---- 键盘布局：把 Shift 印刷变体折回物理键位（见 `mo_ui::keys::fold_typographic_shift`）----
+//
+// macOS 上 gpui 的 `Keystroke` 只给字符、不给虚拟键码，没法像 Windows 那样
+// `VkKeyScanExW` 直接反查键码。于是反过来：用 `TISCopyCurrentKeyboardLayoutInputSource`
+// 拿当前布局的 `uchr` 表，枚举每个虚拟键码（不带 Shift / 带 Shift 各一次），用
+// `UCKeyTranslate` 解「基本键 → Shift 变体」映射，再把 `ch` 折回去。语义与 Windows 版
+// 对齐，只是查表方向相反（Windows 是「字符→键码→基本键」，macOS 是「键码→基本键 /
+// Shift 变体」建表后查字符）。
+//
+// `TIS*` / `UCKeyTranslate` / `LMGetKbdType` 都在 Carbon（HIToolbox）里——纯 C、不在
+// AppKit 之下，所以**不需要** `appkit_usable()` 那道门（后台线程也能查，不会把测试挂死）。
+// 不缓存：用户换布局立刻跟着变（同 Windows 那条纪律）。只在符号键被按下时才会被
+// [`mo_ui::keys::fold_typographic_shift`] 调到，枚举 128 个键码的代价可接受。
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut std::ffi::c_void;
+    fn TISGetInputSourceProperty(
+        source: *mut std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    static kTISPropertyUnicodeKeyLayoutData: *const std::ffi::c_void;
+    fn UCKeyTranslate(
+        layout: *const std::ffi::c_void,
+        key_code: u16,
+        key_action: u16,
+        modifier_key_state: u32,
+        keyboard_type: u32,
+        option_bits: u32,
+        dead_key_state: *mut u32,
+        max_string_length: u32,
+        actual_string_length: *mut u32,
+        unicode_string: *mut u16,
+    ) -> i32;
+    fn LMGetKbdType() -> i8;
+    fn CFRelease(cf: *const std::ffi::c_void);
+    fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
+}
+
+/// `UCKeyTranslate` 的动作：`kUCKeyActionDown`（模拟「按下」这个键）。
+const K_UC_KEY_ACTION_DOWN: u16 = 0;
+/// `kUCKeyTranslateNoDeadKeysMask`：死键直接解成可见字符，别停在「等下一个键」的状态。
+const K_UC_KEY_TRANSLATE_NO_DEAD_KEYS: u32 = 1;
+/// `uchr` 布局里「Shift 按下」的修饰位（`UCKeyModifiers`：`0x0002`，注意**不是**
+/// EventRecord 的 `shiftKey`(0x0200)——`UCKeyTranslate` 用的是布局自己的修饰位表）。
+const SHIFT_KEY_BIT: u32 = 0x0002;
+
+/// 字符 `ch` 在**当前键盘布局**上的基本键（它所在物理键未加 Shift 打出的字符）。
+///
+/// 给 `mo_ui::keys` 折 Shift 的印刷变体用：默认键位按 US 布局写（`cmd+=`、`cmd+.`），
+/// 而符号键「Shift 后是什么字符」是**布局**的事——德语布局上 `:` 才是 `.` 的 Shift
+/// 变体，`?` 与 `/` 根本在两个不同的键上。照一张 US 表折所有布局会把德语用户按下的
+/// `:` 折成分号、把 `?` 折到 `/` 上：动作串到别处，默认键位反而按不出来。
+///
+/// 答 `None`（= 问不出，调用方退回自己的 US 表）：本布局打不出这个字符；或要 AltGr /
+/// Ctrl 参与才出得来（不是 Shift 的印刷变体）。
+pub fn unshifted_key(ch: char) -> Option<char> {
+    let source = unsafe { TISCopyCurrentKeyboardLayoutInputSource() };
+    if source.is_null() {
+        return None;
+    }
+    let data = unsafe { TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) };
+    if data.is_null() {
+        unsafe { CFRelease(source) };
+        return None;
+    }
+    let bytes = unsafe { CFDataGetBytePtr(data) };
+    if bytes.is_null() {
+        unsafe { CFRelease(source) };
+        return None;
+    }
+    let layout = bytes as *const std::ffi::c_void;
+    let kbd = unsafe { LMGetKbdType() } as u32;
+
+    // 枚举虚拟键码，建「Shift 变体 → 基本键」映射。
+    let mut map: std::collections::HashMap<char, char> = std::collections::HashMap::new();
+    for keycode in 0u16..=127 {
+        if let Some(base) = unsafe { translate(layout, keycode, 0, kbd) } {
+            map.insert(base, base);
+            if let Some(shifted) = unsafe { translate(layout, keycode, SHIFT_KEY_BIT, kbd) } {
+                map.insert(shifted, base);
+            }
+        }
+    }
+    unsafe { CFRelease(source) };
+    map.get(&ch).copied()
+}
+
+/// 用 `UCKeyTranslate` 解某个虚拟键码在当前布局下的一个字符（带 / 不带 Shift）。
+unsafe fn translate(
+    layout: *const std::ffi::c_void,
+    key_code: u16,
+    modifiers: u32,
+    kbd: u32,
+) -> Option<char> {
+    let mut dead = 0u32;
+    let mut buf = [0u16; 4];
+    let mut len = 0u32;
+    let status = UCKeyTranslate(
+        layout,
+        key_code,
+        K_UC_KEY_ACTION_DOWN,
+        modifiers,
+        kbd,
+        K_UC_KEY_TRANSLATE_NO_DEAD_KEYS,
+        &mut dead,
+        buf.len() as u32,
+        &mut len,
+        buf.as_mut_ptr(),
+    );
+    if status != 0 || len == 0 {
+        return None;
+    }
+    // `buf` 里是 UTF-16；取首码元解成字符。非法代理对（理论上 UCKeyTranslate 不出）
+    // 当「问不出」处理。
+    char::decode_utf16(buf.iter().take(len as usize).copied())
+        .next()
+        .and_then(|r| r.ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 当前布局下，大写字母的基本键应是其小写孪生（验证「Shift 方向」枚举正确），
+    /// 且基本键映射到自己（验证「基本键 → 基本键」那条也建了）。这两条在几乎所有
+    /// Latin 布局上都成立，足以证明 TIS / `UCKeyTranslate` 链路没接反——非 US 布局的
+    /// 真值（德语 `:`→`.`）由用户在真机验（devlog §22）。
+    #[test]
+    fn unshifted_key_resolves_shift_direction_on_current_layout() {
+        assert_eq!(unshifted_key('a'), Some('a'), "基本键映射到自己");
+        assert_eq!(unshifted_key('A'), Some('a'), "Shift 方向枚举正确");
+        assert_eq!(unshifted_key('z'), Some('z'));
+        assert_eq!(unshifted_key('Z'), Some('z'));
+    }
 
     /// `NSURL` 必须自己处理百分号编码——名字里有空格 / 中文 / `#` 的路径都得能转成 URL。
     ///
