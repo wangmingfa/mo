@@ -416,7 +416,12 @@ impl mo_operations::Operation for FakeOp {
 }
 
 /// 种一批假操作进当前标签页的 `OperationManager`（广播事件触发 `sync_panel`）。
-fn seed_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ops: Vec<FakeOp>) {
+/// 泛型是为了让自定义 describe 的假操作（长路径用例）也能走同一条真管线。
+fn seed_ops<O: mo_operations::Operation + Clone + 'static>(
+    window: &WindowHandle<RootView>,
+    cx: &mut TestAppContext,
+    ops: Vec<O>,
+) {
     window
         .update(cx, |root, _window, _cx| {
             let app = mo_ui::app_state_for_tests(root);
@@ -442,11 +447,11 @@ fn remove_ops(window: &WindowHandle<RootView>, cx: &mut TestAppContext, ids: &[u
 ///
 /// seed 的广播事件可能赶在 `tab_loop` 订阅总线之前发出去而丢失（open_home 的
 /// 真 IO 还在路上），所以失败就重发——register 同 id 幂等（HashMap 覆盖）。
-fn seed_ops_until_visible(
+fn seed_ops_until_visible<O: mo_operations::Operation + Clone + 'static>(
     vcx: &mut VisualTestContext,
     window: &WindowHandle<RootView>,
     cx: &mut TestAppContext,
-    ops: &[FakeOp],
+    ops: &[O],
 ) {
     for _ in 0..20 {
         seed_ops(window, cx, ops.to_vec());
@@ -552,7 +557,7 @@ fn badge_click_toggles_the_transfer_popover(cx: &mut TestAppContext) {
     vcx.update(|window, cx| window.render_frame(cx));
     let pop = bounds(&mut vcx, "mo-ops-popover");
     assert!(
-        f32::from(pop.size.width) <= 400.0,
+        f32::from(pop.size.width) <= 460.0,
         "浮层宽 {}：不该铺满窗口",
         pop.size.width
     );
@@ -652,6 +657,51 @@ fn broom_clears_completed_and_popover_auto_closes(cx: &mut TestAppContext) {
     assert!(
         vcx.debug_bounds("mo-ops-popover").is_none(),
         "自动收起后新任务不应把浮层重新弹开"
+    );
+}
+
+/// 长路径描述：换行显示完整（不再单行截断掐成「… → /Users/11」），行高随
+/// 内容加高。用户报：传输浮层里「复制 /Users/… → /Users/11…」看不到完整落点。
+#[gpui_kit::test]
+fn long_transfer_description_wraps_instead_of_truncating(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+
+    // 描述远超一行宽度的假任务：两端都是完整深路径（数字/字母比真实路径
+    // 再长一截，保证在任何字体度量下都稳超两行）。
+    #[derive(Clone)]
+    struct LongDescribeOp(u64);
+    impl mo_operations::Operation for LongDescribeOp {
+        fn id(&self) -> u64 {
+            self.0
+        }
+        fn describe(&self) -> String {
+            "复制 /Users/11048490/Documents/Qoder/很深的子目录/带一个相当长的条目名字/再套一层目录/源端最深处 → /Volumes/Backup/2026/09/30/同样很深的目标目录/带一个相当长的条目名字/备份批次编号20260930/落点最深处".to_string()
+        }
+        fn status(&self) -> OperationStatus {
+            OperationStatus::Running
+        }
+        fn progress(&self) -> (u64, u64) {
+            (1, 4)
+        }
+        fn cancel(&self) {}
+        fn pause(&self) {}
+        fn resume(&self) {}
+        fn run(&self) -> Result<(), mo_core::MoError> {
+            Ok(())
+        }
+    }
+
+    seed_ops_until_visible(&mut vcx, &window, cx, &[LongDescribeOp(9)]);
+
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+    let row = bounds(&mut vcx, "mo-ops-row-9");
+    // 保底行高 56 只容一行描述；换行 ≥ 3 行时行高 ≥ 3×16+22 = 70。
+    // 断言 64（=56+8）而不是 70：行数多了多少不重要，「不是单行」才是重点。
+    assert!(
+        f32::from(row.size.height) >= 64.0,
+        "长描述应把行撑高（换行显示完整）而不是单行截断，实际行高 {:?}",
+        row.size
     );
 }
 
@@ -1967,6 +2017,10 @@ fn trash_multi_select_restore_acts_on_the_selection(cx: &mut TestAppContext) {
 ///   与面板列表同步改名（账本一致，之后还原仍可用）。
 #[gpui_kit::test]
 fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppContext) {
+    // 本测试会真的打开重命名卡：那是真实 `InputState`，渲染 / 编辑动作
+    // （⌘A 全选、退格删除）都依赖 `gpui_kit::init` 注册的全局（生产环境在
+    // `run()` 里注册）。只补 theme 不够——action 派发会哑掉。
+    cx.update(gpui_kit::init);
     // 预种三条（f0..f2；列表最新在前 → 行序 f2, f1, f0）。
     let seed = std::env::temp_dir().join(format!("mo-layout-trash-rename-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&seed);
@@ -2049,14 +2103,19 @@ fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppCont
     assert!(vcx.debug_bounds("mo-dialog-card").is_none());
     assert_eq!(sel(&mut vcx, &window), vec![0]);
 
-    // ④ 再进重命名卡：清空预填 → 输入新名 → Enter 提交。
+    // ④ 再进重命名卡：⌘A 全选预填名 → 直接敲新名覆盖 → Enter 提交。
+    // ⚠️ 编辑动作必须走 `window.press` / `window.input`（真实按键派发：绑定
+    // 阶段的 action 会被输入组件消费）；`simulate_keystrokes` 只派发裸按键
+    // 事件，退格 / ⌘A 这类绑定动作到不了输入组件（实测敲了不删）。
     cx.simulate_keystrokes(window.into(), RENAME_KEY);
     redraw(&mut vcx);
-    cx.simulate_keystrokes(
-        window.into(),
-        "backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace backspace",
-    );
-    cx.simulate_keystrokes(window.into(), "r e n a m e d . t x t");
+    // ⚠️ 用 `vcx.update`（只借窗口）而不是 `window.update`（会把 RootView 一起
+    // 借住）：按键路由里要 update RootView，双重借用直接 panic。
+    vcx.update(|window, cx| {
+        window.press("cmd-a", cx);
+        window.input("renamed.txt", cx);
+    });
+    // Enter 单独派发：它会被表单拦截器接走并提交。
     cx.simulate_keystrokes(window.into(), "enter");
     for _ in 0..20 {
         redraw(&mut vcx);

@@ -55,18 +55,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Filesystem
-notify = "7"
+notify = "8"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # 正则（内容搜索的「正则模式」）。已在依赖树里（传递依赖），提为直接依赖不新增下载。
 regex = "1"
 
 # 哈希（校验和）
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
 
 # IDs / utils
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
@@ -75,7 +75,7 @@ parking_lot = "0.12"
 # 本地时间格式化（文件列表「修改日期」列）
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 用户目录（缓存 / 配置存放位置），跨平台
-dirs = "5"
+dirs = "7"
 
 # 系统钥匙串（macOS Keychain / Windows 凭据管理器 / Linux Secret Service）：
 # 「连接到服务器」勾了「记住密码」时，密码的落点。**不要**把密码写进
@@ -83,7 +83,7 @@ dirs = "5"
 keyring = "4"
 
 # 归档（压缩 / 解压）
-zip = "0.6"
+zip = "8"
 tar = "0.4"
 flate2 = "1"
 walkdir = "2"
@@ -103,7 +103,7 @@ image = { version = "0.25", default-features = false, features = [
 jpeg-decoder = "0.3"
 
 # 基准测试（仅 dev-dependencies 使用）
-criterion = "0.5"
+criterion = "0.8"
 
 # UI (single facade for GPUI + base + component + assets)
 gpui-kit = "0.6"

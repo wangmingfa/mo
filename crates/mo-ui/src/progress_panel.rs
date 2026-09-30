@@ -11,10 +11,15 @@ const CARD_W: f32 = 176.0;
 const CARD_H: f32 = 30.0;
 /// 任务浮层宽度：比卡片宽（任务描述 + 速度 + 剩余时间需要横向空间），
 /// 左缘与卡片对齐、向上展开，超出侧栏盖在内容区上是浮层的本分。
-const POPOVER_W: f32 = 380.0;
-/// 任务行定高（两行式内容垂直居中）。定高是为了让列表高度可以**算出来**：
-/// `Scrollable` 需要定高上下文，auto 高度链 + `max_h` 撑不出滚动区。
+const POPOVER_W: f32 = 440.0;
+/// 任务行的**保底**高度（单行描述 + 进度条，两行式内容垂直居中）。描述按
+/// 真实换行撑开（长路径自动加高，见 [`render_op_row`]），这只是下限。
+/// 保底值仍要存在：列表滚动区高度是**算出来**的，`Scrollable` 需要定高上下文，
+/// auto 高度链 + `max_h` 撑不出滚动区。
 const ROW_H: f32 = 56.0;
+/// 描述文本的行高——**显式钉住**：行高估算（[`estimated_row_h`]）与真实布局
+/// 必须用同一个值，否则估的行高和实际渲染高度对不上。
+const DESC_LINE_H: f32 = 16.0;
 /// 任务列表的滚动区上限；行数少时列表按内容自适应（不撑到上限）。
 const LIST_MAX_H: f32 = 300.0;
 
@@ -236,9 +241,13 @@ fn render_popover(
 
     // 列表高度**算出来**而非 max_h 钳：`Scrollable`（overflow_y_scrollbar）的
     // 根节点走 size_full 并从调用方抄 size——处在 auto 高度链里时撑不出有界
-    // 滚动区，既滚不动也看不见滚动条（用户实测）。行高是定值（[`ROW_H`]），
-    // 行数少时高度=内容自然高，不浪费空间。
-    let list_h = (ops.len() as f32 * ROW_H).min(LIST_MAX_H);
+    // 滚动区，既滚不动也看不见滚动条（用户实测）。行高按描述估行数折算
+    // （[`estimated_row_h`]），行数少时高度=内容自然高，不浪费空间。
+    let list_h = ops
+        .iter()
+        .map(|op| estimated_row_h(&op.describe))
+        .sum::<f32>()
+        .min(LIST_MAX_H);
     div()
         .id("mo-ops-popover")
         .w(px(POPOVER_W))
@@ -335,8 +344,10 @@ fn render_op_row(
     div()
         .id(("mo-ops-row", op.id))
         .debug_selector(move || format!("mo-ops-row-{}", op.id))
-        // 定高 + 垂直居中：列表高度按 [`ROW_H`] 算，行必须守约。
-        .h(px(ROW_H))
+        // 保底高 + 垂直居中：单行描述时与旧定高观感一致；描述按**真实换行**
+        // 撑开（长路径不截断，用户要看得见完整路径），行自然加高。列表滚动区
+        // 高度按估算折算（[`estimated_row_h`]），估差不裁字、只差几像素滚动余量。
+        .min_h(px(ROW_H))
         .justify_center()
         .flex()
         .flex_col()
@@ -344,7 +355,7 @@ fn render_op_row(
         .px(px(12.0))
         .py(px(7.0))
         .hover(|s| s.bg(theme::hover_bg()))
-        // 上行：状态点 + 描述（截断）+ 动作。
+        // 上行：状态点 + 描述（自然换行，行高钉 [`DESC_LINE_H`]）+ 动作。
         .child(
             div()
                 .flex()
@@ -362,8 +373,8 @@ fn render_op_row(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
                         .text_size(px(12.0))
+                        .line_height(px(DESC_LINE_H))
                         .text_color(theme::text())
                         .child(text!(op.describe.clone())),
                 )
@@ -403,6 +414,32 @@ fn render_op_row(
                         .child(text!(status_tail(op, ratio, speed))),
                 ),
         )
+}
+
+/// 描述文本在浮层行内的可用宽度：浮层宽 − 左右内边距 − 状态点 − 两处 gap −
+/// 行尾动作钮（「暂停 / 继续 / 取消」两字 + 内边距的余量）。估算与真实布局
+/// 共用这一个推导，改浮层内边距时两处自动同调。
+fn desc_usable_w() -> f32 {
+    POPOVER_W - 12.0 * 2.0 - 7.0 - 8.0 * 2.0 - 40.0
+}
+
+/// 估算一行描述折成的行数（半角记 0.55em、CJK/全角记 1em，按
+/// [`DESC_LINE_H`] 的 12px 字号折像素）。启发式只服务**滚动视口高度**：
+/// 行本身按真实换行 auto 撑开，估差了最多让滚动条长度差几像素，不裁字。
+fn estimate_desc_lines(text: &str) -> usize {
+    let em: f32 = text
+        .chars()
+        .map(|ch| if ch.is_ascii() { 0.55 } else { 1.0 })
+        .sum();
+    let lines = (em * 12.0 / desc_usable_w().max(1.0)).ceil();
+    lines.max(1.0) as usize
+}
+
+/// 单行的估算高度：行数 × 钉住的行高 + 下行进度条 4 + 行间 gap 4 + 上下
+/// 内边距 14；不低于保底高 [`ROW_H`]（单行时的观感与旧定高一致）。
+fn estimated_row_h(describe: &str) -> f32 {
+    let content = estimate_desc_lines(describe) as f32 * DESC_LINE_H + 22.0;
+    ROW_H.max(content)
 }
 
 /// 进度比值（total == 0 时给 0，别除零）；已结束的成功任务视为 100%。

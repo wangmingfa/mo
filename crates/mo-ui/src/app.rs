@@ -1174,6 +1174,22 @@ pub struct RootView {
     pub(crate) archive_name: String,
     /// 回收站条目重命名的新名字（`Modal::TrashRename` 的输入缓冲）。
     pub(crate) trash_rename_name: String,
+    /// 四处表单模态的真实输入框（gpui-component `InputState`）——批量重命名
+    /// 4 字段 / 属性文件名 / 压缩包名 / 回收站重命名卡。与地址栏同一套生命周期：
+    /// 模态开着才存在（每帧 [`Self::sync_form_inputs`] 收口），关了连实体带
+    /// 订阅一起丢，下次打开重建（旧文本 / 选区 / 撤销历史不跟过来）。
+    pub(crate) rename_inputs: [Option<Entity<InputState>>; 4],
+    pub(crate) rename_subs: [Option<Subscription>; 4],
+    pub(crate) prop_input: Option<Entity<InputState>>,
+    pub(crate) prop_sub: Option<Subscription>,
+    pub(crate) archive_input: Option<Entity<InputState>>,
+    pub(crate) archive_sub: Option<Subscription>,
+    pub(crate) trash_rename_input: Option<Entity<InputState>>,
+    pub(crate) trash_rename_sub: Option<Subscription>,
+    /// 表单模态的导航键拦截器（随视图注册一次，见 [`Self::register_form_keys`]）。
+    /// 只挂不读——Subscription drop 即注销，保活必须留在字段上。
+    #[allow(dead_code)]
+    form_keys_sub: Option<Subscription>,
     /// 磁盘空间分析结果（条形图的数据源）。
     pub(crate) usage: Vec<mo_app::DirUsage>,
     /// 磁盘地图的数据源（懒加载：切到地图视图才建树）。
@@ -1387,6 +1403,15 @@ impl RootView {
             cmd_input: None,
             cmd_input_sub: None,
             cmd_keys_sub: Some(Self::register_cmd_keys(cx)),
+            rename_inputs: [None, None, None, None],
+            rename_subs: [None, None, None, None],
+            prop_input: None,
+            prop_sub: None,
+            archive_input: None,
+            archive_sub: None,
+            trash_rename_input: None,
+            trash_rename_sub: None,
+            form_keys_sub: Some(Self::register_form_keys(cx)),
             palette_index: 0,
             palette_scroll: ScrollHandle::default(),
             app_picker_scroll: ScrollHandle::default(),
@@ -2920,6 +2945,295 @@ impl RootView {
         self.palette_index = 0;
         self.scroll_palette_to_selection();
         cx.notify();
+    }
+
+    /// 四个表单模态（批量重命名 / 属性 / 压缩 / 回收站重命名卡）的输入框收口，
+    /// 每帧从 `render` 早段调用（与 [`Self::sync_connect_inputs`] 同一位置那一拍）。
+    ///
+    /// 与 [`Self::sync_connect_address`] 同一形状：模态没开就丢实体（下次打开
+    /// 重建，旧文本 / 选区 / 撤销历史不跟过来）；开了就懒建 + 把输入变更镜像回
+    /// 模型字段（预览 / 提交的判据仍读模型字段，老调用点一行不用动）。
+    ///
+    /// 焦点纪律按表单形状分两档：
+    /// * 单字段（压缩 / 重命名卡）：**每帧确保聚焦**——对话框里点一下空白焦点
+    ///   被带走，之后打字就没反应了（地址栏同款）；
+    /// * 多字段（批量重命名 4 字段 + 2 开关 / 属性 名字 + 权限位）：焦点跟着
+    ///   `form_index` 走——落在输入字段上就聚焦那个框；走到开关 / 权限位上就
+    ///   把焦点还给视图根，不然输入框还握着焦点，空格 / 上下键全进文本。
+    fn sync_form_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // ---- 批量重命名：4 个字段框 ----
+        if self.modal != Modal::BatchRename {
+            self.rename_inputs = Default::default();
+            self.rename_subs = Default::default();
+        } else if self.rename_inputs[0].is_none() {
+            let seeds = [
+                self.rename_spec.find.clone(),
+                self.rename_spec.replace.clone(),
+                self.rename_spec.prefix.clone(),
+                self.rename_spec.suffix.clone(),
+            ];
+            for (i, seed) in seeds.iter().enumerate() {
+                let state = cx.new(|cx| InputState::new(window, cx));
+                if !seed.is_empty() {
+                    let seed = seed.clone();
+                    state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                }
+                let sub = cx.subscribe_in(
+                    &state,
+                    window,
+                    move |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            if let Some(s) = this.rename_inputs[i].as_ref() {
+                                let value = s.read(cx).value().to_string();
+                                set_rename_spec_field(this, i, value);
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                self.rename_inputs[i] = Some(state);
+                self.rename_subs[i] = Some(sub);
+            }
+        }
+        if self.modal == Modal::BatchRename {
+            if self.form_index < 4 {
+                if let Some(state) = self.rename_inputs[self.form_index].clone() {
+                    if !state.read(cx).focus_handle(cx).is_focused(window) {
+                        state.update(cx, |s, cx| s.focus(window, cx));
+                    }
+                }
+            } else if self.rename_inputs.iter().any(|s| {
+                s.as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window))
+            }) {
+                // 走到开关行：把焦点还给视图根（`track_focus` 那个 handle），
+                // 否则输入框继续吃键，空格 / 上下键全被它抢走。
+                window.focus(&self.focus, cx);
+            }
+        }
+
+        // ---- 属性：文件名框 ----
+        if self.modal != Modal::Properties {
+            self.prop_input = None;
+            self.prop_sub = None;
+        } else {
+            if self.prop_input.is_none() {
+                let seed = self
+                    .prop
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let state = cx.new(|cx| InputState::new(window, cx));
+                if !seed.is_empty() {
+                    state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                }
+                let sub = cx.subscribe_in(
+                    &state,
+                    window,
+                    |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            if let Some(s) = this.prop_input.as_ref() {
+                                let value = s.read(cx).value().to_string();
+                                if let Some(p) = this.prop.as_mut() {
+                                    p.name = value;
+                                }
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                self.prop_input = Some(state);
+                self.prop_sub = Some(sub);
+            }
+            if self.form_index == 0 {
+                if let Some(state) = self.prop_input.clone() {
+                    if !state.read(cx).focus_handle(cx).is_focused(window) {
+                        state.update(cx, |s, cx| s.focus(window, cx));
+                    }
+                }
+            } else if self
+                .prop_input
+                .as_ref()
+                .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window))
+            {
+                window.focus(&self.focus, cx);
+            }
+        }
+
+        // ---- 压缩：包名框（单字段，每帧确保聚焦） ----
+        if self.modal != Modal::Archive {
+            self.archive_input = None;
+            self.archive_sub = None;
+        } else {
+            if self.archive_input.is_none() {
+                let seed = self.archive_name.clone();
+                let state = cx.new(|cx| InputState::new(window, cx));
+                if !seed.is_empty() {
+                    state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                }
+                let sub = cx.subscribe_in(
+                    &state,
+                    window,
+                    |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            if let Some(s) = this.archive_input.as_ref() {
+                                this.archive_name = s.read(cx).value().to_string();
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                self.archive_input = Some(state);
+                self.archive_sub = Some(sub);
+            }
+            if let Some(state) = self.archive_input.clone() {
+                if !state.read(cx).focus_handle(cx).is_focused(window) {
+                    state.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+        }
+
+        // ---- 回收站重命名卡：新名字框（单字段，每帧确保聚焦） ----
+        if !matches!(self.modal, Modal::TrashRename(_)) {
+            self.trash_rename_input = None;
+            self.trash_rename_sub = None;
+        } else {
+            if self.trash_rename_input.is_none() {
+                let seed = self.trash_rename_name.clone();
+                let state = cx.new(|cx| InputState::new(window, cx));
+                if !seed.is_empty() {
+                    state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                }
+                let sub = cx.subscribe_in(
+                    &state,
+                    window,
+                    |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            if let Some(s) = this.trash_rename_input.as_ref() {
+                                this.trash_rename_name = s.read(cx).value().to_string();
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                self.trash_rename_input = Some(state);
+                self.trash_rename_sub = Some(sub);
+            }
+            if let Some(state) = self.trash_rename_input.clone() {
+                if !state.read(cx).focus_handle(cx).is_focused(window) {
+                    state.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+        }
+    }
+
+    /// 四个表单模态里「当前字段的输入框」是否持有焦点——
+    /// [`Self::register_form_keys`] 的接管判据（同命令面板那一套）。
+    fn form_input_focused(&self, window: &Window, cx: &App) -> bool {
+        let current: Option<&Entity<InputState>> = match &self.modal {
+            Modal::BatchRename if self.form_index < 4 => {
+                self.rename_inputs[self.form_index].as_ref()
+            }
+            Modal::Properties if self.form_index == 0 => self.prop_input.as_ref(),
+            Modal::Archive => self.archive_input.as_ref(),
+            Modal::TrashRename(_) => self.trash_rename_input.as_ref(),
+            _ => None,
+        };
+        current.is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// 表单 ↑ / ↓ 移字段：批量重命名 0..=5（4 字段 + 2 开关），属性 0↔1。
+    /// 移动后的焦点归位交给每帧的 [`Self::sync_form_inputs`]（落到输入字段就
+    /// 聚焦那个框；走到开关 / 权限位就把焦点还给视图根）。
+    fn form_move_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        match self.modal {
+            Modal::BatchRename => {
+                self.form_index = if delta < 0 {
+                    self.form_index.saturating_sub(1)
+                } else {
+                    (self.form_index + 1).min(5)
+                };
+            }
+            Modal::Properties => {
+                self.form_index = if delta < 0 { 0 } else { 1 };
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// 表单模态的导航键拦截器（随视图注册一次，形状同 [`Self::register_cmd_keys`]）。
+    ///
+    /// 输入框聚焦后 ↑ / ↓ / Enter 都在 `Input` 键位上下文里有绑定（↑↓ 移光标、
+    /// 回车报 `PressEnter`），不拦住就轮不到表单的「↑↓ 切字段 / Enter 执行」。
+    /// 只拦裸键；字符 / 输入法组合 / 带修饰键的一律放行。压缩与回收站重命名卡
+    /// 是单字段，没有 ↑↓ 导航——方向键放行给输入组件移光标。
+    fn register_form_keys(cx: &mut Context<Self>) -> Subscription {
+        let this = cx.weak_entity();
+        cx.intercept_keystrokes(move |ev, window, cx| {
+            let ks = &ev.keystroke;
+            if ks.modifiers.control
+                || ks.modifiers.alt
+                || ks.modifiers.platform
+                || ks.modifiers.shift
+            {
+                return;
+            }
+            enum Nav {
+                Up,
+                Down,
+                Escape,
+                Enter,
+            }
+            let nav = match ks.key.as_str() {
+                "up" | "arrowup" => Nav::Up,
+                "down" | "arrowdown" => Nav::Down,
+                "escape" => Nav::Escape,
+                "enter" => Nav::Enter,
+                _ => return,
+            };
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            let takeover = entity.update(cx, |v, cx| {
+                match v.modal {
+                    Modal::BatchRename
+                    | Modal::Properties
+                    | Modal::Archive
+                    | Modal::TrashRename(_) => {}
+                    _ => return false,
+                }
+                // ↑↓ 只在多字段表单里是「切字段」；单字段表单放行给光标。
+                if matches!(nav, Nav::Up | Nav::Down)
+                    && !matches!(v.modal, Modal::BatchRename | Modal::Properties)
+                {
+                    return false;
+                }
+                v.form_input_focused(window, cx)
+            });
+            if !takeover {
+                return;
+            }
+            match nav {
+                Nav::Up => entity.update(cx, |v, cx| v.form_move_focus(-1, cx)),
+                Nav::Down => entity.update(cx, |v, cx| v.form_move_focus(1, cx)),
+                Nav::Escape => {
+                    if matches!(entity.read(cx).modal, Modal::TrashRename(_)) {
+                        dismiss_trash_rename(&entity, cx);
+                    } else {
+                        close_modal(&entity, cx);
+                    }
+                }
+                Nav::Enter => match entity.read(cx).modal {
+                    Modal::BatchRename => commit_rename(&entity, cx),
+                    Modal::Properties => commit_properties(&entity, cx),
+                    Modal::Archive => commit_archive(&entity, cx),
+                    Modal::TrashRename(_) => commit_trash_rename(&entity, cx),
+                    _ => {}
+                },
+            }
+            cx.stop_propagation();
+        })
     }
 
     /// 命令面板光标移动（↑ / ↓）：夹在列表范围内并把选中行滚进可视区。
@@ -8631,6 +8945,7 @@ impl Render for RootView {
         // 放在这里（而不是打开 / 关闭两处）见 `sync_connect_input` 的说明。
         self.sync_connect_inputs(window, cx);
         self.sync_cmd_input(window, cx);
+        self.sync_form_inputs(window, cx);
 
         let visible_panes = if self.split && self.panes.len() > 1 {
             2
@@ -9033,18 +9348,24 @@ impl Render for RootView {
             });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
-        // ⚠️ 四个例外——焦点属于真实输入组件时不能抢：
+        // ⚠️ 焦点属于真实输入组件时不能抢，抢回来就是焦点乒乓（无限重绘，
+        // headless 下 run_until_parked 永不收敛 → 测试挂死）：
         // * 地址栏编辑态：抢回来会立刻给输入框一个 Blur → 触发 end_address_edit，
         //   表现为「点编辑闪一下又退回显示态」；
         // * 「连接到服务器」对话框：抢走刚给地址框的焦点，打字就没反应了；
-        // * 「需要登录（认证）」弹窗：同上，而且那里有两个框要 Tab 切换。
-        // * 命令面板：输入框每帧自聚焦，这里再抢回去就是焦点乒乓（无限重绘，
-        //   headless 下 run_until_parked 永不收敛 → 测试挂死）。
+        // * 「需要登录（认证）」弹窗：同上，而且那里有两个框要 Tab 切换；
+        // * 命令面板：输入框每帧自聚焦；
+        // * 四个表单模态（批量重命名 / 属性 / 压缩 / 回收站重命名卡）：输入框
+        //   也每帧自聚焦（`sync_form_inputs`）——但批量重命名 / 属性走到开关 /
+        //   权限位那格时焦点本来就该归视图根，那里不豁免，让 focus_self 兜底。
         let input_owns_focus = self.panel().address_editing
-            || matches!(
-                self.modal,
-                Modal::ConnectServer | Modal::ConnectAuth | Modal::CommandPalette
-            );
+            || match &self.modal {
+                Modal::ConnectServer | Modal::ConnectAuth | Modal::CommandPalette => true,
+                Modal::BatchRename => self.form_index < 4,
+                Modal::Properties => self.form_index == 0,
+                Modal::Archive | Modal::TrashRename(_) => true,
+                _ => false,
+            };
         if !self.focus.is_focused(window) && !input_owns_focus {
             cx.focus_self(window);
         }
@@ -9717,19 +10038,12 @@ fn handle_modal_key(
             _ => {}
         },
         Modal::TrashRename(_) => match key {
+            // 字符 / 退格归输入框（真实 InputState，变更经订阅镜像回
+            // `trash_rename_name`）；Esc / Enter 平时由表单拦截器
+            // （`register_form_keys`）在键位匹配前处理，这里是焦点不在输入框
+            // 时的兜底（同命令面板的 fallback 形状）。
             "escape" => dismiss_trash_rename(entity, cx),
             "enter" => commit_trash_rename(entity, cx),
-            "backspace" => entity.update(cx, |v, cx| {
-                v.trash_rename_name.pop();
-                cx.notify();
-            }),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    v.trash_rename_name.push(ch);
-                    cx.notify();
-                });
-            }
             _ => {}
         },
         Modal::Properties => match key {
@@ -9757,27 +10071,15 @@ fn handle_modal_key(
                 cx.notify();
             }),
             "enter" => commit_properties(entity, cx),
-            "backspace" => entity.update(cx, |v, cx| {
-                if v.form_index == 0 {
-                    if let Some(p) = v.prop.as_mut() {
-                        p.name.pop();
-                    }
-                }
-                cx.notify();
-            }),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    if v.form_index == 0 {
-                        if let Some(p) = v.prop.as_mut() {
-                            p.name.push(ch);
-                        }
-                    }
-                    cx.notify();
-                });
-            }
+            // 名字字符 / 退格归输入框（真实 InputState，变更经订阅镜像回
+            // `prop.name`）；↑↓ / ←→ / 空格在焦点不在输入框时（权限位那格）
+            // 从这里走。
             _ => {}
         },
+        // 字段字符 / 退格归输入框（真实 InputState，变更经订阅镜像回
+        // `rename_spec`）。下面这些平时多由表单拦截器在键位匹配前处理
+        // （输入框持有焦点时 ↑↓ / Esc / Enter 都在 Input 键位上下文里有绑定），
+        // 这里兜底焦点不在输入框的时刻：开关行、或焦点被点走的边角情况。
         Modal::BatchRename => match key {
             "escape" => close_modal(entity, cx),
             "up" => entity.update(cx, |v, cx| {
@@ -9797,33 +10099,13 @@ fn handle_modal_key(
                 cx.notify();
             }),
             "enter" => commit_rename(entity, cx),
-            "backspace" => entity.update(cx, |v, cx| {
-                pop_rename_field(v);
-                cx.notify();
-            }),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    push_rename_field(v, ch);
-                    cx.notify();
-                });
-            }
             _ => {}
         },
         Modal::Archive => match key {
+            // 包名字符 / 退格归输入框（真实 InputState，变更经订阅镜像回
+            // `archive_name`）；Esc / Enter 同上由表单拦截器先接，这里兜底。
             "escape" => close_modal(entity, cx),
             "enter" => commit_archive(entity, cx),
-            "backspace" => entity.update(cx, |v, cx| {
-                v.archive_name.pop();
-                cx.notify();
-            }),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    v.archive_name.push(ch);
-                    cx.notify();
-                });
-            }
             _ => {}
         },
         Modal::DiskUsage => match key {
@@ -13859,31 +14141,15 @@ fn diff_same_fg() -> gpui_kit::Rgba {
 
 // ---------- 新模态的打开 / 提交 ----------
 
-/// 批量重命名字段的读写（0 查找 / 1 替换 / 2 前缀 / 3 后缀）。
-fn push_rename_field(v: &mut RootView, ch: char) {
-    match v.form_index {
-        0 => v.rename_spec.find.push(ch),
-        1 => v.rename_spec.replace.push(ch),
-        2 => v.rename_spec.prefix.push(ch),
-        3 => v.rename_spec.suffix.push(ch),
-        _ => {}
-    }
-}
-
-fn pop_rename_field(v: &mut RootView) {
-    match v.form_index {
-        0 => {
-            v.rename_spec.find.pop();
-        }
-        1 => {
-            v.rename_spec.replace.pop();
-        }
-        2 => {
-            v.rename_spec.prefix.pop();
-        }
-        3 => {
-            v.rename_spec.suffix.pop();
-        }
+/// 批量重命名字段写入（0 查找 / 1 替换 / 2 前缀 / 3 后缀）：输入框的变更经
+/// `sync_form_inputs` 的订阅镜像回 `rename_spec`——预览 / 提交的判据仍读模型
+/// 字段，老调用点一行不用动（同 `cmd_query` 的镜像收口）。
+fn set_rename_spec_field(v: &mut RootView, i: usize, text: String) {
+    match i {
+        0 => v.rename_spec.find = text,
+        1 => v.rename_spec.replace = text,
+        2 => v.rename_spec.prefix = text,
+        3 => v.rename_spec.suffix = text,
         _ => {}
     }
 }
@@ -14000,7 +14266,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, Context, Entity, TestAppContext};
+    use gpui_kit::{px, Context, Entity, Focusable as _, TestAppContext};
     use mo_app::AppState;
 
     use super::{
@@ -17472,6 +17738,227 @@ mod tests {
             })
         });
         assert_eq!(after, "Pictures", "离开回收站后标签应回到目录名");
+    }
+
+    /// 批量重命名的 4 个字段框是真实输入组件（不再有假光标）。
+    ///
+    /// 用户报：「为什么还有这种输入框？光标也没有闪烁」——旧实现是
+    /// 「字符串 + 假光标 `▏`」，按键走模态键表逐字 push/pop：没有焦点、没有
+    /// 选区、⌘A/⌘C/⌘V 全落空、中文输入法没有落点。迁移后与地址栏同一套：
+    /// 开模态懒建 4 个 `InputState`，活动字段持有焦点（光标闪烁的判据），
+    /// 变更经订阅镜像回 `rename_spec`（预览 / 提交的判据仍读模型字段）；
+    /// 走到开关行时输入框要让出焦点，否则空格 / 上下键全进文本。
+    #[test]
+    fn batch_rename_fields_are_real_inputs() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.begin_batch_rename(vec![PathBuf::from("/tmp/mo-batch/a.txt")], cx);
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // 4 个字段框都建好了，活动字段（form_index 0）握着焦点。
+        let (all, focused) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                let all = v.rename_inputs.iter().all(|s| s.is_some());
+                let focused = v.rename_inputs[0]
+                    .as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                (all, focused)
+            })
+        });
+        assert!(all, "四个字段框都应已创建");
+        assert!(focused, "活动字段的输入框应持有焦点（光标闪烁的判据）");
+
+        // 输入镜像回 rename_spec：预览与提交都读模型字段，镜像断了就全断。
+        // 用 `window.input` 走**真实键入路径**（文本 → Change 事件 → 订阅镜像），
+        // 不用 `set_value`——后者是编程式改值，未必报 Change。
+        cx.update(|window, cx| window.input("新年份", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let find = cx.update(|_window, cx| root.read(cx).rename_spec.find.clone());
+        assert_eq!(find, "新年份", "字段输入要镜像回 rename_spec.find");
+
+        // ↓×4 走到开关行：输入框应让出焦点（焦点归视图根）。
+        for _ in 0..4 {
+            cx.update(|_window, cx| root.update(cx, |v, cx| v.form_move_focus(1, cx)));
+        }
+        cx.update(|window, cx| window.render_frame(cx));
+        let still_focused = cx.update(|window, cx| {
+            root.read(cx).rename_inputs[0]
+                .as_ref()
+                .expect("字段框在")
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(!still_focused, "焦点在开关行时输入框应让出焦点");
+
+        // ↑ 回到字段 3：焦点应回到那个框。
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.form_move_focus(-1, cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+        let back = cx.update(|window, cx| {
+            root.read(cx).rename_inputs[3]
+                .as_ref()
+                .expect("字段框在")
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(back, "↑ 回到字段行时焦点应跟着回去");
+    }
+
+    /// 另外三个单字段表单（属性文件名 / 压缩包名 / 回收站重命名卡）同样迁到
+    /// 真实输入组件：开模态懒建、预填种子值、变更镜像回模型字段、每帧确保
+    /// 聚焦（地址栏同款——点一下空白焦点被带走后打字不该没反应）。
+    #[test]
+    fn single_field_form_modals_use_real_inputs() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // ---- 压缩：包名预填提示名 ----
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.begin_archive(vec![PathBuf::from("/tmp/mo-arch/a.txt")], cx);
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        let (focused, value, model) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                let focused = v
+                    .archive_input
+                    .as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                let value = v
+                    .archive_input
+                    .as_ref()
+                    .map(|s| s.read(cx).value().to_string());
+                (focused, value, v.archive_name.clone())
+            })
+        });
+        assert!(focused, "压缩对话框的包名框应持有焦点");
+        assert_eq!(
+            value.as_deref(),
+            Some(model.as_str()),
+            "包名框应预填模型里的提示名"
+        );
+
+        // 变更镜像回 archive_name（真实键入路径：⌘A 全选预填名 → 整段替换）。
+        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.input("打包.zip", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let name = cx.update(|_window, cx| root.read(cx).archive_name.clone());
+        assert_eq!(name, "打包.zip", "键入要镜像回 archive_name");
+
+        // ---- 属性：文件名框预填显示名，镜像回 prop.name ----
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.panel_mut().path = Some(PathBuf::from("/tmp/mo-props"));
+                v.open_properties(cx, Some(PathBuf::from("/tmp/mo-props/旧名字.txt")));
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        let (focused, value, model) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                let focused = v
+                    .prop_input
+                    .as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                let value = v
+                    .prop_input
+                    .as_ref()
+                    .map(|s| s.read(cx).value().to_string());
+                let model = v.prop.as_ref().map(|p| p.name.clone());
+                (focused, value, model)
+            })
+        });
+        assert!(focused, "属性面板的名字框应持有焦点");
+        assert_eq!(
+            value.as_deref(),
+            model.as_deref(),
+            "名字框应预填模型里的显示名"
+        );
+        assert!(value.as_deref().is_some_and(|s| !s.is_empty()));
+        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.input("新名字", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let prop_name =
+            cx.update(|_window, cx| root.read(cx).prop.as_ref().map(|p| p.name.clone()));
+        assert_eq!(
+            prop_name.as_deref(),
+            Some("新名字"),
+            "名字输入要镜像回 prop.name"
+        );
+
+        // ---- 回收站重命名卡：预填原名，镜像回 trash_rename_name ----
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                let entry = mo_operations::TrashEntry {
+                    id: "t1".to_string(),
+                    original: PathBuf::from("/tmp/mo-trash/原名字.txt"),
+                    trashed: PathBuf::from("/tmp/mo-trash/.Trash/t1"),
+                    is_dir: false,
+                    at: 0,
+                };
+                v.trash_rename_name = "原名字.txt".to_string();
+                v.modal = Modal::TrashRename(Box::new(entry));
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        let (focused, seeded) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                let focused = v
+                    .trash_rename_input
+                    .as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                let value = v
+                    .trash_rename_input
+                    .as_ref()
+                    .map(|s| s.read(cx).value().to_string());
+                (focused, value)
+            })
+        });
+        assert!(focused, "重命名卡的输入框应持有焦点");
+        assert_eq!(
+            seeded.as_deref(),
+            Some("原名字.txt"),
+            "重命名卡应预填原文件名"
+        );
+        // 探针：聚焦输入框上退格要真的删字（真机键盘路径）。
+        // 「原名字.txt」7 字符，退格×2 → 「原名字.t」。
+        cx.update(|window, cx| {
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        let after_bs = cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.trash_rename_input
+                    .as_ref()
+                    .map(|s| s.read(cx).value().to_string())
+            })
+        });
+        assert_eq!(
+            after_bs.as_deref(),
+            Some("原名字.t"),
+            "聚焦输入框上 backspace 应逐字删除"
+        );
+        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.input("改个名.txt", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let new_name = cx.update(|_window, cx| root.read(cx).trash_rename_name.clone());
+        assert_eq!(new_name, "改个名.txt", "输入要镜像回 trash_rename_name");
     }
 
     /// 网格 / 画廊视图：内容四周要留白，单元名称要水平居中（长名字截断不溢出）。

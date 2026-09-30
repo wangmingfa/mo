@@ -1,14 +1,16 @@
 //! dialogs：需要输入的模态（属性 / 批量重命名 / 压缩 / 磁盘用量 / 标签）。
 //!
-//! 统一套路：`RootView` 只持有**表单状态**（当前字段、文本、选项），
-//! 这里负责渲染 + 把按键结果写回。所有提交动作都通过 `AppState` 发命令，
-//! UI 不直接碰文件系统。
+//! 统一套路：`RootView` 持有**表单状态**（当前字段、选项）与真实输入框实体
+//! （`InputState`，生命周期收口在 `sync_form_inputs`），这里负责渲染；文本变更
+//! 经订阅镜像回模型字段，提交动作都通过 `AppState` 发命令，UI 不直接碰文件系统。
 //!
 //! 两类壳的归属见 `crate::app`：
 //! * `central_view`——占满中央区的次级视图（批量重命名 / 磁盘用量）；
 //! * `dialog_overlay`——带遮罩的浮层对话框（属性 / 压缩 / 标签）。
 
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_core::plan_batch_rename;
 use mo_operations::{mode_string, TrashEntry};
@@ -55,10 +57,12 @@ pub fn properties(view: &RootView, entity: &Entity<RootView>) -> impl IntoElemen
                 .text_color(theme::muted())
                 .child(text!("名称（可编辑，Enter 重命名）".to_string())),
         )
-        .child(field_row(
-            &p.name,
+        .child(input_field_row(
+            view.prop_input.clone(),
             view.form_index == 0,
-            format!("prop-name-{}", p.name.len()),
+            "prop-name".to_string(),
+            entity.clone(),
+            0,
         ));
 
     // 2) 权限位：9 个开关，← → 移动光标，空格切换，Enter 应用
@@ -124,7 +128,7 @@ pub fn properties(view: &RootView, entity: &Entity<RootView>) -> impl IntoElemen
 }
 
 /// 批量重命名：规则表单 + 实时预览（占满中央区的次级视图）。
-pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
+pub fn batch_rename(view: &RootView, entity: &Entity<RootView>) -> Div {
     let spec = &view.rename_spec;
     let names: Vec<String> = view
         .rename_paths
@@ -144,13 +148,12 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
         .min_h_0()
         .gap(px(4.0))
         .p(px(8.0));
-    let fields: [(&str, String, usize); 4] = [
-        ("查找", spec.find.clone(), 0),
-        ("替换为", spec.replace.clone(), 1),
-        ("前缀", spec.prefix.clone(), 2),
-        ("后缀", spec.suffix.clone(), 3),
-    ];
-    for (label, value, idx) in fields {
+    for (label, input, idx) in [
+        ("查找", view.rename_inputs[0].clone(), 0usize),
+        ("替换为", view.rename_inputs[1].clone(), 1),
+        ("前缀", view.rename_inputs[2].clone(), 2),
+        ("后缀", view.rename_inputs[3].clone(), 3),
+    ] {
         body = body
             .child(
                 div()
@@ -160,10 +163,12 @@ pub fn batch_rename(view: &RootView, _entity: &Entity<RootView>) -> Div {
                     .text_color(theme::muted())
                     .child(text!(label.to_string())),
             )
-            .child(field_row(
-                &value,
+            .child(input_field_row(
+                input,
                 view.form_index == idx,
                 format!("rn-{idx}"),
+                entity.clone(),
+                idx,
             ));
     }
 
@@ -258,10 +263,12 @@ pub fn archive(view: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
                     names.len()
                 ))),
         )
-        .child(field_row(
-            &view.archive_name,
+        .child(input_field_row(
+            view.archive_input.clone(),
             true,
             "archive-name".to_string(),
+            entity.clone(),
+            0,
         ));
     for (i, n) in names.iter().take(8).enumerate() {
         // ⚠️ 循环行需要唯一 ID（防重复 a11y 节点）。
@@ -304,10 +311,12 @@ pub fn trash_rename(
                 .text_color(theme::muted())
                 .child(text!(format!("将「{old}」重命名为："))),
         )
-        .child(field_row(
-            &view.trash_rename_name,
+        .child(input_field_row(
+            view.trash_rename_input.clone(),
             true,
             "trash-rename-name".to_string(),
+            entity.clone(),
+            0,
         ));
     dialog_overlay(entity, "重命名", "", body, "")
 }
@@ -619,14 +628,22 @@ pub fn tags(entity: &Entity<RootView>, view: &RootView) -> impl IntoElement {
     )
 }
 
-/// 一个可编辑的输入行（带光标提示）。
+/// 一个真实输入行（gpui-component `Input`）：光标 / 选区 / IME / 剪贴板归
+/// 组件，壳仍是原来那层胶囊（边框按 `active` 着色）。
 ///
-/// ⚠️ 这是「字符串 + 假光标 `▏`」那套：没有选区，⌘A / ⌘C / ⌘V 全都落空，
-/// 按键会穿透到根视图的键表变成浏览区动作。键盘路由那头有兜底（模态打开时
-/// 作用于文件列表的动作一律吞掉，见 `keys::BROWSER_SCOPED`），但**新写的输入行
-/// 优先用真实 `InputState`**（地址栏 / 连接到服务器就是这么做的）。
-pub(crate) fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> {
-    div()
+/// ⚠️ 取代了旧的「字符串 + 假光标 `▏`」`field_row`（没有选区，⌘A / ⌘C / ⌘V
+/// 全落空，光标不闪，中文输入法没有落点）。输入框实体的生命周期在
+/// `RootView::sync_form_inputs`（模态开着才存在），这里只负责把它摆进壳里。
+/// `entity` 供点击行时把 `form_index` 拨到这一字段——多字段表单的 ↑↓ 导航跟
+/// 它走。
+pub(crate) fn input_field_row(
+    input: Option<Entity<InputState>>,
+    active: bool,
+    id: String,
+    entity: Entity<RootView>,
+    field: usize,
+) -> Stateful<Div> {
+    let row = div()
         .id(id)
         .flex()
         .flex_row()
@@ -640,8 +657,38 @@ pub(crate) fn field_row(value: &str, active: bool, id: String) -> Stateful<Div> 
         } else {
             theme::separator()
         })
-        .bg(theme::surface())
-        .child(text!(format!("{}{}", value, if active { "▏" } else { "" })))
+        .bg(theme::surface());
+    let Some(input) = input else {
+        // 输入框实体还没建好（sync 在 render 早段做，正常到不了这里）：空壳。
+        return row;
+    };
+    row.on_click(move |_, _window, cx| {
+        entity.update(cx, |v, cx| {
+            if v.form_index != field {
+                v.form_index = field;
+                cx.notify();
+            }
+        })
+    })
+    .child(
+        // ⚠️ 必须自己是居中 flex：Input 若被 h_full 拉满整行高，文字按它自己
+        // 的行盒画在顶部（命令面板搜索框那条同款教训）。让 Input 保持自然高、
+        // 由这里垂直居中，光标才落在行的中线上。
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .child(
+                Input::new(&input)
+                    .appearance(false)
+                    .bordered(false)
+                    .small()
+                    .text_size(px(12.5))
+                    .p(px(0.0)),
+            ),
+    )
 }
 
 fn icon_for(_u: &mo_app::DirUsage) -> &'static [u8] {
