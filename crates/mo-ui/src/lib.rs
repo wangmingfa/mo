@@ -11,6 +11,7 @@ mod bitmap;
 mod columns;
 mod context_menu;
 mod dialogs;
+mod extensions_window;
 mod file_item;
 mod file_list;
 mod grid;

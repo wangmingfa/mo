@@ -310,21 +310,19 @@ pub(crate) enum Modal {
     /// 原先是主题、布局、快捷键三个各开各的弹窗，入口散在命令面板与用户命令里；
     /// 收进一个带标签栏的窗口后入口只换标签页，不再各自为政。
     Settings,
-    /// 扩展管理器（列出已加载的扩展，可启停）。
-    Extensions,
     /// 「启用这个扩展」的确认卡（P2-6，devlog §6 的权限确认在声明层的形态）。
     ///
     /// 携带的是扩展 **id** 而不是第几行（§4.2「载荷带身份而不是下标」）：卡开着的那段时间里
     /// `self.extensions` 仍会被刷新（重新打开面板、启停别的扩展），而按位置启用的是**刷新后
     /// 那一行的邻居**。
     ///
-    /// 扩展面板**保留在遮罩后面**（中央区仍按 `Modal::Extensions` 画），与
-    /// [`Modal::ConfirmTrash`] 同一套；Esc / 取消 / 点遮罩都回到面板。
+    /// 扩展管理器已迁**独立窗口**：这档模态值只是状态账（卡画在扩展窗口里，页面
+    /// 保留在卡下面），与 [`Modal::ConfirmTrash`] 同一套；Esc / 取消 / 点遮罩都回到面板。
     ConfirmEnableExt(String),
     /// 「卸载这个扩展」的确认卡（删 `<id>/` 目录，不可恢复）。
     ///
     /// 携带扩展 **id** 而不是第几行（与 [`Modal::ConfirmEnableExt`] 同一条纪律）；
-    /// 扩展面板保留在遮罩后面，Esc / 取消 / 点遮罩都回到面板。
+    /// 卡画在扩展管理器窗口里，Esc / 取消 / 点遮罩都回到面板。
     ConfirmUninstallExt(String),
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
     ConnectServer,
@@ -999,8 +997,20 @@ pub struct RootView {
     /// 弹确认卡时记下——那时五处传输入口都还拿得到两端；决策提交、整批复传完
     /// 之后对它 `refresh_if_showing`，让远程目标端立刻冒出新文件。
     pub(crate) resume_dest: Option<(mo_app::AppState, PathBuf)>,
-    /// 命令面板过滤词。
+    /// 命令面板过滤词（输入框值的镜像：过滤判据仍读它，与老调用点兼容）。
     cmd_query: String,
+    /// 命令面板的**真实输入框**（[`InputState`]：光标 / 选区 / 剪贴板 / 输入法都由
+    /// 它提供）。原先过滤词靠拦截按键手拼——没有焦点、没有光标，中文 IME 的组合
+    /// 输入根本没有落点（用户报：命令面板搜不了中文、搜索框不聚焦）。与
+    /// `connect_input` 同一套收口：开面板懒建、关面板即丢。
+    cmd_input: Option<Entity<InputState>>,
+    /// Change 订阅（保活用：字段只写不读，`pub(crate)` 仅为绕过 dead_code）。
+    cmd_input_sub: Option<Subscription>,
+    /// 命令面板导航键拦截器（Esc / ↑ / ↓ / Enter 要**先于**输入组件的绑定生效，
+    /// 否则输入框会把它们当编辑键吃掉）；随视图存活，仅面板开着且有焦点时出手。
+    /// 只挂不读——Subscription drop 即注销，保活必须留在字段上。
+    #[allow(dead_code)]
+    cmd_keys_sub: Option<Subscription>,
     /// 命令面板 / 搜索结果的高亮下标。
     palette_index: usize,
     /// 命令面板 / 应用选择器 / 全局搜索三个键盘导航列表各自的滚动句柄：
@@ -1032,6 +1042,10 @@ pub struct RootView {
     search_results: Vec<SearchHit>,
     /// 快速预览独立窗口（`None` = 未开；已开时复用换内容，不重复开）。
     pub(crate) preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
+    /// 扩展管理器独立窗口（`None` = 未开；已开时复用置前，不重复开）。
+    /// 状态仍全部住在主窗口根视图（见 `extensions_window` 模块注释），这个字段
+    /// 只管窗口本身；用户点红绿灯关掉后句柄失效，下次打开时 `update` 报错重建。
+    pub(crate) extensions_window: Option<WindowHandle<crate::extensions_window::ExtensionsWindow>>,
     /// 预览**代际**：每次 `show_preview` 递增。
     ///
     /// 图片的降采样副本在后台生成，回来时可能已经换了预览对象（翻页）——
@@ -1062,8 +1076,8 @@ pub struct RootView {
     keys_capturing: Option<&'static str>,
     /// 用户自定义命令快照（打开命令面板时刷新；下标即 CommandId::User 的参数）。
     user_commands: Vec<mo_app::UserCommand>,
-    /// 已加载的扩展快照（打开扩展管理器时刷新）。
-    extensions: Vec<mo_app::extensions::Extension>,
+    /// 已加载的扩展快照（打开扩展管理器时刷新；独立窗口借渲染，故对兄弟模块开放）。
+    pub(crate) extensions: Vec<mo_app::extensions::Extension>,
     /// 工作流快照（打开命令面板时刷新；下标即 CommandId::Workflow 的参数）。
     workflows: Vec<mo_app::Workflow>,
     /// 工作流是否正在执行。
@@ -1091,7 +1105,7 @@ pub struct RootView {
     /// 扩展管理器的光标位。
     ext_index: usize,
     /// 加载失败的清单（`extensions::load_report` 的另一半）：扩展页要亮出来并说原因。
-    broken_exts: Vec<mo_app::extensions::BrokenExtension>,
+    pub(crate) broken_exts: Vec<mo_app::extensions::BrokenExtension>,
     /// 重复文件查找结果（`None` = 还没跑过）。
     dedup: Option<mo_operations::DedupReport>,
     /// 重复文件查找是否在跑。
@@ -1329,6 +1343,9 @@ impl RootView {
             conflict_pending: None,
             resume_dest: None,
             cmd_query: String::new(),
+            cmd_input: None,
+            cmd_input_sub: None,
+            cmd_keys_sub: Some(Self::register_cmd_keys(cx)),
             palette_index: 0,
             palette_scroll: ScrollHandle::default(),
             app_picker_scroll: ScrollHandle::default(),
@@ -1338,6 +1355,7 @@ impl RootView {
             search_query: String::new(),
             search_results: Vec::new(),
             preview_window: None,
+            extensions_window: None,
             preview_seq: 0,
             theme_name: theme_name.clone(),
             appearance_dark: false,
@@ -2742,6 +2760,138 @@ impl RootView {
         self.sync_connect_auth(window, cx);
     }
 
+    /// 命令面板导航键拦截器（随视图注册一次）。
+    ///
+    /// 输入框聚焦后，Esc / ↑ / ↓ / Enter 都在 `Input` 键位上下文里**有绑定**——
+    /// 不拦住它们就会被输入组件吃掉（Esc 关不掉面板、上下键变成移动光标）。拦截器
+    /// 在键位匹配**之前**跑（`intercept_keystrokes` 的语义），这里抢先把导航键处理掉
+    /// 并 `stop_propagation`。只拦三样：①命令面板开着；②面板输入框在**本窗口**
+    /// 持有焦点（别的窗口敲的键不算——`is_focused(window)` 自带这个判定）；
+    /// ③裸键（带修饰键的一律放行，⌘⇧P 重开面板这类不能被吞）。
+    fn register_cmd_keys(cx: &mut Context<Self>) -> Subscription {
+        let this = cx.weak_entity();
+        cx.intercept_keystrokes(move |ev, window, cx| {
+            let ks = &ev.keystroke;
+            if ks.modifiers.control
+                || ks.modifiers.alt
+                || ks.modifiers.platform
+                || ks.modifiers.shift
+            {
+                return;
+            }
+            enum Nav {
+                Up,
+                Down,
+                Escape,
+                Enter,
+            }
+            let nav = match ks.key.as_str() {
+                "up" | "arrowup" => Nav::Up,
+                "down" | "arrowdown" => Nav::Down,
+                "escape" => Nav::Escape,
+                "enter" => Nav::Enter,
+                _ => return,
+            };
+            let Some(entity) = this.upgrade() else {
+                return;
+            };
+            let handled = entity.update(cx, |v, cx| {
+                if v.modal != Modal::CommandPalette {
+                    return false;
+                }
+                let focused = v
+                    .cmd_input
+                    .as_ref()
+                    .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                if !focused {
+                    return false;
+                }
+                match nav {
+                    Nav::Up => v.palette_move(-1, cx),
+                    Nav::Down => v.palette_move(1, cx),
+                    Nav::Escape => {
+                        v.modal = Modal::None;
+                        v.cmd_query.clear();
+                        v.palette_index = 0;
+                        v.app_picker = None;
+                        cx.notify();
+                    }
+                    Nav::Enter => {}
+                }
+                true
+            });
+            if !handled {
+                return;
+            }
+            if let Nav::Enter = nav {
+                on_palette_enter(&entity, cx);
+            }
+            cx.stop_propagation();
+        })
+    }
+
+    /// 命令面板的输入框（每帧收口，与 [`Self::sync_connect_address`] 同一套形状）：
+    /// 面板没开就丢掉实体（下次打开是干净的）；开了就懒建 + **每帧确保聚焦**——
+    /// 用户报的「搜索框无法聚焦、没有光标」就是缺这一拍：gpui 只有焦点在输入框上
+    /// 才会画光标、才收 IME 输入。
+    fn sync_cmd_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal != Modal::CommandPalette {
+            self.cmd_input = None;
+            self.cmd_input_sub = None;
+            return;
+        }
+        if self.cmd_input.is_none() {
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder("输入以过滤…"));
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |this: &mut Self, _state, ev: &InputEvent, _window, cx| {
+                    // 回车已被导航拦截器吃掉（面板开着时到不了这里）；万一拦不住
+                    // （焦点不在输入框的边角情况），Enter 会从 handle_modal_key 走。
+                    if matches!(ev, InputEvent::Change) {
+                        this.sync_cmd_query_from_input(cx);
+                    }
+                },
+            );
+            self.cmd_input = Some(state);
+            self.cmd_input_sub = Some(sub);
+            self.cmd_query.clear();
+            self.palette_index = 0;
+        }
+        let Some(state) = self.cmd_input.clone() else {
+            return;
+        };
+        if !state.read(cx).focus_handle(cx).is_focused(window) {
+            state.update(cx, |s, cx| s.focus(window, cx));
+        }
+    }
+
+    /// 输入框 → 过滤词镜像：过滤判据（`palette_len` / `filtered_commands_in`）
+    /// 仍读 `cmd_query`，这里在每次变更时对齐，老调用点一行不用动。
+    fn sync_cmd_query_from_input(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.cmd_input else {
+            return;
+        };
+        self.cmd_query = state.read(cx).value().to_string();
+        self.palette_index = 0;
+        self.scroll_palette_to_selection();
+        cx.notify();
+    }
+
+    /// 命令面板光标移动（↑ / ↓）：夹在列表范围内并把选中行滚进可视区。
+    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.palette_len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.palette_index as isize + delta).clamp(0, n as isize - 1) as usize;
+        if next != self.palette_index {
+            self.palette_index = next;
+            self.scroll_palette_to_selection();
+        }
+        cx.notify();
+    }
+
     /// 地址对话框的输入框。
     ///
     /// **每帧都确保聚焦**而不是只在建的时候聚焦一次：对话框里点一下空白或按钮
@@ -4044,7 +4194,12 @@ impl RootView {
         body
     }
 
-    /// 打开扩展管理器。
+    /// 打开扩展管理器（**独立窗口**）。
+    ///
+    /// 原先是 `Modal::Extensions` 顶掉主窗口中央区——看一眼「这个扩展会往界面里放
+    /// 什么」，正在浏览的文件就没了。现在迁独立窗口：已开着就复用（刷新 + 置前，
+    /// Quick Look 习惯），被用户点红绿灯关掉了就当没开重新创建（`update` 报错即
+    /// 句柄失效，与 `show_preview` 同一条重建路径）。
     pub(crate) fn open_extensions_picker(&mut self, cx: &mut Context<Self>) {
         // `extensions_report` 的另一半是坏清单：面板开着的时候必须**这一刻**的答案，
         // 用户往往就是改完清单马上回来看。键表同理重取（与 `palette.open` 同一个
@@ -4055,14 +4210,91 @@ impl RootView {
         self.broken_exts = broken;
         self.ext_index = 0;
         self.keymap = keymap_from(&self.app());
-        self.modal = Modal::Extensions;
         cx.notify();
+
+        if let Some(handle) = self.extensions_window {
+            let updated = handle.update(cx, |_, window, _| {
+                window.activate_window();
+            });
+            if updated.is_ok() {
+                // 清单刚刷新过，窗口里的行可能变了（新装了一个、删了一个）。
+                self.sync_extensions_window(cx);
+                return;
+            }
+            self.extensions_window = None;
+        }
+
+        let bounds = WindowBounds::centered(size(px(560.0), px(520.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(bounds),
+            titlebar: Some(TitlebarOptions {
+                title: Some("扩展".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // ⚠️ **同步**开窗（与 `show_preview` 同一条纪律）：建完就能拿到句柄，
+        // 复用 / 关闭检测都靠它；异步开窗会有「句柄未就绪」的竞态。
+        let root_for_window = cx.entity();
+        match cx.open_window(options, move |_, cx| {
+            cx.new(|cx| crate::extensions_window::ExtensionsWindow::new(root_for_window, cx))
+        }) {
+            Ok(handle) => {
+                // 首帧（open_window 内同步渲染）画的是空壳——那一刻本视图还锁在
+                // `root.update` 里，窗口去读它会 panic。现在 update 已收尾在即，
+                // 放行真页并通知重画。
+                let _ = handle.update(cx, |w, _, cx| w.set_ready(cx));
+                self.extensions_window = Some(handle);
+            }
+            Err(e) => {
+                self.modal = Modal::Info(format!("打开扩展管理器窗口失败：{e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 扩展窗口还开着就让它重画。
+    ///
+    /// 扩展页的状态全在本视图（主窗口根）上，独立窗口只是借渲染——两个窗口各画
+    /// 各的帧，本视图 `cx.notify()` 只会让主窗口重画，扩展窗口得单独递一次通知。
+    /// 只写句柄不升级失败（用户刚关掉窗口）不算错：下次打开会走重建。
+    pub(crate) fn sync_extensions_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.extensions_window {
+            let _ = handle.update(cx, |_, _window, cx| cx.notify());
+        }
+    }
+
+    /// 扩展窗口里 ↑↓ 换选中行（原 `handle_modal_key` 扩展分支的 up/down）。
+    pub(crate) fn extension_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.extensions.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.ext_index as isize + delta).clamp(0, n as isize - 1) as usize;
+        if next != self.ext_index {
+            self.ext_index = next;
+            self.sync_extensions_window(cx);
+            cx.notify();
+        }
+    }
+
+    /// 扩展窗口里 Enter = 翻当前行的启停（与点胶囊同一个入口，仍按 id 认人）。
+    pub(crate) fn extension_toggle_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .extensions
+            .get(self.ext_index)
+            .map(|e| e.manifest.id.clone())
+        else {
+            return;
+        };
+        self.toggle_extension(&id, cx);
     }
 
     /// 选中某一行 = 展开它的贡献清单（翻状态是右侧那颗状态胶囊与 Enter 的事）。
     fn select_extension(&mut self, i: usize, cx: &mut Context<Self>) {
         if self.ext_index != i {
             self.ext_index = i;
+            self.sync_extensions_window(cx);
             cx.notify();
         }
     }
@@ -4081,6 +4313,7 @@ impl RootView {
         let id = id.to_string();
         if !e.manifest.enabled {
             self.modal = Modal::ConfirmEnableExt(id);
+            self.sync_extensions_window(cx);
             cx.notify();
             return;
         }
@@ -4089,6 +4322,7 @@ impl RootView {
             return;
         }
         self.extensions = self.app().extensions();
+        self.sync_extensions_window(cx);
         cx.notify();
     }
 
@@ -4096,6 +4330,7 @@ impl RootView {
     /// 动作）。载荷带 id 不带下标——卡开着期间列表变了，按位置删等于删另一条。
     fn ask_uninstall_extension(&mut self, id: &str, cx: &mut Context<Self>) {
         self.modal = Modal::ConfirmUninstallExt(id.to_string());
+        self.sync_extensions_window(cx);
         cx.notify();
     }
 
@@ -4131,6 +4366,7 @@ impl RootView {
             }
             Err(err) => self.notice(err, None, cx),
         }
+        self.sync_extensions_window(cx);
         cx.notify();
     }
 
@@ -4163,6 +4399,7 @@ impl RootView {
             }
             Err(err) => self.notice(err, None, cx),
         }
+        self.sync_extensions_window(cx);
         cx.notify();
     }
 
@@ -4171,7 +4408,7 @@ impl RootView {
     /// 句子来自 [`mo_app::extensions::contributions`]，这里只做措辞——名字、落点、键位
     /// 三处加工规则都已经有主（`display_name` / `slots()` / `has_chord()`），UI 再各走
     /// 一遍就是两处作答，而这张表的用途是对用户说真话。
-    fn contribution_lines(&self, id: &str) -> Vec<String> {
+    pub(crate) fn contribution_lines(&self, id: &str) -> Vec<String> {
         let Some(e) = self.extensions.iter().find(|x| x.manifest.id == id) else {
             return Vec::new();
         };
@@ -4214,7 +4451,8 @@ impl RootView {
             .collect()
     }
 
-    fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
+    /// 扩展管理器页面（独立窗口借渲染：状态住在本视图，监听器直接改本视图）。
+    pub(crate) fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
         let mut body = div()
             .flex()
             .flex_col()
@@ -8298,6 +8536,7 @@ impl Render for RootView {
         // 「连接到服务器」的地址输入框：开着就确保存在并握着焦点，关了就回收。
         // 放在这里（而不是打开 / 关闭两处）见 `sync_connect_input` 的说明。
         self.sync_connect_inputs(window, cx);
+        self.sync_cmd_input(window, cx);
 
         let visible_panes = if self.split && self.panes.len() > 1 {
             2
@@ -8408,9 +8647,10 @@ impl Render for RootView {
             Modal::Diff => self.render_diff(),
             Modal::BatchRename => dialogs::batch_rename(self, &entity),
             Modal::DiskUsage => dialogs::disk_usage(self, &entity),
-            Modal::Extensions | Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => {
-                self.render_extensions(&entity)
-            }
+            // 扩展管理器已迁独立窗口（`extensions_window` 模块）：这档模态值只是
+            // 状态账（确认卡画在扩展窗口里、页面状态在本视图上），主窗口对它们
+            // **什么都不画**——浏览不被打断。
+            Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => div(),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::History => self.render_history(&entity),
             Modal::Workflow => self.render_workflow(),
@@ -8699,13 +8939,18 @@ impl Render for RootView {
             });
 
         // 让焦点落在本视图上，否则按键不会派发到这里。
-        // ⚠️ 三个例外——焦点属于真实输入组件时不能抢：
+        // ⚠️ 四个例外——焦点属于真实输入组件时不能抢：
         // * 地址栏编辑态：抢回来会立刻给输入框一个 Blur → 触发 end_address_edit，
         //   表现为「点编辑闪一下又退回显示态」；
         // * 「连接到服务器」对话框：抢走刚给地址框的焦点，打字就没反应了；
         // * 「需要登录（认证）」弹窗：同上，而且那里有两个框要 Tab 切换。
+        // * 命令面板：输入框每帧自聚焦，这里再抢回去就是焦点乒乓（无限重绘，
+        //   headless 下 run_until_parked 永不收敛 → 测试挂死）。
         let input_owns_focus = self.panel().address_editing
-            || matches!(self.modal, Modal::ConnectServer | Modal::ConnectAuth);
+            || matches!(
+                self.modal,
+                Modal::ConnectServer | Modal::ConnectAuth | Modal::CommandPalette
+            );
         if !self.focus.is_focused(window) && !input_owns_focus {
             cx.focus_self(window);
         }
@@ -9164,39 +9409,26 @@ fn handle_modal_key(
 ) {
     let modal = entity.update(cx, |v, _cx| v.modal.clone());
     match modal {
+        // 扩展管理器（含两张确认卡）已迁独立窗口：按键在
+        // `extensions_window::ExtensionsWindow` 里路由，主窗口对它们不响应。
+        Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => {}
         Modal::CommandPalette => match key {
             "escape" => close_modal(entity, cx),
+            // ↑ / ↓ / Enter：只在**输入框没拿到焦点**时才从这里走（面板刚开的那一帧、
+            // 或焦点被点走的边角情况）。输入框持有焦点时它们由导航拦截器
+            // （`register_cmd_keys`）在键位匹配之前处理——输入组件自己的键位上下文
+            // 里这三个键都有绑定，不拦就轮不到这里。
             "up" | "arrowup" => entity.update(cx, |v, cx| {
-                if v.palette_index > 0 {
-                    v.palette_index -= 1;
-                    v.scroll_palette_to_selection();
-                }
-                cx.notify();
+                v.palette_move(-1, cx);
             }),
             "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = v.palette_len();
-                if n > 0 {
-                    v.palette_index = (v.palette_index + 1).min(n - 1);
-                    v.scroll_palette_to_selection();
-                }
-                cx.notify();
+                v.palette_move(1, cx);
             }),
             "enter" => on_palette_enter(entity, cx),
-            k if plain && k.chars().count() == 1 => {
-                let ch = k.chars().next().unwrap();
-                entity.update(cx, |v, cx| {
-                    v.cmd_query.push(ch);
-                    v.palette_index = 0;
-                    v.scroll_palette_to_selection();
-                    cx.notify();
-                });
-            }
-            "backspace" => entity.update(cx, |v, cx| {
-                v.cmd_query.pop();
-                v.palette_index = 0;
-                v.scroll_palette_to_selection();
-                cx.notify();
-            }),
+            // 字符与退格都归输入框（光标 / 选区 / 输入法 / 剪贴板是它的职责）：
+            // 这里**不再**手拼过滤词——原先那套拦截按键 push/pop 的写法没有焦点、
+            // 没有光标，中文 IME 的组合输入也没有落点。输入框变更经
+            // `sync_cmd_query_from_input` 镜像回 `cmd_query`。
             _ => {}
         },
         Modal::GlobalSearch => match key {
@@ -9541,41 +9773,8 @@ fn handle_modal_key(
             }
             _ => {}
         },
-        Modal::Extensions => match key {
-            "escape" => close_modal(entity, cx),
-            "up" | "arrowup" => entity.update(cx, |v, cx| {
-                v.ext_index = v.ext_index.saturating_sub(1);
-                cx.notify();
-            }),
-            "down" | "arrowdown" => entity.update(cx, |v, cx| {
-                let n = v.extensions.len();
-                if n > 0 {
-                    v.ext_index = (v.ext_index + 1).min(n - 1);
-                }
-                cx.notify();
-            }),
-            "enter" => entity.update(cx, |v, cx| {
-                // 光标位只是「当前那一行」，翻状态仍然按 id 找（与点胶囊同一个入口）。
-                let Some(id) = v.extensions.get(v.ext_index).map(|e| e.manifest.id.clone()) else {
-                    return;
-                };
-                v.toggle_extension(&id, cx);
-            }),
-            _ => {}
-        },
-        // 确认卡上 Esc / Enter 与那两颗按钮同义（Esc = 取消，Enter = 启用）；这里**不**
-        // 复用扩展页那档的上下键——卡还开着就换选中行，等于确认的是别条扩展。
-        Modal::ConfirmEnableExt(_) => match key {
-            "escape" => dismiss_enable_confirm(entity, cx),
-            "enter" => confirm_enable_ext(entity, cx),
-            _ => {}
-        },
-        // 卸载确认卡同款（Enter = 确认删，Esc = 取消）；同样不吃上下键。
-        Modal::ConfirmUninstallExt(_) => match key {
-            "escape" => dismiss_uninstall_confirm(entity, cx),
-            "enter" => confirm_uninstall_ext(entity, cx),
-            _ => {}
-        },
+        // 扩展管理器（含它的两张确认卡）已迁独立窗口：按键在
+        // `extensions_window::ExtensionsWindow` 里路由，这里不再有分支。
         Modal::Settings => {
             // 捕获态（快捷键页）：下一次按键就是新键位（Esc 取消，不绑）。
             let capturing = entity.update(cx, |v, _cx| v.keys_capturing.is_some());
@@ -11081,7 +11280,11 @@ impl RootView {
         let list = filtered_commands_in(&self.cmd_query, &self.user_commands, &self.workflows);
         let idx = self.palette_index;
         let mut body = div().flex().flex_col();
-        body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤命令…"));
+        body = body.child(match &self.cmd_input {
+            Some(state) => palette_search_row(state),
+            // 输入框还没建（面板刚开、渲染第一拍之前）：先摆静默壳，下一拍就有了。
+            None => dialog_search_row(&self.cmd_query, "输入以过滤…"),
+        });
         // 行列表。kit 的 `overflow_y_scrollbar()` 把滚动句柄藏进私有 keyed
         // state，拿不到就没法让「键盘选中行」滚进可视区；照它 wrapper 的三层
         // 结构自拼：root 定尺寸 + relative，滚动区 track_scroll **直接持有行**
@@ -11143,7 +11346,10 @@ impl RootView {
         let list = filtered_apps(&self.cmd_query, &picker.apps);
         let idx = self.palette_index;
         let mut body = div().flex().flex_col();
-        body = body.child(dialog_search_row(&self.cmd_query, "输入以过滤应用…"));
+        body = body.child(match &self.cmd_input {
+            Some(state) => palette_search_row(state),
+            None => dialog_search_row(&self.cmd_query, "输入以过滤应用…"),
+        });
         // 结构同命令面板（见那里的注释）。
         let mut rows_area = div()
             .id("app-picker-scroll-area")
@@ -12401,6 +12607,36 @@ fn dialog_search_row(query: &str, placeholder: &str) -> Div {
         )
 }
 
+/// 命令面板 / 应用选择器的搜索行：外壳与 [`dialog_search_row`] 同形，但内容是
+/// **真输入框**（[`Input`]）——光标、选区、输入法、剪贴板都由它负责。
+fn palette_search_row(state: &Entity<InputState>) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(10.0))
+        .h(px(34.0))
+        .mb(px(8.0))
+        .rounded(px(8.0))
+        .bg(theme::container())
+        .child(crate::icons::icon(
+            crate::icons::SEARCH,
+            14.0,
+            theme::muted(),
+        ))
+        .child(
+            div().flex_1().min_w_0().h_full().child(
+                Input::new(state)
+                    .appearance(false)
+                    .bordered(false)
+                    .small()
+                    .text_size(px(13.5))
+                    .p(px(0.0)),
+            ),
+        )
+}
+
 /// 面板空态：居中一行灰字（此前是贴边的裸文本，看着像渲染坏了）。
 fn dialog_empty_row(msg: &str) -> Div {
     div()
@@ -13072,7 +13308,7 @@ fn contribution_line(c: &mo_app::extensions::Contribution) -> String {
 ///
 /// 扩展页保留在遮罩后面，所以取消 / Esc / 点遮罩都走 [`dismiss_enable_confirm`]，
 /// **不能**走 [`close_modal`]（那会把整页关掉）。
-fn render_enable_confirm(
+pub(crate) fn render_enable_confirm(
     m: &mo_app::extensions::Manifest,
     lines: &[String],
     entity: &Entity<RootView>,
@@ -13172,13 +13408,13 @@ fn render_enable_confirm(
     dialog_overlay(entity, "", "", body, "")
 }
 
-/// 确认卡上点了「启用」（或按 Enter）：写盘，然后回到扩展页。
+/// 确认卡上点了「启用」（或按 Enter）：写盘，然后回到扩展页（独立窗口）。
 ///
 /// id 从模态里**取出来**而不是回读 `ext_index`：确认期间列表可能已经变了（另一个标签页
 /// 改了配置、或用户就是点了别的行），按位置启用等于启用另一条（§4.2 那条纪律）。
-fn confirm_enable_ext(entity: &Entity<RootView>, cx: &mut App) {
+pub(crate) fn confirm_enable_ext(entity: &Entity<RootView>, cx: &mut App) {
     let id = entity.update(cx, |v, _cx| {
-        match std::mem::replace(&mut v.modal, Modal::Extensions) {
+        match std::mem::replace(&mut v.modal, Modal::None) {
             Modal::ConfirmEnableExt(id) => Some(id),
             other => {
                 // 不在确认卡上（重复触发）：原样放回，什么都不做。
@@ -13197,16 +13433,17 @@ fn confirm_enable_ext(entity: &Entity<RootView>, cx: &mut App) {
     }
     entity.update(cx, |v, cx| {
         v.extensions = v.app().extensions();
-        v.modal = Modal::Extensions;
+        v.sync_extensions_window(cx);
         cx.notify();
     });
 }
 
-/// 取消：回到扩展页（**不是** `close_modal`——那会把整页关掉）。
-fn dismiss_enable_confirm(entity: &Entity<RootView>, cx: &mut App) {
+/// 取消：回到扩展页（独立窗口开着，**不是**关窗）。
+pub(crate) fn dismiss_enable_confirm(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         if matches!(v.modal, Modal::ConfirmEnableExt(_)) {
-            v.modal = Modal::Extensions;
+            v.modal = Modal::None;
+            v.sync_extensions_window(cx);
             cx.notify();
         }
     });
@@ -13217,7 +13454,7 @@ fn dismiss_enable_confirm(entity: &Entity<RootView>, cx: &mut App) {
 /// 外壳与「启用」那张同款；两处差别都表达语义：按钮用**警示红**（删目录不可恢复，
 /// 与清空回收站同级），正文是一句后果说明而不是贡献清单——卸载是收缩边界，用户
 /// 不需要再审一遍它贡献了什么，只需要确认「真的要删」。
-fn render_uninstall_confirm(
+pub(crate) fn render_uninstall_confirm(
     m: &mo_app::extensions::Manifest,
     entity: &Entity<RootView>,
 ) -> impl IntoElement {
@@ -13292,14 +13529,14 @@ fn render_uninstall_confirm(
     dialog_overlay(entity, "", "", body, "")
 }
 
-/// 确认卡上点了「卸载」（或按 Enter）：删目录，然后回到扩展页。
+/// 确认卡上点了「卸载」（或按 Enter）：删目录，然后回到扩展页（独立窗口）。
 ///
 /// id 从模态里**取出来**而不是回读 `ext_index`（与 [`confirm_enable_ext`] 同一条
 /// 纪律）：确认期间列表可能已经变了，按位置删等于删另一条。删完后选中行夹回
 /// 合法区间——原来的行没了，别指到界外去。
-fn confirm_uninstall_ext(entity: &Entity<RootView>, cx: &mut App) {
+pub(crate) fn confirm_uninstall_ext(entity: &Entity<RootView>, cx: &mut App) {
     let (id, name) = entity.update(cx, |v, _cx| {
-        match std::mem::replace(&mut v.modal, Modal::Extensions) {
+        match std::mem::replace(&mut v.modal, Modal::None) {
             Modal::ConfirmUninstallExt(id) => {
                 let name = v
                     .extensions
@@ -13330,16 +13567,17 @@ fn confirm_uninstall_ext(entity: &Entity<RootView>, cx: &mut App) {
         v.broken_exts = broken;
         v.keymap = keymap_from(&v.app());
         v.ext_index = v.ext_index.min(v.extensions.len().saturating_sub(1));
-        v.modal = Modal::Extensions;
+        v.sync_extensions_window(cx);
         cx.notify();
     });
 }
 
-/// 取消：回到扩展页（**不是** `close_modal`——那会把整页关掉）。
-fn dismiss_uninstall_confirm(entity: &Entity<RootView>, cx: &mut App) {
+/// 取消：回到扩展页（独立窗口开着，**不是**关窗）。
+pub(crate) fn dismiss_uninstall_confirm(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         if matches!(v.modal, Modal::ConfirmUninstallExt(_)) {
-            v.modal = Modal::Extensions;
+            v.modal = Modal::None;
+            v.sync_extensions_window(cx);
             cx.notify();
         }
     });
@@ -14100,11 +14338,9 @@ mod tests {
             "初始应当渲染浏览区（文件列表）"
         );
 
-        // 快捷键页已并入统一设置窗口（B 类浮层），不再是次级视图。
-        let cases: [(&str, Modal); 2] = [
-            ("全局搜索", Modal::GlobalSearch),
-            ("扩展", Modal::Extensions),
-        ];
+        // 快捷键页已并入统一设置窗口（B 类浮层）；扩展管理器已迁独立窗口
+        // （见 `extensions_window_is_a_separate_window`），两者都不再是次级视图。
+        let cases: [(&str, Modal); 1] = [("全局搜索", Modal::GlobalSearch)];
         for (name, modal) in cases {
             cx.update(|_window, cx| {
                 root.update(cx, |v, cx| {
@@ -16003,25 +16239,38 @@ mod tests {
         );
 
         cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
-        assert!(matches!(modal_of(cx), Modal::Extensions), "扩展页应当打开");
-        cx.debug_bounds("mo-ext-row-p26manager")
-            .expect("清单在盘上，扩展页那一行却没渲染（选择器 mo-ext-row-p26manager）");
+        cx.run_until_parked();
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "扩展页不再占用主窗口模态（独立窗口，浏览不被打断）"
+        );
+        // 扩展管理器窗口：从根视图拿句柄，对它单独建一份测试上下文。
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-row-p26manager")
+            .expect("清单在盘上，扩展窗口那一行却没渲染（选择器 mo-ext-row-p26manager）");
 
         // ① 点行 = 选中并展开贡献，**不改状态**。
-        cx.update(|window, cx| window.click("ext-row-p26manager", cx));
-        cx.run_until_parked();
-        cx.debug_bounds("mo-ext-detail-p26manager-0")
+        ex.update(|window, cx| window.click("ext-row-p26manager", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-detail-p26manager-0")
             .expect("选中那一行没展开出贡献（命令那条，选择器 mo-ext-detail-p26manager-0）");
-        cx.debug_bounds("mo-ext-detail-p26manager-1")
+        ex.debug_bounds("mo-ext-detail-p26manager-1")
             .expect("选中那一行没展开出贡献（类型那条，选择器 mo-ext-detail-p26manager-1）");
         assert!(
             disk_says(false),
             "只是想看一眼，盘上不该被改成启用——想看就得有代价的话没人敢点"
         );
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "点行不该离开扩展页：{:?}",
-            modal_of(cx)
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "点行不该离开扩展页，更不该在主窗口弹模态"
         );
         let lines =
             cx.update(|_w, cx| root.update(cx, |v, _cx| v.contribution_lines("p26manager")));
@@ -16040,8 +16289,8 @@ mod tests {
         }
 
         // ② 点那颗胶囊 → 弹确认卡；卡开着 = 还没点头，盘上仍然不动。
-        cx.update(|window, cx| window.click("ext-toggle-p26manager", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-toggle-p26manager", cx));
+        ex.update(|window, cx| window.render_frame(cx));
         match modal_of(cx) {
             Modal::ConfirmEnableExt(id) => assert_eq!(
                 id.as_str(),
@@ -16052,9 +16301,9 @@ mod tests {
                 panic!("点停用中扩展那颗胶囊应当弹确认卡，实际 modal = {other:?}（启用没经过确认）")
             }
         }
-        cx.debug_bounds("mo-ext-enable-ok")
+        ex.debug_bounds("mo-ext-enable-ok")
             .expect("确认卡的「启用」按钮没渲染（选择器 mo-ext-enable-ok）");
-        cx.debug_bounds("mo-ext-enable-line-0")
+        ex.debug_bounds("mo-ext-enable-line-0")
             .expect("确认卡没把贡献清单摊开（选择器 mo-ext-enable-line-0）");
         // 卡上的行数 = 展开区读到的条数。headless 里读不出**句子的字面**（gpui 测试没有
         // 文本快照，见本文件多条注释），所以这里钉的是「一条不许少、一条不许多」：
@@ -16065,10 +16314,10 @@ mod tests {
             2,
             "前置条件：这份 fixture 贡献两条（命令 + 类型），下面的行号断言以此为前提：{all}"
         );
-        cx.debug_bounds("mo-ext-enable-line-1")
+        ex.debug_bounds("mo-ext-enable-line-1")
             .expect("卡上只摊了一条，展开区明明有两条（选择器 mo-ext-enable-line-1）");
         assert!(
-            cx.debug_bounds("mo-ext-enable-line-2").is_none(),
+            ex.debug_bounds("mo-ext-enable-line-2").is_none(),
             "卡上多出了一条展开区没有的行文"
         );
         assert!(
@@ -16076,34 +16325,38 @@ mod tests {
             "确认卡弹出来了，但盘上已经写了启用：那这张卡只是通知，不是征求"
         );
 
-        // ③ Esc = 取消，回到扩展页（不是关掉整页），一个字都不写。
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "Esc 应当回到扩展页，而不是把整页关掉：{:?}",
-            modal_of(cx)
+        // ③ Esc = 取消，回到扩展页（独立窗口还开着），一个字都不写。
+        ex.simulate_keystrokes("escape");
+        ex.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "Esc 应当回到扩展页（modal 清空、窗口保持打开），而不是关掉整个管理器"
         );
+        ex.debug_bounds("mo-ext-row-p26manager")
+            .expect("Esc 取消后扩展窗口应当还开着");
         assert!(disk_says(false), "取消 = 不写盘");
 
         // ④ 再点一次、这回真启用：只有这一步动盘。
-        cx.update(|window, cx| window.click("ext-toggle-p26manager", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-toggle-p26manager", cx));
+        ex.update(|window, cx| window.render_frame(cx));
         assert!(
             matches!(modal_of(cx), Modal::ConfirmEnableExt(_)),
             "第二次点胶囊应当还是弹卡"
         );
-        cx.update(|window, cx| window.click("ext-enable-ok", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-enable-ok", cx));
+        ex.update(|window, cx| window.render_frame(cx));
         let enabled = disk_says(true);
         let cleaned = std::fs::remove_dir_all(&dir);
 
         assert!(enabled, "点了「启用」才该写盘");
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "启用后回到扩展页接着看，而不是把面板关掉：{:?}",
-            modal_of(cx)
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "启用后回到扩展页接着看（modal 清空、窗口保持打开），而不是把管理器关掉"
         );
+        ex.debug_bounds("mo-ext-row-p26manager")
+            .expect("启用后扩展窗口应当还开着");
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
 
@@ -16171,14 +16424,21 @@ mod tests {
         };
 
         cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
         assert!(
             disk_says(&dir_a, false) && disk_says(&dir_b, false),
             "起点：两份清单都是停用（否则后面对「改了什么」的断言没有意义）"
         );
 
         // ① 选中 B。
-        cx.update(|window, cx| window.click("ext-row-p26b", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-row-p26b", cx));
         assert_eq!(
             selected_id(cx).as_deref(),
             Some("p26b"),
@@ -16186,8 +16446,7 @@ mod tests {
         );
 
         // ② 再点 A 那颗胶囊：弹的是 A 的卡，选中行不许被顺带换掉。
-        cx.update(|window, cx| window.click("ext-toggle-p26a", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-toggle-p26a", cx));
         match modal_of(cx) {
             Modal::ConfirmEnableExt(id) => {
                 assert_eq!(id.as_str(), "p26a", "卡应当是关于刚点的那一家");
@@ -16201,8 +16460,7 @@ mod tests {
         );
 
         // ③ 点头：只有 A 上盘，B 一个字都没动。
-        cx.update(|window, cx| window.click("ext-enable-ok", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-enable-ok", cx));
         let a_on = disk_says(&dir_a, true);
         let b_still = disk_says(&dir_b, false);
         assert!(a_on, "卡上写的是 A，点了「启用」就该启用 A");
@@ -16212,21 +16470,20 @@ mod tests {
         );
 
         // ④ 停用不弹卡：收缩边界没什么要再问的。
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "启用后回到扩展页：{:?}",
-            modal_of(cx)
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "启用后回到扩展页（modal 清空、窗口保持打开）"
         );
-        cx.update(|window, cx| window.click("ext-toggle-p26a", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-toggle-p26a", cx));
         let a_off = disk_says(&dir_a, false);
         let b_off = disk_says(&dir_b, false);
         let cleaned = std::fs::remove_dir_all(&dir_a);
         let cleaned_b = std::fs::remove_dir_all(&dir_b);
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "停用是收缩边界，不该再要一次确认：{:?}",
-            modal_of(cx)
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "停用是收缩边界，不该再要一次确认"
         );
         assert!(a_off, "停用当场写盘");
         assert!(
@@ -16289,15 +16546,26 @@ mod tests {
         let cleaned_bad = std::fs::remove_dir_all(&dir_bad);
         let cleaned_drop = std::fs::remove_dir_all(&dir_drop);
 
-        assert!(matches!(modal_of(cx), Modal::Extensions));
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "扩展管理器在独立窗口，主窗口无模态"
+        );
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
         // ① 加载失败的清单亮出来了，连着原因行。
-        cx.debug_bounds("mo-ext-broken-p27bad")
+        ex.debug_bounds("mo-ext-broken-p27bad")
             .expect("加载失败的清单没在扩展页出现（选择器 mo-ext-broken-p27bad）");
-        cx.debug_bounds("mo-ext-broken-p27bad-why")
+        ex.debug_bounds("mo-ext-broken-p27bad-why")
             .expect("坏清单的原因行没渲染（选择器 mo-ext-broken-p27bad-why）");
         // 它没有可启停的胶囊——没有状态可翻。
         assert!(
-            cx.debug_bounds("mo-ext-toggle-p27bad").is_none(),
+            ex.debug_bounds("mo-ext-toggle-p27bad").is_none(),
             "加载失败的清单不该有「已启用/已停用」胶囊"
         );
         // 模型侧：原因就是 validate 的原句，作者能对着它改清单。
@@ -16319,13 +16587,13 @@ mod tests {
         );
 
         // ② 键位撞车的那一家，行下有「没生效」这句。
-        cx.debug_bounds("mo-ext-row-p27drop")
+        ex.debug_bounds("mo-ext-row-p27drop")
             .expect("合法但键位被撞的扩展要正常出现在面板上");
-        cx.update(|window, cx| window.click("ext-row-p27drop", cx));
-        cx.run_until_parked();
-        cx.debug_bounds("mo-ext-detail-p27drop-0")
+        ex.update(|window, cx| window.click("ext-row-p27drop", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-detail-p27drop-0")
             .expect("选中后贡献行没展开（选择器 mo-ext-detail-p27drop-0）");
-        cx.debug_bounds("mo-ext-detail-p27drop-drop-0")
+        ex.debug_bounds("mo-ext-detail-p27drop-drop-0")
             .expect("键位撞车的「没生效」没亮在这一家下面（选择器 mo-ext-detail-p27drop-drop-0）");
         let drop_lines = cx.update(|_w, cx| {
             root.update(cx, |v, _cx| {
@@ -16376,15 +16644,22 @@ mod tests {
         cx.run_until_parked();
         cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
         cx.run_until_parked();
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
 
         cx.update(|_w, cx| root.update(cx, |v, cx| v.install_extension_from(&src, cx)));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.render_frame(cx));
 
-        cx.debug_bounds("mo-ext-row-p28ui")
+        ex.debug_bounds("mo-ext-row-p28ui")
             .expect("装完面板当场要有这一行，不该靠关掉再开");
-        cx.debug_bounds("mo-ext-toggle-p28ui")
+        ex.debug_bounds("mo-ext-toggle-p28ui")
             .expect("新行有可启停的胶囊");
-        cx.debug_bounds("mo-ext-detail-p28ui-0")
+        ex.debug_bounds("mo-ext-detail-p28ui-0")
             .expect("装完选中新行，贡献清单当场展开");
 
         let (installed_enabled, on_disk, has_ledger) = cx.update(|_w, cx| {
@@ -16453,13 +16728,19 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|_w, cx| root.update(cx, |v, cx| v.install_extension_from_zip(&archive, cx)));
-        cx.run_until_parked();
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
 
-        cx.debug_bounds("mo-ext-row-p28zip")
+        ex.debug_bounds("mo-ext-row-p28zip")
             .expect("装完面板当场要有这一行，不该靠关掉再开");
-        cx.debug_bounds("mo-ext-toggle-p28zip")
+        ex.debug_bounds("mo-ext-toggle-p28zip")
             .expect("新行有可启停的胶囊");
-        cx.debug_bounds("mo-ext-detail-p28zip-0")
+        ex.debug_bounds("mo-ext-detail-p28zip-0")
             .expect("装完选中新行，贡献清单当场展开");
 
         let (installed_enabled, on_disk, has_ledger) = cx.update(|_w, cx| {
@@ -16519,18 +16800,23 @@ mod tests {
             cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
         };
         cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
-        cx.run_until_parked();
-        cx.debug_bounds("mo-ext-row-unui")
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-row-unui")
             .expect("fixture 在盘上，扩展页应当有这一行");
         // 选中首行（唯一一行）后，详情区里应当有那颗「卸载…」按钮。
-        cx.update(|window, cx| window.click("ext-row-unui", cx));
-        cx.run_until_parked();
-        cx.debug_bounds("mo-ext-uninstall-unui")
+        ex.update(|window, cx| window.click("ext-row-unui", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-uninstall-unui")
             .expect("选中行的展开区里没有「卸载…」按钮（选择器 mo-ext-uninstall-unui）");
 
         // ① 点「卸载…」→ 弹确认卡；卡开着 = 还没删，目录原地不动。
-        cx.update(|window, cx| window.click("ext-uninstall-unui", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-uninstall-unui", cx));
         match modal_of(cx) {
             Modal::ConfirmUninstallExt(id) => assert_eq!(
                 id.as_str(),
@@ -16539,35 +16825,40 @@ mod tests {
             ),
             other => panic!("点「卸载…」应当弹确认卡，实际 modal = {other:?}（删除没经过确认）"),
         }
-        cx.debug_bounds("mo-ext-uninstall-ok")
+        ex.debug_bounds("mo-ext-uninstall-ok")
             .expect("确认卡的「卸载」按钮没渲染（选择器 mo-ext-uninstall-ok）");
         assert!(dir.is_dir(), "确认卡开着，盘上不该已经删了");
 
-        // ② Esc = 取消，回到扩展页，目录还在。
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "Esc 应当回到扩展页，而不是把整页关掉：{:?}",
-            modal_of(cx)
+        // ② Esc = 取消，回到扩展页（窗口还开着），目录还在。
+        ex.simulate_keystrokes("escape");
+        ex.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "Esc 应当回到扩展页（modal 清空、窗口保持打开），而不是关掉整个管理器"
         );
+        ex.debug_bounds("mo-ext-row-unui")
+            .expect("Esc 取消后扩展窗口应当还开着");
         assert!(dir.is_dir(), "取消 = 不删盘");
 
         // ③ 再点一次、这回真卸：目录整个消失，面板当场重取（行没了）、回到扩展页。
-        cx.update(|window, cx| window.click("ext-uninstall-unui", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-uninstall-unui", cx));
         assert!(
             matches!(modal_of(cx), Modal::ConfirmUninstallExt(_)),
             "第二次点应当还是弹卡"
         );
-        cx.update(|window, cx| window.click("ext-uninstall-ok", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-uninstall-ok", cx));
 
         assert!(!dir.exists(), "点了「卸载」之后目录应当整个消失");
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "卸载后回到扩展页（modal 清空、窗口保持打开），而不是把管理器关掉"
+        );
+        ex.update(|window, cx| window.render_frame(cx));
         assert!(
-            matches!(modal_of(cx), Modal::Extensions),
-            "卸载后回到扩展页，而不是把面板关掉：{:?}",
-            modal_of(cx)
+            ex.debug_bounds("mo-ext-row-unui").is_none(),
+            "卸载后那一行应当当场消失（面板重取了）"
         );
         // ⚠️ 断言收窄到「卸的那个不见了」，不是「面板空了」：`isolate_user_dirs_for_tests`
         // 给的是**本进程共享**的 extensions 目录，整包并行时别的测试的 fixture 可能正在场
@@ -16723,10 +17014,15 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
-        cx.run_until_parked();
-        cx.update(|window, cx| window.render_frame(cx));
-        cx.debug_bounds("mo-ext-row-p29a").expect("赢家那行没出现");
-        cx.debug_bounds("mo-ext-row-p29b").expect("输家那行没出现");
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-row-p29a").expect("赢家那行没出现");
+        ex.debug_bounds("mo-ext-row-p29b").expect("输家那行没出现");
 
         // 模型侧：一笔账，赢家 p29a / 输家 p29b，停用语义由单测管（这里两家都启用）。
         let conflicts =
@@ -16742,14 +17038,14 @@ mod tests {
         );
 
         // 渲染侧：选输家 → 句子亮在它下面；选赢家 → 没有这句。
-        cx.update(|window, cx| window.click("ext-row-p29b", cx));
-        cx.run_until_parked();
-        cx.debug_bounds("mo-ext-detail-p29b-typelabel-0")
+        ex.update(|window, cx| window.click("ext-row-p29b", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-detail-p29b-typelabel-0")
             .expect("输家那家的展开区没有「被抢先认领」这句");
-        cx.update(|window, cx| window.click("ext-row-p29a", cx));
-        cx.run_until_parked();
+        ex.update(|window, cx| window.click("ext-row-p29a", cx));
+        ex.update(|window, cx| window.render_frame(cx));
         assert!(
-            cx.debug_bounds("mo-ext-detail-p29a-typelabel-0").is_none(),
+            ex.debug_bounds("mo-ext-detail-p29a-typelabel-0").is_none(),
             "赢家的标签生效着，不该被告诉「这条不生效」"
         );
 
