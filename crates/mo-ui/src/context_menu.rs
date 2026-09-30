@@ -170,16 +170,14 @@ impl MenuItem {
     }
 }
 
-/// 常见归档后缀（决定是否显示「解压」）。
+/// 决定是否给「解压」这一项。
+///
+/// 判据**不在这里**：能不能解压由 `mo_operations::is_extractable` 说了算——
+/// 早先这里自己列了八个后缀，其中 `.tar.bz2` / `.tar.xz` 其实解不开（tar 分支
+/// 只接 gzip），于是菜单给了「解压」、点下去报一句看不懂的「不是 tar」
+/// （2026-09-29 用户报）。同一件事两处作答，迟早对不上。
 fn looks_like_archive(path: &std::path::Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    const SUFFIXES: [&str; 8] = [
-        ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
-    ];
-    SUFFIXES.iter().any(|s| name.ends_with(s))
+    mo_operations::is_extractable(path)
 }
 
 /// 按当前上下文推导菜单条目。
@@ -832,10 +830,18 @@ mod tests {
         assert!(zip.contains(&MenuAction::Extract));
         let txt = actions(&menu(Some("/tmp/a.txt"), false, 1));
         assert!(!txt.contains(&MenuAction::Extract));
-        // 常见后缀都要认。
-        for name in ["x.tar", "x.tar.gz", "x.tgz", "x.tar.bz2"] {
+        // **解得开**的后缀才给这一项：给了却解不开，点下去就是一句看不懂的
+        // 底层报错（判据在 `mo_operations::is_extractable`，这里不另列一份）。
+        for name in ["x.zip", "x.tar", "x.tar.gz", "x.tgz"] {
             let p = format!("/tmp/{name}");
             assert!(looks_like_archive(Path::new(&p)), "{name} 应当被识别为归档");
+        }
+        for name in ["x.tar.bz2", "x.tar.xz", "x.7z", "x.rar"] {
+            let p = format!("/tmp/{name}");
+            assert!(
+                !looks_like_archive(Path::new(&p)),
+                "{name} 解不开，不该给「解压」这一项"
+            );
         }
     }
 

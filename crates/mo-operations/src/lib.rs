@@ -24,7 +24,7 @@ mod transfer;
 mod trash;
 mod trash_op;
 
-pub use archive::{create_archive, extract_archive, ArchiveFormat};
+pub use archive::{create_archive, extract_archive, extract_format, is_extractable, ArchiveFormat};
 pub use copy::CopyOperation;
 pub use dedup::{find_duplicates, DedupReport, DupGroup};
 pub use delete::DeleteOperation;

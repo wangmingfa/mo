@@ -132,6 +132,18 @@ pub(crate) const CONNECT_ADDRESS_PLACEHOLDER: &str =
 /// 同步计划最多列出这么多项（再多也只报总数，避免一次画几千行）。
 const PLAN_LIMIT: usize = 400;
 
+/// 会话（窗口布局）写盘的去抖时长。
+///
+/// `sync_panel` 每个总线事件都跑一遍（传输进度 150ms 一拍），每次都落盘就是每秒
+/// 好几次无谓的 IO；而只到退出时才写，崩了就全丢。折中：标脏后 1 秒写一次。
+const SESSION_SAVE_DEBOUNCE_MS: u64 = 1000;
+
+/// 操作历史面板最多画多少行。
+///
+/// 引擎侧每页留 200 条（环形），多标签页汇总后可能是它的几倍——全画出来没有
+/// 意义，翻到底也看不完，而历史的价值在**最近这几步**。
+const HISTORY_ROWS: usize = 200;
+
 /// 磁盘地图铺到第几层：再深的块已经小到看不出是谁，点进去再展开更划算
 /// （`AppState::usage_tree` 的 `max_depth` 用的就是它）。
 pub(crate) const USAGE_MAP_DEPTH: usize = 3;
@@ -268,6 +280,9 @@ pub(crate) enum Modal {
     GlobalSearch,
     /// 回收站面板。
     Trash,
+    /// 操作历史面板（B，2026-09-29）：列出这一轮做过的复制 / 移动 / 删除 /
+    /// 重命名，点一条跳到那次操作的落点目录。
+    History,
     /// 文件 / 文件夹比较结果。
     Diff,
     /// 属性与权限。
@@ -476,6 +491,8 @@ pub(crate) enum CommandId {
     Undo,
     Redo,
     OpenTrash,
+    /// 操作历史面板。
+    OpenHistory,
     OpenTerminal,
     AddBookmark,
     RemoveBookmark,
@@ -776,6 +793,11 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
             category: "操作".to_string(),
         },
         CmdDef {
+            id: CommandId::OpenHistory,
+            title: "操作历史…".to_string(),
+            category: "操作".to_string(),
+        },
+        CmdDef {
             id: CommandId::OpenTerminal,
             title: "在当前目录打开终端".to_string(),
             category: "工具".to_string(),
@@ -1058,6 +1080,14 @@ pub struct RootView {
     sync_report: Option<mo_operations::SyncReport>,
     /// 同步：是否正在生成计划 / 执行。
     sync_busy: bool,
+    /// 操作历史快照（历史面板数据源；**跨标签页汇总**，见
+    /// [`RootView::open_history_panel`]——`AppState` 是一页一个，历史也就记在
+    /// 各自那一份里，单看当前页会漏掉别的页做过的事）。最新在前。
+    pub(crate) history: Vec<mo_app::HistoryEntry>,
+    /// 历史面板的键盘光标位。
+    history_index: usize,
+    /// 会话（窗口布局）去抖写盘是否已经有任务在等（`true` = 别再排一个）。
+    session_saving: bool,
     /// 扩展管理器的光标位。
     ext_index: usize,
     /// 加载失败的清单（`extensions::load_report` 的另一半）：扩展页要亮出来并说原因。
@@ -1289,7 +1319,7 @@ impl RootView {
         // 键表在启动时建一次，之后每开一次命令面板重取（见 `dispatch_action` 的
         // `palette.open`）——用户手改清单里的 `key` 不必重启 Mo 就生效。
         let keymap = keymap_from(&app);
-        let view = Self {
+        let mut view = Self {
             panes: vec![Pane::new(panel_with_prefs(app.clone(), &ui))],
             active_pane: 0,
             split: false,
@@ -1326,6 +1356,9 @@ impl RootView {
             user_commands: Vec::new(),
             extensions: Vec::new(),
             broken_exts: Vec::new(),
+            history: Vec::new(),
+            history_index: 0,
+            session_saving: false,
             ext_index: 0,
             workflows: Vec::new(),
             wf_running: false,
@@ -1388,11 +1421,18 @@ impl RootView {
             notice_ok: None,
         };
 
-        let weak = cx.entity().downgrade();
-        cx.spawn(async move |_weak, cx| {
-            tab_loop(app, weak, cx, 0, 0, true).await;
-        })
-        .detach();
+        // 会话恢复优先于「打开 Home」：有上次那一组标签页就还原它们，否则
+        // 才走默认的 Home 起步（`restore_session` 内部自己起各页的 tab_loop）。
+        let session = view.app().load_session();
+        if session.is_empty() {
+            let weak = cx.entity().downgrade();
+            cx.spawn(async move |_weak, cx| {
+                tab_loop(app, weak, cx, 0, 0, true).await;
+            })
+            .detach();
+        } else {
+            view.restore_session(app, session, cx);
+        }
 
         view
     }
@@ -2001,6 +2041,47 @@ impl RootView {
         cx.notify();
     }
 
+    /// 打开操作历史面板（命令面板入口）。
+    ///
+    /// 历史**跨标签页汇总**：`AppState` 是一页一个，记账也就记在各自那一份里——
+    /// 只看当前页会漏掉别的页做过的事（复制发生在 A 页、人在 B 页翻历史）。
+    /// 每页自己的快照已经是最新在前，按 `at` 倒序**稳定**归并后全局仍是最新在前
+    /// （同一秒里的多条保持原相对顺序，不会来回跳）。
+    pub(crate) fn open_history_panel(&mut self, cx: &mut Context<Self>) {
+        let snaps: Vec<Vec<mo_app::HistoryEntry>> = self
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .map(|t| t.app.history_snapshot())
+            .collect();
+        self.history = merge_history(snaps);
+        self.history_index = 0;
+        self.modal = Modal::History;
+        cx.notify();
+    }
+
+    /// 清空操作历史（历史面板的「清空」按钮）：所有标签页一起清——只清当前页
+    /// 会留下「面板上还有一半」的假象。
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        for pane in &self.panes {
+            for tab in &pane.tabs {
+                tab.app.clear_history();
+            }
+        }
+        self.history.clear();
+        self.history_index = 0;
+        cx.notify();
+    }
+
+    /// 历史面板的键盘光标移动（越界钳住，不绕圈）。
+    fn history_move_cursor(&mut self, delta: i32) {
+        if self.history.is_empty() {
+            return;
+        }
+        let i = self.history_index as i32 + delta;
+        self.history_index = i.clamp(0, self.history.len() as i32 - 1) as usize;
+    }
+
     /// 回收站 shift 连选：以锚点为起点**覆盖**到 `i`（锚点缺失退化为单选）。
     fn trash_select_range(&mut self, i: usize) {
         let a = self.trash_anchor.unwrap_or(i);
@@ -2186,6 +2267,220 @@ impl RootView {
         out
     }
 
+    // ------------------------------------------------------------ 会话（窗口布局）
+
+    /// 把当前窗口布局拍成一份会话快照（供 [`Self::save_session`] 落盘）。
+    ///
+    /// 远程标签页记**端点 + 远端路径**而不是路径：那条路径在本机不存在，
+    /// 只记路径就永远恢复不回去。端点是 `scheme://host:port`（不含用户名 /
+    /// 密码——密码在系统钥匙串里，重连时 `connect_remote` 自己去取）。
+    pub(crate) fn session_snapshot(&self) -> mo_app::Session {
+        let mut panes = Vec::new();
+        let mut active_tabs = Vec::new();
+        for pane in &self.panes {
+            let mut tabs = Vec::new();
+            for t in &pane.tabs {
+                let url = t.app.remote_url();
+                let on_remote = url.is_some();
+                let here = t
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                tabs.push(mo_app::SavedTab {
+                    path: if on_remote || here.is_empty() {
+                        None
+                    } else {
+                        Some(here.clone())
+                    },
+                    endpoint: url.as_ref().map(|u| u.endpoint()),
+                    remote_path: if on_remote && !here.is_empty() {
+                        Some(here)
+                    } else {
+                        None
+                    },
+                });
+            }
+            active_tabs.push(pane.active);
+            panes.push(tabs);
+        }
+        mo_app::Session {
+            panes,
+            active_tabs,
+            active_pane: self.active_pane,
+            split: self.split,
+        }
+    }
+
+    /// 存下当前窗口布局（去抖到点 / 关窗 / 退出都走这里）。
+    pub(crate) fn save_session(&mut self) {
+        self.session_saving = false;
+        let snapshot = self.session_snapshot();
+        self.app().save_session(&snapshot);
+    }
+
+    /// 标一次脏：窗口布局变了，一会儿存一份。
+    ///
+    /// 去抖的理由见 [`SESSION_SAVE_DEBOUNCE_MS`]——`sync_panel` 每个总线事件都
+    /// 跑一遍，不去抖就是每秒好几次无谓的写盘。已经有任务在等就什么都不做。
+    fn mark_session_dirty(&mut self, cx: &mut Context<Self>) {
+        if self.session_saving {
+            return;
+        }
+        self.session_saving = true;
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(SESSION_SAVE_DEBOUNCE_MS))
+                .await;
+            this.update(cx, |v, _cx| v.save_session()).ok();
+        })
+        .detach();
+    }
+
+    /// 恢复上次退出时的窗口布局（重开 Mo 回到上次那些标签页）。
+    ///
+    /// * **本地**标签页直接打开原目录；
+    /// * **远程**标签页**后台重连**（用户 2026-09-29 选的语义）：连上就回到当时
+    ///   那个目录；连不上（服务器没了 / 要输密码）的留成空标签页，最后汇总弹
+    ///   一条提示——侧边栏「远程」区那条连接仍在，点一下就能连回来。
+    ///   启动时不弹登录框：那会一次弹出好几个，且没人看着。
+    ///
+    /// ⚠️ 必须在**默认那一页的 `tab_loop` 起来之前**调用：那个循环会把「首页的
+    /// `AppState`」同步进 `panes[0].tabs[0]`，而恢复后那一格已经是别的
+    /// `AppState` 了（两个 app 往同一个格子里写，界面会来回跳）。
+    fn restore_session(
+        &mut self,
+        first: AppState,
+        session: mo_app::Session,
+        cx: &mut Context<Self>,
+    ) {
+        let ui = self.ui.clone();
+        let mut panes: Vec<Pane> = Vec::new();
+        // 每个标签页的「活儿」：自己的 AppState + 要打开哪（本地路径 or 远程端点）。
+        let mut jobs: Vec<RestoreJob> = Vec::new();
+        let failed: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done: std::sync::Arc<std::sync::atomic::AtomicUsize> =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for (pane_idx, saved) in session.panes.iter().enumerate() {
+            if saved.is_empty() {
+                continue;
+            }
+            let mut tabs: Vec<Panel> = Vec::new();
+            for st in saved {
+                // 第一个标签页复用外面那个 `AppState`（它的泵已经在 `run()` 里
+                // 起好了），其余的现开一份。
+                let app = if panes.is_empty() && tabs.is_empty() {
+                    first.clone()
+                } else {
+                    let a = AppState::new();
+                    a.spawn_watcher_pump();
+                    a.spawn_remote_poll_pump();
+                    a.spawn_refresh_pump();
+                    a
+                };
+                let tab_idx = tabs.len();
+                tabs.push(panel_with_prefs(app.clone(), &ui));
+                let local = st
+                    .path
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty());
+                let endpoint = st.endpoint.clone().filter(|s| !s.is_empty());
+                if endpoint.is_some() || local.is_some() {
+                    jobs.push(RestoreJob {
+                        app,
+                        pane: pane_idx,
+                        tab: tab_idx,
+                        endpoint,
+                        target: st.remote_path.as_ref().map(PathBuf::from).or(local),
+                    });
+                }
+            }
+            let active = session
+                .active_tabs
+                .get(pane_idx)
+                .copied()
+                .unwrap_or(0)
+                .min(tabs.len() - 1);
+            panes.push(Pane { tabs, active });
+        }
+        if panes.is_empty() {
+            return;
+        }
+        self.panes = panes;
+        self.active_pane = session.active_pane.min(self.panes.len() - 1);
+        // 分栏要靠两个窗格才成立：只恢复出一个窗格时就当没分栏。
+        self.split = session.split && self.panes.len() > 1;
+        cx.notify();
+
+        let total = jobs.len();
+        for RestoreJob {
+            app,
+            pane: pane_idx,
+            tab: tab_idx,
+            endpoint,
+            target,
+        } in jobs
+        {
+            let nav_app = app.clone();
+            let weak = cx.entity().downgrade();
+            // 事件循环：先起，之后导航发出的事件经总线回灌（`open_home=false`——
+            // 别先闪一次 Home 再跳过去）。
+            cx.spawn(async move |_weak, cx| {
+                tab_loop(app.clone(), weak, cx, pane_idx, tab_idx, false).await;
+            })
+            .detach();
+
+            let failed = failed.clone();
+            let done = done.clone();
+            let this = cx.entity().downgrade();
+            cx.spawn(async move |_weak, cx| {
+                let result = match &endpoint {
+                    Some(ep) => match nav_app.connect_remote(ep).await {
+                        Ok(()) => {
+                            if let Some(p) = target.as_ref() {
+                                let _ = nav_app.open_directory(p).await;
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("{ep}：{e}")),
+                    },
+                    None => match target.as_ref() {
+                        Some(p) => nav_app
+                            .open_local(p)
+                            .await
+                            .map_err(|e| format!("{}：{e}", p.display())),
+                        None => Ok(()),
+                    },
+                };
+                if let Err(msg) = result {
+                    if let Ok(mut f) = failed.lock() {
+                        f.push(msg);
+                    }
+                }
+                // 最后跑完的那个负责汇总提示：一个标签页一条太吵。
+                if done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == total {
+                    let list = failed.lock().ok().map(|f| f.clone()).unwrap_or_default();
+                    if list.is_empty() {
+                        return;
+                    }
+                    this.update(cx, |v, cx| {
+                        v.notice(
+                            format!("有 {} 个标签页没能恢复", list.len()),
+                            Some(list.join("\n")),
+                            cx,
+                        );
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+    }
+
     // ------------------------------------------------------------ 标签页 / 分栏
 
     /// 在 `pane_idx` 新建一个标签页并切到它。
@@ -2224,6 +2519,8 @@ impl RootView {
             // 这是该窗格最后一个标签页：仅在「整个应用再无其它标签页」时退出应用。
             let total: usize = self.panes.iter().map(|p| p.tabs.len()).sum();
             if total <= 1 {
+                // 退出前存一份窗口布局：下次开 Mo 回到这些标签页。
+                self.save_session();
                 cx.quit();
                 return true;
             }
@@ -5010,6 +5307,148 @@ impl RootView {
         .detach();
     }
 
+    /// 操作历史面板（2026-09-29 新增，引擎侧那份 `history` 的第一个消费者）。
+    ///
+    /// 每行 = 时刻 + 动作 + 涉及的文件名 + 落点目录；点一行（或 Enter）跳到
+    /// 那次操作的落点。跳转走**哪个后端**由记账时写下的 `remote` 决定——
+    /// 面板里的路径可能来自任何一个标签页，此刻「在看远程吗」答不对这个问题。
+    fn render_history(&self, entity: &Entity<RootView>) -> Div {
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
+        if self.history.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .text_color(theme::muted())
+                    .child(text!(
+                        "（这一轮还没做过复制 / 移动 / 删除 / 重命名）".to_string()
+                    )),
+            );
+        }
+        for (i, e) in self.history.iter().enumerate() {
+            let selected = i == self.history_index;
+            let at = crate::file_item::format_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.at),
+            );
+            // 文件名（不是完整路径）：路径太长，一屏放不下几行，而这里要看的是
+            // 「对谁做了什么」。三个以上只报个数。
+            let names = if e.sources.len() <= 3 {
+                e.sources
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            } else {
+                format!("{} 项", e.sources.len())
+            };
+            let dest = e
+                .landing_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "—".to_string());
+
+            let mut row = div()
+                .id(format!("history-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(6.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .text_size(px(12.0));
+            row = if selected {
+                row.bg(theme::selected_bg())
+                    .text_color(theme::selected_text())
+            } else {
+                row.hover(|s| s.bg(theme::hover_bg()))
+            };
+            row = row
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(132.0))
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(at)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(78.0))
+                        .child(text!(e.kind.clone())),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(text!(names)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(dest)),
+                );
+            let ent = entity.clone();
+            row.interactivity().on_click(move |_ev, _window, cx| {
+                // 点哪一行就把光标放在哪一行（双击语义与键盘共用一条路）。
+                ent.update(cx, |v, _cx| v.history_index = i);
+                history_jump(&ent, cx);
+            });
+            list = list.child(row);
+        }
+
+        let ent2 = entity.clone();
+        let mut clear = div()
+            .id("history-clear")
+            .flex_shrink_0()
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .text_size(px(11.0))
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::selected_bg()))
+            .child(text!("清空".to_string()));
+        clear.interactivity().on_click(move |_ev, _window, cx| {
+            ent2.update(cx, |v, cx| v.clear_history(cx));
+        });
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(4.0))
+            .p(px(8.0));
+        body = body.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .child(text!(format!(
+                    "最近 {} 条（跨所有标签页）",
+                    self.history.len()
+                ))),
+        );
+        body = body.child(list);
+        central_view_with_action(
+            "操作历史",
+            "",
+            body,
+            "↑↓ 选择 · Enter 跳到落点目录 · Esc 关闭",
+            clear,
+        )
+    }
+
     fn render_dedup(&self, entity: &Entity<RootView>) -> Div {
         let mut body = div()
             .flex()
@@ -5172,7 +5611,10 @@ impl RootView {
     pub(crate) fn dispatch_action(&mut self, id: &str, cx: &mut Context<Self>) {
         let entity = cx.entity().clone();
         match id {
-            "app.quit" => cx.quit(),
+            "app.quit" => {
+                self.save_session();
+                cx.quit();
+            }
             // macOS 惯例的 ⌘, ——直开设置窗口，省去「命令面板 → 翻到主题/布局」两步。
             "settings.open" => self.open_settings(SettingsTab::Layout, cx),
             "staging.collect" => self.stage_selection(cx),
@@ -6251,17 +6693,26 @@ impl RootView {
             let Some(dest) = dest else { return };
             let mut ok = 0usize;
             let mut failed = 0usize;
+            // 失败原因要带到界面上：光说「失败 1 个」，用户不知道是格式不支持
+            // 还是盘满了（格式不支持那句现在由 `extract_archive` 写明是哪个格式）。
+            let mut reason = None;
             for p in paths {
                 match app.extract_archive(p, dest.clone()).await {
                     Ok(_) => ok += 1,
                     Err(e) => {
                         failed += 1;
                         tracing::warn!("解压失败：{e}");
+                        if reason.is_none() {
+                            reason = Some(e.to_string());
+                        }
                     }
                 }
             }
             this.update(cx, |v, cx| {
-                v.modal = Modal::Info(format!("解压完成：成功 {ok} 个，失败 {failed} 个"));
+                v.modal = Modal::Info(match reason {
+                    Some(e) => format!("解压完成：成功 {ok} 个，失败 {failed} 个 —— {e}"),
+                    None => format!("解压完成：成功 {ok} 个"),
+                });
                 cx.notify();
             });
         })
@@ -7741,6 +8192,9 @@ async fn sync_panel(
             v.palette_index = 0;
         }
         v.trash_entries = trash_entries;
+        // 窗口布局可能变了（切目录 / 连上远程 / 断开）——标一次脏，去抖后落盘。
+        // 放在这里是因为 `sync_panel` 是「任一标签页状态变了」的唯一漏斗。
+        v.mark_session_dirty(cx);
         // 回收站条目变了（还原 / 清空 / 新删除）就补缺的大小缓存：
         // fire-and-forget（无缺键即空转），绝不挂在 sync 的 await 链上。
         v.ensure_trash_sizes(cx);
@@ -7958,6 +8412,7 @@ impl Render for RootView {
                 self.render_extensions(&entity)
             }
             Modal::Duplicates => self.render_dedup(&entity),
+            Modal::History => self.render_history(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::List => self.render_list_panel(&entity),
             Modal::Sync => self.render_sync(&entity),
@@ -9262,6 +9717,19 @@ fn handle_modal_key(
                 });
             }
         }
+        Modal::History => match key {
+            "escape" => close_modal(entity, cx),
+            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                v.history_move_cursor(-1);
+                cx.notify();
+            }),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                v.history_move_cursor(1);
+                cx.notify();
+            }),
+            "enter" => history_jump(entity, cx),
+            _ => {}
+        },
         Modal::Diff | Modal::Info(_) => match key {
             "escape" | "space" => close_modal(entity, cx),
             _ => {}
@@ -9325,6 +9793,77 @@ fn on_trash_empty(entity: &Entity<RootView>, cx: &mut App) {
 
 /// 回收站：打开**选中的**条目（Windows / Linux 的 Enter 语义，与双击同款）：
 /// 文件交系统默认应用，目录进当前窗口浏览。
+/// 恢复一个标签页要做的活儿（[`RootView::restore_session`] 内部用）。
+///
+/// 建好之后统一开工：边建边起 `tab_loop` 会让「先建好的那个」在别人还没落地时
+/// 就开始往界面同步，闪一下空目录。
+struct RestoreJob {
+    app: AppState,
+    /// 落在第几个窗格 / 第几个标签页。
+    pane: usize,
+    tab: usize,
+    /// 远程端点 `scheme://host:port`（本地标签页为 `None`）。
+    endpoint: Option<String>,
+    /// 要打开的路径：远程连上之后走 `open_directory`，本地走 `open_local`。
+    target: Option<PathBuf>,
+}
+
+/// 把各标签页的历史快照并成一份：**最新在前**，超出 [`HISTORY_ROWS`] 的砍掉。
+///
+/// 抽成纯函数只为能单测——跨页归并是历史面板最容易错的一处：只看当前页会漏掉
+/// 别的页做过的事（复制在 A 页、人在 B 页翻历史），而排序不稳会让同一秒的几条
+/// 每次打开都在换位置。
+///
+/// 排序是**稳定**的：每页自己的快照已经是最新在前，同一秒里的多条因此保持
+/// 「后做的仍在前面」。
+fn merge_history(snaps: Vec<Vec<mo_app::HistoryEntry>>) -> Vec<mo_app::HistoryEntry> {
+    let mut all: Vec<mo_app::HistoryEntry> = Vec::new();
+    for s in snaps {
+        all.extend(s);
+    }
+    // 稳定排序（同秒多条保持原相对顺序）+ Reverse 换倒序。
+    all.sort_by_key(|e| std::cmp::Reverse(e.at));
+    all.truncate(HISTORY_ROWS);
+    all
+}
+
+/// 历史面板：跳到光标那一条的**落点目录**（双击 / Enter / 点行）。
+///
+/// 先按记账时写下的 `remote` 选入口——远程落点走 `open_directory`、本机落点走
+/// `open_local`（路径自己答不出这个问题，而面板里的条目可能来自任何一页）。
+/// 面板当场关掉：跳转是「浏览」而不是「管理」，跟回收站打开目录同一条。
+fn history_jump(entity: &Entity<RootView>, cx: &mut App) {
+    let Some((entry, app)) = entity.update(cx, |v, _cx| {
+        let e = v.history.get(v.history_index).cloned()?;
+        Some((e, v.app()))
+    }) else {
+        return;
+    };
+    let Some(dir) = entry.landing_dir() else {
+        return;
+    };
+    entity.update(cx, |v, cx| {
+        v.modal = Modal::None;
+        cx.notify();
+    });
+    let this = entity.clone();
+    cx.spawn(async move |cx| {
+        let result = if entry.remote {
+            app.open_directory(&dir).await
+        } else {
+            app.open_local(&dir).await
+        };
+        if let Err(e) = result {
+            // 落点是远程的那几步，会话可能已经断了：给用户一句话，别默默不动。
+            this.update(cx, |v, cx| {
+                v.modal = Modal::Info(format!("打不开 {}：{e}", dir.display()));
+                cx.notify();
+            });
+        }
+    })
+    .detach();
+}
+
 fn on_trash_open(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         let picked = trash_picked(v);
@@ -9536,6 +10075,9 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::OpenTrash) => {
             entity.update(cx, |v, cx| v.open_trash_panel(cx));
+        }
+        Some(CommandId::OpenHistory) => {
+            entity.update(cx, |v, cx| v.open_history_panel(cx));
         }
         Some(CommandId::StageSelection) => {
             entity.update(cx, |v, cx| v.stage_selection(cx));
@@ -9974,6 +10516,7 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::HashSelection
         | CommandId::CompareSelection
         | CommandId::OpenTrash
+        | CommandId::OpenHistory
         | CommandId::OpenTerminal
         | CommandId::AddBookmark
         | CommandId::RemoveBookmark
@@ -13041,9 +13584,9 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, contribution_line, filtered_apps, located_row, resolve_address_input,
-        slot_word, type_ahead_repeats_one_char, AddressInput, ConnectAuthState, Modal,
-        OperationHandle, RootView, SettingsTab,
+        box_row_range, contribution_line, filtered_apps, located_row, merge_history,
+        resolve_address_input, slot_word, type_ahead_repeats_one_char, AddressInput,
+        ConnectAuthState, Modal, OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -13076,6 +13619,39 @@ mod tests {
             resolve_address_input("/Users/me/下载", false, None::<&Path>),
             AddressInput::LocalPath(PathBuf::from("/Users/me/下载"))
         );
+    }
+
+    /// 操作历史是**跨标签页汇总**的：`AppState` 一页一个，历史也就记在各自那一
+    /// 份里。这里钉两件事——别的页做过的事不能漏；同一秒的几条顺序要稳（不然
+    /// 每次打开面板顺序都在变）。
+    #[test]
+    fn history_merges_every_tab_newest_first() {
+        let e = |at: u64, name: &str| mo_app::HistoryEntry {
+            kind: "复制".to_string(),
+            sources: vec![PathBuf::from(name)],
+            dest: None,
+            remote: false,
+            at,
+        };
+        // 两页交错：A 页 30/10 秒，B 页 20 秒（每页内部已是最新在前）。
+        let merged = merge_history(vec![
+            vec![e(30, "a30"), e(10, "a10")],
+            vec![e(20, "b20")],
+            Vec::new(),
+        ]);
+        let names: Vec<String> = merged
+            .iter()
+            .map(|x| x.sources[0].display().to_string())
+            .collect();
+        assert_eq!(names, vec!["a30", "b20", "a10"], "全局最新在前，别页的不丢");
+
+        // 同一秒：稳定排序保留原相对顺序（A 页内部后做的仍在前面）。
+        let same = merge_history(vec![vec![e(5, "late"), e(5, "early")], vec![e(5, "other")]]);
+        let names: Vec<String> = same
+            .iter()
+            .map(|x| x.sources[0].display().to_string())
+            .collect();
+        assert_eq!(names, vec!["late", "early", "other"], "同秒多条不该乱序");
     }
 
     /// Windows 的关键钉子：正斜杠与反斜杠两种写法必须解析出**同一个** `PathBuf`

@@ -7,6 +7,12 @@
 //! 侧栏 190px）。完整绝对路径在里面会折行 / 被截得只剩前缀，而相邻
 //! 项的路径前缀本来就大量重复（列视图相邻几列会各写一遍同一个父目录），信息量几乎
 //! 为零、视觉噪音却很大。需要看全路径的地方是**地址栏**（面包屑）与对话框。
+//!
+//! 2026-09-29 用户决定：全应用一律显示**磁盘上的原样目录名**，「文件夹是什么名字
+//! 就显示什么」。此前这里还有一份 `folder_label`（把主目录 / 桌面 / 下载换成侧栏
+//! 那套中文标签），地址栏先改了，本轮把侧栏书签、列头、标签页标题一并改过来后
+//! 它就没人用了——中文标签只保留给侧栏「快捷访问」那一区（那里是**入口**，不是
+//! 「当前位置」的标识）。
 
 use std::path::Path;
 
@@ -24,55 +30,11 @@ pub(crate) fn last_segment(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// 目录的显示名：已知文件夹用侧边栏那套中文名，其余退回 [`last_segment`]。
-///
-/// 标签表在 [`mo_app::known_folder_labels`]，与侧边栏同源，不会再各写一份。
-/// 现在的使用方是**侧栏书签 / 列头 / 标签页**——面包屑（地址栏）不在此列：
-/// 2026-09-29 用户决定地址栏一律显示磁盘上的**原样目录名**（「文件夹是什么
-/// 名字就显示什么」），见 `toolbar.rs` 的 `segments` 与钉住它的测试。
-pub(crate) fn folder_label(path: &Path) -> String {
-    match known_folder_label(path) {
-        Some(label) => label.to_string(),
-        None => last_segment(path),
-    }
-}
-
-/// 这条路径是不是某个已知文件夹。
-pub(crate) fn known_folder_label(path: &Path) -> Option<&'static str> {
-    mo_app::known_folder_labels()
-        .iter()
-        .find(|(known, _)| same_dir(known, path))
-        .map(|(_, label)| *label)
-}
-
-/// 两个目录路径是否指同一个地方：忽略尾部分隔符；Windows 上再忽略大小写。
-///
-/// 大小写不是吹毛求疵：已知文件夹从 `dirs` 拿（`...\Desktop`），而用户从别处
-/// 粘来的、或书签里存的可能写成 `...\desktop`，判据不一致就会出现「同一个目录
-/// 一会儿显示「桌面」一会儿显示 `desktop`」。
-fn same_dir(a: &Path, b: &Path) -> bool {
-    fn norm(p: &Path) -> String {
-        let s = p
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_string();
-        #[cfg(target_os = "windows")]
-        {
-            s.to_ascii_lowercase()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            s
-        }
-    }
-    norm(a) == norm(b)
-}
-
 #[cfg(test)]
 mod tests {
     // ⚠️ 显式导入而非 `use super::*`：其他模块的 `use super::*` 会把
     // `gpui_kit::*` 一并 glob 进来，其 `test` 与 `#[test]` 撞名。
-    use super::{folder_label, last_segment, Path};
+    use super::{last_segment, Path};
 
     #[test]
     fn keeps_only_the_last_segment() {
@@ -97,46 +59,25 @@ mod tests {
         assert_eq!(last_segment(Path::new("/")), "/");
     }
 
-    /// 已知文件夹必须显示成侧边栏那份标签，而不是磁盘上的目录名。
+    /// 已知文件夹也显示**磁盘上的目录名**，而不是侧栏那份中文标签。
     ///
+    /// 这条钉住 2026-09-29 的决定（地址栏先改，侧栏书签 / 列头 / 标签页随后统一）。
     /// 拿真机上的表来问，不写死路径：这台机器桌面被重定向到 `D:\Users\x\Desktop`，
     /// 换一台就是 `C:\...`，写死断言的测试只会在一半的机器上跑得过。
     #[test]
-    fn known_folders_share_the_sidebar_labels() {
+    fn known_folders_show_their_real_name() {
         let table = mo_app::known_folder_labels();
         assert!(!table.is_empty(), "至少该解析出主目录");
         for (path, label) in table {
-            assert_eq!(&folder_label(path), label, "{path:?} 该显示成侧栏那份标签");
-            // 尾部分隔符不算差异：从地址栏复制回来的路径常带一个。
-            let with_slash = format!("{}{}", path.display(), std::path::MAIN_SEPARATOR);
+            let shown = last_segment(path);
+            assert_ne!(shown, *label, "{path:?} 不该再显示中文标签「{label}」");
             assert_eq!(
-                &folder_label(Path::new(&with_slash)),
-                label,
-                "尾部斜杠不该让标签掉回目录名"
+                shown,
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                "{path:?} 该显示目录本名"
             );
         }
-    }
-
-    /// Windows 上大小写不算差异（`desktop` 与 `Desktop` 是同一个目录）。
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn known_folder_match_ignores_case_on_windows() {
-        for (path, label) in mo_app::known_folder_labels() {
-            let lower = path.to_string_lossy().to_ascii_lowercase();
-            assert_eq!(
-                &folder_label(Path::new(&lower)),
-                label,
-                "小写写法 {lower:?} 也要认"
-            );
-        }
-    }
-
-    /// 不是已知文件夹的目录照旧取最后一段——这张表不该把普通目录也改名。
-    #[test]
-    fn other_dirs_keep_their_real_name() {
-        assert_eq!(
-            folder_label(Path::new("/some/place/mo-not-a-known-folder")),
-            "mo-not-a-known-folder"
-        );
     }
 }

@@ -372,3 +372,34 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   aws-lc-sys 的 C 构建脚本（要 Windows C 工具链），**cfg(windows) 代码本机验不了**
   ——靠用户侧编译 + `driveless_root_uses_the_browsed_drive_on_windows`（cwd 落点
   用同一 API 算期望值，不写死盘符）兜。
+
+### §32：显示名统一——全应用显示目录本名（2026-09-29，80a677b / 9b5eebc）
+
+* 那张「已知文件夹 → 中文标签」表（`mo_app::known_folder_labels`）本是修 Windows
+  上「侧栏写桌面、地址栏写 `Desktop`」引出来的，结果跨到了 macOS：unix 根被标签
+  成「Mac」（§31 修的一处泄漏）。用户 2026-09-29 定调：**文件夹是什么名字就显示
+  什么**。
+* 落地顺序：地址栏面包屑（`toolbar::segments`，80a677b）→ 侧栏书签、列视图列头、
+  标签页标题（`sidebar::bookmark_rows` / `columns` 列头 / `Panel::title`，9b5eebc）。
+  三处都从 `path_label::folder_label` 换成 `last_segment` 后，`folder_label` /
+  `known_folder_label` / `same_dir` 无人使用，一并删掉（含钉中文标签的三条测试），
+  换成 `known_folders_show_their_real_name`（拿真机的表问：显示目录本名 ≠ 中文标签）。
+* **保留**：侧栏「快捷访问」那一区（`AppState::quick_locations`）仍是中文标签——
+  它是**入口**，不是「当前位置」的标识，跟访达侧栏同理。要改再说。
+* 判据：**同一个目录在窗口里任何一处只能有一个名字**。再加新的显示位置，默认
+  取 `last_segment`，别再开一份「这边翻译、那边不翻译」的表。
+
+### §33：解不开的压缩格式要说人话（2026-09-29，74164e0）
+
+* **现象**：`.7z` / `.rar` / `.tar.bz2` / `.tar.xz` 都掉进 `extract_tar`，报一句
+  底层库的「不是 tar」——用户不知道发生了什么，也不知道该怎么办。
+* **根因（又是「同一件事两处作答」）**：`extract_archive` 按 `.zip` 判完之后
+  **一律**交给 tar 分支；而右键菜单的 `looks_like_archive` 自己列了八个后缀，
+  其中 `.tar.bz2` / `.tar.xz` 其实解不开（tar 分支只接 gzip，flate2 不管 bz2/xz）
+  ——菜单给了「解压」，点下去报错。
+* **修法**：解压的判据收口成 `mo_operations::extract_format`（zip / tar /
+  tar.gz / tgz，其余 `None`），**与打包用的 `ArchiveFormat::from_path` 分开**——
+  打包认不出按 zip 处理（给个能用的结果），解压认不出必须直说。菜单改问
+  `is_extractable`（解不开就不给这一项），`extract_archive` 认不出就当场报错
+  并列出支持的格式；UI 的解压结果带上失败原因。
+* 要不要真接外部工具（`7z` / `bsdtar`）另说——那是新依赖 + 进程调用，不在这一刀里。

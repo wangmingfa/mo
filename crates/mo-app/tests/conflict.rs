@@ -1,5 +1,7 @@
-//! 远程传输的**冲突探测与决策**（`transfer_between` → `PendingConflict` →
-//! `resolve_conflict`）。
+//! 传输的**冲突探测与决策**（`transfer_between` → `PendingConflict` →
+//! `resolve_conflict`）——远程 leg（下面这批用例）与**两端都本地**（文末那批）
+//! 走同一条：2026-09-29 起本机复制 / 移动撞上同名条目也弹这张卡，不再闷声
+//! 改名成 `a 2.txt`。
 //!
 //! 目标端已有同名条目时**整批不提交**，交回确认卡让用户选覆盖 / 改名 / 跳过
 //! （取消 = 丢弃请求什么都不传）。批里可能并存「部分完成」的文件：冲突优先
@@ -7,9 +9,11 @@
 //!
 //! 分类判据与续传共用一次 `metadata` 探测：`0 < 已传 < 源大小` 算续传候选，
 //! 其余已存在（完整同名、更大、目录）算冲突——目标比源**短**的完整文件按
-//! 「没传完」续传处理，这是断点续传的语义而不是冲突。
+//! 「没传完」续传处理，这是断点续传的语义而不是冲突。本地对只判冲突不判续传
+//! （本机复制不落「部分完成」的中间文件）。
 //!
-//! 端点直接传 `Endpoint::Remote(假后端)`，不需要 SessionRegistry 基建。
+//! 远程用例直接传 `Endpoint::Remote(假后端)`，不需要 SessionRegistry 基建；
+//! 本地用例传 `Endpoint::Local` 加一对真实临时目录。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -300,4 +304,117 @@ async fn skip_decision_leaves_conflicts_the_rest() {
         Some(FOREIGN),
         "冲突文件原样不动"
     );
+}
+
+// ------------------------------------------------------------ 本地对（两端都在本机）
+
+/// 本地场景：`src/` 下 `a.txt`（整份）与 `b.txt`，`dst/` 下已有**更长**的同名
+/// `a.txt`。真临时目录 + 真 `LocalFileSystem`——本地对走的是本机队列，用假后端
+/// 测不到「覆盖」到底有没有落到 `CopyOperation` 上。
+fn local_scene(tag: &str) -> (AppState, PathBuf, PathBuf) {
+    let app = common::isolated(tag, AppState::new);
+    let root = std::env::temp_dir().join(format!("mo-conflict-local-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("src");
+    let dst = root.join("dst");
+    std::fs::create_dir_all(&src).expect("建源目录");
+    std::fs::create_dir_all(&dst).expect("建目标目录");
+    std::fs::write(src.join("a.txt"), PAYLOAD).expect("写源 a.txt");
+    std::fs::write(src.join("b.txt"), b"hello").expect("写源 b.txt");
+    std::fs::write(dst.join("a.txt"), FOREIGN).expect("写目标同名 a.txt");
+    (app, src, dst)
+}
+
+/// 等本地文件被后台操作写成 `want`（提交只入队，落盘在 blocking 池）。
+async fn wait_local(path: &Path, want: &[u8]) {
+    for _ in 0..250 {
+        if std::fs::read(path).ok().as_deref() == Some(want) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("等了 5s，{} 还没写成期望内容", path.display());
+}
+
+/// 探测一遍拿回本地冲突请求（各决策用例共用前置）。
+async fn hold_local(app: &AppState, src: &Path, dst: &Path) -> PendingConflict {
+    match app
+        .transfer_between(
+            vec![src.join("a.txt"), src.join("b.txt")],
+            Endpoint::Local,
+            dst,
+            Endpoint::Local,
+            false,
+        )
+        .await
+    {
+        TransferOutcome::NeedsConflictConfirmation(p) => *p,
+        TransferOutcome::NeedsResumeConfirmation(_) => {
+            panic!("本地没有「部分完成」这回事，不该弹续传卡")
+        }
+        TransferOutcome::Started(_) => panic!("目标有同名文件，本机也该等用户决策"),
+    }
+}
+
+/// 本机复制撞同名：整批不提交、冲突清单里只有那一个（与远程同款反馈）。
+#[tokio::test]
+async fn local_conflicting_target_holds_the_whole_batch() {
+    let (app, src, dst) = local_scene("local-hold");
+    let pending = hold_local(&app, &src, &dst).await;
+    assert_eq!(pending.conflicts, vec![dst.join("a.txt")]);
+    assert!(
+        !dst.join("b.txt").exists(),
+        "什么都没传：无冲突的 b.txt 也还没落盘"
+    );
+    let _ = std::fs::remove_dir_all(dst.parent().expect("有父目录"));
+}
+
+/// 本机选「覆盖」：真把目标重写了，而不是多出一个 `a 2.txt`。
+#[tokio::test]
+async fn local_overwrite_decision_replaces_the_file() {
+    let (app, src, dst) = local_scene("local-overwrite");
+    let pending = hold_local(&app, &src, &dst).await;
+    let ids = app
+        .resolve_conflict(pending, ConflictDecision::Overwrite)
+        .await;
+    assert_eq!(ids.len(), 2, "两个都提交（覆盖一个、正常传一个）");
+    wait_local(&dst.join("a.txt"), PAYLOAD).await;
+    wait_local(&dst.join("b.txt"), b"hello").await;
+    assert!(
+        !dst.join("a 2.txt").exists(),
+        "选了覆盖就不该再冒出改名的副本"
+    );
+    let _ = std::fs::remove_dir_all(dst.parent().expect("有父目录"));
+}
+
+/// 本机选「改名」：两边都留（`a 2.txt` 与原来的 `a.txt`）。
+#[tokio::test]
+async fn local_rename_decision_keeps_both() {
+    let (app, src, dst) = local_scene("local-rename");
+    let pending = hold_local(&app, &src, &dst).await;
+    app.resolve_conflict(pending, ConflictDecision::Rename)
+        .await;
+    wait_local(&dst.join("a 2.txt"), PAYLOAD).await;
+    assert_eq!(
+        std::fs::read(dst.join("a.txt")).ok().as_deref(),
+        Some(FOREIGN),
+        "原有文件不被覆盖"
+    );
+    let _ = std::fs::remove_dir_all(dst.parent().expect("有父目录"));
+}
+
+/// 本机选「跳过」：冲突的那个不动，其余照常。
+#[tokio::test]
+async fn local_skip_decision_leaves_conflicts_the_rest() {
+    let (app, src, dst) = local_scene("local-skip");
+    let pending = hold_local(&app, &src, &dst).await;
+    let ids = app.resolve_conflict(pending, ConflictDecision::Skip).await;
+    assert_eq!(ids.len(), 1, "只有无冲突的 b.txt 提交");
+    wait_local(&dst.join("b.txt"), b"hello").await;
+    assert_eq!(
+        std::fs::read(dst.join("a.txt")).ok().as_deref(),
+        Some(FOREIGN),
+        "冲突文件原样不动"
+    );
+    let _ = std::fs::remove_dir_all(dst.parent().expect("有父目录"));
 }

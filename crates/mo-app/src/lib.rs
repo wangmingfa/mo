@@ -49,8 +49,8 @@ pub use treemap::{Rect, Tile, UsageTree};
 // `MenuSlot` 一起出去：注册表面板的行与右键菜单的行是**同一条声明**翻译出来的，
 // 各翻一份就会出现「面板里名字对得上、菜单里对不上」。
 pub use mo_config::{
-    clamp_icon_scale, ColumnPrefs, Config, MenuSlot, SavedServer, ThemeColors, UiPrefs,
-    UserCommand, Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
+    clamp_icon_scale, ColumnPrefs, Config, MenuSlot, SavedServer, SavedTab, Session, ThemeColors,
+    UiPrefs, UserCommand, Workflow, ICON_SCALE_MAX, ICON_SCALE_MIN, ICON_SCALE_STEP,
 };
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};
@@ -69,9 +69,9 @@ use mo_core::{
 };
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
-    CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle, OperationManager,
-    RenameOperation, RestoreOperation, SharedOperation, TransferOperation, TransferOpts, Trash,
-    TrashEntry, TrashError, TrashOperation,
+    ConflictPolicy, CopyOperation, LinkKind, LinkOperation, MoveOperation, OperationHandle,
+    OperationManager, RenameOperation, RestoreOperation, SharedOperation, TransferOperation,
+    TransferOpts, Trash, TrashEntry, TrashError, TrashOperation,
 };
 use mo_preview::Preview;
 use mo_remote::RemoteUrl;
@@ -3919,7 +3919,7 @@ impl AppState {
                 let _ = self.refresh().await;
                 return Err(e);
             }
-            self.record_history("删除（远程）", vec![p], None);
+            self.record_history("删除（远程）", vec![p], None, true);
         }
         self.refresh().await
     }
@@ -3938,7 +3938,7 @@ impl AppState {
             let id = self.ops.lock().await.next_id();
             let op = TrashOperation::new(id, p.clone(), self.trash.clone());
             let hid = self.submit_operation(op).await;
-            self.record_history("删除", vec![p.clone()], None);
+            self.record_history("删除", vec![p.clone()], None, false);
             self.push_reversible(Reversible::Delete { original: p });
             ids.push(hid);
         }
@@ -3971,7 +3971,7 @@ impl AppState {
             let id = self.ops.lock().await.next_id();
             let op: SharedOperation = CopyOperation::new(id, src.clone(), to.clone());
             let hid = self.submit_operation(op).await;
-            self.record_history("复制", vec![src.clone()], None);
+            self.record_history("复制", vec![src.clone()], None, false);
             self.push_reversible(Reversible::Copy { src, dest: to });
             ids.push(hid);
         }
@@ -4049,11 +4049,16 @@ impl AppState {
     /// [`Reversible::RemoteMove`]；续传 / 覆盖两档不记，见
     /// [`AppState::submit_transfer_entry`]）。
     ///
-    /// 提交前先探测：远程 leg 的目标里若有「部分完成」的文件（上次传输被取消
-    /// 留下的，`0 < 已传 < 源大小`），**整批不提交**，交回
-    /// [`TransferOutcome::NeedsResumeConfirmation`] 让 UI 弹确认卡；用户选定后
-    /// 走 [`AppState::resolve_resume`]。探测只对远程 leg 做——本地对的同名冲突
-    /// 由 `ConflictPolicy` 处理，与续传无关。
+    /// 提交前先探测：目标里若有同名条目，或远程 leg 的目标里有「部分完成」的
+    /// 文件（上次传输被取消留下的，`0 < 已传 < 源大小`），**整批不提交**，交回
+    /// 确认卡让用户决策；冲突优先于续传，选定后走 [`AppState::resolve_conflict`]
+    /// 或 [`AppState::resolve_resume`]。
+    ///
+    /// 探测**两端都本地时也做**（2026-09-29 起）：本机复制 / 移动撞上同名条目，
+    /// 过去走 `CopyOperation` 默认的 `ConflictPolicy::Rename` 静默改名成
+    /// `a 2.txt`——同一个动作，远程会弹卡、本机却闷声改名，反馈不对称。
+    /// 续传那半不跟着扩：本地复制不落「部分完成」的中间文件（要么没写、要么
+    /// 写完整），把「目标比源短」判成续传会误伤用户本来就有的同名小文件。
     pub async fn transfer_between(
         &self,
         paths: Vec<PathBuf>,
@@ -4068,6 +4073,9 @@ impl AppState {
         // 要是先把没冲突的传了，用户选「跳过」时已经动过的那些就收不回来了。
         // 同一条目二者只居其一：部分完成（0 < 已传 < 源大小）算续传候选，
         // 其余已存在（完整同名 / 目录 / 空文件）算冲突。冲突优先弹卡。
+        // 两端都本地时没有 leg，但探测照样做（见本函数文档：本机也要弹冲突卡），
+        // 只是不判续传——本地没有「部分完成」这回事。
+        let both_local = matches!((&src_ep, &dest_ep), (Endpoint::Local, Endpoint::Local));
         let mut partial: Vec<PathBuf> = Vec::new();
         let mut conflicts: Vec<PathBuf> = Vec::new();
         for src in &paths {
@@ -4075,14 +4083,15 @@ impl AppState {
                 continue;
             };
             let to = dest.join(&name);
-            let Some((src_fs, dst_fs, _)) = resolve_transfer_leg(&src_ep, &dest_ep, &local) else {
-                continue;
+            let (src_fs, dst_fs) = match resolve_transfer_leg(&src_ep, &dest_ep, &local) {
+                Some((s, d, _)) => (s, d),
+                None => (local.clone(), local.clone()),
             };
             // 任一头问不到（探测失败）就当没有：宁可多传一遍，不可误判。
             let (Ok(s), Ok(d)) = (src_fs.metadata(src).await, dst_fs.metadata(&to).await) else {
                 continue;
             };
-            if d.size > 0 && d.size < s.size {
+            if !both_local && d.size > 0 && d.size < s.size {
                 partial.push(to);
             } else {
                 conflicts.push(to);
@@ -4189,18 +4198,21 @@ impl AppState {
             if is_conflict && decision == ConflictDecision::Skip {
                 continue;
             }
+            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
             let mode = if is_conflict {
                 match decision {
                     ConflictDecision::Overwrite => SubmitMode::Overwrite,
                     // 改名：冲突文件走普通路径（free_path 改名，两边都留）。
                     _ => SubmitMode::Normal,
                 }
-            } else {
+            } else if leg.is_some() {
                 // 非冲突文件挂续传：批里并存的部分完成文件仍可从断点续写，
-                // 引擎侧 can_resume 判据兜底（不满足自动退回改名）。
+                // 引擎侧 can_resume 判据兜底（不满足自动退回改名）。本地对没有
+                // leg（也就没有续传这回事），走普通提交。
                 SubmitMode::Resume
+            } else {
+                SubmitMode::Normal
             };
-            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
             let hid = self
                 .submit_transfer_entry(src, &to, &pending.dest, leg, pending.move_, mode)
                 .await;
@@ -4213,8 +4225,9 @@ impl AppState {
     }
 
     /// 提交单个条目的传输（远程 leg 走 [`TransferOperation`]，本地对走
-    /// `CopyOperation` / `MoveOperation`）——[`Self::transfer_between`] 与
-    /// [`Self::resolve_resume`] 共用的落点。
+    /// `CopyOperation` / `MoveOperation`，`overwrite` 翻成本地的
+    /// [`ConflictPolicy::Overwrite`]）——[`Self::transfer_between`]、
+    /// [`Self::resolve_resume`] 与 [`Self::resolve_conflict`] 共用的落点。
     async fn submit_transfer_entry(
         &self,
         src: &Path,
@@ -4229,6 +4242,9 @@ impl AppState {
             SubmitMode::Resume => (true, false),
             SubmitMode::Overwrite => (false, true),
         };
+        // 先问再拆：`if let Some(..) = leg` 会把 leg 拆走，之后就问不到
+        // 「有没有 leg」了。
+        let remote = leg.is_some();
         if let Some((src_fs, dst_fs, label)) = leg {
             // 普通提交先预去重，拿**真实落点**：撤销记录必须指向实际写出的那个
             // 名字（见 `unique_remote_path`）。续传 / 覆盖引擎侧不走 free_path，
@@ -4265,10 +4281,13 @@ impl AppState {
                 )
             };
             let hid = self.submit_operation(op).await;
+            // leg 有值 = 这一段路走远程后端（上传 / 下载 / 远程内复制），落点
+            // 也跟着在远程；本机对没有 leg。
             self.record_history(
                 if move_ { "移动" } else { label },
                 vec![src.to_path_buf()],
                 Some(dest_dir.to_path_buf()),
+                remote,
             );
             // 记远程可逆项，但只记**普通**提交：续传 / 覆盖的落点在本次操作之前
             // 就存在——部分文件是上次取消留下的、被覆盖的旧内容已经没了——撤销
@@ -4296,35 +4315,60 @@ impl AppState {
         }
 
         let id = self.ops.lock().await.next_id();
-        let op: SharedOperation = if move_ {
-            MoveOperation::new(id, src.to_path_buf(), to.to_path_buf())
+        // 本地队列也有「覆盖」这一档：冲突卡上选了覆盖却仍走默认 Rename，
+        // 用户看到的就会是「选了覆盖，结果多出一个 `a 2.txt`」。续传对本地
+        // 没有意义（复制不落中间文件），只有 overwrite 进得来。
+        let policy = if overwrite {
+            ConflictPolicy::Overwrite
         } else {
-            CopyOperation::new(id, src.to_path_buf(), to.to_path_buf())
+            ConflictPolicy::Rename
+        };
+        let op: SharedOperation = if move_ {
+            MoveOperation::with_policy(id, src.to_path_buf(), to.to_path_buf(), policy)
+        } else {
+            CopyOperation::with_policy(id, src.to_path_buf(), to.to_path_buf(), policy)
         };
         let hid = self.submit_operation(op).await;
         self.record_history(
             if move_ { "移动" } else { "复制" },
             vec![src.to_path_buf()],
             Some(dest_dir.to_path_buf()),
+            false,
         );
-        self.push_reversible(if move_ {
-            Reversible::Move {
-                from: src.to_path_buf(),
-                to: to.to_path_buf(),
-            }
-        } else {
-            Reversible::Copy {
-                src: src.to_path_buf(),
-                dest: to.to_path_buf(),
-            }
-        });
+        // 覆盖提交**不记**可逆项，理由与远程那两档（见上）同一条：落点在本次
+        // 操作之前就存在，被覆盖的旧内容已经没了，撤销只能把不是这次产生的
+        // 东西一并抹掉（覆盖复制的逆操作是「删掉目标」，用户要的是旧内容，
+        // 拿到的是文件消失）。宁可让 ⌘Z 对这一档无效。
+        if !overwrite {
+            self.push_reversible(if move_ {
+                Reversible::Move {
+                    from: src.to_path_buf(),
+                    to: to.to_path_buf(),
+                }
+            } else {
+                Reversible::Copy {
+                    src: src.to_path_buf(),
+                    dest: to.to_path_buf(),
+                }
+            });
+        }
         hid
     }
 
     // ---- 操作历史 ----
 
     /// 记录一条操作历史（环形，最多保留 200 条）。
-    pub fn record_history(&self, kind: &str, sources: Vec<PathBuf>, dest: Option<PathBuf>) {
+    ///
+    /// `remote` 是这条记录的**落点**在远程吗（`AppState` 每标签页一个，历史
+    /// 面板要跨页汇总，光看路径已经答不出该走 `open_directory` 还是
+    /// `open_local` 了，所以记账时就写下来）。
+    pub fn record_history(
+        &self,
+        kind: &str,
+        sources: Vec<PathBuf>,
+        dest: Option<PathBuf>,
+        remote: bool,
+    ) {
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -4333,6 +4377,7 @@ impl AppState {
             kind: kind.to_string(),
             sources,
             dest,
+            remote,
             at,
         };
         let mut g = self.history.lock();
@@ -4346,6 +4391,11 @@ impl AppState {
     /// 操作历史快照（最新在前）。
     pub fn history_snapshot(&self) -> Vec<HistoryEntry> {
         self.history.lock().iter().rev().cloned().collect()
+    }
+
+    /// 清空操作历史（历史面板的「清空」用）。
+    pub fn clear_history(&self) {
+        self.history.lock().clear();
     }
 
     // ---- 撤销 / 重做 ----
@@ -4747,19 +4797,47 @@ impl Reversible {
     }
 }
 
-/// 一条操作历史记录（轻量，仅用于「操作历史」展示）。
+/// 一条操作历史记录（轻量，仅用于「操作历史」面板展示）。
 ///
 /// 可撤销性由 [`Reversible`] 单独承载，这里只做展示用途。
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
-    /// 操作类型：删除 / 复制 / 移动。
+    /// 操作类型：删除 / 复制 / 移动 / 重命名。
     pub kind: String,
     /// 源路径。
     pub sources: Vec<PathBuf>,
-    /// 目标目录（复制 / 移动时）。
+    /// 目标**目录**。三种都记目录：复制 / 移动是落点目录，重命名是新名字所在
+    /// 目录（不记新名字那条路径——这一列恒为目录，跳过去才有意义）。
     pub dest: Option<PathBuf>,
+    /// 落点在远程吗——决定「跳过去」走 [`AppState::open_directory`] 还是
+    /// [`AppState::open_local`]（`Path` 自己答不出这个问题）。
+    pub remote: bool,
     /// 发生时刻（Unix 秒）。
     pub at: u64,
+}
+
+impl HistoryEntry {
+    /// 「跳过去」应该落到哪个目录：有 `dest` 就用它（重命名取它所在目录——
+    /// `dest` 是**新名字那条路径**，不是目录），否则退回第一个源所在目录
+    /// （删除类操作的「事发现场」）。
+    pub fn landing_dir(&self) -> Option<PathBuf> {
+        if let Some(d) = &self.dest {
+            return Some(d.clone());
+        }
+        self.sources
+            .first()
+            .and_then(|s| s.parent().map(|p| p.to_path_buf()))
+    }
+}
+
+/// 一条路径所在目录（历史记账恒记**目录**，见 [`HistoryEntry::dest`]）。
+///
+/// 没有父目录（根 `/`）时退回路径本身——记「不存在」不如记原值，最坏也只是
+/// 跳过去时打不开，不会让这一条从面板上消失。
+fn dir_of(p: &Path) -> PathBuf {
+    p.parent()
+        .map(|x| x.to_path_buf())
+        .unwrap_or_else(|| p.to_path_buf())
 }
 
 impl Default for AppState {
@@ -4830,6 +4908,26 @@ impl AppState {
     /// 读取配置；读不到就用默认配置（缓存不可用不影响启动）。
     pub fn config(&self) -> mo_config::Config {
         mo_config::Config::load(&Self::config_path()).unwrap_or_default()
+    }
+
+    /// 会话文件路径（与 config.json 同一目录的 `session.json`）。
+    ///
+    /// 为什么不进 `config.json`：见 [`mo_config::Session`] 的注释——它是机器态、
+    /// 每次导航都变，跟给人手改的设置放一个文件会互相覆盖。
+    fn session_path() -> PathBuf {
+        Self::config_path().with_file_name("session.json")
+    }
+
+    /// 上次退出时的窗口布局（会话恢复用）。
+    pub fn load_session(&self) -> mo_config::Session {
+        mo_config::Session::load(&Self::session_path())
+    }
+
+    /// 存下当前的窗口布局。
+    pub fn save_session(&self, s: &mo_config::Session) {
+        if let Err(e) = s.save(&Self::session_path()) {
+            tracing::warn!("会话保存失败：{e}");
+        }
     }
 
     fn save_config(&self, cfg: &mo_config::Config) {
@@ -5820,7 +5918,7 @@ impl AppState {
             if self.goes_through_remote(&from).await {
                 let fs = self.active_fs();
                 fs.rename(&from, &to).await?;
-                self.record_history("重命名", vec![from.clone()], Some(to.clone()));
+                self.record_history("重命名", vec![from.clone()], Some(dir_of(&to)), true);
                 self.push_reversible(Reversible::RemoteRename {
                     fs,
                     from: from.clone(),
@@ -5832,7 +5930,7 @@ impl AppState {
             let id = self.ops.lock().await.next_id();
             let op = RenameOperation::new(id, from.clone(), to.clone());
             ids.push(self.submit_operation(op).await);
-            self.record_history("重命名", vec![from.clone()], Some(to.clone()));
+            self.record_history("重命名", vec![from.clone()], Some(dir_of(&to)), false);
             self.push_reversible(Reversible::Move {
                 from: from.clone(),
                 to: to.clone(),

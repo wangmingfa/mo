@@ -119,21 +119,64 @@ fn write_tar(dest: &Path, sources: &[PathBuf], gzip: bool) -> Result<(), MoError
     Ok(())
 }
 
-/// 解压 `archive` 到 `dest`（自动识别 zip / tar / tar.gz）。
-pub fn extract_archive(archive: &Path, dest: &Path) -> Result<usize, MoError> {
-    std::fs::create_dir_all(dest).map_err(MoError::Io)?;
-    let name = archive
+/// 这个压缩包我们**解得开**吗（按扩展名判，不看内容）。
+///
+/// 与 [`ArchiveFormat::from_path`]（**打包**用）是两条判据，别合并：打包时认不出
+/// 的后缀一律按 zip 处理（给个能用的结果），解压时认不出就必须直说——把 `.7z`
+/// 丢给 tar 只会得到一句看不懂的「不是 tar」（2026-09-29 用户报的胡话）。
+pub fn extract_format(path: &Path) -> Option<ArchiveFormat> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())?;
+    if name.ends_with(".zip") {
+        return Some(ArchiveFormat::Zip);
+    }
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        return Some(ArchiveFormat::TarGz);
+    }
+    if name.ends_with(".tar") {
+        return Some(ArchiveFormat::Tar);
+    }
+    None
+}
+
+/// 右键菜单 / 命令面板「要不要给解压这一项」用同一条判据（[`extract_format`]）。
+pub fn is_extractable(path: &Path) -> bool {
+    extract_format(path).is_some()
+}
+
+/// 报错里要指名道姓「是哪个格式」——只说「不支持」等于没说。
+fn archive_suffix(path: &Path) -> String {
+    let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if name.ends_with(".zip") {
-        return extract_zip(archive, dest);
+    // 复合后缀整体报（`a.tar.bz2` 报「tar.bz2」而不是「bz2」）。
+    for s in [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz"] {
+        if name.ends_with(s) {
+            return s.trim_start_matches('.').to_string();
+        }
     }
-    extract_tar(
-        archive,
-        dest,
-        name.ends_with(".tar.gz") || name.ends_with(".tgz"),
-    )
+    name.rsplit('.').next().unwrap_or(&name).to_string()
+}
+
+/// 解压 `archive` 到 `dest`（自动识别 zip / tar / tar.gz）。
+///
+/// 认不出的格式**当场报错**（列出支持的那些），不往下试：往下试只会拿到底层
+/// 库的一句「不是 tar / 不是 zip」，用户看不懂也不知道该怎么办。
+pub fn extract_archive(archive: &Path, dest: &Path) -> Result<usize, MoError> {
+    let Some(fmt) = extract_format(archive) else {
+        return Err(MoError::Other(format!(
+            "暂不支持解压 {}（目前支持 zip / tar / tar.gz / tgz）",
+            archive_suffix(archive)
+        )));
+    };
+    std::fs::create_dir_all(dest).map_err(MoError::Io)?;
+    match fmt {
+        ArchiveFormat::Zip => extract_zip(archive, dest),
+        ArchiveFormat::Tar => extract_tar(archive, dest, false),
+        ArchiveFormat::TarGz => extract_tar(archive, dest, true),
+    }
 }
 
 fn extract_zip(archive: &Path, dest: &Path) -> Result<usize, MoError> {
@@ -215,6 +258,43 @@ mod tests {
             "文件内容未还原"
         );
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// 解不开的格式要**指名道姓**地说，不能拿底层库那句「不是 tar」糊弄过去
+    /// （用户报的胡话：`.7z` / `.tar.bz2` 原先都掉进 tar 分支）。
+    #[test]
+    fn unsupported_formats_say_which_one() {
+        let dir = fixture("unsupported");
+        for (name, want) in [
+            ("pack.7z", "7z"),
+            ("pack.rar", "rar"),
+            ("pack.tar.bz2", "tar.bz2"),
+            ("pack.tar.xz", "tar.xz"),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"not really an archive").unwrap();
+            assert!(!is_extractable(&p), "{name} 不该被当成解得开的");
+            let err = extract_archive(&p, &dir.join("out"))
+                .expect_err("{name} 该报错")
+                .to_string();
+            assert!(
+                err.contains(want),
+                "报错要写明是哪个格式：{want} 不在「{err}」里"
+            );
+            assert!(
+                err.contains("zip / tar / tar.gz / tgz"),
+                "报错要列出支持的格式：{err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 解得开的四种照旧（别因为加了判据把能用的砍掉）。
+    #[test]
+    fn supported_formats_are_recognized() {
+        for name in ["a.zip", "a.tar", "a.tar.gz", "a.tgz"] {
+            assert!(is_extractable(Path::new(name)), "{name} 该解得开");
+        }
     }
 
     #[test]

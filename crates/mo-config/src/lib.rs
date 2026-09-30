@@ -27,6 +27,78 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// 上次退出时的窗口布局（会话恢复：重开 Mo 回到上次那些标签页）。
+///
+/// ⚠️ 单独一个文件（`session.json`），**不进 `config.json`**：这是机器写的状态
+/// （每次导航都变），而 config.json 是给人手改的——混在一起会互相覆盖（两边
+/// 都是「读整份 → 改一个字段 → 写回」，一个写会话一个写设置，后写的抹掉先写的）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    /// 每个窗格的标签页（外层 = 窗格，内层 = 标签页）。
+    #[serde(default)]
+    pub panes: Vec<Vec<SavedTab>>,
+    /// 每个窗格当前是第几个标签页（比 `panes` 短就按 0 处理）。
+    #[serde(default)]
+    pub active_tabs: Vec<usize>,
+    /// 退出时在第几个窗格。
+    #[serde(default)]
+    pub active_pane: usize,
+    /// 是否分栏。
+    #[serde(default)]
+    pub split: bool,
+}
+
+/// 一个恢复出来的标签页。
+///
+/// 本地与远程互斥：远程标签页要记**端点**（重连用）而不是路径——路径在远端，
+/// 本机没有它；反过来说，只记路径就永远恢复不回远程页。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedTab {
+    /// 本机目录（远程标签页为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 远程端点 `scheme://host:port`（**不含**用户名 / 密码 / 路径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 远程标签页当时在看的路径（重连成功后回到这里）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_path: Option<String>,
+}
+
+impl Session {
+    /// 有没有值得恢复的东西（空会话 = 首次启动 / 上次一个标签页都没剩）。
+    pub fn is_empty(&self) -> bool {
+        self.panes.iter().all(|p| p.is_empty())
+    }
+
+    /// 从 `path` 加载；文件不存在 / 解析失败 → 空会话。
+    ///
+    /// 解析失败**不报错、只当没有**：这是机器态，坏了顶多不恢复（回到默认那一
+    /// 页），不该像配置那样吵——更不能因为它把启动搞挂。
+    pub fn load(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else {
+            return Session::default();
+        };
+        let Ok(s) = std::str::from_utf8(
+            bytes
+                .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+                .unwrap_or(&bytes),
+        ) else {
+            return Session::default();
+        };
+        serde_json::from_str(s.trim_start()).unwrap_or_default()
+    }
+
+    /// 保存到 `path`（自动创建父目录）。
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let s = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, s).map_err(|e| e.to_string())
+    }
+}
+
 /// 一台记住的远程服务器。
 ///
 /// **只存地址与用户名，密码不在这里**——config.json 是明文，密码写进去等于换个
@@ -462,6 +534,53 @@ mod tests {
         assert_eq!(cfg.sidebar_bookmarks, vec!["/tmp/x".to_string()]);
         assert_eq!(cfg.ui.view_mode, "list", "缺字段走默认值");
         assert_eq!(cfg.ui.icon_scale, 1.0, "缺字段走默认值");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话快照：存进去再读出来必须一样（含「远程标签页记端点」这一条）。
+    #[test]
+    fn session_round_trips() {
+        let dir = std::env::temp_dir().join(format!("mo-session-rt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("session.json");
+        let _ = std::fs::remove_file(&path);
+
+        // 文件不存在 → 空会话（首次启动不该被它绊住）。
+        assert!(Session::load(&path).is_empty());
+
+        let s = Session {
+            panes: vec![
+                vec![SavedTab {
+                    path: Some("/Users/me/文稿".to_string()),
+                    endpoint: None,
+                    remote_path: None,
+                }],
+                vec![SavedTab {
+                    path: None,
+                    endpoint: Some("sftp://host:2222".to_string()),
+                    remote_path: Some("/pub/incoming".to_string()),
+                }],
+            ],
+            active_tabs: vec![0, 0],
+            active_pane: 1,
+            split: true,
+        };
+        s.save(&path).expect("写得出");
+        let back = Session::load(&path);
+        assert_eq!(back, s, "往返要一致");
+        assert!(!back.is_empty());
+
+        // 坏内容不该让启动挂掉：读不出来就当没有（回到默认那一页）。
+        std::fs::write(&path, "{ not json").expect("写得出");
+        assert!(Session::load(&path).is_empty(), "坏文件回落空会话");
+
+        // 有窗格但里面一个标签页都没有，也算空。
+        let blank = Session {
+            panes: vec![Vec::new()],
+            ..Session::default()
+        };
+        assert!(blank.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

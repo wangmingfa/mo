@@ -375,7 +375,7 @@ fn bookmark_rows(bookmarks: &[PathBuf], current: Option<&Path>) -> Vec<Row> {
         .enumerate()
         .map(|(ix, path)| Row {
             id: format!("sidebar-bm-{ix}").into(),
-            label: crate::path_label::folder_label(path),
+            label: crate::path_label::last_segment(path),
             icon: crate::icons::FOLDER,
             active: current == Some(path.as_path()),
             truncate: true,

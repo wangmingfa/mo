@@ -263,7 +263,9 @@ impl Panel {
                     trimmed
                 }
             }
-            Some(p) => crate::path_label::folder_label(p),
+            // 目录本名（已知文件夹也不换成「主目录」这类中文标签——2026-09-29
+            // 用户决定：全应用一律「文件夹是什么名字就显示什么」）。
+            Some(p) => crate::path_label::last_segment(p),
             None => "新标签页".to_string(),
         }
     }

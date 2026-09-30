@@ -77,6 +77,10 @@ pub fn isolate_user_dirs_for_tests() -> std::path::PathBuf {
         let cache = std::env::temp_dir().join(format!("mo-test-cache-{pid}"));
         let _ = std::fs::create_dir_all(&config);
         let _ = std::fs::create_dir_all(&cache);
+        // 会话恢复的快照也住在这个目录里（`session.json`）。pid 复用会让两次
+        // 测试撞进同一个目录，上次写下的会话会被这次的 `RootView::new` 读走，
+        // 于是「应该从 Home 起步」的用例开局就在别的目录——先抹掉。
+        let _ = std::fs::remove_file(config.join("session.json"));
         // 顺手扫掉历史测试进程留下的过期目录（见 `sweep_stale_isolated_dirs`）：
         // 进程级只做一次，读一遍 TEMP 的成本可忽略。
         sweep_stale_isolated_dirs();
@@ -263,6 +267,23 @@ pub fn panel_path_for_tests(view: &RootView) -> Option<std::path::PathBuf> {
     view.panel_at(0, 0).and_then(|p| p.path.clone())
 }
 
+/// 测试专用：「每个窗格各有几个标签页」（会话恢复的判据）。
+///
+/// 窗格数 = 返回的长度；`is_split` = 分栏是否开着。
+#[doc(hidden)]
+pub fn pane_tab_counts_for_tests(view: &RootView) -> (Vec<usize>, bool) {
+    (
+        view.panes.iter().map(|p| p.tabs.len()).collect(),
+        view.split,
+    )
+}
+
+/// 测试专用：把当前窗口布局拍成会话快照（`session_snapshot` 的判据）。
+#[doc(hidden)]
+pub fn session_snapshot_for_tests(view: &RootView) -> mo_app::Session {
+    view.session_snapshot()
+}
+
 /// 测试专用：当前标签页的窗口快照是否已同步到 `rows` 行（导航等待用）。
 #[doc(hidden)]
 pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {
@@ -324,8 +345,17 @@ pub fn run() {
         };
         cx.spawn(async move |cx| {
             let _window = cx
-                .open_window(options, move |_, cx| {
-                    cx.new(|cx| RootView::new(app.clone(), cx))
+                .open_window(options, move |window, cx| {
+                    let view = cx.new(|cx| RootView::new(app.clone(), cx));
+                    // 关窗（点红绿灯 / Alt+F4）前存一份窗口布局：`cx.quit()` 那两条
+                    // 路（关最后一个标签页、⌘Q）各自存过了，直接关窗不走它们。
+                    // 回调返回 true = 允许关。
+                    let v = view.clone();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        v.update(cx, |v, _cx| v.save_session());
+                        true
+                    });
+                    view
                 })
                 .expect("failed to open window");
         })
