@@ -106,7 +106,7 @@ jpeg-decoder = "0.3"
 criterion = "0.8"
 
 # UI (single facade for GPUI + base + component + assets)
-gpui-kit = "0.6"
+gpui-kit = "0.7"
 
 # Internal crates
 mo-core = { path = "crates/mo-core" }
