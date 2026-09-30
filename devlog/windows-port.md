@@ -183,8 +183,13 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   修饰位表，**Shift 位是 `0x0002`（bit 1），不是** EventRecord 的 `shiftKey`(0x0200)——
   后者在本 API 下完全不生效（实测所有键 `base == shift`，正是这个坑；`0x0004` 是 caps-lock，
   只移字母不移数字，用来交叉确认）。语义与 Windows 版对齐，非 US 布局的 mac 用户不再串键。
-  单测 `unshifted_key_resolves_shift_direction_on_current_layout` 验「大写 → 小写」方向正确
-  （这一层才证明 Shift 位没接反）；德语真值由用户在真机验（同本节 Windows 那条，需德语布局）。
+  单测 `unshifted_key_consults_current_layout`：**字母断言恒跑**（基本键映射到自己、大写→小写，
+  这一层才证明 Shift 位没接反），**德语子断言按布局跳过**——`unshifted_key('Ö') != Some('ö')`
+  即非德语（US 产不出 `ö`/`Ö`），`eprintln!` 跳过，避免沙箱（US/ABC）误报。切到德语后钉死
+  `:`→`.` / `;`→`,` / `Ö`→`ö` / `Ä`→`ä` / `Ü`→`ü` / `?`→`ß`（多源核对键位表一致，见下「实机验证」）。
+  ⚠️ **并发坑**：两条 `unshifted_key` 测试并行跑时各自进 `TISCopyCurrentKeyboardLayoutInputSource`
+  + `UCKeyTranslate`，这套 HIToolbox 布局查询在无 GUI 会话的并发下会 **SIGABRT**；已合并成**一个**
+  测试消除并发调用（用户在真机跑 `cargo test -p mo-platform unshifted_key` 也是并行，必须合并）。
 * **单测不碰真布局**：`fold_typographic_shift` 在 `#[cfg(test)]` 下把查询退化成 `None`（开发机插什么键盘不该决定断言红绿，与 §16/§21 同一类卫生）；非 US 的行为由 `fold_with` 那组测试喂**假布局**覆盖。`mo-platform` 侧按 KLID 显式 `ActivateKeyboardLayout` 后实测 US 与德语两列答案，装不上布局的机器跳过并 `eprintln!`。
 * **实机验证撞到的两件事**（记下来，免得下一个人重踩）：
     * gpui 算字符走 `ToUnicode(vk, lParam 高字节的扫描码, state)`，它只看**当前线程**的布局。而 `SetForegroundWindow` 一激活窗口，Windows 就把该线程的布局打回这个窗口登记的输入语言（本机是 `0x0804` 中文）；`WM_INPUTLANGCHANGEREQUEST` 想切德语（`00000407`）也不落地——不在用户「输入语言列表」里的布局，Shell 不给切。所以**没能让 Mo 的线程真变成德语键盘**，GUI 上的德语端到端这一轮没验成。
@@ -249,7 +254,10 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 
 * 全篇（§1~§13）都是**落地之后补记**的，当时第一手的调试感（比如 `$I` 扫了几千条才反查通、`explorer` 退出码是怎么误报的）已丢了一些；§14 之后是当轮写的。
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
-* **§22 在 macOS 上还是 US 表**（gpui 不给虚拟键码）；Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报 Shift + 符号未验），只保证单测三平台跑得过。
+* **§22 macOS 的「US 表」缺口已补**（2026-09-30，`dcbe702`）：macOS 也走 `TIS + UCKeyTranslate`
+  查当前布局折符号键，非 US 布局不再串键；德语真值由 `unshifted_key_consults_current_layout`
+  在德语机器上断言（US 自动跳过）。Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报
+  Shift + 符号未验），只保证单测三平台跑得过。
 * **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。
 
 
