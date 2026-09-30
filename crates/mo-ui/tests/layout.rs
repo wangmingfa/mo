@@ -817,18 +817,30 @@ fn selection_count(window: &WindowHandle<RootView>, cx: &mut TestAppContext) -> 
 ///
 /// ⚠️ 目录读取走的是**真 IO**（`spawn_blocking` / tokio worker 读完再唤醒 GPUI 任务），
 /// 而 headless 的 `run_until_parked` 只排自己的任务队列，不等那条线程——所以「导航已经
-/// 生效、列表还没回来」这种中间态会被单次 `render_frame` 撞上（实测一轮约 5 次红 1 次）。
+/// 生效、列表还没回来」这种中间态会被单次 `render_frame` 撞上（实测一轮约 5 次红 1 次，
+/// 整包并行时尤甚，见 devlog/engine-testing.md §9）。
 /// 判据用 `panel_window_ready_for_tests`（行数精确相等）而不是「≥1 行」：后者会被启动时
 /// 那次「按需打开 Home」的内容蒙过去。
+///
+/// 每轮把这套异步吃透，避免撞中间态：
+/// 1. `run_until_parked` 把上一轮累积的目录读 / `sync_panel` 跑完；
+/// 2. `render_frame` 让 `uniform_list` 据此请求可见区窗口快照，派生补窗任务；
+/// 3. **再** `run_until_parked` 一次——`app.list_window().await` 走 spawn_blocking 读盘，
+///    不 drain 就撞上「`list_count` 已就位、`window` 还空」的中间态；
+/// 4. 还没就绪就 `sleep` 让出 CPU——并行负载下那条 spawn_blocking 线程被 worker 池饿死，
+///    `run_until_parked` 会瞬间空转返回；让 OS 先跑完真读盘，下一轮才能查到（原先 100 轮
+///    在几百个并行测试抢线程时毫秒级空转完、真 IO 还没回来，于是假红）。
+/// 5. 轮数提到 600（≈3s 真实等待上限），给足被饿 IO 的时间。
 fn wait_for_panel_rows(
     vcx: &mut VisualTestContext,
     window: &WindowHandle<RootView>,
     cx: &mut TestAppContext,
     want_rows: usize,
 ) -> bool {
-    for _ in 0..100 {
+    for _ in 0..600 {
         vcx.run_until_parked();
         vcx.update(|window, cx| window.render_frame(cx));
+        vcx.run_until_parked();
         let ready = window
             .update(cx, |root, _window, _cx| {
                 mo_ui::panel_window_ready_for_tests(root, want_rows)
@@ -837,7 +849,14 @@ fn wait_for_panel_rows(
         if ready {
             return true;
         }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    let diag = window
+        .update(cx, |root, _window, _cx| {
+            mo_ui::panel_readiness_debug_for_tests(root, want_rows)
+        })
+        .unwrap_or_else(|_| "window-handle-closed".to_string());
+    eprintln!("[wait_for_panel_rows] TIMEOUT after 600 iters (~3s): {diag}");
     false
 }
 
@@ -1409,16 +1428,21 @@ fn trash_zebra_fill_requests_its_own_second_frame(cx: &mut TestAppContext) {
 /// 与 [`wait_for_panel_rows`] 同一类判据：**回收站那几条是从磁盘 `index.json` 真读
 /// 回来的**，唤醒不记在 `run_until_parked` 的账上，所以「点了侧栏回收站、面板还空着」
 /// 这个中间态会被单次 `render_frame` 撞上（整包并行时实测红过，
-/// 见 devlog/engine-testing.md §9）。返回值交给调用方断言，失败时能报出实际看到什么。
+/// 见 devlog/engine-testing.md §9）。
+///
+/// 每轮同样在 `render_frame` 后多 `run_until_parked` 一次，且没就绪就 `sleep` 让出 CPU
+/// （并行负载下真磁盘读被 worker 池饿死，`run_until_parked` 会瞬间空转返回）；轮数提到
+/// 600 给足被饿 IO 的时间。返回值交给调用方断言，失败时能报出实际看到什么。
 fn wait_for_trash_state(
     vcx: &mut VisualTestContext,
     window: &WindowHandle<RootView>,
     want: (usize, bool),
 ) -> (usize, bool) {
     let mut last = (0, false);
-    for _ in 0..100 {
+    for _ in 0..600 {
         vcx.run_until_parked();
         vcx.update(|window, cx| window.render_frame(cx));
+        vcx.run_until_parked();
         last = window
             .update(&mut vcx.cx, |root, _w, _cx| {
                 mo_ui::trash_panel_state_for_tests(root)
@@ -1427,6 +1451,7 @@ fn wait_for_trash_state(
         if last == want {
             return last;
         }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     last
 }

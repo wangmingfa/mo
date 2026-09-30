@@ -291,6 +291,21 @@ pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {
         .is_some_and(|p| p.list_count == rows && p.window.len() == rows)
 }
 
+/// 测试专用：等行超时时的面板状态快照——路径是否切过去、`list_count` 与
+/// `window` 各到多少行。用来区分「导航没生效 / 目录读没回来 / 补窗没回来」。
+#[doc(hidden)]
+pub fn panel_readiness_debug_for_tests(view: &RootView, rows: usize) -> String {
+    match view.panel_at(0, 0) {
+        None => "no-panel".to_string(),
+        Some(p) => format!(
+            "want={rows} path={:?} list_count={} window={}",
+            p.path,
+            p.list_count,
+            p.window.len()
+        ),
+    }
+}
+
 /// 启动 Mo 图形界面。
 pub fn run() {
     init_tracing();

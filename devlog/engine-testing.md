@@ -244,3 +244,29 @@ for _ in 0..n - 1 { cx.simulate_keystrokes("down"); }
 * 残留的存量目录不用手动清：24h 前的下一次测试跑起来就扫掉了。
 
 * **补记（同日 69655e6）**：清扫下沉成 `mo_fs::sweep_stale_temp_dirs(prefixes, ttl)` 共用——mo-app 的 `mo-app-store-*` / `mo-trash-*` 也是大户（一次全量留 400+），由 `tests/common::store()` 进程级一次性扫；mo-ui 的实现删除、委托过来。行为钉子也跟着搬进 mo-fs。
+
+## 13. 等行轮询在整包并行下仍假红：`run_until_parked` 会瞬间空转，必须让出 CPU 给真 IO（2026-09-30）
+
+* **现象**：全量 CI 里 `layout.rs` 又红两条（`contributed_type_label_shows_in_the_kind_column`
+  与 `clicking_blank_below_the_list_clears_the_selection`），都是「导航后 N 行没画出来」。
+  单跑 12 次全绿——只在整包并行（几十个二进制抢 CPU）时复现。
+* **根因**：§9 那轮加的轮询（100 轮 `run_until_parked` + `render_frame`）在并行负载下
+  **毫秒级空转完**——`run_until_parked` 只排 GPUI 自己的任务队列，不推进真实时钟也不等
+  `spawn_blocking` 线程；机器忙时那条真读盘的 worker 被线程池饿着，100 轮烧完它还没回来。
+  于是「轮询」实际没给 IO 任何时间窗。
+* **修法**（`wait_for_panel_rows` / `wait_for_trash_state` 同步升级）：
+  1. 每轮结构 `run_until_parked` → `render_frame` → **再** `run_until_parked`（第 2 次
+     把 `uniform_list` 派生的补窗任务 drain 掉，否则撞「`list_count` 已就位、`window`
+     还空」的中间态）；
+  2. 没就绪就 `std::thread::sleep(5ms)` **让出 CPU**——这是关键一步，OS 先跑完被饿的
+     真读盘，下一轮才查得到。别信「轮询」三个字：不 sleep 的轮询在忙机器上等于忙等；
+  3. 轮数 100 → 600（≈3s 真实等待上限）。插桩实测收敛都在第 1 轮（0.3–1.9s），
+     说明 sleep 换来的时间窗足够，600 只是上限保险。
+* **同轮抓到的另一个信号——整包 SIGABRT**：一轮并行跑 21 条过后**整个测试进程**
+  `signal: 6` 直接 abort，没有 `test result:` 行、没有任何 FAILED——这就是 §6 那个
+  `end_test` 非确定性 panic 的进程级形态（机器越忙越易撞，背景真 IO 落地晚于测试结束）。
+  排查注意：libtest 默认捕获输出，abort 后探针全丢，**必须 `--nocapture` 重跑**才看得到
+  panic 文本；且判绿要 grep `test result: ok`（小写）而不是看退出码——abort 轮的输出里
+  连 panic 都没有，先见到「没 result 行」就该怀疑进程级死亡。
+* **验证**：`--nocapture --test-threads=4` 连跑 12 次全绿（36/36）；全量 CI 重跑不再出
+  「N 行没画出来」。
