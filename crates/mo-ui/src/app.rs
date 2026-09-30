@@ -9306,6 +9306,26 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
     col
 }
 
+/// 标签页上**实际显示**的标题。
+///
+/// 正常情况就是 [`Panel::title`]（当前目录名）；但回收站面板（`Modal::Trash`
+/// 这一族）是窗口级模态——它顶掉中央区时**不会**改 `panel().path`，标签上
+/// 就还写着进面板前的目录（用户报：人已在回收站，标签却写着「Pictures」）。
+/// 与地址栏的「回收站」胶囊同一语义（见 `toolbar` 的 `in_trash` 分支）：
+/// 回收站开着时，**活动窗格的活动标签**改显「回收站」；其余标签照旧显示
+/// 自己的目录——它们本来就没在看回收站。
+///
+/// 判据抽成函数是因为 `render_tab_bar` 里画的是文本，headless 读不出；
+/// 这一半能在模型层单测（与 `remote_badge` 的拆法同源）。
+fn tab_display_title(view: &RootView, pane_idx: usize, is_active_tab: bool, tab: &Panel) -> String {
+    if is_active_tab && pane_idx == view.active_pane.min(view.panes.len() - 1) && view.is_in_trash()
+    {
+        "回收站".to_string()
+    } else {
+        tab.title()
+    }
+}
+
 /// 标签条：每个标签是一个胶囊（显示当前目录名），右侧 ✕ 关闭，末尾 ＋ 新建。
 fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -> Div {
     let Some(pane) = view.panes.get(pane_idx) else {
@@ -9388,7 +9408,7 @@ fn render_tab_bar(view: &RootView, pane_idx: usize, entity: &Entity<RootView>) -
                 .flex_1()
                 .overflow_hidden()
                 .truncate()
-                .child(text!(tab.title())),
+                .child(text!(tab_display_title(view, pane_idx, is_active, tab))),
         );
 
         {
@@ -13985,8 +14005,9 @@ mod tests {
 
     use super::{
         box_row_range, contribution_line, filtered_apps, filtered_commands_in, located_row,
-        merge_history, resolve_address_input, slot_word, type_ahead_repeats_one_char, AddressInput,
-        CommandId, ConnectAuthState, Modal, OperationHandle, RootView, SettingsTab,
+        merge_history, resolve_address_input, slot_word, tab_display_title,
+        type_ahead_repeats_one_char, AddressInput, CommandId, ConnectAuthState, Modal,
+        OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -17391,6 +17412,66 @@ mod tests {
             None,
             "当前看的是本地，标签页不该还挂着远程徽标"
         );
+    }
+
+    /// 回收站面板开着时，活动标签页显示「回收站」而不是进面板前的目录名。
+    ///
+    /// 用户报：人已在回收站（中央区、地址栏都已是「回收站」），标签上却还写着
+    /// 「Pictures」。回收站是窗口级模态，打开时**不改** `panel().path`，显示层
+    /// 得单独换名（见 `tab_display_title`，与地址栏的「回收站」胶囊同一语义）；
+    /// 离开面板后应原样回到目录名。具体怎么画在 `render_tab_bar`（headless
+    /// 读不出文本），这里钉的是模型层判据。
+    #[test]
+    fn tab_title_shows_trash_while_the_trash_panel_is_open() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 摆一个目录名可辨识的标签：path 直接放好（异步回灌 headless 不稳定），
+        // 只测「拿标题去做显示」这段我们自己的接线。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                v.panel_mut().path = Some(PathBuf::from("/tmp/mo-tab-title/Pictures"));
+            })
+        });
+
+        // 进回收站前：标签显示目录本名。
+        let before = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                let pane = v.active_pane;
+                let tab = v.panes[pane].active;
+                // 单活动标签，`is_active` 恒真——渲染层传的是 `i == pane.active`。
+                tab_display_title(v, pane, true, &v.panes[pane].tabs[tab])
+            })
+        });
+        assert_eq!(before, "Pictures", "进回收站前标签应显示目录名");
+
+        // 回收站面板开着：活动标签改显「回收站」。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| v.open_trash_panel(cx));
+        });
+        let during = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                let pane = v.active_pane;
+                let tab = v.panes[pane].active;
+                tab_display_title(v, pane, true, &v.panes[pane].tabs[tab])
+            })
+        });
+        assert_eq!(during, "回收站", "回收站面板开着时活动标签要显示「回收站」");
+
+        // 离开面板（Esc / 点目录导航）：标签原样回到目录名——path 从没被改过。
+        cx.update(|_window, cx| super::close_modal(&root, cx));
+        let after = cx.update(|_window, cx| {
+            root.update(cx, |v, _| {
+                let pane = v.active_pane;
+                let tab = v.panes[pane].active;
+                tab_display_title(v, pane, true, &v.panes[pane].tabs[tab])
+            })
+        });
+        assert_eq!(after, "Pictures", "离开回收站后标签应回到目录名");
     }
 
     /// 网格 / 画廊视图：内容四周要留白，单元名称要水平居中（长名字截断不溢出）。
