@@ -888,3 +888,34 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
   模态的下标滚进下一个模态。
 * 回归：`palette_selection_follows_keyboard_scrolling`（推到底偏移<0、
   回顶归零、`bounds_for_item(0)` 高=34px 钉行号对位）。
+
+## 行内改名的聚焦抢焦点死循环（F2 单选分流，2026-10-01）
+
+* **病**：headless 里 `f2_on_one_file_edits_the_name_in_place` 在 F2 之后的
+  `run_until_parked()` **永不返回**（跑了 90 分钟，内存缓涨）。诊断打印：行内
+  输入框每帧 `is_focused == false`，每帧都重发 `focus()`。
+* **因**：`render` 尾段的视图根兜底 `cx.focus_self(window)`（「焦点不在任何
+  输入框就还给根」）与 `sync_inline_rename` 的**每帧确保聚焦**互抢——
+  sync 先把焦点给行内框，文末兜底看见「根没焦点且没人声明所有权」又抢回来，
+  两次 `window.focus` 都触发 `refresh()`，永不收敛。模态表单没这问题，是因为
+  `input_owns_focus` 豁免表按 `Modal` 枚举写死了，而行内改名**没有模态壳**。
+* **收口**：`input_owns_focus` 加 `self.inline_rename_input.is_some()` 一档。
+  约定：**任何**每帧自聚焦的输入框（无模态壳的那种）都必须进这张豁免表，
+  否则就是这种「测试挂死」而不是「测试红」——比红难查一个量级。
+* ⚠️ uniform_list 行在 headless 里 `window.click("file-row-…")` 报 missing
+  ElementId（行号不在元素 ID 可达路径上）——只能照 tests/layout.rs
+  `click_with_modifiers` / tests/os_drop.rs 的坐标派发（`debug_bounds` 取中心
+  → `MouseDownEvent`/`MouseUpEvent`）。`to_platform_input()` 走 UFCS
+  `gpui_kit::InputEvent::to_platform_input(...)`：app.rs 顶部导入的组件
+  `InputEvent` 枚举会遮蔽同名 trait。
+* 分流契约（`list.rename` → `open_rename`；右键 `A::Rename` 同款）：单选 →
+  行内（懒建 `InputState`，种子 `mo_core::display_name`，提交 `name_after_edit`
+  还原藏后缀，Enter/Esc 由 `register_form_keys` 拦截器在输入框持焦时接管，
+  无需订阅 `PressEnter`）；多选 / 空选 → 批量对话框（命令面板入口不受影响）。
+  点列表内别处先提交收场（`end_inline_rename_on_click`，点编辑行本身=挪光标）；
+  点列表外（侧栏 / 工具栏）暂不结束编辑——已知 v1 限制。
+* 回归：`f2_on_one_file_edits_the_name_in_place`（真盘改名）、
+  `escape_cancels_inline_rename_without_touching_disk`、
+  `f2_with_several_selected_still_opens_batch_rename`。
+  变异体钉契约：分流写死走批量 → 前两条红在「出现行内输入框」；拦截器不接管
+  → 红在「Enter 应当把新名落盘」「Esc 后输入框该消失」。
