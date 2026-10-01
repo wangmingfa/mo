@@ -138,7 +138,9 @@ fn column_box(
                 theme::selected_text()
             } else {
                 theme::text()
-            });
+            })
+            // 测试用（release no-op）：定位「第 `index` 列第 `i` 行」（拖拽 / drop 投事件要坐标）。
+            .debug_selector(move || format!("mo-col-row-{pane}-{tab}-{index}-{i}"));
         if !selected {
             line = line.hover(|s| s.bg(theme::hover_bg()));
         }
@@ -170,6 +172,42 @@ fn column_box(
                 cx.notify();
             });
         });
+        // 拖拽：按下记源、抬起结算——与列表行 / 网格单元同款接线（§36~§38）。
+        // 列视图条目没有选区概念，起点走单源版 `begin_drag_single`。
+        let drag_down_entity = entity.clone();
+        let drag_down_path = e.path.clone();
+        line.interactivity()
+            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                drag_down_entity.update(cx, |v, cx| {
+                    v.begin_drag_single(pane, tab, drag_down_path.clone(), cx);
+                });
+            });
+        let drag_up_entity = entity.clone();
+        let drag_up_path = e.path.clone();
+        line.interactivity()
+            .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
+                // 按住 Alt（mac 上是 ⌥）拖 = 移动，否则复制。
+                let alt = ev.modifiers.alt;
+                drag_up_entity.update(cx, |v, cx| {
+                    v.drop_on_entry(pane, tab, drag_up_path.clone(), is_dir, alt, cx);
+                });
+            });
+        // 从系统拖文件进来：**只有目录行接得住**；非目录行不注册监听，让事件
+        // 冒泡到窗格兜底（判据同 `file_list.rs` / `grid.rs`：`can_drop` 拒绝会吞事件）。
+        if is_dir {
+            let os_entity = entity.clone();
+            let os_dest = e.path.clone();
+            line = line
+                .drag_over::<ExternalPaths>(|style, _, _window, _cx| style.bg(theme::hover_bg()));
+            line.interactivity()
+                .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+                    let paths = paths.paths().to_vec();
+                    let dest = os_dest.clone();
+                    os_entity.update(cx, |v, cx| {
+                        v.drop_os_paths_on_entry(paths, pane, dest, cx);
+                    });
+                });
+        }
         // 图标：与列表 / 网格 / 画廊**同一条链路**（`file_item::system_icon`）。
         //
         // 列视图的条目来自 `AppState::list_dir`（不走主目录模型），缩略图状态一律是

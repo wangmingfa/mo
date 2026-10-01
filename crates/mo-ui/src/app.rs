@@ -7631,6 +7631,24 @@ impl RootView {
         self.watch_drag_egress(cx);
     }
 
+    /// 列视图的拖拽起点：它的条目来自 `list_dir`（不走主目录模型），没有
+    /// FileId、没有选区概念，拖拽源恒为**单条**。结算与 [`Self::begin_drag`]
+    /// 共用同一个 `DragState`（`drop_on_entry` / `drop_on_pane` 不看来源视图）。
+    pub(crate) fn begin_drag_single(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag = Some(DragState {
+            pane,
+            tab,
+            paths: vec![path],
+        });
+        self.watch_drag_egress(cx);
+    }
+
     // ------------------------------------------------------- 列表表头交互
 
     /// prepaint 回写：记下这个窗格 / 标签页表头各列的真实 bounds。
