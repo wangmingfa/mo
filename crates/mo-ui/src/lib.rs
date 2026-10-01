@@ -307,6 +307,24 @@ pub fn panel_row_paths_for_tests(view: &RootView) -> Vec<(std::path::PathBuf, bo
         .unwrap_or_default()
 }
 
+/// 测试专用：列视图第 0 列**已经画出来**的条目 `(路径, 是否目录)`。
+///
+/// 列视图的数据不走主目录窗口（`Panel::columns`，`LightEntry` 全量读盘），
+/// 所以坐标派发测试要单独问它——第 0 列恒等于当前目录（见 `ensure_columns`）。
+/// 列没读回来时返回空表，测试拿它当「可以投事件了」的判据。
+#[doc(hidden)]
+pub fn column_rows_for_tests(view: &RootView) -> Vec<(std::path::PathBuf, bool)> {
+    view.panel_at(0, 0)
+        .and_then(|p| p.columns.first())
+        .map(|c| {
+            c.entries
+                .iter()
+                .map(|e| (e.path.clone(), e.kind.is_dir()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 测试专用：等行超时时的面板状态快照——路径是否切过去、`list_count` 与
 /// `window` 各到多少行。用来区分「导航没生效 / 目录读没回来 / 补窗没回来」。
 #[doc(hidden)]
