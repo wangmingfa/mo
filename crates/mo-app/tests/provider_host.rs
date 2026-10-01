@@ -112,11 +112,15 @@ fn manager_list_source_end_to_end() {
 
         let ext_dir = tmp.join("extensions").join("p4a");
         std::fs::create_dir_all(&ext_dir).unwrap();
+        // ⚠️ `run` 里的宿主路径必须**按 JSON 字符串转义**再拼进清单：Windows 上
+        // `exe()` 是 `C:\Users\…`，反斜杠原样进 JSON 就是非法转义（`\U`），
+        // `load` 把这整份清单当坏清单跳过——端到端两条当场认不出扩展。
+        let exe_json = serde_json::to_string(&exe()).unwrap();
         std::fs::write(
             ext_dir.join("manifest.json"),
             format!(
-                r#"{{"id":"p4a","name":"P4夹具","provider":{{"run":["{}","ok"],"methods":["list"]}},"lists":[{{"id":"recent","title":"最近文件"}}]}}"#,
-                exe().display()
+                r#"{{"id":"p4a","name":"P4夹具","provider":{{"run":[{},"ok"],"methods":["list"]}},"lists":[{{"id":"recent","title":"最近文件"}}]}}"#,
+                exe_json
             ),
         )
         .unwrap();
@@ -259,11 +263,13 @@ fn manager_end_to_end_classifies_stores_and_forgets() {
         std::fs::create_dir_all(&ext_dir).unwrap();
         // capabilities 带 read-contents：宿主应把文件头附进 classify 入参（capability
         // 的执行点在派发侧，夹具进程不管这个字段，但参数里必须看得见）。
+        // 宿主路径按 JSON 转义拼进清单——理由见 `manager_list_source_end_to_end`。
+        let exe_json = serde_json::to_string(&exe()).unwrap();
         std::fs::write(
             ext_dir.join("manifest.json"),
             format!(
-                r#"{{"id":"p3a","name":"P3夹具","provider":{{"run":["{}","ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
-                exe().display()
+                r#"{{"id":"p3a","name":"P3夹具","provider":{{"run":[{},"ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
+                exe_json
             ),
         )
         .unwrap();
