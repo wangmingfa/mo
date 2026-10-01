@@ -1382,6 +1382,18 @@ fn keymap_from(app: &AppState) -> crate::keys::Keymap {
     )
 }
 
+/// 行内改名起手式的选区终点（字节）：只选**词干**，扩展名留给用户直接续写
+/// （资源管理器 F2 同款）。判据从显示名（`mo_core::display_name` 的产物，
+/// `.lnk` 已藏）上取：最后一个 `.` 且不在开头才算扩展分界——
+/// `旧名.txt` → 选 `旧名`；`archive.tar.gz` → 选 `archive.tar`（Windows 也只摘最后一段）；
+/// 点开头文件（`.gitignore`）与无点名字整体选中（没有「可留」的后缀）。
+fn inline_rename_stem_end(name: &str) -> usize {
+    match name.rfind('.') {
+        Some(i) if i > 0 => i,
+        _ => name.len(),
+    }
+}
+
 impl RootView {
     pub fn new(app: AppState, cx: &mut Context<Self>) -> Self {
         // 启动即套用持久化主题：此时还没有 Window，先按浅色基底解析系统外观，
@@ -3163,7 +3175,12 @@ impl RootView {
             };
             let state = cx.new(|cx| InputState::new(window, cx));
             if !seed.is_empty() {
+                let stem = inline_rename_stem_end(&seed);
                 state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                // 只选词干（资源管理器 F2 同款）：扩展名留在选区外，敲新名不吃后缀。
+                // 必须紧跟 set_value（它把选区重置了）；每帧的 focus 只补焦点、
+                // 不动选区，所以这一下不会被后续帧抹掉。
+                state.update(cx, |s, cx| s.set_selected_range(0..stem, cx));
             }
             self.inline_rename_input = Some(state);
         }
@@ -14432,10 +14449,10 @@ mod tests {
     use mo_app::AppState;
 
     use super::{
-        box_row_range, contribution_line, filtered_apps, filtered_commands_in, located_row,
-        merge_history, resolve_address_input, slot_word, tab_display_title,
-        type_ahead_repeats_one_char, AddressInput, CommandId, ConnectAuthState, Modal, NewEntry,
-        OperationHandle, RootView, SettingsTab,
+        box_row_range, contribution_line, filtered_apps, filtered_commands_in,
+        inline_rename_stem_end, located_row, merge_history, resolve_address_input, slot_word,
+        tab_display_title, type_ahead_repeats_one_char, AddressInput, CommandId, ConnectAuthState,
+        Modal, NewEntry, OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
 
@@ -18324,6 +18341,146 @@ mod tests {
         assert!(
             cx.update(|_w, cx| root.read(cx).inline_rename.is_none()),
             "多选不该进行内改名"
+        );
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 词干选区终点的取法（见 `inline_rename_stem_end` 的注释）：最后一个点
+    /// 且不在开头才算分界；点开头与无点名字整体选中。
+    #[test]
+    fn inline_rename_stem_end_cases() {
+        assert_eq!(
+            inline_rename_stem_end("旧名.txt"),
+            "旧名".len(),
+            "中文词干按**字节**给终点（选区是 UTF-8 偏移）"
+        );
+        assert_eq!(
+            inline_rename_stem_end("archive.tar.gz"),
+            "archive.tar".len(),
+            "多段后缀只摘最后一段，与 Windows 一致"
+        );
+        assert_eq!(
+            inline_rename_stem_end(".gitignore"),
+            ".gitignore".len(),
+            "点开头文件没有「可留」的后缀，整体选中"
+        );
+        assert_eq!(
+            inline_rename_stem_end("Makefile"),
+            "Makefile".len(),
+            "无点名字整体选中"
+        );
+    }
+
+    /// 打开行内改名时只选中**词干**：直接打字替换主干、`.txt` 原地保留
+    /// （资源管理器 F2 同款）。走真输入路径：`window.input` 逐键派发，
+    /// 选中区被替换、未选中的扩展名不动，Enter 提交后盘上见 `X.txt`。
+    #[test]
+    fn inline_rename_selects_the_stem_not_the_extension() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-inline-stem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("词干.txt"), b"hi").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(RENAME_KEY);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let state = cx
+            .update(|_w, cx| root.read(cx).inline_rename_input.clone())
+            .expect("前置：行内输入框已建");
+        assert_eq!(
+            cx.update(|_w, cx| state.read(cx).selected_range()),
+            0..("词干".len()),
+            "选区应停在词干末尾（字节），把 .txt 留在选区外"
+        );
+
+        // 真打字：只替换选中的词干，扩展名不动。
+        cx.update(|window, cx| window.input("X", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_w, cx| state.read(cx).value().to_string()),
+            "X.txt",
+            "打一个字应当只顶掉词干，后留着"
+        );
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            dir.join("X.txt").is_file(),
+            "Enter 应把只改词干的结果落盘： {:?}",
+            std::fs::read_dir(&dir).unwrap().collect::<Vec<_>>()
+        );
+        assert!(!dir.join("词干.txt").exists(), "旧名不该还在");
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 列表**外**的点击（这里点侧栏回收站）也要结束行内改名，且语义是提交：
+    /// 与点其他行的收场一致——先把手上的新名落盘，再继续新动作（切到回收站）。
+    #[test]
+    fn click_outside_the_list_commits_inline_rename() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-inline-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("列表外.txt"), b"hi").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(RENAME_KEY);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-inline-rename").is_some(),
+            "前置：编辑框在"
+        );
+
+        cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                if let Some(s) = v.inline_rename_input.clone() {
+                    s.update(cx, |st, cx| {
+                        st.set_value("改了名.txt".to_string(), window, cx)
+                    });
+                }
+            })
+        });
+
+        // 点侧栏（列表外）：mousedown 落在编辑行之外，走 on_mouse_down_out 提交。
+        cx.update(|window, cx| window.click("sidebar-trash", cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            dir.join("改了名.txt").is_file(),
+            "列表外的点击应当把编辑提交落盘： {:?}",
+            std::fs::read_dir(&dir).unwrap().collect::<Vec<_>>()
+        );
+        assert!(!dir.join("列表外.txt").exists(), "旧名不该还在");
+        assert!(
+            cx.update(|_w, cx| root.read(cx).inline_rename.is_none()),
+            "提交后编辑态应收场"
         );
 
         let cleaned = std::fs::remove_dir_all(&dir);

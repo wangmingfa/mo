@@ -499,6 +499,23 @@ pub fn render(
                     row = row.hover(|s| s.bg(crate::theme::hover_bg()));
                 }
 
+                // 行内改名收尾（devlog 记的 v1 缺口）：**列表外**（侧栏 / 工具栏 /
+                // 标签页 / 空白处 / 右键菜单）的点击也要提交收场，与点其他行的
+                // 语义一致（资源管理器习惯）。`on_mouse_down_out` 盯的是这一整个
+                // row div：点在本行内部（含输入框自己）算「内」，不触发。与行
+                // mouse_down 那条提交路径可能同帧双发也不要紧——
+                // `commit_inline_rename` 见编辑态已清直接返回，幂等。
+                if view
+                    .inline_rename
+                    .as_ref()
+                    .is_some_and(|p| *p == entry.path)
+                {
+                    let entity_out = entity.clone();
+                    row = row.on_mouse_down_out(move |_ev, window, cx| {
+                        crate::dialogs::commit_inline_rename(&entity_out, window, cx);
+                    });
+                }
+
                 // `Div` 只实现 `InteractiveElement`（提供 `interactivity()`），
                 // fluent `on_click` 在 `StatefulInteractiveElement`（Div 未实现），
                 // 因此点击回调走 imperative API。
