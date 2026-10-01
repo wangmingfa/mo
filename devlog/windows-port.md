@@ -259,7 +259,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   在德语机器上断言（US 自动跳过）。Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报
   Shift + 符号未验），只保证单测三平台跑得过。
 * **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。收账盘点见 §35。
-* **应用内拖拽零 headless 覆盖**（§35）：`begin_drag` / `drop_on_entry` / `drop_on_pane` / `run_transfer` 含 Alt=移动，UI 派发层没有直接测试；传输引擎本身在 mo-app 集成测试里有。
+* ~~**应用内拖拽零 headless 覆盖**（§35）~~ **已补**（2026-10-01，§36）：`crates/mo-ui/tests/internal_drag.rs` 五条，含 Alt=移动。
 * **网格 / 画廊没接应用内拖拽**（§35）：手拼鼠标事件只挂在列表视图行上。
 
 
@@ -480,3 +480,26 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
      行上（`file_list.rs`），grid 无 `begin_drag`。
   4. 移动语义两端统一成复制（§34 订正二=§29 订正二的决策，留了 MOVE 分支
      口子）——这是设计选择，记此备查，不是欠账。
+
+### §36：应用内拖拽的 headless 覆盖补齐（2026-10-01）
+
+* **补的是 §35 欠账 2**：`begin_drag` / `drop_on_entry` / `run_transfer` 这条
+  UI 派发链此前零直接测试。新增 `crates/mo-ui/tests/internal_drag.rs` 五条，
+  全真链路（真导航、真行、真落盘，墙钟轮询——传输在进程级 tokio runtime 上，
+  不受 GPUI 测试调度器驱动，理由同 `os_drop.rs`）：
+  * 拖文件行到目录行 = 复制进去、源留着；
+  * **Alt 抬起 = 移动**（把 `ev.modifiers.alt` 从鼠标事件一路钉到落盘）；
+  * 同行按下抬起 = 点击不是拖拽，且拖拽状态没被消费卡死（随后真拖照常）；
+  * 同窗格拖到**文件行**上谁都不接（`drop_on_entry` 拒非目录、不回抛窗格兜底）；
+  * 多选拖拽 = 整个选中集一起复制（`begin_drag` 的 `selection.count() > 1` 分支）。
+* **行序不靠猜**：fixture 里目录排在第几行受排序规则影响，新增
+  `mo_ui::panel_row_paths_for_tests`（已渲染快照逐行给 `(路径, 是否目录)`），
+  测试先查行号再摆鼠标；多选那条还断言两条文件行**相邻**，排序变了会响。
+* **坑位（headless 测试姿势）**：`VisualTestContext::from_window` 之后，
+  **派发鼠标/渲染用 vcx，读 `RootView` 状态必须走外层 `TestAppContext`**
+  （`window.update(tcx, ...)`）——从 `vcx.update` 闭包里递进来的那个 `App`
+  查不到这个窗口，直接「window not found」。
+* **变异反验两处**（红在预测断言、还原字节一致）：`file_list.rs` 的
+  `alt = ev.modifiers.alt` 写死 `false` → Alt 移动条红在「源文件还在」；
+  `begin_drag` 的 `multiple` 写死 `false` → 多选条红在「a2 没进箱子」。
+  原地点击的守卫分支查过等价（`self_drop` 已挡住传输），不做该变异。
