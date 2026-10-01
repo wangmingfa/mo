@@ -219,6 +219,27 @@ fn cell(
             cx.stop_propagation();
         });
     let click_entity = entity.clone();
+    // 拖拽（§36 之后网格补上，接线与 `file_list.rs` 行级同款）：按下记源、抬起结算。
+    // 与 `on_click` 共存没有冲突：原地按下抬起时 `drop_on_entry` 的同地判据直接返回，
+    // 选中仍由 click 那条路做；跨单元拖动时 up 不在原单元上，click 根本不会触发。
+    let drag_down_entity = entity.clone();
+    let drag_down_path = entry.path.clone();
+    c.interactivity()
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            drag_down_entity.update(cx, |v, cx| {
+                v.begin_drag(pane, tab, drag_down_path.clone(), id, cx);
+            });
+        });
+    let drag_up_entity = entity.clone();
+    let drag_up_path = entry.path.clone();
+    c.interactivity()
+        .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
+            // 按住 Alt（mac 上是 ⌥）拖 = 移动，否则复制。
+            let alt = ev.modifiers.alt;
+            drag_up_entity.update(cx, |v, cx| {
+                v.drop_on_entry(pane, tab, drag_up_path.clone(), is_dir, alt, cx);
+            });
+        });
     c.interactivity().on_click(move |ev, _window, cx| {
         if ev.click_count() >= 2 {
             click_entity.update(cx, |v, cx| v.open_entry(entry_path.clone(), is_dir, cx));
