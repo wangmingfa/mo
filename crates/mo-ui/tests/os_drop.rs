@@ -7,7 +7,8 @@
 //! 于是**从「事件进窗口」到「文件真的落盘」整条路都是真的**：命中测试、drop 监听、
 //! `RootView` 的结算、`AppState::transfer_between`、后台拷贝。
 //!
-//! 覆盖面只到能安全落盘的目标：目录行、窗格空白处、侧栏回收站。侧栏「快捷访问」
+//! 覆盖面只到能安全落盘的目标：目录行、窗格空白处、侧栏回收站，外加网格的目录
+//! 单元（§37 补的接线）与它冒到窗格兜底的那条对照。侧栏「快捷访问」
 //! 那几条指向**真实** Home 目录（`quick_locations` 用 `dirs` 现推，
 //! `isolate_user_dirs_for_tests` 只钉配置与缓存），往里写东西等于动用户的文件，
 //! 所以那条留给人工验证。
@@ -216,6 +217,88 @@ fn os_drop_on_sidebar_row_moves_into_trash(cx: &mut TestAppContext) {
     assert!(
         rig.trash_root().exists(),
         "回收站根没被建出来：条目没走 `trash_paths` 那条记账链路"
+    );
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
+// —————————————————————————————————— 网格（§37 之后补的目录单元接线）
+
+/// 真点工具栏按钮切视图，等到第一个网格单元渲染出来。
+fn to_mode(vcx: &mut VisualTestContext, mode_button: &'static str) {
+    vcx.update(|window, cx| window.click(mode_button, cx));
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if vcx.debug_bounds("mo-grid-cell-0").is_some() {
+            return;
+        }
+    }
+    panic!("切到视图 {mode_button} 后网格单元没渲染");
+}
+
+/// 第 `idx` 个网格单元的中心点（`debug_bounds` 要 `&'static str`，漏一个串无所谓）。
+fn grid_center(vcx: &mut VisualTestContext, idx: usize) -> Point<Pixels> {
+    let s: &'static str = Box::leak(format!("mo-grid-cell-{idx}").into_boxed_str());
+    center(vcx, s)
+}
+
+/// 窗口快照逐条 `(路径, 是否目录)`。⚠️ 读状态走外层 `TestAppContext`（与
+/// `internal_drag.rs` 同一条坑位：`vcx.update` 递进来的 `App` 查不到这个窗口）。
+fn grid_rows(tcx: &mut TestAppContext, window: &WindowHandle<RootView>) -> Vec<(PathBuf, bool)> {
+    window
+        .update(tcx, |root, _w, _cx| mo_ui::panel_row_paths_for_tests(root))
+        .expect("读行")
+}
+
+/// 拖到网格的目录单元 = 复制进**那个目录**，而不是窗格兜底的「当前目录」。
+#[gpui_kit::test]
+fn os_drop_on_grid_directory_cell_copies_into_that_directory(cx: &mut TestAppContext) {
+    let rig = Rig::new("grid-dir");
+    let (mut vcx, _window) = open_at(&rig.here, &rig, 1, cx);
+    to_mode(&mut vcx, "view-mode-grid");
+    // `here/` 只有 `inbox/` 这一条，第 0 格必是目录单元。
+    let src = rig.source_file("note.txt");
+    let at = grid_center(&mut vcx, 0);
+    drop_files(&mut vcx, at, vec![src.clone()]);
+
+    let dest = rig.inbox.join("note.txt");
+    assert!(
+        wait_until(false, &dest),
+        "拖到网格目录单元后 {dest:?} 没出现：目录单元没挂行级 drop 监听"
+    );
+    assert!(
+        !rig.here.join("note.txt").exists(),
+        "进了当前目录 = 事件漏到窗格兜底，行级监听没接住"
+    );
+    assert!(src.exists(), "复制不该动源文件");
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
+/// 拖到网格的**文件**单元：单元不接（非目录不注册监听），事件**冒泡**到窗格兜底、
+/// 落进当前目录。这条是「不注册而不是 `can_drop` 拒绝」那条接线判据的正面证据。
+#[gpui_kit::test]
+fn os_drop_on_grid_file_cell_bubbles_to_pane_fallback(cx: &mut TestAppContext) {
+    let rig = Rig::new("grid-file");
+    std::fs::write(rig.here.join("sibling.txt"), b"x").unwrap();
+    let (mut vcx, window) = open_at(&rig.here, &rig, 2, cx);
+    to_mode(&mut vcx, "view-mode-grid");
+    let rs = grid_rows(cx, &window);
+    let idx = rs
+        .iter()
+        .position(|(p, d)| !d && p.file_name().and_then(|n| n.to_str()) == Some("sibling.txt"))
+        .expect("文件单元没在窗口快照里");
+    let src = rig.source_file("loose.txt");
+    let at = grid_center(&mut vcx, idx);
+    drop_files(&mut vcx, at, vec![src.clone()]);
+
+    let dest = rig.here.join("loose.txt");
+    assert!(
+        wait_until(false, &dest),
+        "拖到文件单元该冒泡到窗格兜底（当前目录）：{dest:?} 没出现——监听被吞了？"
+    );
+    assert!(
+        !rig.inbox.join("loose.txt").exists(),
+        "落点该是当前目录，不该同时进目录单元"
     );
     let _ = std::fs::remove_dir_all(&rig.base);
 }
