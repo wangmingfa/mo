@@ -260,7 +260,8 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   Shift + 符号未验），只保证单测三平台跑得过。
 * **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。收账盘点见 §35。
 * ~~**应用内拖拽零 headless 覆盖**（§35）~~ **已补**（2026-10-01，§36）：`crates/mo-ui/tests/internal_drag.rs` 五条，含 Alt=移动。
-* **网格 / 画廊没接应用内拖拽**（§35）：手拼鼠标事件只挂在列表视图行上。
+* ~~**网格 / 画廊没接应用内拖拽**（§35）~~ **已接**（2026-10-01，§37）：`grid::cell` 挂上 down→`begin_drag` / up→`drop_on_entry`，`tests/grid_drag.rs` 五条。
+* **网格 / 画廊的目录单元没接「OS 拖入」**（§37 发现）：从资源管理器拖到目录**格子**上会落到窗格兜底 = 复制进**当前**目录，而不是那个目录（列表视图的目录行有行级监听，网格没有）。列视图（`columns.rs`）同样没接应用内拖拽与行级 OS 拖入。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
@@ -503,3 +504,28 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   `alt = ev.modifiers.alt` 写死 `false` → Alt 移动条红在「源文件还在」；
   `begin_drag` 的 `multiple` 写死 `false` → 多选条红在「a2 没进箱子」。
   原地点击的守卫分支查过等价（`self_drop` 已挡住传输），不做该变异。
+
+### §37：网格 / 画廊接上应用内拖拽（2026-10-01）
+
+* **补的是 §35 欠账 3**：§14 手拼的拖拽机器此前只挂在列表行上。`grid::cell`
+  补两笔接线（与 `file_list.rs` 同款）：`on_mouse_down(Left)` → `begin_drag`、
+  `on_mouse_up(Left)` → `drop_on_entry(pane, tab, path, is_dir, alt)`——
+  网格/画廊共用同一个 `cell`，一处接线两种视图同时生效（画廊那条测试就是钉这个的）。
+* **与 `on_click` 共存的契约**（列表行没有这条，网格特有）：网格的选中走
+  `on_click`，行内改名收尾的 `end_inline_rename_on_click` 网格本来就没有——
+  不动。原地按下抬起：`drop_on_entry` 同地判据返回、`on_click` 照常落地选中；
+  跨单元拖：up 不在源单元上，click 根本不触发。`grid_drag.rs` 的
+  `grid_press_and_release_is_a_click_that_still_selects` 两头都钉住
+  （选区 = 1、不传输、随后真拖照常）。
+* **测试**：`crates/mo-ui/tests/grid_drag.rs` 五条——目录单元接拖=复制、
+  Alt=移动、原地点击、文件单元拒接、画廊同链路。视图切换**真点工具栏按钮**
+  （`vcx.update(|w, cx| w.click("view-mode-grid", cx))`，按 ElementId 定位），
+  不碰内部状态；单元定位 `mo-grid-cell-{条目位}`，条目位与窗口快照同序，
+  目录在第几格仍由 `panel_row_paths_for_tests` 查出来。
+* **变异反验两处**（还原字节一致）：网格里 `alt` 写死 `false` → 只有 Alt 条红；
+  掐掉 down 接线的 `begin_drag` → 四条传输类全红、「文件单元拒接」照常绿
+  （它钉的是「不动盘」，没接线时本来不动——正说明那条要配着前四条读）。
+* **查记时新发现的缺口（记进待办，非本轮范围）**：网格/画廊的目录**单元**没挂
+  OS 拖入的行级监听，从资源管理器拖到目录格子上会落到窗格兜底、进的是**当前**
+  目录而非那个目录（列表视图有 `on_drop::<ExternalPaths>`，网格没有）；
+  列视图（`columns.rs`）应用内拖拽与 OS 拖入都没接。
