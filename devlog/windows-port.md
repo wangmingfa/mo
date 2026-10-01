@@ -258,7 +258,9 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   查当前布局折符号键，非 US 布局不再串键；德语真值由 `unshifted_key_consults_current_layout`
   在德语机器上断言（US 自动跳过）。Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报
   Shift + 符号未验），只保证单测三平台跑得过。
-* **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。
+* **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。收账盘点见 §35。
+* **应用内拖拽零 headless 覆盖**（§35）：`begin_drag` / `drop_on_entry` / `drop_on_pane` / `run_transfer` 含 Alt=移动，UI 派发层没有直接测试；传输引擎本身在 mo-app 集成测试里有。
+* **网格 / 画廊没接应用内拖拽**（§35）：手拼鼠标事件只挂在列表视图行上。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
@@ -449,3 +451,32 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **仍欠（已知，非漏做）**：7z/rar 的真机验证要用户机器装了 7z（本机未装，只验了
   tar 路径命令形态 + Rust 外部分支对 .tar.xz 真解压）；Windows 的 `CREATE_NO_WINDOW`
   是编译期 cfg，端到端没在 Windows 跑过黑框验证。
+
+### §35：拖放收账——两端实况与真正还欠着的（2026-10-02）
+
+* **为什么有这一节**：移植清单上的「拖放」项（任务 #17）要关账。盘点结论：
+  **Windows 侧功能完整、测试在场**；记忆里的「macOS 欠账（拖出 / 文件剪贴板写）」
+  **并不存在**——§28（剪贴板写）、§29（拖出）2026-09-29 都已补齐且真机验证过
+  （§29 的两条订正恰恰就是用户实测的产物），不必另立待办。
+* **Windows 侧对账**：
+  * 拖入：gpui 的 `IDropTarget` 翻译 `FileDropEvent`（§24），UI 四处落点注册；
+    `crates/mo-ui/tests/os_drop.rs` 三条 headless e2e 投**真的** Entered+Submit
+    事件、真盘验落点，跨平台跑（无 cfg 门控）。
+  * 拖出：OLE 全套（§25，STA 线程 + Shell 数据对象 + `IDropSource`），
+    `mo-platform/src/windows/drag.rs` 三条单测钉数据对象与两个确定分支
+    （掺幽灵路径整批拒、Esc→CANCEL、按键位按着→S_OK）+ `dropfiles_bytes`
+    字节级钉 `CF_HDROP` 布局（windows.rs）。
+  * 文件剪贴板读写：`CF_HDROP` 写 + `Preferred DropEffect` 读（§19/§20），
+    引擎侧 `crates/mo-app/tests/clipboard.rs` 五条（cut 消费、系统剪贴板接管）。
+  * 收账当日全量：`cargo test --workspace --all-features` 60 个套件 0 失败。
+* **真正还欠着的（都是已知项，不是这次查出来的新窟窿）**：
+  1. Windows 拖出**端到端人工实测**仍未做（待办里那条；§25 的清单：拖进
+     资源管理器松手应复制、Esc 无副作用）。macOS 侧同款清单 09-29 已走完。
+  2. **应用内拖拽零 headless 覆盖**：`begin_drag` / `drop_on_entry` /
+     `drop_on_pane` / `run_transfer`（含 Alt=移动）没有一个直接测试；底下
+     传输引擎在 mo-app 集成测试里有（remote_local.rs 分栏那几条），缺的是
+     UI 派发层。
+  3. **网格 / 画廊视图没接应用内拖拽**：§14 的手拼鼠标事件只挂在列表视图
+     行上（`file_list.rs`），grid 无 `begin_drag`。
+  4. 移动语义两端统一成复制（§34 订正二=§29 订正二的决策，留了 MOVE 分支
+     口子）——这是设计选择，记此备查，不是欠账。
