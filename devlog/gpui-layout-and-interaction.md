@@ -913,9 +913,21 @@ AppState 发 DirectoryController::open，标签页订阅循环自动 sync + 补�
   还原藏后缀，Enter/Esc 由 `register_form_keys` 拦截器在输入框持焦时接管，
   无需订阅 `PressEnter`）；多选 / 空选 → 批量对话框（命令面板入口不受影响）。
   点列表内别处先提交收场（`end_inline_rename_on_click`，点编辑行本身=挪光标）；
-  点列表外（侧栏 / 工具栏）暂不结束编辑——已知 v1 限制。
+  点**列表外**（侧栏 / 工具栏 / 标签页）2026-10-02 补齐收口：编辑行的
+  `on_mouse_down_out` → `commit_inline_rename`，与点其他行同款语义（先提交
+  再继续新动作）。`commit_inline_rename` 幂等，同帧与行 mouse_down 双发也不要紧。
+* 行内改名起手式只选**词干**（2026-10-02，资源管理器 F2 同款）：
+  `sync_inline_rename` 里 `set_value` 之后紧跟 `set_selected_range(0..stem)`
+  ——顺序不能反，`set_value` 会把选区重置；每帧的补聚焦只动焦点、不动选区。
+  分界取显示名最后一个 `.` 且不在开头（`archive.tar.gz` 只摘最后一段；
+  `.gitignore`、无点名字整体选中）。选区是 UTF-8 **字节**偏移，中文词干别按字数。
 * 回归：`f2_on_one_file_edits_the_name_in_place`（真盘改名）、
   `escape_cancels_inline_rename_without_touching_disk`、
-  `f2_with_several_selected_still_opens_batch_rename`。
+  `f2_with_several_selected_still_opens_batch_rename`、
+  `click_outside_the_list_commits_inline_rename`（真点侧栏回收站：提交落盘 + 收场）、
+  `inline_rename_selects_the_stem_not_the_extension`（钉 0..6 字节选区，真打字
+  只换词干后 Enter 落盘 `X.txt`）、`inline_rename_stem_end_cases`（分界判据）。
   变异体钉契约：分流写死走批量 → 前两条红在「出现行内输入框」；拦截器不接管
-  → 红在「Enter 应当把新名落盘」「Esc 后输入框该消失」。
+  → 红在「Enter 应当把新名落盘」「Esc 后输入框该消失」；掏空
+  `on_mouse_down_out` 的提交 → 红在「列表外的点击应当把编辑提交落盘」；
+  `set_selected_range` 改 0..0 → 红在选区断言 0..6。
