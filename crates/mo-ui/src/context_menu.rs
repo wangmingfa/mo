@@ -89,7 +89,7 @@ pub(crate) enum MenuAction {
     OpenInSplit,
     /// 快速预览（与空格键同语义）。
     QuickLook,
-    /// 重命名（单个走批量重命名对话框，规则留空即是改名）。
+    /// 重命名（单个 → 行内输入框，多个 → 批量重命名对话框；标签已按数量区分）。
     Rename,
     /// 同目录就地复制（`a.txt` → `a 2.txt`）。
     Duplicate,

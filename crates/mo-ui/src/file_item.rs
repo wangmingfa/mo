@@ -1,3 +1,5 @@
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::{Bitmap, Entry, EntryKind, MetadataState, ThumbnailState};
@@ -73,6 +75,7 @@ pub(crate) fn entry_system_icon(
 /// 位图（缩略图 / 系统图标）由后台泵备成内存位图，这里经
 /// [`crate::bitmap::image_source`] 转成 `ImageSource::Render` 同步上屏——
 /// `img(path)` 的异步读盘会让那一格空一两帧（切目录时的闪烁），不走。
+#[allow(clippy::too_many_arguments)]
 pub fn view(
     entry: &Entry,
     selected: bool,
@@ -81,6 +84,7 @@ pub fn view(
     system_icon: Option<Arc<Bitmap>>,
     contributed_kinds: &mo_app::extensions::TypeLabels,
     provider_kind: Option<&str>,
+    inline_input: Option<&Entity<InputState>>,
 ) -> impl IntoElement {
     // 文件类型图标：统一 Lucide 风格、单色描边，颜色随选中态（蓝底用白字）。
     let icon_data = crate::icons::entry_icon(entry);
@@ -167,21 +171,43 @@ pub fn view(
         );
     }
 
-    name_cell = name_cell.child(
-        div()
-            .flex_1()
-            // 文件名过长时省略号截断（`truncate` = overflow_hidden + nowrap + ellipsis），
-            // 防止长名把右侧列顶出去。
-            .truncate()
-            .text_size(px(13.0))
-            // 选中时整行是 Finder 蓝底，文字改白以保证对比度。
-            .text_color(if selected {
-                crate::theme::selected_text()
-            } else {
-                crate::theme::text()
-            })
-            .child(text!(entry.display_name().to_string())),
-    );
+    // 行内改名中：名称格换成真输入框（资源管理器式）。外层不拉 `h_full`——
+    // Input 被拉满时文字按它自己的行盒画在顶部（`input_field_row` 那条教训），
+    // 让 Input 保持自然高、由这里垂直居中。
+    if let Some(state) = inline_input {
+        name_cell = name_cell.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .debug_selector(|| "mo-inline-rename".to_string())
+                .child(
+                    Input::new(state)
+                        .appearance(false)
+                        .bordered(false)
+                        .small()
+                        .text_size(px(13.0))
+                        .p(px(0.0)),
+                ),
+        );
+    } else {
+        name_cell = name_cell.child(
+            div()
+                .flex_1()
+                // 文件名过长时省略号截断（`truncate` = overflow_hidden + nowrap + ellipsis），
+                // 防止长名把右侧列顶出去。
+                .truncate()
+                .text_size(px(13.0))
+                // 选中时整行是 Finder 蓝底，文字改白以保证对比度。
+                .text_color(if selected {
+                    crate::theme::selected_text()
+                } else {
+                    crate::theme::text()
+                })
+                .child(text!(entry.display_name().to_string())),
+        );
+    }
 
     // 修改日期：后台加载未就绪时留空，加载失败显示 —。
     let date = match &entry.metadata {
@@ -394,6 +420,7 @@ mod tests {
                     None,
                     &none(),
                     None,
+                    None,
                 ))
         }
     }
@@ -419,6 +446,7 @@ mod tests {
                     None,
                     &none(),
                     Some(&self.1),
+                    None,
                 ))
         }
     }
@@ -651,7 +679,16 @@ mod tests {
                 .w_full()
                 .h(px(24.0))
                 .p(px(4.0))
-                .child(view(&self.0, false, None, &self.1, None, &none(), None))
+                .child(view(
+                    &self.0,
+                    false,
+                    None,
+                    &self.1,
+                    None,
+                    &none(),
+                    None,
+                    None,
+                ))
         }
     }
 }

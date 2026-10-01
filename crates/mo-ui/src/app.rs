@@ -1186,6 +1186,13 @@ pub struct RootView {
     pub(crate) archive_sub: Option<Subscription>,
     pub(crate) trash_rename_input: Option<Entity<InputState>>,
     pub(crate) trash_rename_sub: Option<Subscription>,
+    /// 行内重命名（资源管理器式）：正在改名的目标路径，`None` = 没在编辑。
+    /// F2 / 右键「重命名」在单选时走这里，多选走批量对话框。
+    pub(crate) inline_rename: Option<PathBuf>,
+    /// 行内重命名的输入框实体——由每帧 [`Self::sync_inline_rename`] 懒建收口，
+    /// 与表单模态输入同一套生命周期、同一档「每帧确保聚焦」的焦点纪律
+    /// （点列表里任何别处都会先提交收场，焦点抢不回别的行）。
+    pub(crate) inline_rename_input: Option<Entity<InputState>>,
     /// 表单模态的导航键拦截器（随视图注册一次，见 [`Self::register_form_keys`]）。
     /// 只挂不读——Subscription drop 即注销，保活必须留在字段上。
     #[allow(dead_code)]
@@ -1411,6 +1418,8 @@ impl RootView {
             archive_sub: None,
             trash_rename_input: None,
             trash_rename_sub: None,
+            inline_rename: None,
+            inline_rename_input: None,
             form_keys_sub: Some(Self::register_form_keys(cx)),
             palette_index: 0,
             palette_scroll: ScrollHandle::default(),
@@ -3127,6 +3136,44 @@ impl RootView {
         }
     }
 
+    /// 行内重命名的输入框收口，每帧从 `render` 早段调用（与
+    /// [`Self::sync_form_inputs`] 同一拍）。建实体要 `&mut Window`，所以
+    /// [`Self::begin_inline_rename`] 只记目标，这里懒建：种子用**显示名**
+    /// （`.lnk` 藏后缀，与属性面板、列表展示同一份答案），提交时
+    /// `name_after_edit` 再还原回去。
+    ///
+    /// 焦点与单字段表单同款「每帧确保聚焦」：首帧只聚一次会被渲染流程吃掉
+    /// （实测测试当场红）。配套的豁免在 `render` 的 `input_owns_focus`——
+    /// 少了它，视图根的 `focus_self` 兜底会每帧把焦点抢回去，两处互抢就是
+    /// 永不重绘收敛的死循环（headless 实测 `run_until_parked` 挂死 90 分钟）。
+    /// 点列表里任何别处都会先走 `end_inline_rename_on_click` 提交收场，编辑态
+    /// 没了，也就不存在抢焦点的对象了。
+    fn sync_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.inline_rename.clone() else {
+            self.inline_rename_input = None;
+            return;
+        };
+        if self.inline_rename_input.is_none() {
+            let seed = match path.file_name() {
+                Some(n) => {
+                    let raw = n.to_string_lossy();
+                    mo_core::display_name(&raw).to_string()
+                }
+                None => String::new(),
+            };
+            let state = cx.new(|cx| InputState::new(window, cx));
+            if !seed.is_empty() {
+                state.update(cx, |s, cx| s.set_value(seed, window, cx));
+            }
+            self.inline_rename_input = Some(state);
+        }
+        if let Some(state) = self.inline_rename_input.clone() {
+            if !state.read(cx).focus_handle(cx).is_focused(window) {
+                state.update(cx, |s, cx| s.focus(window, cx));
+            }
+        }
+    }
+
     /// 四个表单模态里「当前字段的输入框」是否持有焦点——
     /// [`Self::register_form_keys`] 的接管判据（同命令面板那一套）。
     fn form_input_focused(&self, window: &Window, cx: &App) -> bool {
@@ -3196,6 +3243,15 @@ impl RootView {
                 return;
             };
             let takeover = entity.update(cx, |v, cx| {
+                // 行内改名没有模态壳：焦点在它的输入框上时 Enter / Esc 归它，
+                // 其余键（含方向键）放行给光标。
+                if v.inline_rename.is_some() {
+                    let focused = v
+                        .inline_rename_input
+                        .as_ref()
+                        .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+                    return focused && matches!(nav, Nav::Enter | Nav::Escape);
+                }
                 match v.modal {
                     Modal::BatchRename
                     | Modal::Properties
@@ -3218,19 +3274,27 @@ impl RootView {
                 Nav::Up => entity.update(cx, |v, cx| v.form_move_focus(-1, cx)),
                 Nav::Down => entity.update(cx, |v, cx| v.form_move_focus(1, cx)),
                 Nav::Escape => {
-                    if matches!(entity.read(cx).modal, Modal::TrashRename(_)) {
+                    if entity.read(cx).inline_rename.is_some() {
+                        entity.update(cx, |v, cx| v.cancel_inline_rename(window, cx));
+                    } else if matches!(entity.read(cx).modal, Modal::TrashRename(_)) {
                         dismiss_trash_rename(&entity, cx);
                     } else {
                         close_modal(&entity, cx);
                     }
                 }
-                Nav::Enter => match entity.read(cx).modal {
-                    Modal::BatchRename => commit_rename(&entity, cx),
-                    Modal::Properties => commit_properties(&entity, cx),
-                    Modal::Archive => commit_archive(&entity, cx),
-                    Modal::TrashRename(_) => commit_trash_rename(&entity, cx),
-                    _ => {}
-                },
+                Nav::Enter => {
+                    if entity.read(cx).inline_rename.is_some() {
+                        crate::dialogs::commit_inline_rename(&entity, window, cx);
+                    } else {
+                        match entity.read(cx).modal {
+                            Modal::BatchRename => commit_rename(&entity, cx),
+                            Modal::Properties => commit_properties(&entity, cx),
+                            Modal::Archive => commit_archive(&entity, cx),
+                            Modal::TrashRename(_) => commit_trash_rename(&entity, cx),
+                            _ => {}
+                        }
+                    }
+                }
             }
             cx.stop_propagation();
         })
@@ -6482,7 +6546,7 @@ impl RootView {
                 .detach();
             }
             "list.rename" => {
-                self.open_batch_rename(cx, None);
+                self.open_rename(cx);
                 cx.notify();
             }
             "list.open" => {
@@ -7299,6 +7363,70 @@ impl RootView {
             self.modal = Modal::BatchRename;
         }
         cx.notify();
+    }
+
+    /// 重命名入口的分流（F2 的 `list.rename`）：单选 → 行内改名（资源管理器
+    /// 式，输入框长在文件名那格里），多选 / 空选 → 批量重命名（空选维持原来
+    /// 的「没有选中文件」提示）。选中集是异步快照，理由同
+    /// [`Self::open_batch_rename`]。
+    pub(crate) fn open_rename(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            let paths = app.selection_paths().await;
+            this.update(cx, |v, cx| match paths.len() {
+                1 => v.begin_inline_rename(paths[0].clone(), cx),
+                _ => v.begin_batch_rename(paths, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// 进入行内改名。输入框实体要 `&mut Window` 才能建，交给每帧的
+    /// [`Self::sync_inline_rename`] 懒建；对同一个文件重复触发（连按 F2）不动，
+    /// 保住用户已敲进去的编辑。
+    pub(crate) fn begin_inline_rename(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.inline_rename.as_ref() == Some(&path) {
+            return;
+        }
+        self.inline_rename = Some(path);
+        self.inline_rename_input = None;
+        cx.notify();
+    }
+
+    /// 退出行内改名（Esc）：不落盘，焦点还给视图根。
+    pub(crate) fn cancel_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_rename.is_none() {
+            return;
+        }
+        self.inline_rename = None;
+        self.inline_rename_input = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// 鼠标点在列表里时结束行内改名（资源管理器语义：点了别处编辑就收）。
+    /// `clicked` 是被点的行路径——点**编辑行本身**是挪光标，不能算结束。
+    /// 空白区（框选起点）传 `None`，一律结束。
+    pub(crate) fn end_inline_rename_on_click(
+        &mut self,
+        clicked: Option<&std::path::Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.is_none() {
+            return;
+        }
+        if let Some(p) = clicked {
+            if self
+                .inline_rename
+                .as_ref()
+                .is_some_and(|e| e.as_path() == p)
+            {
+                return;
+            }
+        }
+        crate::dialogs::commit_inline_rename(&cx.entity(), window, cx);
     }
 
     /// 打开压缩对话框（`paths` 语义同 [`Self::open_batch_rename`]）。
@@ -8546,7 +8674,17 @@ impl RootView {
                     }
                 }
             }
-            A::Rename => self.open_batch_rename(cx, Some(menu.paths.clone())),
+            A::Rename => {
+                // 菜单带着**本次右键目标**的路径快照，当场就能分流：单个文件
+                // 直接在行上改名，多个（或拖选一片）开批量对话框。
+                let mut paths = menu.paths.clone();
+                if paths.len() == 1 {
+                    let p = paths.pop().unwrap_or_default();
+                    self.begin_inline_rename(p, cx);
+                } else {
+                    self.open_batch_rename(cx, Some(paths));
+                }
+            }
             A::Duplicate => {
                 let app = self.app();
                 let paths = menu.paths.clone();
@@ -8949,6 +9087,7 @@ impl Render for RootView {
         self.sync_connect_inputs(window, cx);
         self.sync_cmd_input(window, cx);
         self.sync_form_inputs(window, cx);
+        self.sync_inline_rename(window, cx);
 
         let visible_panes = if self.split && self.panes.len() > 1 {
             2
@@ -9360,8 +9499,11 @@ impl Render for RootView {
         // * 命令面板：输入框每帧自聚焦；
         // * 四个表单模态（批量重命名 / 属性 / 压缩 / 回收站重命名卡）：输入框
         //   也每帧自聚焦（`sync_form_inputs`）——但批量重命名 / 属性走到开关 /
-        //   权限位那格时焦点本来就该归视图根，那里不豁免，让 focus_self 兜底。
-        let input_owns_focus = self.panel().address_editing
+        //   权限位那格时焦点本来就该归视图根，那里不豁免，让 focus_self 兜底；
+        // * 行内改名：与表单模态同款每帧聚焦（`sync_inline_rename`），不豁免
+        //   就是两处抢焦点的死循环——headless 里实测 `run_until_parked` 永不收敛。
+        let input_owns_focus = self.inline_rename_input.is_some()
+            || self.panel().address_editing
             || match &self.modal {
                 Modal::ConnectServer | Modal::ConnectAuth | Modal::CommandPalette => true,
                 Modal::BatchRename => self.form_index < 4,
@@ -14289,6 +14431,14 @@ mod tests {
         "ctrl-a"
     };
 
+    /// 「重命名」的平台默认键（见 keys.rs `default_spec`）：macOS 走 Finder 惯例
+    /// enter，其它平台走资源管理器惯例 f2。测试里写死 `f2` 在 mac 上没人绑定。
+    const RENAME_KEY: &str = if cfg!(target_os = "macos") {
+        "enter"
+    } else {
+        "f2"
+    };
+
     /// 地址栏解析：字符串层收口（见 `resolve_address_input` 的注释——Windows 上
     /// 报过「两种斜杠都停在盘根」），这里把每个分支钉住。
     ///
@@ -17912,6 +18062,255 @@ mod tests {
                 .is_focused(window)
         });
         assert!(back, "↑ 回到字段行时焦点应跟着回去");
+    }
+
+    // ---- 行内重命名（F2 分流：单选 → 行内输入框，多选 → 批量对话框） ----
+
+    /// 按 os_drop 的 `open_at` 同款套路导航到 fixture 目录：先等启动时那次
+    /// 「按需打开 Home」落地（它是异步的、比任何导航都晚，不等会被盖回来），
+    /// 再真导航，轮询到 `rows` 行的窗口快照与首行渲染都到位。
+    fn goto_dir_and_wait(
+        cx: &mut gpui_kit::VisualTestContext,
+        root: &gpui_kit::Entity<RootView>,
+        dir: &std::path::Path,
+        rows: usize,
+    ) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+            let started = cx.update(|_w, cx| {
+                root.update(cx, |v, _cx| crate::panel_path_for_tests(v).is_some())
+            });
+            if started {
+                break;
+            }
+        }
+        cx.update(|_w, cx| {
+            root.update(cx, |v, cx| {
+                crate::navigate_for_tests(v, dir.to_path_buf(), cx)
+            })
+        });
+        for _ in 0..200 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+            let ready = cx.update(|_w, cx| {
+                root.update(cx, |v, _cx| crate::panel_window_ready_for_tests(v, rows))
+            }) && cx.debug_bounds("mo-file-row-0").is_some();
+            if ready {
+                return;
+            }
+        }
+        panic!(
+            "fixture 目录 {dir:?} 没等到 {rows} 行：{}",
+            cx.update(|_w, cx| {
+                root.update(cx, |v, _cx| crate::panel_readiness_debug_for_tests(v, rows))
+            })
+        );
+    }
+
+    /// 对指定 debug_selector 的元素派发一次左键点击。uniform_list 的行在
+    /// headless 里查不到元素 ID 路径（`window.click` 会报 missing），与
+    /// tests/layout.rs 的 `click_with_modifiers`、tests/os_drop.rs 同款坐标派发。
+    fn click_row(cx: &mut gpui_kit::VisualTestContext, selector: &'static str) {
+        let b = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} 没有渲染"));
+        let at = gpui_kit::point(
+            b.origin.x + b.size.width / 2.0,
+            b.origin.y + b.size.height / 2.0,
+        );
+        cx.update(|window, cx| {
+            // `to_platform_input` 是 gpui 的 `InputEvent` trait 方法；本文件顶上
+            // 已把同名（输入组件事件枚举）导入进来，走 UFCS 避开遮蔽。
+            window.dispatch_event(
+                gpui_kit::InputEvent::to_platform_input(gpui_kit::MouseDownEvent {
+                    button: gpui_kit::MouseButton::Left,
+                    position: at,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            window.dispatch_event(
+                gpui_kit::InputEvent::to_platform_input(gpui_kit::MouseUpEvent {
+                    button: gpui_kit::MouseButton::Left,
+                    position: at,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+        });
+    }
+
+    /// 单选按 F2：不弹对话框，文件名那格变成真输入框（资源管理器式），
+    /// Enter 把新名落盘。真文件、真盘，`rename_many` 的结果必须看得见。
+    #[test]
+    fn f2_on_one_file_edits_the_name_in_place() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-inline-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("旧名.txt"), b"hi").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+
+        // 点首行选中，再按 F2。
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(RENAME_KEY);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-inline-rename").is_some(),
+            "单选按 F2 应当在行上出现行内输入框"
+        );
+        let (path, focused, seed) = cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                (
+                    v.inline_rename.clone(),
+                    v.inline_rename_input
+                        .as_ref()
+                        .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window)),
+                    v.inline_rename_input
+                        .as_ref()
+                        .map(|s| s.read(cx).value().to_string()),
+                )
+            })
+        });
+        assert_eq!(
+            path.as_deref(),
+            Some(dir.join("旧名.txt").as_path()),
+            "编辑目标应是选中那条"
+        );
+        assert!(focused, "行内输入框应当持有焦点（光标闪烁的判据）");
+        assert_eq!(seed.as_deref(), Some("旧名.txt"), "种子是当前显示名");
+
+        // 换新名 → Enter：走拦截器的真实接管路径提交。
+        cx.update(|window, cx| {
+            root.update(cx, |v, cx| {
+                if let Some(s) = v.inline_rename_input.clone() {
+                    s.update(cx, |st, cx| {
+                        st.set_value("新名.txt".to_string(), window, cx)
+                    });
+                }
+            })
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            dir.join("新名.txt").is_file(),
+            "Enter 应当把新名落盘：目录里现在是 {:?}",
+            std::fs::read_dir(&dir).unwrap().collect::<Vec<_>>()
+        );
+        assert!(!dir.join("旧名.txt").exists(), "旧名不该还在");
+        assert!(
+            cx.update(|_w, cx| root.read(cx).inline_rename.is_none()),
+            "提交后编辑态应收场"
+        );
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// Esc 退出行内改名：盘上一个字都不动，名称文字回来。
+    #[test]
+    fn escape_cancels_inline_rename_without_touching_disk() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-inline-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("保持原名.txt"), b"hi").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+        cx.simulate_keystrokes(RENAME_KEY);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-inline-rename").is_some(),
+            "前置：编辑框在"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-inline-rename").is_none(),
+            "Esc 后输入框该消失"
+        );
+        assert!(
+            cx.update(|_w, cx| root.read(cx).inline_rename.is_none()),
+            "Esc 清掉编辑态"
+        );
+        assert!(dir.join("保持原名.txt").is_file(), "Esc 不该动盘上的名字");
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 多选按 F2：照旧开批量重命名对话框，不进行内改名。
+    #[test]
+    fn f2_with_several_selected_still_opens_batch_rename() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-inline-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"1").unwrap();
+        std::fs::write(dir.join("b.txt"), b"2").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 2);
+
+        // 点首行 + ⇧↓ 连选第二条（与真实键盘路径同一套）。
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-down");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_w, cx| root.read(cx).panel().selection.count()),
+            2,
+            "前置：两条都已选中"
+        );
+
+        cx.simulate_keystrokes(RENAME_KEY);
+        cx.run_until_parked();
+        let modal = cx.update(|_w, cx| root.read(cx).modal.clone());
+        assert!(
+            matches!(modal, Modal::BatchRename),
+            "多选按 F2 应当开批量重命名，实际 modal = {modal:?}"
+        );
+        assert!(
+            cx.update(|_w, cx| root.read(cx).inline_rename.is_none()),
+            "多选不该进行内改名"
+        );
+
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
 
     /// 另外三个单字段表单（属性文件名 / 压缩包名 / 回收站重命名卡）同样迁到

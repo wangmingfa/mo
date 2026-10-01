@@ -691,6 +691,46 @@ pub(crate) fn input_field_row(
     )
 }
 
+/// 行内重命名提交：读输入框算新名（`name_after_edit` 还原被藏起的后缀），
+/// 空名 / 没改 = 取消。无论成败这一轮编辑都结束——输入框收掉、焦点回视图根。
+/// 与 `register_form_keys` 的 Enter 接管同一入口：拦截器先吃掉 Enter，输入框
+/// 收不到，不存在双提交。
+pub(crate) fn commit_inline_rename(entity: &Entity<RootView>, window: &mut Window, cx: &mut App) {
+    let (path, edited) = entity.update(cx, |v, cx| {
+        let edited = v
+            .inline_rename_input
+            .as_ref()
+            .map(|s| s.read(cx).value().to_string());
+        let path = v.inline_rename.clone();
+        // 清态 + 焦点归位收在 cancel 里（`focus` 字段私有，也免得两处各写一遍）。
+        v.cancel_inline_rename(window, cx);
+        (path, edited)
+    });
+    let (Some(path), Some(edited)) = (path, edited) else {
+        return;
+    };
+    let new_name = edited.trim().to_string();
+    let old_real = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let new_real = mo_core::name_after_edit(&new_name, &old_real);
+    if new_name.is_empty() || new_real == old_real {
+        return;
+    }
+    let to = path.with_file_name(&new_real);
+    let app = entity.update(cx, |v, _cx| v.app());
+    let this = entity.clone();
+    cx.spawn(async move |cx| {
+        if let Err(e) = app.rename_many(vec![(path, to)]).await {
+            this.update(cx, |v, cx| {
+                v.notice(format!("重命名失败：{e}"), None, cx);
+            });
+        }
+    })
+    .detach();
+}
+
 fn icon_for(_u: &mo_app::DirUsage) -> &'static [u8] {
     // 磁盘用量对话框逐项都是目录，统一用文件夹图标。
     crate::icons::FOLDER

@@ -578,8 +578,9 @@ pub fn render(
                 let entity_down = entity.clone();
                 let down_path = entry.path.clone();
                 row.interactivity()
-                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                         entity_down.update(cx, |v, cx| {
+                            v.end_inline_rename_on_click(Some(down_path.as_path()), window, cx);
                             v.begin_drag(pane, tab, down_path.clone(), id, cx);
                         });
                     });
@@ -690,6 +691,11 @@ pub fn render(
                         system_icon,
                         &contributed_kinds,
                         provider_kind.as_deref(),
+                        // 行内改名中且正是这一行：名称格换输入框。
+                        view.inline_rename
+                            .as_ref()
+                            .filter(|p| **p == entry.path)
+                            .and(view.inline_rename_input.as_ref()),
                     ))
                     .into_any_element(),
                 );
@@ -734,10 +740,12 @@ pub fn render(
     // 拖动过程与收尾在 `RootView` 的窗口级 `on_mouse_move` / `on_mouse_up` 里处理。
     let entity_box = entity.clone();
     list.interactivity()
-        .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
             let extend = ev.modifiers.platform || ev.modifiers.control || ev.modifiers.shift;
             entity_box.update(cx, |v, cx| {
+                // 点的是列表空白区：行内改名当作「点了别处」，提交收场。
+                v.end_inline_rename_on_click(None, window, cx);
                 v.start_box_selection_if_empty(pane, tab, x, y, extend, cx)
             });
         });
