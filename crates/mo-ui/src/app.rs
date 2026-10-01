@@ -14280,6 +14280,15 @@ mod tests {
     };
     use crate::panel::Panel;
 
+    /// 输入框「全选」的平台键：macOS ⌘A，Windows/Linux Ctrl+A。写死 `cmd-a`
+    /// 在非 mac 上派发的是「Win键+A」，输入组件收不到 SelectAll（实测预填名
+    /// 不覆盖、新名追加在后面）。
+    const SELECT_ALL_KEY: &str = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
+
     /// 地址栏解析：字符串层收口（见 `resolve_address_input` 的注释——Windows 上
     /// 报过「两种斜杠都停在盘根」），这里把每个分支钉住。
     ///
@@ -14305,10 +14314,33 @@ mod tests {
             AddressInput::RemotePath(PathBuf::from("/pub/incoming"))
         );
         // 本机路径照原样构造——两种斜杠在 Windows 上由 std 分量级解析归一（下面那条）。
+        // Windows 例外：无盘符的绝对路径按 `absolutize_drive_root` 补上进程 cwd 所在
+        // 盘的盘符（资源管理器语义，`None` 时退回 cwd）——原样断言 `/Users/...` 是
+        // macOS 写法，在 Windows 上会拿到 `D:/Users/...`（跟测试进程启动盘走，玄学）。
+        // 这里 Windows 分支钉「补盘跟 cwd 的盘一致、分量不丢」，不钉死具体盘符。
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             resolve_address_input("/Users/me/下载", false, None::<&Path>),
             AddressInput::LocalPath(PathBuf::from("/Users/me/下载"))
         );
+        #[cfg(target_os = "windows")]
+        {
+            use std::path::Component;
+            let got = resolve_address_input("/Users/me/下载", false, None::<&Path>);
+            let AddressInput::LocalPath(p) = got else {
+                panic!("应解析成本机路径，实际 {got:?}");
+            };
+            let cwd = std::env::current_dir().expect("读 cwd 失败");
+            let Some(Component::Prefix(pre)) = cwd.components().next() else {
+                panic!("cwd 没有盘符前缀，测不了这条：{cwd:?}");
+            };
+            let mut want = PathBuf::from(pre.as_os_str());
+            want.push(std::path::MAIN_SEPARATOR.to_string());
+            want.push("Users");
+            want.push("me");
+            want.push("下载");
+            assert_eq!(p, want, "补盘符应跟着 cwd 的盘走，且分量不丢");
+        }
     }
 
     /// 操作历史是**跨标签页汇总**的：`AppState` 一页一个，历史也就记在各自那一
@@ -17922,7 +17954,7 @@ mod tests {
         );
 
         // 变更镜像回 archive_name（真实键入路径：⌘A 全选预填名 → 整段替换）。
-        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.press(SELECT_ALL_KEY, cx));
         cx.update(|window, cx| window.input("打包.zip", cx));
         cx.update(|window, cx| window.render_frame(cx));
         let name = cx.update(|_window, cx| root.read(cx).archive_name.clone());
@@ -17957,7 +17989,7 @@ mod tests {
             "名字框应预填模型里的显示名"
         );
         assert!(value.as_deref().is_some_and(|s| !s.is_empty()));
-        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.press(SELECT_ALL_KEY, cx));
         cx.update(|window, cx| window.input("新名字", cx));
         cx.update(|window, cx| window.render_frame(cx));
         let prop_name =
@@ -18022,7 +18054,7 @@ mod tests {
             Some("原名字.t"),
             "聚焦输入框上 backspace 应逐字删除"
         );
-        cx.update(|window, cx| window.press("cmd-a", cx));
+        cx.update(|window, cx| window.press(SELECT_ALL_KEY, cx));
         cx.update(|window, cx| window.input("改个名.txt", cx));
         cx.update(|window, cx| window.render_frame(cx));
         let new_name = cx.update(|_window, cx| root.read(cx).trash_rename_name.clone());

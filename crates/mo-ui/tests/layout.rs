@@ -105,6 +105,15 @@ const RENAME_KEY: &str = if cfg!(target_os = "macos") {
     "f2"
 };
 
+/// 输入框「全选」的平台键：macOS 走 ⌘A，Windows/Linux 走 Ctrl+A。
+/// ⚠️ 测试里写死 `cmd-a` 在非 mac 上派发的是「Win键+A」，输入组件收不到
+/// SelectAll（实测预填名不会被覆盖，新名直接追加在后面）。
+const SELECT_ALL_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-a"
+} else {
+    "ctrl-a"
+};
+
 /// 文件列表必须吃满中央区的剩余高度——它没有自我撑高的能力。
 #[gpui_kit::test]
 fn file_list_fills_the_central_area(cx: &mut TestAppContext) {
@@ -2144,7 +2153,7 @@ fn trash_enter_renames_and_restore_button_follows_selection(cx: &mut TestAppCont
     // ⚠️ 用 `vcx.update`（只借窗口）而不是 `window.update`（会把 RootView 一起
     // 借住）：按键路由里要 update RootView，双重借用直接 panic。
     vcx.update(|window, cx| {
-        window.press("cmd-a", cx);
+        window.press(SELECT_ALL_KEY, cx);
         window.input("renamed.txt", cx);
     });
     // Enter 单独派发：它会被表单拦截器接走并提交。
