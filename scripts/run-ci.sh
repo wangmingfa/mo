@@ -6,7 +6,7 @@
 #   1. 格式检查   cargo fmt --all -- --check
 #   2. 编译检查   cargo check --all-targets --all-features
 #   3. Clippy     cargo clippy --all-targets --all-features -- -D warnings
-#   4. 测试       cargo test --all-features
+#   4. 测试       cargo test --workspace --all-features
 #
 # 行为与 CI 一致：任一步骤失败即中止（退出码非 0）。加 -k / --keep-going
 # 可跑完全部步骤再汇总，方便一次性看清 fmt / clippy / test 各自的问题。
@@ -69,7 +69,7 @@ STEPS=(
   "格式检查|cargo fmt --all -- --check"
   "编译检查|cargo check --all-targets --all-features"
   "Clippy（告警即失败）|cargo clippy --all-targets --all-features -- -D warnings"
-  "测试|cargo test --all-features"
+  "测试|cargo test --workspace --all-features"
 )
 
 # 「测试」那一步的显示名——只有它会被 --retry-flaky 重试。
