@@ -301,6 +301,25 @@ fn cell(
         }
     });
 
+    // 从系统（资源管理器 / 访达）拖文件进来：**只有目录单元接得住**，且与列表行
+    // 同一条纪律——非目录单元干脆不注册监听（gpui 在判定可行性前就取走
+    // `active_drag`，用 `can_drop` 拒绝等于吞事件，外层窗格兜底再也收不到）。
+    if is_dir {
+        let os_entity = entity.clone();
+        let os_dest = entry.path.clone();
+        c = c.drag_over::<ExternalPaths>(|style, _, _window, _cx| {
+            style.bg(crate::theme::hover_bg())
+        });
+        c.interactivity()
+            .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+                let paths = paths.paths().to_vec();
+                let dest = os_dest.clone();
+                os_entity.update(cx, |v, cx| {
+                    v.drop_os_paths_on_entry(paths, pane, dest, cx);
+                });
+            });
+    }
+
     c.child(visual)
         .child(
             // 名称：作为 cell（`flex_col` + `items_center`）里的一个**收缩到内容宽**的
