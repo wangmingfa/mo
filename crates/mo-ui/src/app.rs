@@ -8530,13 +8530,30 @@ impl RootView {
         }
     }
 
-    /// 在当前窗格的目录里新建一个条目（文件夹 / 空文本文件）。
+    /// 新建一个条目（文件夹 / 空文本文件）。
     ///
-    /// 两种新建的流程一模一样（取当前目录 → 异步创建 → 刷新列表），差别只在
+    /// 两种新建的流程一模一样（定落点 → 异步创建 → 刷新列表），差别只在
     /// 调哪个 `AppState` 方法，所以合成一处——顺手也把错误文案统一了。
+    ///
+    /// 落点跟资源管理器：文件夹**恰好选中一个目录**时建进那个目录（「选中
+    /// 文件夹直接往里建」省一次进入）；其余情形（无选中 / 选的是文件 / 多选）
+    /// 建在窗格当前目录根。新建文本文件始终建在当前目录根——不替用户猜意图。
     fn create_entry(&mut self, kind: NewEntry, cx: &mut Context<Self>) {
-        let Some(dir) = self.panel().path.clone() else {
-            return;
+        let dir = {
+            let panel = self.panel();
+            let selected_dir = if matches!(kind, NewEntry::Folder) && panel.selection.count() == 1 {
+                panel
+                    .window_entries()
+                    .find(|e| panel.selection.is_selected(&e.id))
+                    .filter(|e| e.kind.is_dir())
+                    .map(|e| e.path.clone())
+            } else {
+                None
+            };
+            match selected_dir.or_else(|| panel.path.clone()) {
+                Some(d) => d,
+                None => return,
+            }
         };
         let app = self.app();
         let this = cx.entity().clone();
@@ -14417,7 +14434,7 @@ mod tests {
     use super::{
         box_row_range, contribution_line, filtered_apps, filtered_commands_in, located_row,
         merge_history, resolve_address_input, slot_word, tab_display_title,
-        type_ahead_repeats_one_char, AddressInput, CommandId, ConnectAuthState, Modal,
+        type_ahead_repeats_one_char, AddressInput, CommandId, ConnectAuthState, Modal, NewEntry,
         OperationHandle, RootView, SettingsTab,
     };
     use crate::panel::Panel;
@@ -18309,6 +18326,142 @@ mod tests {
             "多选不该进行内改名"
         );
 
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    // ---- 新建文件夹分流：恰好选中一个目录 → 建进那个目录 ----
+
+    /// 轮询等异步创建落盘（create_folder 走 AppState 后台，稳妥起见多等几拍）。
+    fn wait_created(cx: &mut gpui_kit::VisualTestContext, p: &std::path::Path) {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if p.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("没等到新建落盘：{p:?}");
+    }
+
+    /// 触发一次「新建」（键盘 / 右键菜单派发的是同一个 `create_entry`，这里直调它）。
+    fn fire_create(
+        cx: &mut gpui_kit::VisualTestContext,
+        root: &gpui_kit::Entity<RootView>,
+        kind: NewEntry,
+    ) {
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| v.create_entry(kind, cx));
+        });
+    }
+
+    /// 恰好选中一个目录：新建文件夹落进那个目录里，当前目录根不动。
+    #[test]
+    fn new_folder_goes_into_the_selected_directory() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-newfolder-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("盒")).unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+
+        fire_create(cx, &root, NewEntry::Folder);
+        wait_created(cx, &dir.join("盒").join("新建文件夹"));
+        assert!(
+            dir.join("盒").join("新建文件夹").is_dir(),
+            "应建在选中的目录里"
+        );
+        assert!(
+            !dir.join("新建文件夹").exists(),
+            "选中目录时当前根不该再被建一份"
+        );
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 无选中：维持老行为，建在当前目录根。
+    #[test]
+    fn new_folder_without_selection_stays_at_root() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-newfolder-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("纸.txt"), b"x").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+
+        fire_create(cx, &root, NewEntry::Folder);
+        wait_created(cx, &dir.join("新建文件夹"));
+        assert!(dir.join("新建文件夹").is_dir(), "无选中应建在当前根");
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 选中的是文件：不猜意图，仍建在当前目录根。
+    #[test]
+    fn new_folder_with_file_selected_stays_at_root() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-newfolder-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("纸.txt"), b"x").unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+
+        fire_create(cx, &root, NewEntry::Folder);
+        wait_created(cx, &dir.join("新建文件夹"));
+        assert!(dir.join("新建文件夹").is_dir(), "选文件应建在当前根");
+        let cleaned = std::fs::remove_dir_all(&dir);
+        assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
+    }
+
+    /// 新建文本文件不分流：就算选中目录也建在当前根（用户只点名了文件夹）。
+    #[test]
+    fn new_file_with_directory_selected_stays_at_root() {
+        crate::isolate_user_dirs_for_tests();
+        let dir = std::env::temp_dir().join(format!("mo-newfile-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("盒")).unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        goto_dir_and_wait(cx, &root, &dir, 1);
+        click_row(cx, "mo-file-row-0");
+        cx.run_until_parked();
+
+        fire_create(cx, &root, NewEntry::File);
+        wait_created(cx, &dir.join("新建文本.txt"));
+        assert!(dir.join("新建文本.txt").is_file(), "新建文件应建在当前根");
+        assert!(
+            !dir.join("盒").join("新建文本.txt").exists(),
+            "新建文本文件不该跟新建文件夹一样钻进选中目录"
+        );
         let cleaned = std::fs::remove_dir_all(&dir);
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
