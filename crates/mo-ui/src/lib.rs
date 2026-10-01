@@ -292,6 +292,21 @@ pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {
         .is_some_and(|p| p.list_count == rows && p.window.len() == rows)
 }
 
+/// 测试专用：已渲染窗口快照每一行的 `(路径, 是否目录)`。
+///
+/// 坐标派发类测试（应用内拖拽）要先弄清「目录行是第几行」才摆得下鼠标——
+/// 行序受排序规则影响，别在测试里赌「目录在前」。
+#[doc(hidden)]
+pub fn panel_row_paths_for_tests(view: &RootView) -> Vec<(std::path::PathBuf, bool)> {
+    view.panel_at(0, 0)
+        .map(|p| {
+            p.window_entries()
+                .map(|e| (e.path.clone(), e.kind.is_dir()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 测试专用：等行超时时的面板状态快照——路径是否切过去、`list_count` 与
 /// `window` 各到多少行。用来区分「导航没生效 / 目录读没回来 / 补窗没回来」。
 #[doc(hidden)]
