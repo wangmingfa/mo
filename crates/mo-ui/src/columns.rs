@@ -1,13 +1,17 @@
 //! columns：Miller 列视图（逐级展开当前选中目录）。
 //!
 //! 数据来自 [`AppState::list_dir`]——**不走主目录模型**，因此切到列视图
-//! 不会污染导航栈 / 选择 / 监听目标；离开列视图时这些列数据也随之弃用。
+//! 不会污染导航栈 / 监听目标；离开列视图时这些列数据也随之弃用。
+//! 单击行会把 **app 选择**整替成该行（`RootView::column_row_clicked`，§40），
+//! 好让 F2 / 复制 / 删除这些选择模型命令打到用户真正点的那一条。
 //!
 //! 主列表用的是「虚拟化 + 窗口懒加载」，这里每列默认最多渲染
 //! [`MAX_PER_COLUMN`] 条：列视图一次只展示一级目录，且更大的收益在于
 //! 逐级下钻而非滚动，因此对超大目录做上限提示更实际。
 
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::EntryKind;
@@ -34,6 +38,9 @@ pub fn render(
     app: &AppState,
     // 分栏对比时这一页的条目状态（按路径查）；`None` = 没在对比。
     diff: Option<&std::collections::HashMap<PathBuf, mo_diff::TreeStatus>>,
+    // 行内改名进行中的 `(路径, 输入框)`：命中的那一行把名字换成输入框
+    //（与 `file_list` 同一套编辑器，§40 缺口 2）。
+    renaming: Option<(&PathBuf, &Entity<InputState>)>,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
@@ -52,12 +59,13 @@ pub fn render(
         );
     }
     for (i, data) in columns_data.iter().enumerate() {
-        row = row.child(column_box(entity, pane, tab, i, data, app, diff));
+        row = row.child(column_box(entity, pane, tab, i, data, app, diff, renaming));
     }
     row
 }
 
 /// 一个列的标题与内容。
+#[allow(clippy::too_many_arguments)]
 fn column_box(
     entity: &Entity<RootView>,
     pane: usize,
@@ -66,6 +74,7 @@ fn column_box(
     data: &ColumnData,
     app: &AppState,
     diff: Option<&std::collections::HashMap<PathBuf, mo_diff::TreeStatus>>,
+    renaming: Option<(&PathBuf, &Entity<InputState>)>,
 ) -> Stateful<Div> {
     let mut col = div()
         // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
@@ -144,6 +153,16 @@ fn column_box(
         if !selected {
             line = line.hover(|s| s.bg(theme::hover_bg()));
         }
+        // 行内改名进行中且正是这一行：名字格换输入框（末尾渲染处），点这一行
+        // **外面**任何地方提交收场——`on_mouse_down_out` 盯整个行 div，点在本行
+        // 内部（含输入框自己）不触发（与 `file_list.rs` :507 同款接线，§40 缺口 2）。
+        let inline_input = renaming.filter(|(p, _)| **p == e.path).map(|(_, i)| i);
+        if inline_input.is_some() {
+            let entity_out = entity.clone();
+            line = line.on_mouse_down_out(move |_ev, window, cx| {
+                crate::dialogs::commit_inline_rename(&entity_out, window, cx);
+            });
+        }
         let is_dir = matches!(e.kind, EntryKind::Directory);
         // 右键：对着这一行弹上下文菜单（`stop_propagation` 防止冒泡到窗格容器）。
         let ctx_entity = entity.clone();
@@ -164,7 +183,8 @@ fn column_box(
                     v.open_entry(entry_path.clone(), is_dir, cx);
                     return;
                 }
-                v.set_column_cursor(pane, tab, index, i);
+                // 单击：挪本列 cursor + 把 app 选择整替成这一行（§40 缺口 1）。
+                v.column_row_clicked(pane, tab, index, i, entry_path.clone(), cx);
                 if is_dir {
                     // 逐级下钻：选中目录就展开它的子列（替换掉更深层的列）。
                     v.load_column(cx, entry_path.clone(), Some(index), pane, tab);
@@ -177,8 +197,11 @@ fn column_box(
         let drag_down_entity = entity.clone();
         let drag_down_path = e.path.clone();
         line.interactivity()
-            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                 drag_down_entity.update(cx, |v, cx| {
+                    // 点别处 = 行内改名提交收场（点编辑行自身算挪光标，判据在
+                    // `end_inline_rename_on_click` 里）；与 `file_list` / `grid` 同款。
+                    v.end_inline_rename_on_click(Some(drag_down_path.as_path()), window, cx);
                     v.begin_drag_single(pane, tab, drag_down_path.clone(), cx);
                 });
             });
@@ -238,12 +261,30 @@ fn column_box(
             )
             .into_any_element(),
         });
-        line = line.child(
-            div()
+        // 名字：编辑态这一行换真输入框（与 `file_item::view` 的 `inline_input`
+        // 同款拼法——外层不拉 `h_full`，让 Input 保持自然高、垂直居中）。
+        line = line.child(match inline_input {
+            Some(state) => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .debug_selector(|| "mo-inline-rename".to_string())
+                .child(
+                    Input::new(state)
+                        .appearance(false)
+                        .bordered(false)
+                        .small()
+                        .text_size(px(13.0))
+                        .p(px(0.0)),
+                )
+                .into_any_element(),
+            None => div()
                 .flex_1()
                 .truncate()
-                .child(text!(mo_core::display_name(&e.name).to_string())),
-        );
+                .child(text!(mo_core::display_name(&e.name).to_string()))
+                .into_any_element(),
+        });
         body = body.child(line);
     }
     if data.entries.len() > MAX_PER_COLUMN {

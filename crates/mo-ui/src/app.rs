@@ -7287,6 +7287,35 @@ impl RootView {
         }
     }
 
+    /// 列视图行级单击：挪本列 cursor，并把 app 选择**整替**成这一行。
+    ///
+    /// 列视图的条目不走主目录模型（`LightEntry`，没有 FileId），选择模型看不见
+    /// 这里的高亮——接同步之前，F2 / 复制 / 粘贴 / 删除打的是列表视图遗留的旧
+    /// 选区（devlog §40 缺口 1：在列视图删「没见选中」的文件）。
+    /// `select_path_exclusive` 第 0 列恒等于当前目录、能命中；深层列不在主模型
+    /// 里，清完就是空选择——命令提示「没有选中文件」，宁空勿误伤。回灌走
+    /// `pull_selection`，切回列表视图时高亮与事实一致。
+    pub(crate) fn column_row_clicked(
+        &mut self,
+        pane: usize,
+        tab: usize,
+        column: usize,
+        row: usize,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_column_cursor(pane, tab, column, row);
+        let Some(app) = self.panel_at(pane, tab).map(|p| p.app.clone()) else {
+            return;
+        };
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            app.select_path_exclusive(&path).await;
+            pull_selection(&app, &this, cx).await;
+        })
+        .detach();
+    }
+
     /// 打开属性面板：取当前聚焦 / 选中项的名称与权限。
     /// 打开「显示简介」。
     ///
@@ -9763,6 +9792,11 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                 ViewMode::Columns => {
                     // 列视图的条目不走主目录模型，取不到「窗口」里那份 app，
                     // 所以把 panel 的 app 传进去（系统图标要走它那条链路）。
+                    // 行内改名的 `(路径, 输入框)` 一并带上：命中的那一行换编辑器。
+                    let renaming = match (&view.inline_rename, &view.inline_rename_input) {
+                        (Some(p), Some(i)) => Some((p, i)),
+                        _ => None,
+                    };
                     columns::render(
                         entity,
                         pane_idx,
@@ -9770,6 +9804,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         &panel.columns,
                         &panel.app,
                         panel.diff.as_deref(),
+                        renaming,
                     )
                     .into_any_element()
                 }

@@ -3055,6 +3055,28 @@ impl AppState {
         true
     }
 
+    /// 把整个选择**整替**为「当前目录里匹配该路径的那一条」：先清空
+    /// （选择集 + 锚点 + 键盘光标一起），再单选它。列视图行级单击的语义。
+    ///
+    /// 清与选在**同一把写锁**里做完——连点两行各走一遍本方法也不会交错成
+    /// 「清了 B 又选上 A」。路径不在当前目录（列视图的深层列不走主模型）时
+    /// 清完就是空选择：编辑类命令收到「没有选中文件」，宁空勿误伤旧选区。
+    pub async fn select_path_exclusive(&self, path: &Path) -> bool {
+        let want = path.to_path_buf();
+        let mut inner = self.inner.write().await;
+        inner.selection.clear();
+        let Some(id) = inner
+            .directory
+            .as_ref()
+            .and_then(|d| d.entries.iter().find(|e| e.path == want))
+            .map(|e| e.id)
+        else {
+            return false;
+        };
+        inner.selection.select(id);
+        true
+    }
+
     // ---- 文件操作 ----
 
     /// 提交一个文件操作：注册到队列 → 后台执行 → 周期性广播进度。

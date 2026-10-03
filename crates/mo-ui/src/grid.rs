@@ -5,6 +5,8 @@
 //! 这样大目录在网格模式下同样只渲染可见单元。
 
 use gpui_kit::base::Scrollbar;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_core::{Entry, MetadataState, ThumbnailState};
 
@@ -55,6 +57,13 @@ pub fn render(
         let Some(panel) = view.panel_at(pane, tab) else {
             return Vec::new();
         };
+        // 行内改名进行中：命中的那一格把名字换成输入框（编辑器与列表同一份
+        // 状态，`sync_inline_rename` 每帧懒建；§40 缺口 2 补上网格这一半）。
+        let renaming: Option<(&std::path::Path, &Entity<InputState>)> =
+            match (&view.inline_rename, &view.inline_rename_input) {
+                (Some(p), Some(i)) => Some((p.as_path(), i)),
+                _ => None,
+            };
         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         // 这一帧真的画出来的、还等着缩略图的单元——行渲染完统一派发（见下方注释）。
         let mut want_thumbs: Vec<Entry> = Vec::new();
@@ -115,6 +124,7 @@ pub fn render(
                     tab,
                     idx,
                     system_icon,
+                    renaming.filter(|(p, _)| *p == entry.path).map(|(_, i)| i),
                 ));
             }
             rows.push(row.into_any_element());
@@ -164,6 +174,8 @@ fn cell(
     tab: usize,
     global_idx: usize,
     system_icon: Option<std::sync::Arc<mo_core::Bitmap>>,
+    // 这一格正在行内改名：`Some` = 名称位置换这份输入框（§40 缺口 2）。
+    inline_input: Option<&Entity<InputState>>,
 ) -> Stateful<Div> {
     let visual = visual(entry, mode, zoom, selected, system_icon);
     // 文字随缩放走但阻尼（见 `listing::zoom_text`）：方框可以 2×，名字不能。
@@ -200,6 +212,14 @@ fn cell(
     if !selected {
         c = c.hover(|s| s.bg(crate::theme::hover_bg()));
     }
+    // 编辑中这一格：点格子的**外面**（含空白、别的格）提交收场，点格内不算
+    //（`on_mouse_down_out` 盯整个格子；与 `file_list.rs` :507 同款接线）。
+    if inline_input.is_some() {
+        let entity_out = entity.clone();
+        c = c.on_mouse_down_out(move |_ev, window, cx| {
+            crate::dialogs::commit_inline_rename(&entity_out, window, cx);
+        });
+    }
 
     let id = entry.id;
     let entry_path = entry.path.clone();
@@ -225,8 +245,10 @@ fn cell(
     let drag_down_entity = entity.clone();
     let drag_down_path = entry.path.clone();
     c.interactivity()
-        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
             drag_down_entity.update(cx, |v, cx| {
+                // 点别的格 = 行内改名「点了别处」提交收场；点编辑格自身算挪光标。
+                v.end_inline_rename_on_click(Some(drag_down_path.as_path()), window, cx);
                 v.begin_drag(pane, tab, drag_down_path.clone(), id, cx);
             });
         });
@@ -320,38 +342,49 @@ fn cell(
             });
     }
 
-    c.child(visual)
-        .child(
-            // 名称：作为 cell（`flex_col` + `items_center`）里的一个**收缩到内容宽**的
-            // 块，靠 `items_center` 水平居中——与图标同一套机制。
-            // ⚠️ 别改成 `w_full` + `text_center()`：那样盒子被拉满整格，居中与否量不出来
-            // （实测名字仍然贴左）。gpui 的 `TextLayout::paint` 是按
-            // `window.text_style().text_align` 在盒子内对齐的，这条路在这里不生效。
-            // `max_w_full` + `truncate` 让长名字截成省略号，而不是溢出到隔壁格。
-            div()
-                .max_w_full()
-                .text_size(px(12.0 * label_k))
-                .text_color(if selected {
-                    crate::theme::selected_text()
-                } else {
-                    crate::theme::text()
-                })
-                .overflow_hidden()
-                .truncate()
-                // 测试用（release no-op）：断言名称相对 cell 居中。
-                .debug_selector(move || format!("mo-grid-name-{global_idx}"))
-                .child(text!(entry.display_name().to_string())),
-        )
-        .child(
-            div()
-                .text_size(px(11.0 * label_k))
-                .text_color(if selected {
-                    crate::theme::selected_text()
-                } else {
-                    crate::theme::muted()
-                })
-                .child(text!(sub)),
-        )
+    // 名字：编辑态这一格换真输入框（`file_item::view` 同款拼法：外层不拉满
+    // 高、让 Input 保持自然高）；非编辑态维持「收缩到内容宽 + 居中 + 截断」。
+    let name: AnyElement = match inline_input {
+        Some(state) => div()
+            .max_w_full()
+            .flex()
+            .items_center()
+            .debug_selector(|| "mo-inline-rename".to_string())
+            .child(
+                Input::new(state)
+                    .appearance(false)
+                    .bordered(false)
+                    .small()
+                    .text_size(px(12.0 * label_k))
+                    .p(px(0.0)),
+            )
+            .into_any_element(),
+        None => div()
+            .max_w_full()
+            .text_size(px(12.0 * label_k))
+            .text_color(if selected {
+                crate::theme::selected_text()
+            } else {
+                crate::theme::text()
+            })
+            .overflow_hidden()
+            .truncate()
+            // 测试用（release no-op）：断言名称相对 cell 居中。
+            .debug_selector(move || format!("mo-grid-name-{global_idx}"))
+            .child(text!(entry.display_name().to_string()))
+            .into_any_element(),
+    };
+
+    c.child(visual).child(name).child(
+        div()
+            .text_size(px(11.0 * label_k))
+            .text_color(if selected {
+                crate::theme::selected_text()
+            } else {
+                crate::theme::muted()
+            })
+            .child(text!(sub)),
+    )
 }
 
 fn kind_icon(entry: &Entry) -> &'static [u8] {

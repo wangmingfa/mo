@@ -314,8 +314,17 @@ pub fn panel_row_paths_for_tests(view: &RootView) -> Vec<(std::path::PathBuf, bo
 /// 列没读回来时返回空表，测试拿它当「可以投事件了」的判据。
 #[doc(hidden)]
 pub fn column_rows_for_tests(view: &RootView) -> Vec<(std::path::PathBuf, bool)> {
+    column_rows_at_for_tests(view, 0)
+}
+
+/// 测试专用：列视图**第 `column` 列**已画出的条目 `(路径, 是否目录)`。
+///
+/// 深层列不在主目录模型里——「点了深层列的行，app 选择该是空」这类判据要能
+/// 问到那一列（§40 缺口 1 的测试）。列还没读回来时返回空表。
+#[doc(hidden)]
+pub fn column_rows_at_for_tests(view: &RootView, column: usize) -> Vec<(std::path::PathBuf, bool)> {
     view.panel_at(0, 0)
-        .and_then(|p| p.columns.first())
+        .and_then(|p| p.columns.get(column))
         .map(|c| {
             c.entries
                 .iter()
