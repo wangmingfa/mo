@@ -101,6 +101,47 @@ fn delete_selection_removes_the_file() {
 }
 
 #[test]
+fn select_path_exclusive_replaces_whole_selection() {
+    // 列视图单击的底座语义：整替——旧选择集（含锚点、键盘光标）一律清掉，
+    // 只剩按路径命中的那一条；命不中就留空，别给编辑命令留一份看不见的旧选区。
+    let base = tree("selx");
+    let app = common::isolated("selx", AppState::new);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        app.open_directory(&base).await.unwrap();
+        let entries = app.current_entries().await;
+        let id_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.path.file_name().and_then(|n| n.to_str()) == Some(name))
+                .unwrap_or_else(|| panic!("{name} 应在当前目录里"))
+                .id
+        };
+        let alpha = id_of("alpha.txt");
+        let beta = id_of("beta.log");
+
+        // 铺垫两条选中 + 一个键盘光标（focused 跟着最后一次 select/toggle）。
+        app.select(alpha).await;
+        app.toggle(beta).await;
+        assert_eq!(app.selection_ids().await.len(), 2, "前置应是双选");
+
+        let target = base.join("beta.log");
+        assert!(app.select_path_exclusive(&target).await, "当前目录内应命中");
+        assert_eq!(app.selection_ids().await, vec![beta], "应只剩点中的那条");
+
+        // 不在当前目录的路径（列视图深层列）：清完为空、返回 false。
+        let miss = base.join("sub").join("gamma.md");
+        assert!(!app.select_path_exclusive(&miss).await);
+        assert!(app.selection_ids().await.is_empty());
+        assert!(
+            app.selection_paths().await.is_empty(),
+            "键盘光标也该被清——selection_paths 的空选回退不能再指旧处"
+        );
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn preview_text_file_reports_kind() {
     let base = tree("pv");
     let app = common::isolated("pv", AppState::new);
