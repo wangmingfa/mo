@@ -262,6 +262,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * ~~**应用内拖拽零 headless 覆盖**（§35）~~ **已补**（2026-10-01，§36）：`crates/mo-ui/tests/internal_drag.rs` 五条，含 Alt=移动。
 * ~~**网格 / 画廊没接应用内拖拽**（§35）~~ **已接**（2026-10-01，§37）：`grid::cell` 挂上 down→`begin_drag` / up→`drop_on_entry`，`tests/grid_drag.rs` 五条。
 * ~~**网格 / 画廊的目录单元没接「OS 拖入」**（§37 发现）~~ **已接**（2026-10-01，§38）：目录格子挂上行级 `on_drop::<ExternalPaths>`，`os_drop.rs` 两条 e2e（含冒泡对照）。~~列视图（`columns.rs`）两种拖拽仍都没接~~ **也已接**（2026-10-01，§39）：至此四种视图 × 两种拖拽全部有接线和 headless 覆盖，拖放线只剩「Windows 拖出人工实测」这一条人做的活。
+* **编辑类交互的列视图/网格缺口已接**（2026-10-03，§40）：列视图单击此前不动 app 选择（编辑命令打在隐形旧选区），行内改名编辑器此前只在列表视图渲染。**新欠**（§40 缺口 3，P1）：同目录内容变更后列视图不刷新——`ensure_columns` 只认第 0 列路径变了才重建。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
@@ -565,3 +566,44 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **收账**：§35 欠账 2/3 与 §37/§38 记下的缺口至此全清——四种视图 × 两种拖拽
   都有接线与 headless 覆盖。拖放线上唯一剩下的还是那条**人做的**：Windows 拖出
   端到端实测（§25 清单）。
+
+### §40：编辑类交互接线——列视图单击整替选择、网格/画廊/列视图可见改名（2026-10-03）
+
+* **盘点（四视图 × 编辑命令）**：网格 / 画廊的单元 `on_click` 走 SelSync，
+  panel.selection 与 app 选择**双同步**，F2 / 复制粘贴 / 删除 / 新建的目标都对。
+  两个缺口：
+  * **缺口 1（数据安全，P0）**：列视图单击只 `set_column_cursor`，app 选择停在
+    列表视图遗留的旧值——在列视图按 F2 / 删除 / ⌘C，动的是**看不见的旧选区**。
+  * **缺口 2（P0）**：行内改名的编辑器只在 `file_item::view`（列表）渲染，而
+    `sync_inline_rename` 不分视图地建 `InputState` 并聚焦——网格 / 画廊 / 列视图
+    按 F2，焦点进一个**没挂载的隐形输入框**，打字看不见、Enter/Esc 由全局拦截器
+    处理，改名能落盘但用户全程盲操作。
+* **缺口 1 的修法沉在 mo-app**：`AppState::select_path_exclusive`——清空
+  （选择集 + 锚点 + 键盘光标）与单选在**同一把写锁**里做完，连点两行也不会交错
+  成「清了 B 又选上 A」；路径不在当前目录（深层列不走主模型）清完即返回 false，
+  选择留**空**——编辑命令收到「没有选中文件」，宁空勿误伤。UI 侧
+  `RootView::column_row_clicked` = 挪 cursor + 整替 + `pull_selection` 回灌面板。
+  契约由 `mo-app/tests/productivity.rs` 一条钉住（含「键盘光标也被清」断言）。
+* **缺口 2 的修法**：`grid::cell` 与 `columns::column_box` 把编辑行的名字格换成
+  `Input::new(state)`（关外观、无边框，选择器同列表的 `mo-inline-rename`），
+  提交走与 `file_list.rs` 同款的**两条路**：别的行 mouse_down →
+  `end_inline_rename_on_click(Some(…))`；编辑行自身 `on_mouse_down_out` →
+  commit。容器级 `end(None)` 没补——出格必过 mouse_down_out，覆盖已闭合。
+* **测试**（`tests/inline_rename.rs` 六条）：网格 F2 编辑器可见 + Enter 落盘、
+  网格点别的格提交（并断言编辑器收干净）、画廊共用 cell（Esc 取消、文件没动）、
+  列视图点行 F2 落盘、列视图旧选区对照（删的必须是刚点的行，旧选区文件一根毛
+  不掉）、深层列点击后选择必须为空。
+* **harness 两条新坑位**：① kit 的 `window.click(selector)` 只认**元素路径注册表**
+  里的元素（工具栏 / 侧栏 / 状态栏），中央虚拟化 / 滚动区里的单元会
+  `missing ElementId … in scope []`——单元 / 行一律按 `debug_bounds` 中心坐标
+  派发 down/up（grid_drag 的 `drag` 同款姿势，本次补成 `click_at` helper）；
+  ② `Input` 是 gpui-component 组件、吃全局 `Theme`，测试窗口要先
+  `cx.update(gpui_kit::init)`（layout.rs :2064 同款）。
+* **变异反验四轮**（还原字节一致，红集互不重叠）：掐 `column_row_clicked` 的
+  整替调用 → 恰红列视图三条；掐 grid 编辑器换名格 → 恰红网格 / 画廊三条；
+  只掐 grid 行 mouse_down 提交路 → **全绿**（说明 `on_mouse_down_out` 单路即可
+  闭合「点别处提交」，两条是冗余防线）；把两条一起掐 → 恰红提交用例；
+  掐 columns 换名格 → 恰红列视图 F2 条。
+* **剩缺口 3（P1，欠着）**：`ensure_columns` 只在第 0 列路径 ≠ tab.path 时重建，
+  同目录内的增删改名之后**列视图不刷新**——本轮改名落盘成功，但列里显示的还是
+  旧名（列数据来自 `list_dir` 快照，与 watcher 是两回事）。下一轮补。
