@@ -334,6 +334,14 @@ pub fn column_rows_at_for_tests(view: &RootView, column: usize) -> Vec<(std::pat
         .unwrap_or_default()
 }
 
+/// 第 `column` 列当前高亮的行下标（§40 缺口 3 的原地重读要保住 / 钳住它）。
+#[doc(hidden)]
+pub fn column_cursor_for_tests(view: &RootView, column: usize) -> Option<usize> {
+    view.panel_at(0, 0)
+        .and_then(|p| p.columns.get(column))
+        .map(|c| c.cursor)
+}
+
 /// 测试专用：等行超时时的面板状态快照——路径是否切过去、`list_count` 与
 /// `window` 各到多少行。用来区分「导航没生效 / 目录读没回来 / 补窗没回来」。
 #[doc(hidden)]

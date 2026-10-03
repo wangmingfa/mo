@@ -7196,6 +7196,7 @@ impl RootView {
     /// [`Self::load_column`] 的注释）。
     fn ensure_columns(&mut self, cx: &mut Context<Self>) {
         let mut todo: Vec<(usize, usize, PathBuf)> = Vec::new();
+        let mut refresh: Vec<(usize, usize)> = Vec::new();
         for (pi, pane) in self.panes.iter().enumerate() {
             for (ti, tab) in pane.tabs.iter().enumerate() {
                 if tab.view_mode != ViewMode::Columns || tab.column_busy {
@@ -7207,12 +7208,76 @@ impl RootView {
                 let stale = tab.columns.first().map(|c| c.path != path).unwrap_or(true);
                 if stale {
                     todo.push((pi, ti, path));
+                } else if tab.column_stale {
+                    // 目录没换、内容变了（watcher / 刷新广播的 `DirectoryChanged`）：
+                    // 原地重读各列，**不**拆列栈——下钻深度和展开都要保住。
+                    refresh.push((pi, ti));
                 }
             }
+        }
+        for (pi, ti) in refresh {
+            self.reload_stale_columns(cx, pi, ti);
         }
         for (pi, ti, path) in todo {
             self.load_column(cx, path, None, pi, ti);
         }
+    }
+
+    /// `DirectoryChanged` 的事件侧：路径正被这一页的某一列显示着才竖牌。
+    ///
+    /// 只记事实、不读盘——重读走 `ensure_columns` 的每帧节奏，和加载任务共用
+    /// `column_busy` 闸（事件来得再急也只排一次原地重读）。
+    pub(crate) fn mark_column_stale(&mut self, pane: usize, tab: usize, path: &std::path::Path) {
+        let Some(p) = self.panel_at_mut(pane, tab) else {
+            return;
+        };
+        if p.view_mode != ViewMode::Columns || p.column_stale {
+            return;
+        }
+        // 第 0 列恒等于当前目录；深层列恰好也被同一目录的广播命中时一并竖牌。
+        if p.columns.iter().any(|c| c.path == path) {
+            p.column_stale = true;
+        }
+    }
+
+    /// 原地重读当前显示的每一列：只换 `entries`、`cursor` 钳进新表，列栈结构不动。
+    ///
+    /// 与 `load_column(.., None, ..)` 的重建区别：那条是「目录换了」——旧列栈没有
+    /// 意义；这条是「目录没换、内容变了」——用户正看着下钻结果，不能给他拆了。
+    /// 在途期间列栈若被重建 / 截断，按**路径**找列：找得着就换血，找不着说明该列
+    /// 已经不显示这个目录了，过期事实自然作废（尽力而为，同 `watch_then_refresh_task`）。
+    fn reload_stale_columns(&mut self, cx: &mut Context<Self>, pane: usize, tab: usize) {
+        let Some(p) = self.panel_at_mut(pane, tab) else {
+            return;
+        };
+        if p.column_busy || p.columns.is_empty() {
+            return;
+        }
+        let app = p.app.clone();
+        let paths: Vec<PathBuf> = p.columns.iter().map(|c| c.path.clone()).collect();
+        p.column_busy = true;
+        cx.spawn(async move |weak, cx| {
+            let mut fresh = Vec::with_capacity(paths.len());
+            for path in &paths {
+                fresh.push((path.clone(), app.list_dir(path).await.unwrap_or_default()));
+            }
+            let _ = weak.update(cx, |v, cx| {
+                let Some(p) = v.panel_at_mut(pane, tab) else {
+                    return;
+                };
+                p.column_busy = false;
+                for (path, entries) in fresh {
+                    if let Some(col) = p.columns.iter_mut().find(|c| c.path == path) {
+                        // 高亮行可能已被删：钳进新表；条目是新的，选择侧不归列栈管。
+                        col.cursor = col.cursor.min(entries.len().saturating_sub(1));
+                        col.entries = entries;
+                    }
+                }
+                p.column_stale = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 加载一列并作为当前最深列。
@@ -7246,6 +7311,8 @@ impl RootView {
             // 换根：旧列栈对新目录已经没有意义，先丢掉，别等到读完。
             if parent.is_none() {
                 p.columns.clear();
+                // 重建读的就是此刻的磁盘，之前竖的过期牌随旧列栈一起作废。
+                p.column_stale = false;
             }
         }
         cx.spawn(async move |weak, cx| {
@@ -9006,15 +9073,19 @@ async fn tab_loop(
 
     let mut rx = app.bus().subscribe();
     loop {
-        if rx.recv().await.is_err() {
-            return;
-        }
+        let Ok(ev) = rx.recv().await else { return };
         // 标签页可能已被关闭：这轮同步前先看目标还在不在。
         let alive = this
             .update(cx, |v, _cx| v.has_panel(pane, tab))
             .unwrap_or(false);
         if !alive {
             return;
+        }
+        // 列视图的数据不走主目录模型（`list_dir` 直读），`sync_panel` 回灌不到它
+        // ——「同目录内容变了」这件事要单独递进去（devlog §40 缺口 3）。
+        if let mo_core::AppEvent::DirectoryChanged { path } = &ev {
+            let path = path.clone();
+            let _ = this.update(cx, |v, _cx| v.mark_column_stale(pane, tab, &path));
         }
         sync_panel(&app, &this, cx, pane, tab).await;
     }

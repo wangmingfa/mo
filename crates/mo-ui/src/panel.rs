@@ -193,6 +193,10 @@ pub(crate) struct Panel {
     pub columns: Vec<ColumnData>,
     /// 列视图正在读盘：避免每帧重复发起加载任务。
     pub column_busy: bool,
+    /// 列视图收到过「某列目录已变化」的广播（`AppEvent::DirectoryChanged`）且
+    /// 该列正显示着：竖牌等 [`super::RootView::ensure_columns`] 下一拍**原地重读**
+    /// （devlog §40 缺口 3——同目录增删改名此前永远显示旧条目）。
+    pub column_stale: bool,
     /// 当前排序方式（键 + 方向），来自 `AppState` 的最近一次同步。
     /// 表头据此画排序指示箭头；点击表头改的也是它（随后回灌 app）。
     pub sort: (SortKey, SortDir),
@@ -235,6 +239,7 @@ impl Panel {
             address_sub: None,
             columns: Vec::new(),
             column_busy: false,
+            column_stale: false,
             sort: (SortKey::Name, SortDir::Asc),
         }
     }
