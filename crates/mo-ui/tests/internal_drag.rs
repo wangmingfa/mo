@@ -3,7 +3,9 @@
 //! （mo-app 的 `transfer_between`）有覆盖，缺的是 UI 派发这一段。
 //!
 //! 派发形状与真机一致：源行上 `MouseDown`（gpui 记选中 + `begin_drag`），目标行上
-//! `MouseUp`（`drop_on_entry` 结算；Alt 抬起 = 移动）。传输在 Mo 的进程级 tokio
+//! `MouseUp`（`drop_on_entry` 结算）。复制 / 移动按资源管理器语义现算（§43）：
+//! 同卷宗直拖 = **移动**，Ctrl 强制复制、Alt 保留为移动别名（本 fixture 全在
+//! 临时目录 = 同一卷宗）。传输在 Mo 的进程级 tokio
 //! runtime 上跑（不受 GPUI 测试调度器驱动），所以落盘判据一律墙钟轮询——与
 //! tests/os_drop.rs 同一条理由。
 //!
@@ -133,9 +135,9 @@ fn selector(i: usize) -> String {
     format!("mo-file-row-{i}")
 }
 
-/// 在 `from` 按下左键、在 `to` 抬起（`alt` = 按住 Alt 抬）。中间拍一帧，
+/// 在 `from` 按下左键、在 `to` 以 `mods` 修饰键抬起。中间拍一帧，
 /// 让按下那次的副作用（选中、`begin_drag`）先落地。
-fn drag(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>, alt: bool) {
+fn drag_with(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>, mods: Modifiers) {
     vcx.update(|window, cx| {
         window.dispatch_event(
             InputEvent::to_platform_input(MouseDownEvent {
@@ -152,10 +154,7 @@ fn drag(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>, alt
             InputEvent::to_platform_input(MouseUpEvent {
                 button: MouseButton::Left,
                 position: to,
-                modifiers: Modifiers {
-                    alt,
-                    ..Default::default()
-                },
+                modifiers: mods,
                 click_count: 1,
             }),
             cx,
@@ -163,6 +162,19 @@ fn drag(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>, alt
         window.render_frame(cx);
     });
     vcx.run_until_parked();
+}
+
+/// 不带修饰键的直拖（同卷宗下 = 移动，§43）；`alt` = 按住 Alt 抬（移动别名）。
+fn drag(vcx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>, alt: bool) {
+    drag_with(
+        vcx,
+        from,
+        to,
+        Modifiers {
+            alt,
+            ..Default::default()
+        },
+    );
 }
 
 /// 等文件出现 / 消失。传输在进程级 tokio runtime 上跑，墙钟轮询。
@@ -193,11 +205,11 @@ fn file_row(rs: &[(PathBuf, bool)], name: &str) -> usize {
         .unwrap_or_else(|| panic!("文件行 {name} 没在窗口快照里：{rs:?}"))
 }
 
-/// 拖文件行到目录行 = 复制进去，源留着（`begin_drag` → `drop_on_entry` →
-/// `run_transfer(move_=false)` 整条 UI 派发链）。
+/// 同卷宗直拖文件行到目录行 = **移动**进去、源没了（§43 的资源管理器默认；
+/// `begin_drag` → `drop_on_entry` → `run_transfer` 现算整条 UI 派发链）。
 #[gpui_kit::test]
-fn drag_file_row_onto_directory_row_copies_it_in(cx: &mut TestAppContext) {
-    let rig = Rig::new("copy");
+fn drag_file_row_onto_directory_row_moves_it_in(cx: &mut TestAppContext) {
+    let rig = Rig::new("move");
     let src = rig.file("note.txt");
     let (mut vcx, window) = open_here(&rig, 2, cx);
 
@@ -211,12 +223,48 @@ fn drag_file_row_onto_directory_row_copies_it_in(cx: &mut TestAppContext) {
         wait_until(false, &dest),
         "拖到目录行后 {dest:?} 没出现：行级拖放链没接上"
     );
-    assert!(src.exists(), "复制不该动源文件");
+    assert!(
+        wait_until(true, &src),
+        "同卷宗直拖该是移动：源文件还留在原地（§43）"
+    );
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
-/// 按住 Alt 拖到目录行 = **移动**：源没了、对面有了。`drop_on_entry` 收的是
-/// `ev.modifiers.alt`，这条把「Alt 语义」从鼠标事件一路钉到落盘。
+/// 按住 Ctrl 拖到目录行 = **强制复制**（资源管理器的 Ctrl+拖）：对面有了、
+/// 源还留着。判据 `drag_resolves_to_move` 的 Ctrl 支由 `mo-app/tests/
+/// drag_semantics.rs` 钉死，这条钉「鼠标事件里的修饰键确实流到了结算」。
+#[gpui_kit::test]
+fn drag_with_ctrl_copies_instead_of_moving(cx: &mut TestAppContext) {
+    let rig = Rig::new("ctrl");
+    let src = rig.file("note.txt");
+    let (mut vcx, window) = open_here(&rig, 2, cx);
+
+    let rs = rows(cx, &window);
+    let from = center(&mut vcx, selector(file_row(&rs, "note.txt")));
+    let to = center(&mut vcx, selector(dir_row(&rs)));
+    drag_with(
+        &mut vcx,
+        from,
+        to,
+        Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+
+    let dest = rig.bin.join("note.txt");
+    assert!(
+        wait_until(false, &dest),
+        "Ctrl 拖完 {dest:?} 没出现：复制没走"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(src.exists(), "Ctrl 是强制复制，不该动源文件");
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
+/// 按住 Alt 拖到目录行 = 移动（§43 保留的移动别名，mac 访达 ⌥=移动、也是
+/// §36 起的既有肌肉记忆）。`drop_on_entry` 收的是 `ev.modifiers`，这条把
+/// 「Alt 语义」从鼠标事件一路钉到落盘。
 #[gpui_kit::test]
 fn drag_with_alt_moves_instead_of_copying(cx: &mut TestAppContext) {
     let rig = Rig::new("alt");
@@ -292,12 +340,12 @@ fn drag_onto_a_file_row_in_the_same_pane_transfers_nothing(cx: &mut TestAppConte
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
-/// 多选拖拽：点选第一条、⇧↓ 连第二条，从选中行起拖 = **整个选中集**一起复制
-/// （`begin_drag` 的 `selection.count() > 1` 分支）。
+/// 多选拖拽：点选第一条、⇧↓ 连第二条，从选中行起拖 = **整个选中集**一起移动
+/// （`begin_drag` 的 `selection.count() > 1` 分支 + §43 同卷宗默认移动）。
 #[gpui_kit::test]
-fn multi_selected_drag_copies_the_whole_set(cx: &mut TestAppContext) {
+fn multi_selected_drag_moves_the_whole_set(cx: &mut TestAppContext) {
     let rig = Rig::new("multi");
-    rig.file("a1.txt");
+    let a = rig.file("a1.txt");
     let b = rig.file("a2.txt");
     let (mut vcx, window) = open_here(&rig, 3, cx);
 
@@ -327,8 +375,9 @@ fn multi_selected_drag_copies_the_whole_set(cx: &mut TestAppContext) {
         "多选拖拽只搬了按下那一条（或一条没搬）：a2 没进箱子"
     );
     assert!(
-        rig.bin.join("a1.txt").exists() && b.exists(),
-        "整个选中集都该复制过去、源都留着"
+        wait_until(true, &a) && wait_until(true, &b),
+        "整个选中集都该移动过去、源都消失（§43）"
     );
+    assert!(rig.bin.join("a1.txt").is_file(), "a1 没进箱子");
     let _ = std::fs::remove_dir_all(&rig.base);
 }

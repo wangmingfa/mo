@@ -195,10 +195,11 @@ fn file_row(rs: &[(PathBuf, bool)], name: &str) -> usize {
         .unwrap_or_else(|| panic!("文件单元 {name} 没在窗口快照里：{rs:?}"))
 }
 
-/// 拖文件单元到目录单元 = 复制进去、源留着（§35-3 补上的那段接线）。
+/// 同卷宗直拖文件单元到目录单元 = **移动**进去、源没了（§35-3 的接线 +
+/// §43 的资源管理器默认）。
 #[gpui_kit::test]
-fn grid_drag_file_cell_onto_directory_cell_copies_it_in(cx: &mut TestAppContext) {
-    let rig = Rig::new("copy");
+fn grid_drag_file_cell_onto_directory_cell_moves_it_in(cx: &mut TestAppContext) {
+    let rig = Rig::new("move");
     let src = rig.file("note.txt");
     let (mut vcx, window) = open_in_mode(&rig, 2, "view-mode-grid", cx);
 
@@ -212,11 +213,15 @@ fn grid_drag_file_cell_onto_directory_cell_copies_it_in(cx: &mut TestAppContext)
         wait_until(false, &dest),
         "拖到目录单元后 {dest:?} 没出现：网格没接上行级拖放链"
     );
-    assert!(src.exists(), "复制不该动源文件");
+    assert!(
+        wait_until(true, &src),
+        "同卷宗直拖该是移动（§43）：网格的源文件还留在原地"
+    );
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
-/// 按住 Alt 拖 = 移动：网格接线要把 `ev.modifiers.alt` 一路带到 `run_transfer`。
+/// 按住 Alt 拖 = 移动（§43 保留的移动别名）：网格接线要把 `ev.modifiers`
+/// 一路带到 `run_transfer`。
 #[gpui_kit::test]
 fn grid_drag_with_alt_moves_instead_of_copying(cx: &mut TestAppContext) {
     let rig = Rig::new("alt");
@@ -309,8 +314,11 @@ fn gallery_shares_the_same_drag_wiring(cx: &mut TestAppContext) {
 
     assert!(
         wait_until(false, &rig.bin.join("note.txt")),
-        "画廊里拖到目录单元没复制：两种视图不是同一条接线"
+        "画廊里拖到目录单元没落盘：两种视图不是同一条接线"
     );
-    assert!(src.exists(), "复制不该动源文件");
+    assert!(
+        wait_until(true, &src),
+        "同卷宗直拖该是移动（§43）：画廊里源文件还留着"
+    );
     let _ = std::fs::remove_dir_all(&rig.base);
 }

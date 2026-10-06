@@ -8,6 +8,9 @@
 //!    （判据与 `drop_on_entry` 对齐——亮起来的落点抬起必定传输）；移到
 //!    空白处后一拍即清（新鲜度指纹：根处理器是冒泡最后一站，这一拍没人
 //!    认领就过期）。
+//! 3. **认领即定动词**（§43）：认领落点那一拍就用 `drag_resolves_to_move`
+//!    把「移动 / 复制」算进 `hover_move`，ghost 显示的动词与抬起结算出自
+//!    同一张判定表——同卷宗直拖=移动、Ctrl=强制复制、悬停中改按键动词逐拍重算。
 //!
 //! 派发形状与 `internal_drag.rs` / `grid_drag.rs` 同款：中央虚拟化区按
 //! `debug_bounds` 中心坐标派发；本文件第一次把 **MouseMove** 也打进这条链
@@ -154,15 +157,23 @@ fn dispatch_down(vcx: &mut VisualTestContext, at: Point<Pixels>) {
 }
 
 fn dispatch_move(vcx: &mut VisualTestContext, at: Point<Pixels>, alt: bool) {
+    dispatch_move_m(
+        vcx,
+        at,
+        Modifiers {
+            alt,
+            ..Default::default()
+        },
+    );
+}
+
+fn dispatch_move_m(vcx: &mut VisualTestContext, at: Point<Pixels>, mods: Modifiers) {
     vcx.update(|window, cx| {
         window.dispatch_event(
             InputEvent::to_platform_input(MouseMoveEvent {
                 position: at,
                 pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers {
-                    alt,
-                    ..Default::default()
-                },
+                modifiers: mods,
             }),
             cx,
         );
@@ -172,15 +183,23 @@ fn dispatch_move(vcx: &mut VisualTestContext, at: Point<Pixels>, alt: bool) {
 }
 
 fn dispatch_up(vcx: &mut VisualTestContext, at: Point<Pixels>, alt: bool) {
+    dispatch_up_m(
+        vcx,
+        at,
+        Modifiers {
+            alt,
+            ..Default::default()
+        },
+    );
+}
+
+fn dispatch_up_m(vcx: &mut VisualTestContext, at: Point<Pixels>, mods: Modifiers) {
     vcx.update(|window, cx| {
         window.dispatch_event(
             InputEvent::to_platform_input(MouseUpEvent {
                 button: MouseButton::Left,
                 position: at,
-                modifiers: Modifiers {
-                    alt,
-                    ..Default::default()
-                },
+                modifiers: mods,
                 click_count: 1,
             }),
             cx,
@@ -292,6 +311,32 @@ fn directory_row_under_the_pointer_claims_the_drop_target(cx: &mut TestAppContex
         Some(format!("entry:{}", rig.bin.display()).as_str()),
         "目录行应认领落点"
     );
+    assert_eq!(
+        p.hover_move,
+        Some(true),
+        "同卷宗直拖的认领应判成移动（§43）"
+    );
+
+    // 悬停中改按键、坐标不动：认领不重发，动词照样逐拍重算（`redo_verb`）。
+    dispatch_move_m(
+        &mut vcx,
+        dst,
+        Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        probe(cx, &window).expect("拖拽中").hover_move,
+        Some(false),
+        "Ctrl 悬停中应按判定表压成复制（§43）"
+    );
+    dispatch_move_m(&mut vcx, dst, Modifiers::default());
+    assert_eq!(
+        probe(cx, &window).expect("拖拽中").hover_move,
+        Some(true),
+        "松开 Ctrl 后动词应回到移动"
+    );
 
     // 移到文件行自身所在行：文件不是有效落点 → 不认领。
     dispatch_move(&mut vcx, src, false);
@@ -307,18 +352,23 @@ fn directory_row_under_the_pointer_claims_the_drop_target(cx: &mut TestAppContex
         "空白处不该有落点"
     );
 
-    // 回到目录行再抬起：高亮承诺的传输真的发生。
+    // 回到目录行再抬起：高亮承诺的传输真的发生，且按 §43 是移动。
     dispatch_move(&mut vcx, dst, false);
     dispatch_up(&mut vcx, dst, false);
     assert!(
         wait_until(true, &rig.bin.join("note.txt")),
-        "亮着的目录行抬起应复制进去"
+        "亮着的目录行抬起应移动进去"
+    );
+    assert!(
+        wait_until(false, &rig.here.join("note.txt")),
+        "同卷宗直拖该搬走源（§43）"
     );
 
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
-/// Alt 的复制 / 移动语义逐拍流进拖拽状态（ghost 的文案跟着换）。
+/// 修饰键逐拍流进拖拽状态（ghost 的文案跟着换）。§43 后 Alt 是**移动别名**：
+/// 判定不再只看 Alt，但这条仍钉「Alt 能从鼠标事件流到 `DragState.alt`」。
 #[gpui_kit::test]
 fn alt_flows_into_the_drag_state(cx: &mut TestAppContext) {
     let rig = Rig::new("alt");
@@ -332,11 +382,14 @@ fn alt_flows_into_the_drag_state(cx: &mut TestAppContext) {
 
     dispatch_down(&mut vcx, src);
     dispatch_move(&mut vcx, dst, false);
-    assert!(!probe(cx, &window).expect("拖拽中").alt, "未按 Alt = 复制");
+    assert!(
+        !probe(cx, &window).expect("拖拽中").alt,
+        "未按 Alt 时状态里的 alt 不该亮"
+    );
     dispatch_move(&mut vcx, dst, true);
     assert!(probe(cx, &window).expect("拖拽中").alt, "按 Alt 应翻动 alt");
 
-    // Alt 态抬起 = 移动：源消失、目标出现。
+    // Alt 态抬起 = 移动（§43 的别名支）：源消失、目标出现。
     dispatch_up(&mut vcx, dst, true);
     assert!(
         wait_until(true, &rig.bin.join("note.txt")),
@@ -346,6 +399,43 @@ fn alt_flows_into_the_drag_state(cx: &mut TestAppContext) {
         wait_until(false, &rig.here.join("note.txt")),
         "移动后源应消失"
     );
+
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
+/// Ctrl 是把动词与落盘都压成**复制**的那颗键（§43 判定表第一行）：认领坐标
+/// 不变也要判对，抬起结算同样走复制。
+#[gpui_kit::test]
+fn ctrl_holdover_on_a_claim_copies_instead_of_moving(cx: &mut TestAppContext) {
+    let rig = Rig::new("ctrl-copy");
+    let (mut vcx, window) = open_here(&rig, 3, None, cx);
+    let rs = rows(cx, &window);
+    let src = center(
+        &mut vcx,
+        format!("mo-file-row-{}", file_row(&rs, "note.txt")),
+    );
+    let dst = center(&mut vcx, format!("mo-file-row-{}", dir_row(&rs)));
+    let ctrl = Modifiers {
+        control: true,
+        ..Default::default()
+    };
+
+    dispatch_down(&mut vcx, src);
+    dispatch_move_m(&mut vcx, dst, ctrl);
+    let p = probe(cx, &window).expect("拖拽中");
+    assert!(p.ctrl, "Ctrl 应逐拍记进拖拽状态");
+    assert_eq!(
+        p.hover_move,
+        Some(false),
+        "Ctrl 覆盖下认领应判成复制（§43）"
+    );
+
+    dispatch_up_m(&mut vcx, dst, ctrl);
+    assert!(
+        wait_until(true, &rig.bin.join("note.txt")),
+        "Ctrl 抬起应复制进去"
+    );
+    assert!(rig.here.join("note.txt").exists(), "Ctrl 复制不该动源文件");
 
     let _ = std::fs::remove_dir_all(&rig.base);
 }
@@ -398,12 +488,21 @@ fn grid_directory_cell_claims_the_drop_target(cx: &mut TestAppContext) {
         Some(format!("entry:{}", rig.bin.display()).as_str()),
         "目录格应认领落点"
     );
+    assert_eq!(
+        p.hover_move,
+        Some(true),
+        "网格同卷宗直拖也该判成移动（§43）"
+    );
     assert!(ghost(&mut vcx).is_some(), "网格拖拽也该有 ghost");
 
     dispatch_up(&mut vcx, dst, false);
     assert!(
         wait_until(true, &rig.bin.join("note.txt")),
-        "亮着的目录格抬起应复制进去"
+        "亮着的目录格抬起应移动进去"
+    );
+    assert!(
+        wait_until(false, &rig.here.join("note.txt")),
+        "同卷宗直拖该搬走源（§43）"
     );
 
     let _ = std::fs::remove_dir_all(&rig.base);
@@ -431,12 +530,21 @@ fn columns_directory_row_claims_the_drop_target(cx: &mut TestAppContext) {
         Some(format!("entry:{}", rig.bin.display()).as_str()),
         "列视图目录行应认领落点"
     );
+    assert_eq!(
+        p.hover_move,
+        Some(true),
+        "列视图同卷宗直拖也该判成移动（§43）"
+    );
     assert!(ghost(&mut vcx).is_some(), "列视图拖拽也该有 ghost");
 
     dispatch_up(&mut vcx, dst, false);
     assert!(
         wait_until(true, &rig.bin.join("note.txt")),
-        "亮着的列行抬起应复制进去"
+        "亮着的列行抬起应移动进去"
+    );
+    assert!(
+        wait_until(false, &rig.here.join("note.txt")),
+        "同卷宗直拖该搬走源（§43）"
     );
 
     let _ = std::fs::remove_dir_all(&rig.base);

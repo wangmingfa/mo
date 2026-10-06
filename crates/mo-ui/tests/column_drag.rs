@@ -197,11 +197,11 @@ fn wait_until(gone: bool, p: &Path) -> bool {
     }
 }
 
-/// 拖文件行到目录行 = 复制进去（`begin_drag_single` → `drop_on_entry` →
-/// `run_transfer`，与列表 / 网格同一个结算机器）。
+/// 拖文件行到目录行 = **移动**进去（§43：同卷宗直拖跟资源管理器一样是移动；
+/// `begin_drag_single` → `drop_on_entry` → `run_transfer`，与列表 / 网格同一个结算机器）。
 #[gpui_kit::test]
-fn column_drag_file_row_onto_directory_row_copies_it_in(cx: &mut TestAppContext) {
-    let rig = Rig::new("copy");
+fn column_drag_file_row_onto_directory_row_moves_it_in(cx: &mut TestAppContext) {
+    let rig = Rig::new("move");
     let src = rig.file("note.txt");
     let (mut vcx, window) = open_in_columns(&rig, 2, cx);
 
@@ -215,11 +215,15 @@ fn column_drag_file_row_onto_directory_row_copies_it_in(cx: &mut TestAppContext)
         wait_until(false, &dest),
         "列视图拖到目录行后 {dest:?} 没出现：接线没挂上"
     );
-    assert!(src.exists(), "复制不该动源文件");
+    assert!(
+        wait_until(true, &src),
+        "同卷宗直拖该是移动（§43）：列视图的源文件还留在原地"
+    );
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
-/// Alt 抬起 = 移动：`ev.modifiers.alt` 要从列行一路带到 `run_transfer`。
+/// Alt 抬起 = 移动**别名**（§43 保留了 §36 的肌肉记忆）：`ev.modifiers` 要从列行
+/// 一路带到 `run_transfer`。
 #[gpui_kit::test]
 fn column_drag_with_alt_moves_instead_of_copying(cx: &mut TestAppContext) {
     let rig = Rig::new("alt");
