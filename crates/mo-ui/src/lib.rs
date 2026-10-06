@@ -342,6 +342,35 @@ pub fn column_cursor_for_tests(view: &RootView, column: usize) -> Option<usize> 
         .map(|c| c.cursor)
 }
 
+/// 测试专用（§42）：拖拽反馈的进行态快照。没在拖时返回 `None`。
+///
+/// `hover` 把落点编码成字符串（`entry:<路径>` / `pane:<序号>`），免得把
+/// `DragHover` 这类内部类型露出 crate；`cursor` 是窗口坐标。
+#[doc(hidden)]
+pub struct DragProbe {
+    pub paths: Vec<std::path::PathBuf>,
+    pub engaged: bool,
+    pub cursor: (f32, f32),
+    pub alt: bool,
+    pub hover: Option<String>,
+}
+
+#[doc(hidden)]
+pub fn drag_probe_for_tests(view: &RootView) -> Option<DragProbe> {
+    let d = view.drag.as_ref()?;
+    Some(DragProbe {
+        paths: d.paths.clone(),
+        engaged: d.engaged,
+        cursor: d.cursor,
+        alt: d.alt,
+        hover: match &d.hover {
+            Some(app::DragHover::Entry(p)) => Some(format!("entry:{}", p.display())),
+            Some(app::DragHover::Pane(i)) => Some(format!("pane:{i}")),
+            None => None,
+        },
+    })
+}
+
 /// 测试专用：等行超时时的面板状态快照——路径是否切过去、`list_count` 与
 /// `window` 各到多少行。用来区分「导航没生效 / 目录读没回来 / 补窗没回来」。
 #[doc(hidden)]

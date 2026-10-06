@@ -330,6 +330,16 @@ pub fn render(
             let Some(panel) = view.panel_at(pane, tab) else {
                 return rows;
             };
+            // 拖拽反馈（§42）：这一帧被拖拽悬停认领的落点路径。行高亮只看它
+            // ——`hover` 的认领方（本行 / 窗格）已经核对过落下会不会真传输。
+            let drop_target: Option<std::path::PathBuf> = view
+                .drag
+                .as_ref()
+                .filter(|d| d.engaged)
+                .and_then(|d| match &d.hover {
+                    Some(crate::app::DragHover::Entry(p)) => Some(p.clone()),
+                    _ => None,
+                });
             // 「种类」列里扩展贡献的那半张表：**每帧取一次**，行循环里只做表查询。
             // 每行取一次等于每帧读一次清单目录（`AppState::type_labels` 有签名缓存，
             // 但那是一次 read_dir + 每份清单一次 stat，摊到三十行就是一帧十几次调用）。
@@ -445,6 +455,9 @@ pub fn render(
                     .as_ref()
                     .and_then(|m| m.get(&entry_path))
                     .copied();
+                // 拖拽落点高亮（§42）排在选中之前：拖到自己头上的判据已被
+                // `note_drag_entry_hover` 挡掉，这里亮起来的行抬起**必定**传输。
+                let drop_lit = is_dir && drop_target.as_deref() == Some(entry_path.as_path());
                 let mut row = div()
                     .id(format!("file-row-{pane}-{tab}-{i}"))
                     .flex()
@@ -458,7 +471,9 @@ pub fn render(
                     .rounded(px(ROW_RADIUS))
                     // Finder 列表视图：选中行蓝底；未选中按奇偶交替斑马纹（可关）。
                     // 对比色排在斑马纹**前面**：它比「奇偶行」信息量大得多。
-                    .bg(if selected {
+                    .bg(if drop_lit {
+                        crate::theme::hover_bg()
+                    } else if selected {
                         crate::theme::selected_bg()
                     } else if let Some(c) = crate::app::compare_tint(tint) {
                         c
@@ -595,12 +610,24 @@ pub fn render(
                 let entity_down = entity.clone();
                 let down_path = entry.path.clone();
                 row.interactivity()
-                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                         entity_down.update(cx, |v, cx| {
                             v.end_inline_rename_on_click(Some(down_path.as_path()), window, cx);
-                            v.begin_drag(pane, tab, down_path.clone(), id, cx);
+                            v.begin_drag(pane, tab, down_path.clone(), id, ev, cx);
                         });
                     });
+                // 拖拽悬停认领（§42）：只有目录行是有效落点；新鲜度判据
+                // （这次移动是不是本行收到的）在 `note_drag_entry_hover` 里。
+                if is_dir {
+                    let hv_entity = entity.clone();
+                    let hv_path = entry.path.clone();
+                    row.interactivity().on_mouse_move(move |ev, _window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        hv_entity.update(cx, |v, cx| {
+                            v.note_drag_entry_hover(&hv_path, true, x, y, cx);
+                        });
+                    });
+                }
                 let entity_up = entity.clone();
                 let up_path = entry.path.clone();
                 row.interactivity()

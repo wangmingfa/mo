@@ -1307,12 +1307,42 @@ pub(crate) enum HeaderDrag {
     },
 }
 
-/// 一次拖拽：从哪个窗格的哪个标签页拖出了哪些路径。
+/// 一次拖拽：从哪个窗格的哪个标签页拖出了哪些路径，以及**拖动中的反馈状态**。
+///
+/// 后四个字段是拖拽可视化（§42）的数据源：`cursor` / `alt` 喂跟随光标的
+/// ghost 浮层，`hover` 喂落点高亮。它们随 `drag` 一起取走即清零——结算 /
+/// 交出系统后不可能留下过期高亮。
 #[derive(Clone)]
 pub(crate) struct DragState {
     pub(crate) pane: usize,
     pub(crate) tab: usize,
     pub(crate) paths: Vec<PathBuf>,
+    /// 指针最近一次上报的位置（窗口坐标）。按下时先钉在按下点。
+    pub(crate) cursor: (f32, f32),
+    /// 按下起点（窗口坐标）：`engaged` 的位移阈值**从它算起**（累计位移，
+    /// 系统拖拽阈值的语义），不是逐拍步长。
+    pub(crate) begin_at: (f32, f32),
+    /// 与 `cursor` 同行的 Alt 态：抬起结算按它决定复制 / 移动，ghost 同步显示。
+    pub(crate) alt: bool,
+    /// 真的拖起来了（位移超过阈值）才为真——原地按下抬起是点击，
+    /// 不该闪一下 ghost。
+    pub(crate) engaged: bool,
+    /// 指针当前悬在哪个**有效**落点上（行 / 单元 / 窗格级），供高亮。
+    pub(crate) hover: Option<DragHover>,
+    /// `hover` 是在**哪一次鼠标移动**上上报的（用该次移动的坐标做指纹）。
+    /// 同一次移动里事件从最内层冒泡到根：内层先认领（写入本坐标），
+    /// 外层比对不上就不许覆盖；根的处理器最后检查指纹，对不上说明这一拍
+    /// 没有任何元素认领（指针在空白处），清空 `hover`。
+    pub(crate) hover_at: (f32, f32),
+}
+
+/// 拖拽悬停认领的落点。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DragHover {
+    /// 一个目录行 / 目录单元（落下 = 复制 / 移动进去）。
+    Entry(PathBuf),
+    /// 另一个窗格的空白区域（落下 = 进那个窗格当前目录，见 `drop_on_pane`）。
+    Pane(usize),
 }
 
 /// 列表视图的鼠标框选（rubber-band）进行态。
@@ -7703,14 +7733,18 @@ impl RootView {
     /// 鼠标在某个文件行上按下：记录拖拽源。
     ///
     /// 行本身已被选中且是多重选择时拖整个选中集合，否则只拖这一行。
+    /// 按下事件带来反馈状态（§42）的初值：起点坐标与 Alt。
     pub(crate) fn begin_drag(
         &mut self,
         pane: usize,
         tab: usize,
         path: PathBuf,
         id: mo_core::FileId,
+        down: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        let at = (f32::from(down.position.x), f32::from(down.position.y));
+        let alt = down.modifiers.alt;
         let Some(p) = self.panel_at(pane, tab) else {
             return;
         };
@@ -7723,7 +7757,17 @@ impl RootView {
         } else {
             vec![path]
         };
-        self.drag = Some(DragState { pane, tab, paths });
+        self.drag = Some(DragState {
+            pane,
+            tab,
+            paths,
+            cursor: at,
+            begin_at: at,
+            alt,
+            engaged: false,
+            hover: None,
+            hover_at: at,
+        });
         self.watch_drag_egress(cx);
     }
 
@@ -7735,14 +7779,113 @@ impl RootView {
         pane: usize,
         tab: usize,
         path: PathBuf,
+        down: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        let at = (f32::from(down.position.x), f32::from(down.position.y));
+        let alt = down.modifiers.alt;
         self.drag = Some(DragState {
             pane,
             tab,
             paths: vec![path],
+            cursor: at,
+            begin_at: at,
+            alt,
+            engaged: false,
+            hover: None,
+            hover_at: at,
         });
         self.watch_drag_egress(cx);
+    }
+
+    /// 拖拽要显出 ghost 的最小位移（像素，按下起点算累计）。低于它视同
+    /// 「按下还没决定要拖」，与系统文件拖动的阈值手感一致，也避免普通点击
+    /// 闪一帧 ghost。
+    const DRAG_ENGAGE_PX: f32 = 4.0;
+
+    /// 这对坐标是不是「真的在拖」：过了位移阈值。**先到者置位** `engaged`
+    /// （行认领和根更新在同一次冒泡里先后看到同一坐标），ghost 与高亮共用
+    /// 这一个判据，两边不会各说各话。
+    fn drag_in_motion(d: &DragState, x: f32, y: f32) -> bool {
+        if d.engaged {
+            return true;
+        }
+        let dx = x - d.begin_at.0;
+        let dy = y - d.begin_at.1;
+        dx * dx + dy * dy > Self::DRAG_ENGAGE_PX * Self::DRAG_ENGAGE_PX
+    }
+
+    /// 根容器的 `on_mouse_move`（冒泡最后一站）在拖拽期间调用：更新光标 / Alt，
+    /// 并给这一拍的落点认领收尾——内层没人认领（指纹对不上本次坐标）说明指针
+    /// 在空白处，清空高亮。只在真的变了时才 `notify`，免得静止帧白白重绘。
+    pub(crate) fn update_drag_cursor(&mut self, x: f32, y: f32, alt: bool, cx: &mut Context<Self>) {
+        let Some(d) = self.drag.as_mut() else {
+            return;
+        };
+        let stale_hover = d.hover_at != (x, y);
+        if stale_hover {
+            d.hover = None;
+            d.hover_at = (x, y);
+        }
+        let engaged_now = Self::drag_in_motion(d, x, y);
+        let changed =
+            d.cursor != (x, y) || d.alt != alt || !d.engaged && engaged_now || stale_hover;
+        d.cursor = (x, y);
+        d.alt = alt;
+        d.engaged = engaged_now;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// 目录行 / 单元在 `on_mouse_move` 里认领落点：只在拖拽真的成立
+    /// （`engaged`）、这一拍还没被更靠内的元素认领、且**落下确实会传输**
+    /// （是目录、不在被拖集合里）时记账。判据与 `drop_on_entry` 对齐，
+    /// 高亮绝不承诺抬起不会做的事。
+    pub(crate) fn note_drag_entry_hover(
+        &mut self,
+        path: &std::path::Path,
+        is_dir: bool,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(d) = self.drag.as_mut() else {
+            return;
+        };
+        if !Self::drag_in_motion(d, x, y) || d.hover_at == (x, y) || !is_dir {
+            return;
+        }
+        if d.paths.iter().any(|p| p == path) {
+            return;
+        }
+        d.engaged = true;
+        d.hover = Some(DragHover::Entry(path.to_path_buf()));
+        d.hover_at = (x, y);
+        cx.notify();
+    }
+
+    /// 窗格容器在 `on_mouse_move` 里认领落点：跨窗格拖拽时，指针在这个窗格
+    /// 的任何**未被行认领**的位置抬起都会落进这个窗格的当前目录
+    /// （`drop_on_pane`），所以空白处、乃至文件行上都该亮——同窗格不亮，
+    /// 因为那时落下什么都不会发生。
+    pub(crate) fn note_drag_pane_hover(
+        &mut self,
+        pane_idx: usize,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(d) = self.drag.as_mut() else {
+            return;
+        };
+        if !Self::drag_in_motion(d, x, y) || d.hover_at == (x, y) || d.pane == pane_idx {
+            return;
+        }
+        d.engaged = true;
+        d.hover = Some(DragHover::Pane(pane_idx));
+        d.hover_at = (x, y);
+        cx.notify();
     }
 
     // ------------------------------------------------------- 列表表头交互
@@ -9627,13 +9770,18 @@ impl Render for RootView {
 
         // 框选（列表视图橡皮筋）：拖动中实时更新，抬起收尾并回灌 app 侧选择。
         // 鼠标事件冒泡到根容器，所以即便指针移到行 / 滚动条上也收得到。
+        // 同一个冒泡也喂给拖拽反馈（§42）：根是最后一站，内层的落点认领
+        // （行 / 窗格）先它发生，这里负责更新光标并给没被认领的一拍清高亮。
         let box_entity = entity.clone();
         root.interactivity().on_mouse_move(move |ev, _window, cx| {
-            if box_entity.read(cx).box_selection.is_none() {
-                return;
-            }
             let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
-            box_entity.update(cx, |v, cx| v.update_box_selection(x, y, cx));
+            if box_entity.read(cx).box_selection.is_some() {
+                box_entity.update(cx, |v, cx| v.update_box_selection(x, y, cx));
+            }
+            if box_entity.read(cx).drag.is_some() {
+                let alt = ev.modifiers.alt;
+                box_entity.update(cx, |v, cx| v.update_drag_cursor(x, y, alt, cx));
+            }
         });
         let box_entity_up = entity.clone();
         root.interactivity()
@@ -9761,6 +9909,67 @@ impl Render for RootView {
             );
         }
 
+        // 拖拽 ghost（§42）：跟随光标的小卡片，写清「拖的是什么、几个、会做什么」。
+        // 与橡皮筋同一套窗口坐标系、画在最上层；不挂 interactivity，不参与命中，
+        // 不会挡住底下的行。`engaged` 之前（位移未过阈值）不画——点击不该闪 ghost。
+        if let Some(d) = self.drag.as_ref().filter(|d| d.engaged) {
+            let vs = window.viewport_size();
+            let (cxp, cyp) = d.cursor;
+            // 靠右缘时翻到指针左侧，别让卡片伸出窗口（估算宽度 220，宁宽勿窄）。
+            let left = if cxp + 220.0 > f32::from(vs.width) {
+                (cxp - 220.0).max(0.0)
+            } else {
+                cxp + 16.0
+            };
+            let top = cyp + 18.0;
+            let name = d
+                .paths
+                .first()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let action = if d.alt { "移动" } else { "复制" };
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .max_w(px(320.0))
+                    .rounded(px(6.0))
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::separator())
+                    .shadow_lg()
+                    .debug_selector(|| "mo-drag-ghost".to_string())
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme::text())
+                            .child(text!(name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .child(text!(if d.paths.len() > 1 {
+                                format!("{} 项 · {}", d.paths.len(), action)
+                            } else {
+                                action.to_string()
+                            })),
+                    ),
+            );
+        }
+
         root
     }
 }
@@ -9868,6 +10077,16 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         (Some(p), Some(i)) => Some((p, i)),
                         _ => None,
                     };
+                    // 拖拽落点（§42）：列视图没有 draw 期闭包读 `RootView`，
+                    // 在这里算好传下去（判据与 list / grid 帧内自读的一致）。
+                    let drag_target: Option<&std::path::Path> = view
+                        .drag
+                        .as_ref()
+                        .filter(|d| d.engaged)
+                        .and_then(|d| match &d.hover {
+                            Some(DragHover::Entry(p)) => Some(p.as_path()),
+                            _ => None,
+                        });
                     columns::render(
                         entity,
                         pane_idx,
@@ -9876,6 +10095,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         &panel.app,
                         panel.diff.as_deref(),
                         renaming,
+                        drag_target,
                     )
                     .into_any_element()
                 }
@@ -9906,6 +10126,27 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
             let alt = ev.modifiers.alt;
             drop_entity.update(cx, |v, cx| v.drop_on_pane(pane_idx, alt, cx));
         });
+
+    // 拖拽反馈（§42）：跨窗格时整块窗格都是落点（抬起会走 `drop_on_pane`），
+    // 所以指针没落在任何目录行上时也把这一窗格认领下来，并给一层淡染。
+    // 判新鲜的方式与行级认领同一条：同一次移动里若目录行先认领了
+    // （`hover_at` 已是本坐标），这里就不覆盖。
+    let pane_hover_entity = entity.clone();
+    col.interactivity().on_mouse_move(move |ev, _window, cx| {
+        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+        pane_hover_entity.update(cx, |v, cx| v.note_drag_pane_hover(pane_idx, x, y, cx));
+    });
+    if matches!(
+        view.drag.as_ref(),
+        Some(d) if d.engaged && d.hover == Some(DragHover::Pane(pane_idx))
+    ) {
+        col = col.relative().child(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(theme::hover_bg().opacity(0.25)),
+        );
+    }
 
     // 从系统拖文件进来落在窗格空白处 = 复制进这一窗格当前显示的目录。
     // 目录行自己有监听（更靠内先吃到事件），这里接的是「没对上任何目录」的那部分。

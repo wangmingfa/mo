@@ -15,7 +15,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_core::EntryKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::panel::{ColumnData, ViewMode};
 use crate::{theme, RootView};
@@ -30,6 +30,7 @@ const ROW_HEIGHT: f32 = 24.0;
 /// 列头高度：**固定一行**，不随路径长度变化。
 pub(crate) const HEAD_HEIGHT: f32 = 22.0;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     entity: &Entity<RootView>,
     pane: usize,
@@ -41,6 +42,9 @@ pub fn render(
     // 行内改名进行中的 `(路径, 输入框)`：命中的那一行把名字换成输入框
     //（与 `file_list` 同一套编辑器，§40 缺口 2）。
     renaming: Option<(&PathBuf, &Entity<InputState>)>,
+    // 拖拽悬停认领的落点路径（§42）：命中的目录行高亮。列视图没有 draw 期
+    // 闭包可读 `RootView`，由 `render_pane` 算好传进来（与 list / grid 同一判据）。
+    drag_target: Option<&Path>,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
@@ -59,7 +63,17 @@ pub fn render(
         );
     }
     for (i, data) in columns_data.iter().enumerate() {
-        row = row.child(column_box(entity, pane, tab, i, data, app, diff, renaming));
+        row = row.child(column_box(
+            entity,
+            pane,
+            tab,
+            i,
+            data,
+            app,
+            diff,
+            renaming,
+            drag_target,
+        ));
     }
     row
 }
@@ -75,6 +89,8 @@ fn column_box(
     app: &AppState,
     diff: Option<&std::collections::HashMap<PathBuf, mo_diff::TreeStatus>>,
     renaming: Option<(&PathBuf, &Entity<InputState>)>,
+    // 拖拽悬停认领的落点路径（§42）：命中的目录行高亮。
+    drag_target: Option<&Path>,
 ) -> Stateful<Div> {
     let mut col = div()
         // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
@@ -125,6 +141,11 @@ fn column_box(
         .overflow_y_scrollbar();
     for (i, e) in data.entries.iter().take(MAX_PER_COLUMN).enumerate() {
         let selected = data.cursor == i;
+        // 目录判据来自列快照（`e.kind`）：远程条目在本地磁盘上不存在，
+        // `Path::is_dir()` 会把远程目录判成文件。
+        let is_dir = matches!(e.kind, EntryKind::Directory);
+        // 拖拽落点高亮（§42）：目录行 + 抬起**必定**传输（判据在认领侧）。
+        let drop_lit = is_dir && drag_target == Some(e.path.as_path());
         let mut line = div()
             .id(format!("col-{pane}-{tab}-{index}-{i}"))
             .flex()
@@ -134,7 +155,9 @@ fn column_box(
             .w_full()
             .h(px(ROW_HEIGHT))
             .px(px(6.0))
-            .bg(if selected {
+            .bg(if drop_lit {
+                theme::hover_bg()
+            } else if selected {
                 theme::selected_bg()
             } else if let Some(c) =
                 crate::app::compare_tint(diff.and_then(|m| m.get(&e.path)).copied())
@@ -163,7 +186,6 @@ fn column_box(
                 crate::dialogs::commit_inline_rename(&entity_out, window, cx);
             });
         }
-        let is_dir = matches!(e.kind, EntryKind::Directory);
         // 右键：对着这一行弹上下文菜单（`stop_propagation` 防止冒泡到窗格容器）。
         let ctx_entity = entity.clone();
         let ctx_path = e.path.clone();
@@ -197,14 +219,25 @@ fn column_box(
         let drag_down_entity = entity.clone();
         let drag_down_path = e.path.clone();
         line.interactivity()
-            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 drag_down_entity.update(cx, |v, cx| {
                     // 点别处 = 行内改名提交收场（点编辑行自身算挪光标，判据在
                     // `end_inline_rename_on_click` 里）；与 `file_list` / `grid` 同款。
                     v.end_inline_rename_on_click(Some(drag_down_path.as_path()), window, cx);
-                    v.begin_drag_single(pane, tab, drag_down_path.clone(), cx);
+                    v.begin_drag_single(pane, tab, drag_down_path.clone(), ev, cx);
                 });
             });
+        // 拖拽悬停认领（§42）：只有目录行是有效落点（与 `file_list` 行级同款）。
+        if is_dir {
+            let hv_entity = entity.clone();
+            let hv_path = e.path.clone();
+            line.interactivity().on_mouse_move(move |ev, _window, cx| {
+                let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                hv_entity.update(cx, |v, cx| {
+                    v.note_drag_entry_hover(&hv_path, true, x, y, cx)
+                });
+            });
+        }
         let drag_up_entity = entity.clone();
         let drag_up_path = e.path.clone();
         line.interactivity()

@@ -57,6 +57,16 @@ pub fn render(
         let Some(panel) = view.panel_at(pane, tab) else {
             return Vec::new();
         };
+        // 拖拽反馈（§42）：这一帧被悬停认领的落点路径（与列表视图同一判据，
+        // 认领方已核对过抬起会不会真传输）。
+        let drop_target: Option<std::path::PathBuf> = view
+            .drag
+            .as_ref()
+            .filter(|d| d.engaged)
+            .and_then(|d| match &d.hover {
+                Some(crate::app::DragHover::Entry(p)) => Some(p.clone()),
+                _ => None,
+            });
         // 行内改名进行中：命中的那一格把名字换成输入框（编辑器与列表同一份
         // 状态，`sync_inline_rename` 每帧懒建；§40 缺口 2 补上网格这一半）。
         let renaming: Option<(&std::path::Path, &Entity<InputState>)> =
@@ -125,6 +135,9 @@ pub fn render(
                     idx,
                     system_icon,
                     renaming.filter(|(p, _)| *p == entry.path).map(|(_, i)| i),
+                    // 拖拽落点高亮（§42）：目录格 + 这一格正是悬停认领的那条路径。
+                    matches!(entry.kind, mo_core::EntryKind::Directory)
+                        && drop_target.as_deref() == Some(entry.path.as_path()),
                 ));
             }
             rows.push(row.into_any_element());
@@ -176,6 +189,8 @@ fn cell(
     system_icon: Option<std::sync::Arc<mo_core::Bitmap>>,
     // 这一格正在行内改名：`Some` = 名称位置换这份输入框（§40 缺口 2）。
     inline_input: Option<&Entity<InputState>>,
+    // 拖拽悬停正落在这格上（§42）：目录格且抬起**必定**传输（判据在认领侧）。
+    drop_lit: bool,
 ) -> Stateful<Div> {
     let visual = visual(entry, mode, zoom, selected, system_icon);
     // 文字随缩放走但阻尼（见 `listing::zoom_text`）：方框可以 2×，名字不能。
@@ -200,7 +215,11 @@ fn cell(
         .h_full()
         .p(px(4.0))
         .rounded(px(6.0))
-        .bg(if selected {
+        .bg(if drop_lit {
+            // 拖拽落点（§42）：排在选中之前——被拖的集合永远不认领自己，
+            // 亮起来的格子抬起必定传输。
+            crate::theme::hover_bg()
+        } else if selected {
             crate::theme::selected_bg()
         } else if let Some(c) = crate::app::compare_tint(tint) {
             c
@@ -245,13 +264,24 @@ fn cell(
     let drag_down_entity = entity.clone();
     let drag_down_path = entry.path.clone();
     c.interactivity()
-        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             drag_down_entity.update(cx, |v, cx| {
                 // 点别的格 = 行内改名「点了别处」提交收场；点编辑格自身算挪光标。
                 v.end_inline_rename_on_click(Some(drag_down_path.as_path()), window, cx);
-                v.begin_drag(pane, tab, drag_down_path.clone(), id, cx);
+                v.begin_drag(pane, tab, drag_down_path.clone(), id, ev, cx);
             });
         });
+    // 拖拽悬停认领（§42）：只有目录格是有效落点（与 `file_list` 行级同款）。
+    if is_dir {
+        let hv_entity = entity.clone();
+        let hv_path = entry.path.clone();
+        c.interactivity().on_mouse_move(move |ev, _window, cx| {
+            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+            hv_entity.update(cx, |v, cx| {
+                v.note_drag_entry_hover(&hv_path, true, x, y, cx)
+            });
+        });
+    }
     let drag_up_entity = entity.clone();
     let drag_up_path = entry.path.clone();
     c.interactivity()
