@@ -346,13 +346,18 @@ pub fn column_cursor_for_tests(view: &RootView, column: usize) -> Option<usize> 
 ///
 /// `hover` 把落点编码成字符串（`entry:<路径>` / `pane:<序号>`），免得把
 /// `DragHover` 这类内部类型露出 crate；`cursor` 是窗口坐标。
+/// `hover_move`（§43）只在有落点认领时给值：ghost 显示的动词、抬起的结算
+/// 与它同一条判据。
 #[doc(hidden)]
 pub struct DragProbe {
     pub paths: Vec<std::path::PathBuf>,
     pub engaged: bool,
     pub cursor: (f32, f32),
+    pub ctrl: bool,
+    pub shift: bool,
     pub alt: bool,
     pub hover: Option<String>,
+    pub hover_move: Option<bool>,
 }
 
 #[doc(hidden)]
@@ -362,12 +367,15 @@ pub fn drag_probe_for_tests(view: &RootView) -> Option<DragProbe> {
         paths: d.paths.clone(),
         engaged: d.engaged,
         cursor: d.cursor,
+        ctrl: d.ctrl,
+        shift: d.shift,
         alt: d.alt,
         hover: match &d.hover {
             Some(app::DragHover::Entry(p)) => Some(format!("entry:{}", p.display())),
             Some(app::DragHover::Pane(i)) => Some(format!("pane:{i}")),
             None => None,
         },
+        hover_move: d.hover.as_ref().map(|_| d.hover_move),
     })
 }
 

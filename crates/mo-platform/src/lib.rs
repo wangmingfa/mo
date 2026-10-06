@@ -562,11 +562,113 @@ pub fn volumes() -> Vec<Volume> {
     }
 }
 
+/// 两条本地路径是不是**同一卷宗**——拖放语义「同盘拖 = 移动」的判据（§43）。
+///
+/// 纯看路径形状、不碰磁盘：只要求把**确凿是两块盘**的形状判开（不同盘符、
+/// 不同网络前缀、`/Volumes/<名>` 挂点）；判不出的都算同一卷宗。这保守性没有
+/// 副作用——判错只是默认动作成了「移动」，而 `MoveOperation` 在 rename
+/// 跨设备失败时会退回复制 + 删除源，数据不会丢。
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    match (volume_key(a), volume_key(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// 路径的卷宗标识：能从形状判定的给 `Some`（Windows 盘符 / UNC、
+/// unix 的 `/Volumes/<名>`），判不出的给 `None`。标识相等 = 同卷宗。
+fn volume_key(path: &Path) -> Option<String> {
+    let mut comps = path.components();
+    match comps.next()? {
+        // Windows：盘符（`C:\`、`\\?\C:`）与网络前缀（`\\srv\share`）都在 component 前缀里。
+        std::path::Component::Prefix(p) => {
+            let mut s = p
+                .as_os_str()
+                .to_string_lossy()
+                .to_lowercase()
+                .replace('\\', "/");
+            // `\\?\`（含 UNC 变体）前缀剥掉，否则同一块盘会得出两种标识。
+            if let Some(rest) = s.strip_prefix("//?/unc/") {
+                s = rest.to_owned();
+            } else if let Some(rest) = s.strip_prefix("//?/") {
+                s = rest.to_owned();
+            }
+            let key = s.trim_matches(['/', ':']).to_string();
+            (!key.is_empty()).then_some(key)
+        }
+        // 绝对路径根：unix 的外接卷挂在 `/Volumes/<名>`（macOS），其余按主卷算。
+        std::path::Component::RootDir => {
+            if matches!(comps.next(), Some(std::path::Component::Normal(v)) if v == "Volumes") {
+                match comps.next() {
+                    Some(std::path::Component::Normal(name)) => Some(format!(
+                        "/volumes/{}",
+                        name.to_string_lossy().to_lowercase()
+                    )),
+                    // 指的就是 `/Volumes` 本身或更怪：按主卷算。
+                    _ => Some("/".to_string()),
+                }
+            } else {
+                Some("/".to_string())
+            }
+        }
+        // 相对路径无从定位根：不区分。
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 不支持的平台必须给 `Unsupported`，别让上层把「没实现」当成「做成了」。
+    /// §43 判据：同一盘符下的两条路径 = 同卷宗；不同盘符 = 跨卷宗。
+    /// 盘符大小写不敏感（`C:\` 与 `c:\` 是同一块盘）。纯形状判定，
+    /// 不需要这些盘真的存在。
+    #[cfg(windows)]
+    #[test]
+    fn drives_are_the_volume_key_on_windows() {
+        assert!(same_volume(
+            Path::new(r"C:\Users\a\note.txt"),
+            Path::new(r"C:\Users\a\box")
+        ));
+        assert!(!same_volume(
+            Path::new(r"C:\Users\a\note.txt"),
+            Path::new(r"D:\Backup\box")
+        ));
+        assert!(same_volume(Path::new(r"C:\a"), Path::new(r"c:\b")));
+        // verbatim 形式与常规形式必须归到同一标识。
+        assert!(same_volume(Path::new(r"C:\a"), Path::new(r"\\?\C:\b")));
+        // UNC：服务器 + 共享名才是一段卷宗身份，同前缀内才算同盘。
+        assert!(same_volume(
+            Path::new(r"\\srv\share\a"),
+            Path::new(r"\\srv\share\b\c")
+        ));
+        assert!(!same_volume(
+            Path::new(r"\\srv\share\a"),
+            Path::new(r"\\srv\other\b")
+        ));
+    }
+
+    /// §43 判据（unix 形状）：外接卷在 `/Volumes/<名>` 下分家，其余都算主卷。
+    /// 这组用正斜杠路径，Windows 宿主也能跑（`/` 同样是分隔符）。
+    #[test]
+    fn volumes_split_at_the_volumes_mount_point() {
+        assert!(same_volume(
+            Path::new("/Users/wmf/notes.txt"),
+            Path::new("/Users/wmf/box/deep")
+        ));
+        assert!(!same_volume(
+            Path::new("/Users/wmf/notes.txt"),
+            Path::new("/Volumes/USB/box")
+        ));
+        assert!(same_volume(
+            Path::new("/Volumes/USB/a"),
+            Path::new("/Volumes/USB/b")
+        ));
+        // 判不出的（相对路径）一律算同一卷宗——默认动作交给移动，引擎有兜底。
+        assert!(same_volume(Path::new("a.txt"), Path::new("box/b.txt")));
+    }
+
+    /// 「支不支持」与**菜单上的叫法**必须一致，别让上层把「没实现」当成「做成了」。
     ///
     /// ⚠️ 这里**不能**在 Windows 上真调 `reveal`——它会拉起资源管理器窗口，
     /// 测试不该有这种副作用；那条路径由 `supports_reveal()` 断言覆盖。

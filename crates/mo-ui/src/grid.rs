@@ -276,9 +276,8 @@ fn cell(
         let hv_entity = entity.clone();
         let hv_path = entry.path.clone();
         c.interactivity().on_mouse_move(move |ev, _window, cx| {
-            let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
             hv_entity.update(cx, |v, cx| {
-                v.note_drag_entry_hover(&hv_path, true, x, y, cx)
+                v.note_drag_entry_hover(pane, &hv_path, true, ev, cx)
             });
         });
     }
@@ -286,10 +285,11 @@ fn cell(
     let drag_up_path = entry.path.clone();
     c.interactivity()
         .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
-            // 按住 Alt（mac 上是 ⌥）拖 = 移动，否则复制。
-            let alt = ev.modifiers.alt;
+            // 复制 / 移动按资源管理器语义现算（§43），判据在 `drop_on_entry`
+            // 背后那条链上，这里只递修饰键。
+            let mods = ev.modifiers;
             drag_up_entity.update(cx, |v, cx| {
-                v.drop_on_entry(pane, tab, drag_up_path.clone(), is_dir, alt, cx);
+                v.drop_on_entry(pane, tab, drag_up_path.clone(), is_dir, mods, cx);
             });
         });
     c.interactivity().on_click(move |ev, _window, cx| {

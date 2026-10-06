@@ -622,9 +622,8 @@ pub fn render(
                     let hv_entity = entity.clone();
                     let hv_path = entry.path.clone();
                     row.interactivity().on_mouse_move(move |ev, _window, cx| {
-                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
                         hv_entity.update(cx, |v, cx| {
-                            v.note_drag_entry_hover(&hv_path, true, x, y, cx);
+                            v.note_drag_entry_hover(pane, &hv_path, true, ev, cx);
                         });
                     });
                 }
@@ -632,10 +631,12 @@ pub fn render(
                 let up_path = entry.path.clone();
                 row.interactivity()
                     .on_mouse_up(MouseButton::Left, move |ev, _window, cx| {
-                        // 按住 ⌥（Windows / Linux 上是 Alt）拖 = 移动，否则复制。
-                        let alt = ev.modifiers.alt;
+                        // 复制 / 移动按资源管理器语义现算（§43）：同盘 = 移动，
+                        // Ctrl 强制复制、Shift / Alt 强制移动——判据在
+                        // `drop_on_entry` 背后那条链上，这里只递修饰键。
+                        let mods = ev.modifiers;
                         entity_up.update(cx, |v, cx| {
-                            v.drop_on_entry(pane, tab, up_path.clone(), is_dir, alt, cx);
+                            v.drop_on_entry(pane, tab, up_path.clone(), is_dir, mods, cx);
                         });
                     });
 

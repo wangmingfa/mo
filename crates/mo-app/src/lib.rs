@@ -143,6 +143,56 @@ pub enum Endpoint {
     Remote(Arc<dyn FileSystem>),
 }
 
+impl Endpoint {
+    /// 两端是不是**同一处**：都本地，或同一条远程会话（Arc 同一实例）。
+    /// 拖放默认移动 / 复制的第一步判定（§43）——跨会话永远只敢复制。
+    pub fn same_session(&self, other: &Endpoint) -> bool {
+        match (self, other) {
+            (Self::Local, Self::Local) => true,
+            (Self::Remote(a), Self::Remote(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// 一次拖放该不该按**移动**结算——资源管理器同款语义（§43）。
+///
+/// 判据三档，从高到低：
+/// 1. **修饰键反向覆盖**：Ctrl = 强制复制；Shift = 强制移动；Alt 保留为
+///    移动别名（macOS 访达的 ⌥=移动、也是 Mo 自 §36 起的既有肌肉记忆，
+///    真按资源管理器走 Alt 是「创建快捷方式」，Mo 没做这个功能，不留空位）。
+/// 2. **跨会话 = 复制**：两端不是同一处（本地↔远程、两条不同远程会话）时
+///    永远复制——「拖一下就把别人服务器上的文件挪走」不该是默认动作。
+/// 3. **同会话内看卷宗**：本地按 [`mo_platform::same_volume`] 判同盘 / 跨盘
+///    （同盘移动、跨盘复制）；同一远程会话按同卷宗走，默认移动——
+///    `MoveOperation` 的 rename 失败会退回复制 + 删除源，判错不丢数据。
+///
+/// 多源时以**第一个源**定卷宗（与资源管理器一致：一批里混盘的其余按整批的
+/// 动作走，引擎逐文件 rename 兜底，跨盘的那几条自动变成 copy+delete）。
+pub fn drag_resolves_to_move(
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    src_ep: &Endpoint,
+    src: &Path,
+    dest: &Path,
+    dest_ep: &Endpoint,
+) -> bool {
+    if ctrl {
+        return false;
+    }
+    if shift || alt {
+        return true;
+    }
+    if !src_ep.same_session(dest_ep) {
+        return false;
+    }
+    if matches!(src_ep, Endpoint::Local) {
+        return mo_platform::same_volume(src, dest);
+    }
+    true
+}
+
 /// 跨端点传输的「一段路」：读端、写端，以及进度条上那个动词（上传 / 下载 / 复制）。
 ///
 /// 抽出来只为压掉 `clippy::type_complexity`；语义就是 [`AppState::transfer_between`]
