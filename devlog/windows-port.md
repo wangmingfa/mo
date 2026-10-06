@@ -266,6 +266,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **拖拽中的视觉反馈已补齐**（2026-10-06，§42）：跟随光标的 ghost（「首项名 · N 项 · 复制/移动」，4px 阈值内不闪、单击无扰动）+ 落点高亮（三视图目录行 / 网格目录格 / 列视图目录行 + 跨窗格空白整块淡染），「亮着的落点抬起必定传输」由 `tests/drag_feedback.rs` 六条兑现（ghost 动词的判定表在 §43 换了引擎，文案形状不变）。**剩真机实感**（headless 验不了）：ghost 配色观感、快拖有无闪烁、分栏跨窗格淡染观感、拖出交接 OS 瞬间 ghost 是否即消——清单见 §42 末尾。
 * ~~**应用内拖放恒复制，与资源管理器的直觉不符**~~ **已改判定表**（2026-10-06，§43）：同卷宗直拖=移动、跨卷宗=复制、Ctrl 强制复制、Shift 强制移动、Alt 保留为移动别名；ghost 动词与抬起结算出自同一张 `drag_resolves_to_move`。**OS 拖入（资源管理器 → Mo）仍恒复制**——gpui 在 FileDrop 提交时把修饰键清零，拿不到键就守最安全的动作，这是与资源管理器**有意分叉**的一处，见 §43。
 * ~~**新建文件后图片行的图标闪一下（缩略图被打回默认图标）**~~ **已修**（2026-10-06，§44）：整目录重读会丢掉旧快照里的 `Loaded` 位图，异步回填那一两帧画的是 fallback；现在换上新快照前按 `FileId` 搬运（只搬 `Loaded`），`crates/mo-app/tests/thumbnail_carry.rs` 三条钉住。**剩真机确认**：新建 / 删除 / 传输落盘之后再扫一眼图片行，是否还看得到那一帧默认图标；**切目录**首屏仍会「先默认后缩略图」——那是真·首次解码（没东西可搬），属预期，别当回归。
+* ~~**拖动多个文件做移动时界面卡住几秒钟**~~ **已修**（2026-10-06，§45）：账在搜索索引，不在拖拽也不在传输——`FileIndex::remove_under` 的 `LIKE '前缀/%'` 是 58 万行全表扫（实测一次 147ms，未命中一样），每个被移走的条目一次，期间索引锁被攥着；主线程那边 `sync_panel` 每拍同步问一次「已索引 N」（`COUNT(*)`，实测 64ms），排在同一把锁后面，两边互相放大。`remove_under` 改 path 字节范围（走 `idx_path`，未命中 33µs），`index_count` 改「第一次就地数、之后读缓存 + 1s TTL 派发后台重算」。**新欠**（同一族，本轮没动）：命令面板的 `global_search` 仍是主线程一次 `LIKE '%q%'` 全表扫（同一份库约 150ms/次按键），那是搜索线的账，不在拖动路径上。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
@@ -803,3 +804,66 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **没修 / 边界**：列视图走 `LightEntry`，那一层本来就没有缩略图（§41 记过的
   「两份数据」张力），不在本轮范围；**切目录**后首屏仍会从 fallback 长成缩略图——
   那是真·首次解码，没有可搬的东西，不属于用户抱怨的这一下。
+
+### §45：拖动多个文件做移动时的几秒钟冻结——账在搜索索引，不在拖拽（2026-10-06）
+
+* **用户报的现象**：「拖动多个文件进行移动时，界面会卡住几秒钟」。截图是
+  `D:\Users\wmf12\Pictures`，四个 `新建文本 N.txt` 选中，ghost 上写着
+  「新建文本 2.txt · 4 项 · 移动」，状态栏「15 项 · 已选 4 · 可撤销」「已索引 581003」。
+* **先排掉的两条**：把 §42/§43 那条链路整个读了一遍——`begin_drag` 只收路径、
+  `update_drag_cursor` / `drag_move_for` / `note_drag_*_hover` 全是纯计算（`same_volume`
+  只比字符串形状，不碰盘），ghost 每帧只拼两段文案；抬起那侧 `run_transfer` →
+  `transfer_between` → `submit_operation` 的真活在 `spawn_blocking` 里。逐拍与结算都没有
+  主线程 IO，所以卡顿不可能是「拖四个文件」这个动作本身。
+* **机制（两处，都在索引上，且互相放大）**：
+  1. §43 把同盘直拖改成默认**移动**之后，一次拖动 = N 次「rename 出当前目录」
+     （`apply_watcher_event` 的 `Renamed` 且父目录不同 → `remove_listing_entry`
+     → `sync_index_removed`）。它落到 `FileIndex::remove_under`，旧写法是
+     `DELETE ... WHERE path LIKE '前缀/%'`：LIKE 默认大小写不敏感，前缀通配用不上
+     索引，`EXPLAIN QUERY PLAN` 给的是 `SCAN files`。在**用户机器上那份真索引的副本**
+     （580997 行 / 276MB）上实测**一次 147ms**——而且**未命中也一样贵**（要扫完才知道没命中），
+     四个文件就是四趟，期间 `PlMutex<FileIndex>` 一直被攥着。
+  2. 同一时间，主线程的事件总线每收到一条 `DirectoryChanged` 就跑一次 `sync_panel`，
+     里面 `let indexed = app.index_count();` 是同步的 `index.lock().count()`，而 `count()`
+     是一条 `SELECT COUNT(*)`：同一份库实测 64ms 全表扫。**一个在扫、一个在等锁**，
+     几拍叠起来就是「几秒钟」。这与当年「主目录自举期间隔几秒冻几秒」是同一族病
+     （那一轮收的是爬取侧的锁，见 `index_root_capped` 与 `crawl.rs` 的注释），
+     这次剩下的两把刀是 `remove_under` 和 `index_count`。
+* **顺手抓到两条正确性**（都在 `remove_under` 那一行上）：
+  * LIKE 把 `_` 与 `%` 当通配符——删 `a_b.txt` 会连邻居 `axb.txt` 的子树一起抹掉；
+  * Windows 落库的是**反斜杠**路径，`{前缀}/%` 一个孩子都匹配不上：本机删 / 移一个
+    目录，等于只删了目录自己那一条，整棵子树留在索引里当孤儿（「搜得到、点不开」）。
+* **修法一**（`mo-search::index.rs`）：`remove_under` 改走 path 的**字节范围**——
+  `/`=0x2F、`\`=0x5C，各取「下一个字节」当右开上界，两段 `[前缀/, 前缀0)` 与
+  `[前缀\, 前缀])` 各扫一遍（两种分隔符都扫，同一个函数在 macOS 与 Windows 上都成立），
+  再加原来那条等值 `remove`。`EXPLAIN` 于是变成 `SEARCH files USING INDEX idx_path
+  (path>? AND path<?)`，同一台机器上未命中 **33µs**（147ms → 33µs）。
+* **修法二**（`mo-app`）：`index_count()` 不再在调用线程上碰 SQL——进程内第一次仍就地数
+  一遍（「重开应用后索引还在」那条判据要当场成立），此后读 `(Instant, usize)` 缓存，
+  过期时按 `INDEX_COUNT_TTL`（1s）派发一次后台重算，派发有单飞标志（`indexed_pumping`）
+  免得每拍往 blocking 池塞一条 COUNT。`ensure_index_started` 把它启动时那一次 COUNT
+  顺手种进缓存，主线程从此不再为状态栏那个装饰数字排队等索引锁。
+  与 `net_shares` / `volumes_cache` 是同一族做法（那两个本来就有 TTL）。
+* **探针留在仓库**：`crates/mo-search/examples/probe_freeze.rs`——
+  `cargo run -p mo-search --release --example probe_freeze -- <索引库副本>`，
+  打 `COUNT(*)` / LIKE / 范围三种墙钟与三条查询计划。上面的数字都是它量出来的，
+  下轮再遇到「索引慢」不必重新搭一遍。
+* **测试**：`mo-search` 单测两条（`remove_under_covers_backslash_children` 反斜杠子树、
+  `remove_under_does_not_treat_underscores_as_wildcards` 邻居不误伤）+
+  `crates/mo-app/tests/index_sync.rs` 三条：① 移走的文件从搜索里消失；② 移走的**目录**
+  连子记录一起消失（这一条在 Windows 上正是旧写法的错法）；③ 缓存的那个数字会被后台
+  追上来。③ 之所以必须存在：变异反验时发现把「派发重算」摘掉，**既有**的
+  `global_index.rs` 与 `productivity.rs` 全绿（前者断言打在 `global_search` 上，后者的
+  重启那半走「第一次就地数」的分支）——那条路原本没人守。
+* **变异反验两轮**（还原字节一致）：`remove_under` 改回 LIKE → 恰红单测两条 +
+  `index_sync` ②（红在「子记录还留在索引里」，端出来的正是那条反斜杠路径）；
+  摘掉重算派发 → 恰红 `index_sync` ③，其余全绿。
+* **没修 / 边界**：
+  * 命令面板那条 `global_search` 仍是主线程一次 `LIKE '%q%'` 全表扫（同一份库约
+    150ms/次按键）。同一张表同一个量级的病，但那是搜索线的账，不在这条拖动路径上，
+    已记进上面的待办。
+  * `files.path` 的 `UNIQUE` 已经自带一份索引，`idx_path` 是第二份（写放大一倍）。
+    本轮反而靠它做范围扫（`EXPLAIN` 显示等值走 `sqlite_autoindex_files_1`、范围走
+    `idx_path`），要不要收成一个留给搜索线一起判。
+  * 跨目录移动后**新位置**不进索引：watcher 只听当前目录，`note_visited` 要用户真走进去
+    才爬。这一条本轮没改（旧行为一样），所以「刚移进来的东西暂时搜不到」仍在。
