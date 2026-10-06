@@ -408,6 +408,11 @@ pub struct AppState {
     stopped: Arc<AtomicBool>,
     /// 全局搜索索引（内存 SQLite）。跨目录搜索的数据源。
     index: Arc<PlMutex<FileIndex>>,
+    /// 状态栏「已索引 N」的缓存：`(上次真数出来的时刻, 那个数)`，
+    /// `usize::MAX` = 进程内还没数过。见 [`AppState::index_count`]。
+    indexed: Arc<PlMutex<(std::time::Instant, usize)>>,
+    /// 重算那个数的单飞标志：有一趟在途就不再往 blocking 池塞第二趟。
+    indexed_pumping: Arc<AtomicBool>,
     /// 「系统里挂了哪些网络盘」的缓存：`(上次查的时刻, 结果)`。
     ///
     /// 侧边栏**每帧**都会问一次，而发现是真要去读 `/proc/mounts` 或跑一次 `mount`
@@ -879,6 +884,13 @@ const NET_SHARE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 卷宗列表的缓存有效期（见 `AppState::volumes_cache`）。
 const VOLUME_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 「已索引多少条」这个数的重算间隔（见 [`AppState::index_count`]）。
+///
+/// 它只喂状态栏那一行文案和命令面板的提示，旧一拍没有任何后果；把它做准的代价
+/// 却是每问一次扫一遍全表（58 万行实测 64ms），而 `sync_panel` 每收到一条总线
+/// 事件就问一次。
+const INDEX_COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 远程目录的轮询间隔（见 `AppState::spawn_remote_poll_pump`）。
 ///
 /// 一拍一次列目录的网络往返：太密了是持续的无谓流量，太疏了「别的设备传完文件」
@@ -1122,6 +1134,8 @@ impl AppState {
             watcher: Arc::new(Mutex::new(None)),
             dirty: Arc::new(AtomicBool::new(false)),
             index: Arc::new(PlMutex::new(Self::open_index())),
+            indexed: Arc::new(PlMutex::new((std::time::Instant::now(), usize::MAX))),
+            indexed_pumping: Arc::new(AtomicBool::new(false)),
             net_shares: Arc::new(std::sync::Mutex::new((
                 // 起点放到「很久以前」，好让第一次问就真的去查一次。
                 std::time::Instant::now() - NET_SHARE_TTL,
@@ -3312,10 +3326,13 @@ impl AppState {
     /// 全程后台，不阻塞启动；爬的过程可由 `stop_indexing` 中断。
     pub fn ensure_index_started(&self) {
         let home = dirs::home_dir();
-        let stale: Vec<String> = {
+        let (count, stale): (usize, Vec<String>) = {
             let idx = self.index.lock();
+            // 这一次全表 COUNT 是启动时的一问（不在每拍的路径上），顺手把状态栏
+            // 那个数种下：此后 `index_count` 只读缓存，不再为它扫表。
+            let count = idx.count();
             let ttl_cut = now_secs() - ROOT_REFRESH_TTL;
-            if idx.count() == 0 {
+            let stale = if count == 0 {
                 Vec::new()
             } else {
                 idx.indexed_roots()
@@ -3323,10 +3340,11 @@ impl AppState {
                     .filter(|(_, at)| *at < ttl_cut)
                     .map(|(r, _)| r)
                     .collect()
-            }
+            };
+            (count, stale)
         };
-        let empty = self.index_count() == 0;
-        if empty {
+        *self.indexed.lock() = (std::time::Instant::now(), count);
+        if count == 0 {
             if let Some(h) = home {
                 self.index_root_capped(h, HOME_INDEX_DEPTH, HOME_INDEX_LIMIT);
             }
@@ -3433,9 +3451,36 @@ impl AppState {
         self.index.lock().search(query, limit).unwrap_or_default()
     }
 
-    /// 索引中的文件总数。
+    /// 索引中的文件总数——**读缓存，不在调用线程上做全表扫描**。
+    ///
+    /// 这个数只给状态栏「已索引 N」和命令面板的提示用，而它原来是
+    /// `index.lock().count()`：`count()` 是一条 `SELECT COUNT(*)`，58 万行的库上
+    /// 实测 64ms 的全表扫，还要排在索引锁后面。锁那边正攥着的是「每个被移走的
+    /// 条目一次」的索引清理（§45 修它之前是 147ms 一次），于是拖动四个文件移动
+    /// 的那几拍，主线程一遍遍替后台等锁 + 全表扫——用户报的「界面卡住几秒钟」。
+    ///
+    /// 现在：进程内第一次仍然就地数（「重开应用后索引还在」的判据要当场成立，
+    /// 见 `tests/global_index.rs`），此后按 [`INDEX_COUNT_TTL`] 派发后台重算，
+    /// 调用方拿到的值最多旧这么一拍。
     pub fn index_count(&self) -> usize {
-        self.index.lock().count()
+        let (at, cached) = *self.indexed.lock();
+        if cached == usize::MAX {
+            let n = self.index.lock().count();
+            *self.indexed.lock() = (std::time::Instant::now(), n);
+            return n;
+        }
+        if at.elapsed() >= INDEX_COUNT_TTL && !self.indexed_pumping.swap(true, Ordering::AcqRel) {
+            let index = self.index.clone();
+            let slot = self.indexed.clone();
+            let pumping = self.indexed_pumping.clone();
+            // 派发即忘：数完了写回缓存，这一拍照旧返回上一个值。
+            std::mem::drop(self.spawn_blocking(move || {
+                let n = index.lock().count();
+                *slot.lock() = (std::time::Instant::now(), n);
+                pumping.store(false, Ordering::Release);
+            }));
+        }
+        cached
     }
 
     /// 按**文件内容**搜索（grep），在 `root` 这棵子树里找 `q`。
