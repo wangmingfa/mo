@@ -1294,7 +1294,7 @@ impl AppState {
         // 这里是个「最多两轮」的循环：连接死在**读的那一瞬间**（探活时还活着）时
         // 重连再读一次——网络抖一下不该变成用户脸上的一条报错。
         let mut retried = false;
-        let (dir, for_verify) = loop {
+        let (mut dir, for_verify) = loop {
             let fs_task = fs.clone();
             let p_task = p.clone();
             let cache_task = cache.clone();
@@ -1379,6 +1379,12 @@ impl AppState {
             let mut inner = self.inner.write().await;
             let mut sel = inner.selection.clone();
             sel.clear();
+            // 换上新快照之前，把旧目录里已解码的缩略图按 `FileId` 搬过来（§44）：
+            // 新建 / 传输之后是同一次 `load_path` 重读，新条目全 `Idle`，不搬就会
+            // 让图片行先画 fallback 图标再等异步回填——闪的那一下就是这么来的。
+            if let Some(old) = inner.directory.as_ref() {
+                thumbnail::carry_thumbnails(&mut dir, old);
+            }
             inner.directory = Some(dir);
             inner.selection = sel;
         }

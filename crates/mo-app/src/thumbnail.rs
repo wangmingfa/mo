@@ -120,6 +120,37 @@ impl ThumbnailScheduler {
 /// `inflight` 账本的封顶（超出整清）。
 const INFLIGHT_MAX: usize = 4000;
 
+/// 把旧目录里**已解码**的缩略图搬到新快照的同 id 条目上。
+///
+/// 存在的理由：同目录刷新（新建文件、传输落盘、watcher 触发）走的是整目录重读，
+/// 新条目一律 `Idle`——直接换上去，可见的图片行会先画一两帧 fallback 图标，再等
+/// 异步回填才是原图，用户眼里就是「图标闪一下」。搬运只发生在模型层，UI 那侧
+/// 一帧都不必多等。
+///
+/// 只搬 [`ThumbnailState::Loaded`]：`Idle` 没东西可搬，`Failed` 搬过去会把一次
+/// 偶发失败钉死。键取 `FileId`（卷 + inode）而非路径，所以条目刚被改名 / 移动过
+/// 也接得上；换目录时新旧 id 集合不相交，这一步自然什么都搬不动，不会串图。
+pub(crate) fn carry_thumbnails(new: &mut mo_core::Directory, old: &mo_core::Directory) {
+    let mut loaded: std::collections::HashMap<mo_core::FileId, std::sync::Arc<mo_core::Bitmap>> =
+        old.entries
+            .iter()
+            .filter_map(|e| match &e.thumbnail {
+                ThumbnailState::Loaded(bm) => Some((e.id, bm.clone())),
+                _ => None,
+            })
+            .collect();
+    if loaded.is_empty() {
+        return;
+    }
+    for e in &mut new.entries {
+        if matches!(e.thumbnail, ThumbnailState::Idle) {
+            if let Some(bm) = loaded.remove(&e.id) {
+                e.thumbnail = ThumbnailState::Loaded(bm);
+            }
+        }
+    }
+}
+
 impl Default for ThumbnailScheduler {
     fn default() -> Self {
         Self::new()
