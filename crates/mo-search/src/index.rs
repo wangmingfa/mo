@@ -205,11 +205,36 @@ impl FileIndex {
     ///
     /// 删目录时用的：`crawl` 只按路径 upsert 单条，目录被移走后它下面那些记录会
     /// 变成孤儿——搜索还能搜到，点开却「文件不存在」。
+    ///
+    /// 走 path 的**字节范围**扫描，不用 `LIKE '前缀/%'`，三条理由（2026-10-06，§45）。
+    ///
+    /// 一是快：LIKE 的前缀通配用不上索引（LIKE 默认大小写不敏感），58 万行的库上
+    /// 实测一次 **147ms 全表扫**，这期间索引锁被攥着，而 `AppState` 那边每个被移走
+    /// 的条目都要来一次——拖动四个文件移动就是四次。同一段时间里主线程还要问状态栏
+    /// 那个「已索引」，排队等这把锁，就是用户报的「卡住几秒钟」。范围写法走
+    /// `idx_path`，同一台机器上未命中 **33µs**。
+    ///
+    /// 二是准：LIKE 把 `_` 与 `%` 当通配符，删 `a_b.txt` 会连邻居 `axb.txt` 的子树
+    /// 一起抹掉。
+    ///
+    /// 三是 Windows：落库的是反斜杠路径，旧写法拼的 `{前缀}/%` 一个孩子都匹配不上
+    /// ——本机删目录等于只删了目录自己那条，整棵子树留在索引里当孤儿。
     pub fn remove_under(&mut self, prefix: &Path) -> Result<usize, SearchError> {
-        let p = format!("{}/%", prefix.to_string_lossy());
-        let n = self
-            .conn
-            .execute("DELETE FROM files WHERE path LIKE ?1", params![p])?;
+        let p = prefix.to_string_lossy();
+        let mut n = 0;
+        // '/' 是 0x2F、'\\' 是 0x5C，各自右开在上界取「下一个字节」（0x30 '0'、0x5D ']'）：
+        // 任何以 `前缀/` 开头的串都落在 [`前缀/`, `前缀0`) 这段连续区间里，反之这段里
+        // 也只有它的孩子（BINARY 排序按 UTF-8 字节逐位比）。两种分隔符各扫一遍，
+        // 于是同一个函数在 macOS 与 Windows 上都成立。
+        for (lo, hi) in [
+            (format!("{p}/"), format!("{p}0")),
+            (format!("{p}\\"), format!("{p}]")),
+        ] {
+            n += self.conn.execute(
+                "DELETE FROM files WHERE path >= ?1 AND path < ?2",
+                params![lo, hi],
+            )?;
+        }
         // 目录自己那条也一起走（watcher 的 Removed 对文件同样适用）。
         let self_row = self.remove(prefix)?;
         Ok(n + self_row)
@@ -417,6 +442,52 @@ mod tests {
         // 别误伤同级其它文件。
         assert_eq!(i.search("other.md", 10).unwrap().len(), 1);
         assert_eq!(i.count(), 1);
+    }
+
+    /// Windows 落库的是反斜杠路径，`{前缀}\` 下的孩子也要一起删。旧写法只拼了
+    /// `{前缀}/%`，在本机一个孩子的都匹配不上——删目录等于只删了目录自己那条。
+    #[test]
+    fn remove_under_covers_backslash_children() {
+        let mut i = idx();
+        for (p, is_dir) in [
+            (r#"D:\x\proj"#, true),
+            (r#"D:\x\proj\a.md"#, false),
+            (r#"D:\x\proj\deep\b.md"#, false),
+            (r#"D:\x\other.md"#, false),
+        ] {
+            i.upsert(
+                Path::new(p),
+                p.rsplit('\\').next().unwrap(),
+                1,
+                None,
+                is_dir,
+            )
+            .unwrap();
+        }
+        assert_eq!(i.count(), 4);
+
+        let n = i.remove_under(Path::new(r#"D:\x\proj"#)).unwrap();
+        assert_eq!(n, 3, "目录自己 + 两条反斜杠子记录");
+        assert_eq!(i.count(), 1, "只剩同级那条");
+        assert_eq!(i.search("other.md", 10).unwrap().len(), 1);
+    }
+
+    /// `_` 与 `%` 在 LIKE 里是通配符：旧写法（`LIKE '前缀/%'`）删 `/x/a_b.txt` 会把
+    /// 邻居 `/x/axb.txt/inner.md` 当成它的子树一起抹掉。范围扫描按字节逐位比，没这个口子。
+    #[test]
+    fn remove_under_does_not_treat_underscores_as_wildcards() {
+        let mut i = idx();
+        i.upsert(Path::new("/x/a_b.txt"), "a_b.txt", 1, None, false)
+            .unwrap();
+        i.upsert(Path::new("/x/axb.txt"), "axb.txt", 0, None, true)
+            .unwrap();
+        i.upsert(Path::new("/x/axb.txt/inner.md"), "inner.md", 1, None, false)
+            .unwrap();
+
+        let n = i.remove_under(Path::new("/x/a_b.txt")).unwrap();
+        assert_eq!(n, 1, "只有被移走的那一条");
+        assert_eq!(i.count(), 2, "邻居和它的子树都该还在");
+        assert_eq!(i.search("inner.md", 10).unwrap().len(), 1);
     }
 
     #[test]
