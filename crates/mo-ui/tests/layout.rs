@@ -549,6 +549,39 @@ fn aggregate_bar_stays_inside_the_badge_corners(cx: &mut TestAppContext) {
     );
 }
 
+/// 常显卡片在**侧栏那一列**里必须左右留白相等。卡片是窗口坐标 `left(10)` 锚的，
+/// 宽度另写一个常数，两者各改各的就会不等——写成 176 时右边只剩 2px，用户一眼看出
+/// 「左右间距不一样」（§47）。这条把两个常数绑成一条判据。
+#[gpui_kit::test]
+fn badge_is_centered_in_the_sidebar_column(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    seed_ops_until_visible(
+        &mut vcx,
+        &window,
+        cx,
+        &[FakeOp {
+            id: 1,
+            status: OperationStatus::Running,
+            progress: (1, 4),
+        }],
+    );
+
+    let sidebar = bounds(&mut vcx, "mo-sidebar");
+    let badge = bounds(&mut vcx, "mo-ops-badge");
+    let inset_l = f32::from(badge.origin.x - sidebar.origin.x);
+    let inset_r =
+        f32::from((sidebar.origin.x + sidebar.size.width) - (badge.origin.x + badge.size.width));
+    assert!(
+        (inset_l - inset_r).abs() <= 1.5,
+        "卡片在侧栏列里左右留白不等：左 {inset_l}px / 右 {inset_r}px"
+    );
+    // 左缘还要落在 10px 那条竖线上（状态栏 `px(10)` 同一个节奏），别靠收窄卡片凑对称。
+    assert!(
+        (8.0..=12.0).contains(&inset_l),
+        "左留白 {inset_l}px 不在 10px 节奏上"
+    );
+}
+
 /// 点常显卡片在**上方**弹出任务浮层，再点一次收起——浮层贴卡片顶部展开、
 /// 左缘对齐（top-start），不是把卡片原地长高。
 #[gpui_kit::test]

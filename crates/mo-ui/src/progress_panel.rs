@@ -6,8 +6,10 @@ use std::collections::HashMap;
 
 use crate::{theme, RootView};
 
-/// 常显卡片尺寸：与侧栏同宽（188）减去左右 6px 留白，一行文字 + 3px 进度条。
-const CARD_W: f32 = 176.0;
+/// 常显卡片尺寸：侧栏宽 188，减去**左右各 10**（与卡片自己的 `left(10)`、状态栏的
+/// `px(10)` 同一条竖线）。两边留白必须相等——写成 176 时右边只剩 2px，用户一眼看出
+/// 「左右间距不一样」（§47，`tests/layout.rs::badge_is_centered_in_the_sidebar_column`）。
+const CARD_W: f32 = 168.0;
 const CARD_H: f32 = 30.0;
 /// 任务浮层宽度：比卡片宽（任务描述 + 速度 + 剩余时间需要横向空间），
 /// 左缘与卡片对齐、向上展开，超出侧栏盖在内容区上是浮层的本分。
