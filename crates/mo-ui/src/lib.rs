@@ -260,6 +260,27 @@ pub fn inject_content_search_for_tests(view: &mut RootView) {
     view.modal = app::Modal::ContentSearch;
 }
 
+/// 测试专用：打开全局搜索模态（等价于那两个真入口：命令「search.global」与
+/// 命令面板的 `OpenGlobalSearch`，两者都走 `reset_global_search`）。
+#[doc(hidden)]
+pub fn open_global_search_for_tests(view: &mut RootView) {
+    view.reset_global_search();
+    view.modal = app::Modal::GlobalSearch;
+}
+
+/// 测试专用：全局搜索模态的此刻状态 `(查询词, 命中条数, 是否有查询在途)`。
+///
+/// 「在途」是这条线的判据本身：查询搬到后台之后，敲下第一个字的那一拍主线程
+/// 只改状态、不等 SQL，命中要等下一拍落地才看得见。
+#[doc(hidden)]
+pub fn global_search_state_for_tests(view: &RootView) -> (String, usize, bool) {
+    (
+        view.search_query.clone(),
+        view.search_results.len(),
+        view.search_busy,
+    )
+}
+
 /// 测试专用：当前标签页**已经显示出来**的目录（导航是否生效的判据）。
 ///
 /// 别用 `AppState::opening_path()` 代替：那条在读取完成时会被发布成 `None`。

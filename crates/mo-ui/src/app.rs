@@ -1074,10 +1074,15 @@ pub struct RootView {
     /// 扩展贡献的只读列表源面板（P4）。`None` = 没开；开着的时候 `modal` 是
     /// [`Modal::List`]，两者同进同出（`close_modal` / Esc 各自清）。
     list_panel: Option<ListPanel>,
-    /// 全局搜索过滤词。
-    search_query: String,
+    /// 全局搜索过滤词（`pub(crate)` 仅为测试钩子，见 `lib.rs::global_search_state_for_tests`）。
+    pub(crate) search_query: String,
     /// 全局搜索结果。
-    search_results: Vec<SearchHit>,
+    pub(crate) search_results: Vec<SearchHit>,
+    /// 全局搜索的趟号：每次派发 +1，回来的结果只对得上它出发时那个号，对不上就是
+    /// 过期（打字期间前一趟可能比后一趟晚落地）。见 [`RootView::run_global_search`]。
+    pub(crate) search_epoch: u64,
+    /// 有一趟全局搜索在途（结果列表空着时用来区分「正在搜」与「没搜到」）。
+    pub(crate) search_busy: bool,
     /// 快速预览独立窗口（`None` = 未开；已开时复用换内容，不重复开）。
     pub(crate) preview_window: Option<WindowHandle<crate::preview::PreviewWindow>>,
     /// 扩展管理器独立窗口（`None` = 未开；已开时复用置前，不重复开）。
@@ -1480,6 +1485,8 @@ impl RootView {
             trash_anchor: None,
             search_query: String::new(),
             search_results: Vec::new(),
+            search_epoch: 0,
+            search_busy: false,
             preview_window: None,
             extensions_window: None,
             preview_seq: 0,
@@ -1977,6 +1984,58 @@ impl RootView {
         self.content_dirty = true;
         self.modal = Modal::ContentSearch;
         cx.notify();
+    }
+
+    /// 关掉 / 重开全局搜索模态的收口：清查询与结果、选中行归零，并把在途那一趟作废。
+    ///
+    /// 作废必须动 `search_epoch`：不然「关窗瞬间还在飞的那一趟」会在下次打开模态时
+    /// 落进一个空的搜索框——结果与查询词对不上，看着像搜索坏了。
+    pub(crate) fn reset_global_search(&mut self) {
+        self.search_epoch += 1;
+        self.search_busy = false;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.palette_index = 0;
+    }
+
+    /// 跑一次全局搜索（查索引里的文件名），派发到 blocking 池。
+    ///
+    /// 这里原来是主线程一次同步 `app.global_search(&q, 50)`：那是一条 `LIKE '%词%'`
+    /// 全表扫，58 万行的库上实测约 150ms——每敲一个字冻一次，与 §45 修掉的那两处
+    /// （`remove_under`、状态栏的 `COUNT(*)`）是同一族病，这是剩下的第三把刀。
+    ///
+    /// 不去抖、也不叫停上一趟（索引查询没有中断点，SQL 已经在跑了）：打字期间确实
+    /// 会同时飞好几趟，但只有趟号最新的那一趟写进结果，其余落地即丢。代价是池上
+    /// 空跑几趟，换来的是回显永不等 SQL。
+    fn run_global_search(&mut self, cx: &mut Context<Self>) {
+        self.search_epoch += 1;
+        let epoch = self.search_epoch;
+        if self.search_query.trim().is_empty() {
+            self.search_busy = false;
+            self.search_results.clear();
+            cx.notify();
+            return;
+        }
+        self.search_busy = true;
+        cx.notify();
+        let query = self.search_query.clone();
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let hits = app.global_search_bg(query, 50).await;
+            this.update(cx, |v, cx| {
+                // 趟号对不上（后来又有新输入）或模态已经关了：这一趟没人要了。
+                if v.search_epoch != epoch || v.modal != Modal::GlobalSearch {
+                    return;
+                }
+                v.search_busy = false;
+                v.search_results = hits;
+                v.palette_index = 0;
+                v.search_scroll.scroll_to_item(0);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 跑一次内容搜索（后台 blocking）。
@@ -6408,9 +6467,7 @@ impl RootView {
             }
             "search.global" => {
                 self.modal = Modal::GlobalSearch;
-                self.search_query.clear();
-                self.search_results.clear();
-                self.palette_index = 0;
+                self.reset_global_search();
                 cx.notify();
             }
             "search.content" => {
@@ -10548,34 +10605,16 @@ fn handle_modal_key(
             "enter" => on_search_enter(entity, cx),
             k if plain && k.chars().count() == 1 => {
                 let ch = k.chars().next().unwrap();
-                let app = entity.update(cx, |v, cx| {
-                    v.search_query.push(ch);
-                    cx.notify();
-                    v.app()
-                });
-                // 实时搜索（同步、毫秒级）。
-                let q = entity.update(cx, |v, _cx| v.search_query.clone());
-                let results = app.global_search(&q, 50);
                 entity.update(cx, |v, cx| {
-                    v.search_results = results;
-                    v.palette_index = 0;
-                    v.search_scroll.scroll_to_item(0);
-                    cx.notify();
+                    v.search_query.push(ch);
+                    // 实时搜索：回显这一拍立刻画（cx.notify 在派发里），查询在后台跑。
+                    v.run_global_search(cx);
                 });
             }
             "backspace" => {
-                let app = entity.update(cx, |v, cx| {
-                    v.search_query.pop();
-                    cx.notify();
-                    v.app()
-                });
-                let q = entity.update(cx, |v, _cx| v.search_query.clone());
-                let results = app.global_search(&q, 50);
                 entity.update(cx, |v, cx| {
-                    v.search_results = results;
-                    v.palette_index = 0;
-                    v.search_scroll.scroll_to_item(0);
-                    cx.notify();
+                    v.search_query.pop();
+                    v.run_global_search(cx);
                 });
             }
             _ => {}
@@ -11230,8 +11269,7 @@ fn close_modal(entity: &Entity<RootView>, cx: &mut App) {
         v.notice_ok = None;
         v.connect_error = None;
         v.cmd_query.clear();
-        v.search_query.clear();
-        v.search_results.clear();
+        v.reset_global_search();
         v.diff_cache = None;
         v.palette_index = 0;
         v.trash_selected.clear();
@@ -11299,9 +11337,7 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         Some(CommandId::OpenGlobalSearch) => {
             entity.update(cx, |v, cx| {
                 v.modal = Modal::GlobalSearch;
-                v.search_query.clear();
-                v.search_results.clear();
-                v.palette_index = 0;
+                v.reset_global_search();
                 cx.notify();
             });
         }
@@ -11698,8 +11734,7 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
                 let _ = app.open_local(&h.path).await;
                 this.update(cx, |v, cx| {
                     v.modal = Modal::None;
-                    v.search_query.clear();
-                    v.search_results.clear();
+                    v.reset_global_search();
                     cx.notify();
                 });
             } else {
@@ -11708,8 +11743,7 @@ fn on_search_enter(entity: &Entity<RootView>, cx: &mut App) {
                         this.update(cx, |v, cx| {
                             // 预览是独立窗口：搜索模态照常关掉。
                             v.modal = Modal::None;
-                            v.search_query.clear();
-                            v.search_results.clear();
+                            v.reset_global_search();
                             cx.notify();
                         });
                         show_preview_twopass(&app, &this, pv, &h.path, cx);
@@ -12508,7 +12542,11 @@ impl RootView {
         if self.search_results.is_empty() {
             // 「索引还没建起来」与「搜了但没匹配」是两件事，提示必须分开：前者用户
             // 什么都没做错，只是得等一等，写成「输入关键词…」会让人以为搜索坏了。
-            let hint = if self.indexed == 0 {
+            // 查询搬到后台之后多了第三种：还在飞。这时候下面那些行是上一拍的，
+            // 说「没搜到」是假话。
+            let hint = if self.search_busy {
+                "搜索中…".to_string()
+            } else if self.indexed == 0 {
                 "索引正在建立（首次启动要爬一遍主目录），稍后再试".to_string()
             } else {
                 "输入关键词搜索整个文件系统".to_string()
