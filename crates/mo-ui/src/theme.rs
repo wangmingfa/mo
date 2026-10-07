@@ -364,12 +364,14 @@ pub fn is_dark() -> bool {
 ///
 /// 切主题后必须再调一次：它是全局状态，不会跟着 `Palette` 自动变。
 ///
-/// ⚠️ 全局 `Theme` 只有在框架初始化过之后才存在（布局测试里只 `init` 了 gpui，
-/// 没有组件主题全局），`global_mut` 对不存在的全局直接 panic——所以先探测。
+/// ⚠️ 全局 `Theme` 是框架初始化时才装的。生产在 `run()` 里 `gpui_kit::init` 过了，
+/// 但**建 `RootView` 的入口不止那一个**（headless 测试直接开窗口），而 kit 组件
+/// （§48 的 `ProgressCircle`）是在**渲染时**读 `cx.theme()` 的——所以这里缺就补装，
+/// 别早退：早退等于把「谁都得记得先 init」摊给每个入口，第一次忘就是整片红。
 pub fn apply_component(cx: &mut gpui_kit::App) {
     use gpui_kit::component::Theme;
     if cx.try_global::<Theme>().is_none() {
-        return;
+        gpui_kit::init(cx);
     }
     let p = current();
     let t = Theme::global_mut(cx);
