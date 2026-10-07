@@ -281,17 +281,6 @@ pub fn global_search_state_for_tests(view: &RootView) -> (String, usize, bool) {
     )
 }
 
-/// 测试专用：任务面板环形进度条的 `(直径, 环内字号)`。
-///
-/// 布局测试从**产品常量**取这两个数（§47 的教训：判据里抄一份尺寸，产品与测试就能
-/// 各改各的）。测试守的是两件算式关系：画出来的直径 == 要的直径（`Sizable::with_size`
-/// 会把请求值折成 0.75，这条拦住改写）、环内文字的宽度 ≤ 环内净空（净空 = 直径 −
-/// 2×笔画，笔画由组件按 `min(0.15×直径, 5px)` 自算）。
-#[doc(hidden)]
-pub fn progress_ring_geometry_for_tests() -> (f32, f32) {
-    progress_panel::ring_geometry_for_tests()
-}
-
 /// 测试专用：当前标签页**已经显示出来**的目录（导航是否生效的判据）。
 ///
 /// 别用 `AppState::opening_path()` 代替：那条在读取完成时会被发布成 `None`。

@@ -70,9 +70,6 @@ fn open_app_seeded(
     // 相关断言靠机器状态侥幸通过）。
     let app = AppState::with_trash(trash_root);
     setup(&app);
-    // kit 的全局 `Theme` 不用在这里补：`RootView::new` → `theme::apply_component`
-    // 缺就装（§48——`ProgressCircle` 渲染时读 `cx.theme()`，补在每个测试入口太散，
-    // 漏一处就是一整片 `no state of type Theme exists`）。
     let window = cx.open_window(window_size, move |_, cx| RootView::new(app.clone(), cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     // Home 目录是异步加载的；这里只关心布局，跑一轮让首帧画出来即可。
@@ -525,120 +522,30 @@ fn transfers_render_as_a_corner_badge_above_the_status_bar(cx: &mut TestAppConte
     assert!(vcx.debug_bounds("mo-ops-popover").is_none());
 }
 
-/// 卡片上的聚合环要同时守住两件事（§48 把聚合条换成环时立的判据）：
-///
-/// * **直径就是 `RING_D` 那个数**：`ProgressCircle` 的 `Sizable::with_size` 把
-///   `Size::Size(n)` 折成 `n × 0.75`（组件 `render` 里那条），照着它写会画 27 而不是
-///   36；实现用的是 `Styled` 的 `.w/.h`（实测与 `.size(px(…))` 等价，都按字面值画），
-///   这条断言钉住别改回去。
-/// * **环里的「100%」不骑到环壁上**：笔画宽由组件按 `min(0.15×直径, 5px)` 自己算，
-///   环内净空 = 直径 − 2×笔画；字号或直径哪天调小，第一个症状就是字压环。
-///
-/// 外加一笔旧账：这个 fork 的 `div` 不把子元素裁进父级圆角（`overflow_hidden()` 不被
-/// 消费），环必须躲开 8px 圆角的四个角块——换环之前，通栏进度条正是栽在这上面。
+/// 聚合进度条必须收在卡片的**直边区**里：这个 fork 的 `div` 不把子元素裁进
+/// 父级圆角（`overflow_hidden()` 不被消费），通栏贴边会从 8px 圆角底下戳出去
+/// （用户截图：进度条跑到圆角外面）。修法是左右收进 10px（≥ 圆角半径）。
 #[gpui_kit::test]
-fn aggregate_ring_keeps_its_diameter_label_and_corners(cx: &mut TestAppContext) {
+fn aggregate_bar_stays_inside_the_badge_corners(cx: &mut TestAppContext) {
     let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
-    // 一条已完成的任务：聚合比 = 100%，环里正是**最宽**的那种文字。
     seed_ops_until_visible(
         &mut vcx,
         &window,
         cx,
         &[FakeOp {
             id: 1,
-            status: OperationStatus::Completed,
-            progress: (5, 5),
+            status: OperationStatus::Running,
+            progress: (3, 10),
         }],
     );
 
     let badge = bounds(&mut vcx, "mo-ops-badge");
-    let ring = bounds(&mut vcx, "mo-ops-ring");
-    let label = bounds(&mut vcx, "mo-ops-ring-label");
-    // 判据用的数从产品常量取，不在测试里抄一份（§47 收过账的写法）。
-    let (want_d, _want_text) = mo_ui::progress_ring_geometry_for_tests();
-
-    let d = f32::from(ring.size.width);
+    let bar = bounds(&mut vcx, "mo-ops-bar");
+    let inset_l = f32::from(bar.origin.x - badge.origin.x);
+    let inset_r = f32::from((badge.origin.x + badge.size.width) - (bar.origin.x + bar.size.width));
     assert!(
-        (d - want_d).abs() <= 1.0 && (f32::from(ring.size.height) - d).abs() <= 1.0,
-        "环画成 {:?} 了：要的直径是 {want_d} 的正圆（`with_size` 会把请求值折成 0.75）",
-        ring.size
-    );
-
-    let stroke = (d * 0.15).min(5.0);
-    let clear = d - 2.0 * stroke;
-    let label_w = f32::from(label.size.width);
-    assert!(
-        label_w <= clear + 0.5,
-        "环内文字宽 {label_w}px，环内净空只有 {clear:.1}px（直径 {d}，笔画 {stroke:.1}）：字会骑到环壁上"
-    );
-
-    // 环的方框不许与卡片四角的 8px 角块相交。
-    const R: f32 = 8.0;
-    let (bx, by) = (f32::from(badge.origin.x), f32::from(badge.origin.y));
-    let (bw, bh) = (f32::from(badge.size.width), f32::from(badge.size.height));
-    let (rx, ry) = (f32::from(ring.origin.x), f32::from(ring.origin.y));
-    let (rw, rh) = (d, f32::from(ring.size.height));
-    let corners = [
-        (bx, by),
-        (bx + bw - R, by),
-        (bx, by + bh - R),
-        (bx + bw - R, by + bh - R),
-    ];
-    for (i, (corner_x, corner_y)) in corners.iter().enumerate() {
-        let overlaps =
-            rx + rw > *corner_x && rx < *corner_x + R && ry + rh > *corner_y && ry < *corner_y + R;
-        assert!(
-            !overlaps,
-            "环与卡片第 {i} 个 8px 圆角相交：ring={ring:?} badge={badge:?}"
-        );
-    }
-}
-
-/// 浮层每一行的环与卡片**同一只尺寸**（共用一个常量），且换环之后环仍完整落在行里：
-/// 行的下行原本是 4px 的细条，现在是一只 `RING_D` 的环，保底行高与滚动区估算
-/// （`estimated_row_h`）都改引用同一个 `RING_D`——这条钉住「估算与真实布局没分家」。
-#[gpui_kit::test]
-fn popover_rows_use_the_same_ring_as_the_badge(cx: &mut TestAppContext) {
-    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
-    seed_ops_until_visible(
-        &mut vcx,
-        &window,
-        cx,
-        &[
-            FakeOp {
-                id: 1,
-                status: OperationStatus::Running,
-                progress: (3, 10),
-            },
-            FakeOp {
-                id: 2,
-                status: OperationStatus::Completed,
-                progress: (5, 5),
-            },
-        ],
-    );
-    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
-    vcx.update(|window, cx| window.render_frame(cx));
-
-    let badge_ring = bounds(&mut vcx, "mo-ops-ring");
-    let row_ring = bounds(&mut vcx, "mo-ops-ring-1");
-    assert!(
-        (f32::from(row_ring.size.width) - f32::from(badge_ring.size.width)).abs() <= 1.0,
-        "行里的环与卡片的环尺寸不同：行={:?} 卡片={:?}",
-        row_ring.size,
-        badge_ring.size
-    );
-    assert!(
-        vcx.debug_bounds("mo-ops-ring-1-label").is_some(),
-        "行里的环没有百分比文字（每行各自一个选择器）"
-    );
-
-    let row = bounds(&mut vcx, "mo-ops-row-1");
-    assert!(
-        f32::from(row_ring.origin.y) >= f32::from(row.origin.y)
-            && f32::from(row_ring.origin.y) + f32::from(row_ring.size.height)
-                <= f32::from(row.origin.y) + f32::from(row.size.height),
-        "环被行高裁掉了：ring={row_ring:?} row={row:?}"
+        inset_l >= 8.0 && inset_r >= 8.0,
+        "进度条距卡片左右缘只有 {inset_l}/{inset_r}px：会从 8px 圆角底下戳出去"
     );
 }
 
@@ -834,11 +741,10 @@ fn long_transfer_description_wraps_instead_of_truncating(cx: &mut TestAppContext
     vcx.update(|window, cx| window.click("mo-ops-badge", cx));
     vcx.update(|window, cx| window.render_frame(cx));
     let row = bounds(&mut vcx, "mo-ops-row-9");
-    // 保底行高 70 = 一行描述 16 + gap 4 + 环 36 + 上下内边距 14（§48 换环后环顶掉了
-    // 原来那 4px 细条）；换行 ≥ 3 行时行高 ≥ 3×16 + 4 + 36 + 14 = 102。断言 82（比保底
-    // 高出一截、又比 102 宽松）：**「不是单行」才是重点**，具体几行由字体度量说了算。
+    // 保底行高 56 只容一行描述；换行 ≥ 3 行时行高 ≥ 3×16+22 = 70。
+    // 断言 64（=56+8）而不是 70：行数多了多少不重要，「不是单行」才是重点。
     assert!(
-        f32::from(row.size.height) >= 82.0,
+        f32::from(row.size.height) >= 64.0,
         "长描述应把行撑高（换行显示完整）而不是单行截断，实际行高 {:?}",
         row.size
     );

@@ -1,4 +1,3 @@
-use gpui_kit::component::progress::ProgressCircle;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::*;
 use mo_app::AppState;
@@ -11,26 +10,15 @@ use crate::{theme, RootView};
 /// `px(10)` 同一条竖线）。两边留白必须相等——写成 176 时右边只剩 2px，用户一眼看出
 /// 「左右间距不一样」（§47，`tests/layout.rs::badge_is_centered_in_the_sidebar_column`）。
 const CARD_W: f32 = 168.0;
-/// 卡片高：环（[`RING_D`]）+ 上下各 3px。旧值 30 装不下环，是 §48 把聚合条换成环时
-/// 一起长的——卡片是绝对定位的浮层，长高不占布局、不动文件区高度。
-const CARD_H: f32 = 42.0;
-/// 环形进度条的直径，卡片与浮层行**共用这一个数**。36 是环内文字反推出来的，不是随手
-/// 定的：笔画宽由组件按 `min(0.15×直径, 5px)` 算（36 时封顶 5），环内净空 = 直径 −
-/// 2×笔画 = 26，[`RING_TEXT`] 字号的「100%」实测宽 22，留 4px 余量——32 的环净空只有
-/// 22.4，同样的字只剩 0.4px，换个字体度量就骑到环壁上。这条由
-/// `tests/layout.rs::aggregate_ring_keeps_its_diameter_label_and_corners` 拿真实
-/// bounds 钉住（§48）。
-const RING_D: f32 = 36.0;
-/// 环内百分比的字号。
-const RING_TEXT: f32 = 9.0;
+const CARD_H: f32 = 30.0;
 /// 任务浮层宽度：比卡片宽（任务描述 + 速度 + 剩余时间需要横向空间），
 /// 左缘与卡片对齐、向上展开，超出侧栏盖在内容区上是浮层的本分。
 const POPOVER_W: f32 = 440.0;
-/// 任务行的**保底**高度（一行描述 + 一行环：`DESC_LINE_H + gap 4 + RING_D + 上下
-/// py 14`，内容垂直居中）。描述按真实换行撑开（长路径自动加高，见 [`render_op_row`]），
-/// 这只是下限。保底值仍要存在：列表滚动区高度是**算出来**的，`Scrollable` 需要定高
-/// 上下文，auto 高度链 + `max_h` 撑不出滚动区。
-const ROW_H: f32 = 70.0;
+/// 任务行的**保底**高度（单行描述 + 进度条，两行式内容垂直居中）。描述按
+/// 真实换行撑开（长路径自动加高，见 [`render_op_row`]），这只是下限。
+/// 保底值仍要存在：列表滚动区高度是**算出来**的，`Scrollable` 需要定高上下文，
+/// auto 高度链 + `max_h` 撑不出滚动区。
+const ROW_H: f32 = 56.0;
 /// 描述文本的行高——**显式钉住**：行高估算（[`estimated_row_h`]）与真实布局
 /// 必须用同一个值，否则估的行高和实际渲染高度对不上。
 const DESC_LINE_H: f32 = 16.0;
@@ -42,17 +30,12 @@ const LIST_MAX_H: f32 = 300.0;
 /// 所有耗时操作（删除 / 复制 / 移动 / 远程传输，以及后续的索引、同步等长期任务）
 /// 都汇进 `OperationManager` 的同一份快照，在这里统一呈现。两层结构：
 ///
-/// * **常显卡片**：贴侧栏底部同宽的长条，「N 个任务」加一只**聚合环**（总百分比写在
-///   环里）——有任何任务（含刚结束还没清走的）就一直在；
+/// * **常显卡片**：贴侧栏底部同宽的长条，显示「N 个任务 + 总百分比」和一条聚合
+///   进度条——有任何任务（含刚结束还没清走的）就一直在；
 /// * **任务浮层**：点卡片后在卡片**上方**（top-start 对齐卡片左缘）弹出，列出
-///   全部任务（行样式见 [`render_op_row`]，每行一只同款环、环色即状态色），右上角
-///   扫帚一键清除已完成的任务。
+///   全部任务（行样式见 [`render_op_row`]），右上角扫帚一键清除已完成的任务。
 ///   点空白处（`on_mouse_down_out`）收起；任务全部移除后由渲染层自动收起
 ///   （见 `RootView::render` 里 `ops_open` 的复位）。
-///
-/// 进度一律用 [`ProgressCircle`]（gpui-kit 现成组件：真画弧线路径，`canvas` +
-/// `paint_path`），不再用细条——环能同时说清「多少」「在不在动」「什么状态」，
-/// 百分比也就有了地方放（§48）。
 ///
 /// 数据来自 `OperationManager::snapshot()`（经 `tab.ops` 快照），由事件总线驱动刷新。
 /// `speeds` 是 UI 层对相邻快照差分出的估速（`RootView::op_speeds`），
@@ -99,7 +82,7 @@ pub fn render_overlay(
         wrapper = wrapper.child(render_popover(ops, speeds, app, entity));
     }
 
-    // ── 常显卡片：N 个任务 + 聚合环（百分比写在环里），整卡点击开合浮层 ──
+    // ── 常显卡片：N 个任务 + 总百分比 + 聚合进度条，整卡点击开合浮层 ──────
     let pct = aggregate_ratio(ops);
     let row = div()
         .flex()
@@ -117,14 +100,14 @@ pub fn render_overlay(
                 .text_color(theme::muted())
                 .child(text!(format!("{} 个任务", ops.len()))),
         )
-        .child(progress_ring(
-            "mo-ops-aggregate",
-            pct,
-            theme::selected_bg(),
-            "mo-ops-ring".to_string(),
-        ));
-    // 点击开合挂**外层卡片**这一层就够了：环里没有可点区，但环要是挂了一次点击，
-    // 冒泡到卡片会触发两遍（toggle × 2 = 没开）——嵌套点击只留最外层。
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::text())
+                .child(text!(format!("{:.0}%", pct * 100.0))),
+        );
+    // 点击开合挂**外层卡片**一层就够了：行里再挂一次会经冒泡触发两遍
+    // （toggle × 2 = 没开），嵌套可点击元素必须只有最内层带语义或外层拦冒泡。
     let card = div()
         .id("mo-ops-badge")
         .w(px(CARD_W))
@@ -139,7 +122,29 @@ pub fn render_overlay(
         .overflow_hidden()
         .hover(|s| s.bg(theme::hover_bg()))
         .debug_selector(|| "mo-ops-badge".to_string())
-        .child(row);
+        .child(row)
+        // 通栏聚合进度条：不占行高也能看出「在动」。
+        // ⚠️ 这个 fork 的 `div` **不把子元素裁进父级圆角**（`overflow_hidden()`
+        // 不被消费），通栏贴边会从卡片 8px 圆角底下戳出去；而 `paint_quad` 又
+        // 不 clamp 超尺寸圆角（3px 高装不下 8px 半径），子元素自己 `rounded_b(8)`
+        // 也画不对。收进卡片左右 10px 的直边区（与行内边距对齐），条自身用
+        // ≤半高的 pill 圆角——任何位置都不与圆角相交。
+        .child(
+            div()
+                .id("mo-ops-bar")
+                .h(px(3.0))
+                .mx(px(10.0))
+                .rounded(px(1.5))
+                .bg(theme::hover_bg())
+                .debug_selector(|| "mo-ops-bar".to_string())
+                .child(
+                    div()
+                        .h(px(3.0))
+                        .w(relative(pct))
+                        .rounded(px(1.5))
+                        .bg(theme::selected_bg()),
+                ),
+        );
     // 点击开合挂**外层卡片**这一层：行里再挂一次会经冒泡触发两遍
     // （toggle × 2 = 没开），嵌套可点击区域只有最外层带语义。
     let toggle = entity.clone();
@@ -151,43 +156,6 @@ pub fn render_overlay(
     // 非 test 构建（不带 test-support feature）这是恒等包装，不影响产物。
     // 必须**最后**包（挂完 children / 事件再包，与 sidebar / trash 行同款，实测踩过）。
     wrapper.child(card.test_support())
-}
-
-/// 环形进度条 + 环内百分比：卡片与浮层行共用这一处构造，于是直径、字号、笔画算式
-/// 只有一份（§48——两处各写一份的话，改了一处另一处就悄悄不对了）。
-///
-/// ⚠️ 直径用 `Styled` 的 `.w/.h` 钉，别换成 `Sizable::with_size`：那条路走
-/// `progress_circle.rs` 的 `Size::Size(s) => this.size(s * 0.75)`，实测
-/// `with_size(px(48.))` 画出来是 36，而 `.size(px(48.))`（= `.w/.h`）画出来是 48。
-/// 测试 `tests/layout.rs::aggregate_ring_keeps_its_diameter_label_and_corners`
-/// 量的就是画出来的那条边。
-fn progress_ring(id: impl Into<ElementId>, ratio: f32, color: Rgba, selector: String) -> Div {
-    let label_selector = format!("{selector}-label");
-    div()
-        .flex_shrink_0()
-        .debug_selector(move || selector.clone())
-        .child(
-            ProgressCircle::new(id)
-                // 组件吃的是 0~100 的百分值，不是 0~1 的比值。
-                .value(ratio * 100.0)
-                .color(color)
-                .w(px(RING_D))
-                .h(px(RING_D))
-                .child(
-                    div()
-                        .debug_selector(move || label_selector.clone())
-                        .text_size(px(RING_TEXT))
-                        .text_color(theme::text())
-                        .child(text!(format!("{:.0}%", (ratio * 100.0).round()))),
-                ),
-        )
-}
-
-/// 测试专用：环的 `(直径, 环内字号)`（见 `lib.rs::progress_ring_geometry_for_tests`）。
-/// 布局判据要读**同一份来源**，不能把直径数字抄进测试——那正是 §47 收过账的写法。
-#[doc(hidden)]
-pub(crate) fn ring_geometry_for_tests() -> (f32, f32) {
-    (RING_D, RING_TEXT)
 }
 
 /// 任务浮层：标题行（任务数 + 扫帚）+ 全部任务列表，绝对定位在卡片上方。
@@ -311,7 +279,7 @@ fn render_popover(
         )
 }
 
-/// 展开列表里的一行：两行式——上行「状态点 + 描述 + 动作」，下行「进度环 + 尾标」。
+/// 展开列表里的一行：两行式——上行「状态点 + 描述 + 动作」，下行「进度条 + 尾标」。
 fn render_op_row(
     op: &OperationHandle,
     speed: Option<(f32, f64)>,
@@ -414,31 +382,38 @@ fn render_op_row(
                 )
                 .child(action),
         )
-        // 下行：环（百分比在里面）+ 尾标（环里装不下的信息：速度 / 剩余时间 / 中文状态）。
+        // 下行：进度条（占满）+ 尾标（进行中给百分比，结束态给中文状态）。
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(progress_ring(
-                    ("mo-ops-ring", op.id),
-                    ratio,
-                    status_color(op),
-                    format!("mo-ops-ring-{}", op.id),
-                ))
                 .child(
                     div()
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(theme::hover_bg())
+                        .child(
+                            div()
+                                .h(px(4.0))
+                                .w(relative(ratio))
+                                .rounded(px(2.0))
+                                .bg(theme::selected_bg()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .min_w(px(40.0))
                         .text_size(px(11.0))
                         .text_color(if running {
                             theme::muted()
                         } else {
                             status_color(op)
                         })
-                        .child(text!(status_tail(op, speed))),
+                        .child(text!(status_tail(op, ratio, speed))),
                 ),
         )
 }
@@ -462,11 +437,10 @@ fn estimate_desc_lines(text: &str) -> usize {
     lines.max(1.0) as usize
 }
 
-/// 单行的估算高度：行数 × 钉住的行高 + 下行环 [`RING_D`] + 行间 gap 4 + 上下
-/// 内边距 14；不低于保底高 [`ROW_H`]（单行时的观感与旧定高一致）。环与估算绑
-/// **同一个常量**——§47 那条教训：两处各写一份尺寸，改一处就漂移，这次直接引用。
+/// 单行的估算高度：行数 × 钉住的行高 + 下行进度条 4 + 行间 gap 4 + 上下
+/// 内边距 14；不低于保底高 [`ROW_H`]（单行时的观感与旧定高一致）。
 fn estimated_row_h(describe: &str) -> f32 {
-    let content = estimate_desc_lines(describe) as f32 * DESC_LINE_H + RING_D + 4.0 + 14.0;
+    let content = estimate_desc_lines(describe) as f32 * DESC_LINE_H + 22.0;
     ROW_H.max(content)
 }
 
@@ -492,23 +466,24 @@ fn aggregate_ratio(ops: &[OperationHandle]) -> f32 {
     ops.iter().map(ratio_of).sum::<f32>() / ops.len() as f32
 }
 
-/// 行尾的小字：百分比画进环里之后，这里只补环装不下的东西——进行中给
-/// 「速度 · 剩余时间」（首次观测还没差分出速度就留空，宁可少一句也不写
-/// 「· 3 MB/s」这种残句）；其余状态给中文标签（排队 / 已暂停 / 完成 / 失败 /
-/// 已取消），于是不再出现「完成 0%」这种自相矛盾的组合。
-fn status_tail(op: &OperationHandle, speed: Option<(f32, f64)>) -> String {
-    if op.status != OperationStatus::Running {
-        return status_label(op).to_string();
-    }
-    match speed {
-        Some((bps, eta)) if bps > 0.0 => {
-            let mut s = speed_label(bps);
-            if eta > 0.0 {
-                s.push_str(&format!(" · {}", eta_label(eta)));
+/// 行尾的小字：进行中给百分比，估得出速度再补「速度 · 剩余时间」；
+/// 结束态给中文状态（不再出现「完成 0%」这种自相矛盾的组合）。
+fn status_tail(op: &OperationHandle, ratio: f32, speed: Option<(f32, f64)>) -> String {
+    match op.status {
+        OperationStatus::Pending | OperationStatus::Running => {
+            let mut s = format!("{:.0}%", ratio * 100.0);
+            if let Some((bps, eta)) = speed {
+                // 首次观测还没差分出速度（或样本太少），只显示百分比。
+                if bps > 0.0 {
+                    s.push_str(&format!(" · {}", speed_label(bps)));
+                    if eta > 0.0 {
+                        s.push_str(&format!(" · {}", eta_label(eta)));
+                    }
+                }
             }
             s
         }
-        _ => String::new(),
+        _ => status_label(op).to_string(),
     }
 }
 
