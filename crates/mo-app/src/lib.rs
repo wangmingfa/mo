@@ -3446,9 +3446,31 @@ impl AppState {
         self.index_stop.store(true, Ordering::Relaxed);
     }
 
-    /// 查询全局索引（同步、毫秒级）。
+    /// 查询全局索引——**同步扫表，别在主线程调**，界面要用的是
+    /// [`AppState::global_search_bg`]。
+    ///
+    /// `FileIndex::search` 是 `name_lower LIKE '%词%' OR path LIKE '%词%'`：中缀通配
+    /// 用不上任何索引，58 万行的库上实测一次约 **150ms**，还要排在索引锁后面（锁的另一头
+    /// 是爬取与 §45 那套清理）。留这个同步门面给测试与非 UI 调用方（`tests/productivity.rs`、
+    /// `tests/global_index.rs` 都在直接问结果）。
     pub fn global_search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         self.index.lock().search(query, limit).unwrap_or_default()
+    }
+
+    /// [`AppState::global_search`] 的后台版本：查询整趟跑在 blocking 池上，调用线程
+    /// 只等一个 future，一次都不碰索引锁、一条 SQL 都不发。
+    ///
+    /// 「输入即搜」的模态框每敲一个字就要问一次（`Modal::GlobalSearch` 的按键处理），
+    /// 而这一次扫描的量级与 §45 修掉的两个是同一族病——那两处把主线程松开之后，
+    /// 剩下的第三把刀就是这里。空查询直接返回空，不占池。
+    pub async fn global_search_bg(&self, query: String, limit: usize) -> Vec<SearchHit> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        let index = self.index.clone();
+        self.spawn_blocking(move || index.lock().search(&query, limit).unwrap_or_default())
+            .await
+            .unwrap_or_default()
     }
 
     /// 索引中的文件总数——**读缓存，不在调用线程上做全表扫描**。
