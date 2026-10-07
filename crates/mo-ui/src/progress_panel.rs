@@ -1,4 +1,5 @@
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mo_app::AppState;
 use mo_operations::{OperationHandle, OperationStatus};
@@ -14,7 +15,7 @@ const CARD_H: f32 = 30.0;
 /// 任务浮层宽度：比卡片宽（任务描述 + 速度 + 剩余时间需要横向空间），
 /// 左缘与卡片对齐、向上展开，超出侧栏盖在内容区上是浮层的本分。
 const POPOVER_W: f32 = 440.0;
-/// 任务行的**保底**高度（单行描述 + 进度条，两行式内容垂直居中）。描述按
+/// 任务行的**保底**高度（上行描述 + 下行小字，两行式内容垂直居中）。描述按
 /// 真实换行撑开（长路径自动加高，见 [`render_op_row`]），这只是下限。
 /// 保底值仍要存在：列表滚动区高度是**算出来**的，`Scrollable` 需要定高上下文，
 /// auto 高度链 + `max_h` 撑不出滚动区。
@@ -30,8 +31,8 @@ const LIST_MAX_H: f32 = 300.0;
 /// 所有耗时操作（删除 / 复制 / 移动 / 远程传输，以及后续的索引、同步等长期任务）
 /// 都汇进 `OperationManager` 的同一份快照，在这里统一呈现。两层结构：
 ///
-/// * **常显卡片**：贴侧栏底部同宽的长条，显示「N 个任务 + 总百分比」和一条聚合
-///   进度条——有任何任务（含刚结束还没清走的）就一直在；
+/// * **常显卡片**：贴侧栏底部同宽的长条，左端「N 个任务」、右端一条聚合
+///   百分比——有任何任务（含刚结束还没清走的）就一直在；
 /// * **任务浮层**：点卡片后在卡片**上方**（top-start 对齐卡片左缘）弹出，列出
 ///   全部任务（行样式见 [`render_op_row`]），右上角扫帚一键清除已完成的任务。
 ///   点空白处（`on_mouse_down_out`）收起；任务全部移除后由渲染层自动收起
@@ -82,7 +83,7 @@ pub fn render_overlay(
         wrapper = wrapper.child(render_popover(ops, speeds, app, entity));
     }
 
-    // ── 常显卡片：N 个任务 + 总百分比 + 聚合进度条，整卡点击开合浮层 ──────
+    // ── 常显卡片：N 个任务 + 聚合百分比，整卡点击开合浮层 ──────────────
     let pct = aggregate_ratio(ops);
     let row = div()
         .flex()
@@ -104,6 +105,9 @@ pub fn render_overlay(
             div()
                 .flex_shrink_0()
                 .text_color(theme::text())
+                // selector 带上的就是这个数字本身：测试断言「卡片右端显示的是聚合比」
+                // 只能验到真正画出来的那串字（同 §47 用 bounds 而不是抄常量）。
+                .debug_selector(move || format!("mo-ops-pct-{}", (pct * 100.0).round()))
                 .child(text!(format!("{:.0}%", pct * 100.0))),
         );
     // 点击开合挂**外层卡片**一层就够了：行里再挂一次会经冒泡触发两遍
@@ -122,29 +126,7 @@ pub fn render_overlay(
         .overflow_hidden()
         .hover(|s| s.bg(theme::hover_bg()))
         .debug_selector(|| "mo-ops-badge".to_string())
-        .child(row)
-        // 通栏聚合进度条：不占行高也能看出「在动」。
-        // ⚠️ 这个 fork 的 `div` **不把子元素裁进父级圆角**（`overflow_hidden()`
-        // 不被消费），通栏贴边会从卡片 8px 圆角底下戳出去；而 `paint_quad` 又
-        // 不 clamp 超尺寸圆角（3px 高装不下 8px 半径），子元素自己 `rounded_b(8)`
-        // 也画不对。收进卡片左右 10px 的直边区（与行内边距对齐），条自身用
-        // ≤半高的 pill 圆角——任何位置都不与圆角相交。
-        .child(
-            div()
-                .id("mo-ops-bar")
-                .h(px(3.0))
-                .mx(px(10.0))
-                .rounded(px(1.5))
-                .bg(theme::hover_bg())
-                .debug_selector(|| "mo-ops-bar".to_string())
-                .child(
-                    div()
-                        .h(px(3.0))
-                        .w(relative(pct))
-                        .rounded(px(1.5))
-                        .bg(theme::selected_bg()),
-                ),
-        );
+        .child(row);
     // 点击开合挂**外层卡片**这一层：行里再挂一次会经冒泡触发两遍
     // （toggle × 2 = 没开），嵌套可点击区域只有最外层带语义。
     let toggle = entity.clone();
@@ -279,7 +261,7 @@ fn render_popover(
         )
 }
 
-/// 展开列表里的一行：两行式——上行「状态点 + 描述 + 动作」，下行「进度条 + 尾标」。
+/// 展开列表里的一行：两行式——上行「状态点 + 描述 + 动作」，下行「百分比 + 尾标」。
 fn render_op_row(
     op: &OperationHandle,
     speed: Option<(f32, f64)>,
@@ -382,40 +364,45 @@ fn render_op_row(
                 )
                 .child(action),
         )
-        // 下行：进度条（占满）+ 尾标（进行中给百分比，结束态给中文状态）。
-        .child(
+        // 下行：百分比（只在还有事在动的时候有）+ 尾标（速度 · 剩余时间，或中文状态）。
+        .child({
+            let op_id = op.id;
+            let pct_int = (ratio * 100.0).round();
+            let tail = status_tail(op, speed);
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .h(px(4.0))
-                        .rounded(px(2.0))
-                        .bg(theme::hover_bg())
-                        .child(
-                            div()
-                                .h(px(4.0))
-                                .w(relative(ratio))
-                                .rounded(px(2.0))
-                                .bg(theme::selected_bg()),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .min_w(px(40.0))
-                        .text_size(px(11.0))
-                        .text_color(if running {
-                            theme::muted()
-                        } else {
-                            status_color(op)
-                        })
-                        .child(text!(status_tail(op, ratio, speed))),
-                ),
-        )
+                .gap(px(6.0))
+                .when(shows_percent(op.status), |this| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .text_color(theme::text())
+                            // 选择器带上数值：测试验的是「这一行显示的是它自己那趟的
+                            // 比例」，不是「有个百分比字样的东西」（§48 撤环之后的判据）。
+                            .debug_selector(move || format!("mo-ops-row-pct-{op_id}-{pct_int}"))
+                            .child(text!(format!("{:.0}%", ratio * 100.0))),
+                    )
+                })
+                // 速度还没差分出来时尾标是空的：空 div 也会吃掉一个 gap，显式收掉。
+                .when(!tail.is_empty(), |this| {
+                    let text = tail;
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.0))
+                            .text_color(if running {
+                                theme::muted()
+                            } else {
+                                status_color(op)
+                            })
+                            .debug_selector(move || format!("mo-ops-row-tail-{op_id}"))
+                            .child(text!(text)),
+                    )
+                })
+        })
 }
 
 /// 描述文本在浮层行内的可用宽度：浮层宽 − 左右内边距 − 状态点 − 两处 gap −
@@ -437,8 +424,9 @@ fn estimate_desc_lines(text: &str) -> usize {
     lines.max(1.0) as usize
 }
 
-/// 单行的估算高度：行数 × 钉住的行高 + 下行进度条 4 + 行间 gap 4 + 上下
-/// 内边距 14；不低于保底高 [`ROW_H`]（单行时的观感与旧定高一致）。
+/// 单行的估算高度：行数 × 钉住的行高，加上描述之外的固定部分（行间 gap + 下行
+/// 小字 + 上下内边距）；不低于保底高 [`ROW_H`]（单行时的观感与旧定高一致）。
+/// 这个叠量取的是经验值 22，只影响滚动条长度，不裁字（见 [`estimate_desc_lines`]）。
 fn estimated_row_h(describe: &str) -> f32 {
     let content = estimate_desc_lines(describe) as f32 * DESC_LINE_H + 22.0;
     ROW_H.max(content)
@@ -466,20 +454,28 @@ fn aggregate_ratio(ops: &[OperationHandle]) -> f32 {
     ops.iter().map(ratio_of).sum::<f32>() / ops.len() as f32
 }
 
-/// 行尾的小字：进行中给百分比，估得出速度再补「速度 · 剩余时间」；
-/// 结束态给中文状态（不再出现「完成 0%」这种自相矛盾的组合）。
-fn status_tail(op: &OperationHandle, ratio: f32, speed: Option<(f32, f64)>) -> String {
+/// 这一行要不要显示百分比：只有「还有事在动」的状态要（排队 / 进行中）。
+/// 已结束的行给中文状态就够，「完成 100%」是重复信息，「失败 40%」反而像进度还在走。
+fn shows_percent(status: OperationStatus) -> bool {
+    matches!(status, OperationStatus::Pending | OperationStatus::Running)
+}
+
+/// 行尾的小字：进行中给「速度 · 剩余时间」（首次观测还没差分出速度时留空，
+/// 百分比已经在同一行左边了）；结束态给中文状态。
+fn status_tail(op: &OperationHandle, speed: Option<(f32, f64)>) -> String {
     match op.status {
         OperationStatus::Pending | OperationStatus::Running => {
-            let mut s = format!("{:.0}%", ratio * 100.0);
-            if let Some((bps, eta)) = speed {
-                // 首次观测还没差分出速度（或样本太少），只显示百分比。
-                if bps > 0.0 {
-                    s.push_str(&format!(" · {}", speed_label(bps)));
-                    if eta > 0.0 {
-                        s.push_str(&format!(" · {}", eta_label(eta)));
-                    }
-                }
+            let Some((bps, eta)) = speed else {
+                return String::new();
+            };
+            // 速度估不出（样本太少或没在动）就连同剩余时间一起不显示，
+            // 别让尾标挂个「0 B/s · 剩余 0s」。
+            if bps <= 0.0 {
+                return String::new();
+            }
+            let mut s = speed_label(bps);
+            if eta > 0.0 {
+                s.push_str(&format!(" · {}", eta_label(eta)));
             }
             s
         }

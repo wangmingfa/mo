@@ -522,30 +522,91 @@ fn transfers_render_as_a_corner_badge_above_the_status_bar(cx: &mut TestAppConte
     assert!(vcx.debug_bounds("mo-ops-popover").is_none());
 }
 
-/// 聚合进度条必须收在卡片的**直边区**里：这个 fork 的 `div` 不把子元素裁进
-/// 父级圆角（`overflow_hidden()` 不被消费），通栏贴边会从 8px 圆角底下戳出去
-/// （用户截图：进度条跑到圆角外面）。修法是左右收进 10px（≥ 圆角半径）。
+/// 卡片右端的数字**就是聚合比**（不是某一条任务自己的比例），并且这块文字必须
+/// 待在直边区里：这个 fork 的 `div` 不把子元素裁进父级圆角（`overflow_hidden()`
+/// 不被消费），通栏贴边会从 8px 圆角底下戳出去——同一条判据原先由进度条守着，
+/// §48 撤掉环和细条之后交给百分比自己守。
+///
+/// 选择器名带的是渲染出来的那串字（`mo-ops-pct-65`），所以「显示对了」这件事是
+/// 在帧上验的，不是把常量抄进测试（§47 的判据）。
 #[gpui_kit::test]
-fn aggregate_bar_stays_inside_the_badge_corners(cx: &mut TestAppContext) {
+fn badge_percentage_is_the_aggregate_and_stays_inside_the_corners(cx: &mut TestAppContext) {
     let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
     seed_ops_until_visible(
         &mut vcx,
         &window,
         cx,
-        &[FakeOp {
-            id: 1,
-            status: OperationStatus::Running,
-            progress: (3, 10),
-        }],
+        &[
+            // 30% 与 100%（已完成记满格）→ 聚合 65%
+            FakeOp {
+                id: 1,
+                status: OperationStatus::Running,
+                progress: (3, 10),
+            },
+            FakeOp {
+                id: 2,
+                status: OperationStatus::Completed,
+                progress: (5, 5),
+            },
+        ],
     );
 
     let badge = bounds(&mut vcx, "mo-ops-badge");
-    let bar = bounds(&mut vcx, "mo-ops-bar");
-    let inset_l = f32::from(bar.origin.x - badge.origin.x);
-    let inset_r = f32::from((badge.origin.x + badge.size.width) - (bar.origin.x + bar.size.width));
+    let pct = bounds(&mut vcx, "mo-ops-pct-65");
+    let inset_l = f32::from(pct.origin.x - badge.origin.x);
+    let inset_r = f32::from((badge.origin.x + badge.size.width) - (pct.origin.x + pct.size.width));
     assert!(
         inset_l >= 8.0 && inset_r >= 8.0,
-        "进度条距卡片左右缘只有 {inset_l}/{inset_r}px：会从 8px 圆角底下戳出去"
+        "百分比距卡片左右缘只有 {inset_l}/{inset_r}px：会从 8px 圆角底下戳出去"
+    );
+    // 单条任务的比例不能串到卡片上（聚合写错成「取第一条」就红在这里）。
+    assert!(
+        vcx.debug_bounds("mo-ops-pct-30").is_none() && vcx.debug_bounds("mo-ops-pct-100").is_none(),
+        "卡片上出现了单条任务的比例，聚合比算错了"
+    );
+}
+
+/// 浮层每一行的下行：进行中显示**自己那趟**的比例，结束态只显示中文状态。
+/// 「完成 100%」是重复信息、「失败 40%」看着像还在走，所以 `shows_percent`
+/// 只放行排队 / 进行中。速度还没差分出来时尾标整块不画（不留空 gap）。
+#[gpui_kit::test]
+fn popover_rows_show_percent_only_while_the_task_is_alive(cx: &mut TestAppContext) {
+    let (mut vcx, window) = open_app(size(px(1000.), px(700.)), cx);
+    seed_ops_until_visible(
+        &mut vcx,
+        &window,
+        cx,
+        &[
+            FakeOp {
+                id: 1,
+                status: OperationStatus::Running,
+                progress: (3, 10),
+            },
+            FakeOp {
+                id: 2,
+                status: OperationStatus::Completed,
+                progress: (5, 5),
+            },
+        ],
+    );
+    vcx.update(|window, cx| window.click("mo-ops-badge", cx));
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    assert!(
+        vcx.debug_bounds("mo-ops-row-pct-1-30").is_some(),
+        "进行中的行没显示自己那趟的比例"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-row-pct-2-100").is_none(),
+        "已完成的行不该再显示百分比"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-row-tail-2").is_some(),
+        "已完成的行要给中文状态（完成）"
+    );
+    assert!(
+        vcx.debug_bounds("mo-ops-row-tail-1").is_none(),
+        "一次快照差分不出速度，进行中的行不该挂着空尾标"
     );
 }
 
