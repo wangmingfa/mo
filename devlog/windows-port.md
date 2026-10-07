@@ -269,6 +269,7 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * ~~**拖动多个文件做移动时界面卡住几秒钟**~~ **已修**（2026-10-06，§45）：账在搜索索引，不在拖拽也不在传输——`FileIndex::remove_under` 的 `LIKE '前缀/%'` 是 58 万行全表扫（实测一次 147ms，未命中一样），每个被移走的条目一次，期间索引锁被攥着；主线程那边 `sync_panel` 每拍同步问一次「已索引 N」（`COUNT(*)`，实测 64ms），排在同一把锁后面，两边互相放大。`remove_under` 改 path 字节范围（走 `idx_path`，未命中 33µs），`index_count` 改「第一次就地数、之后读缓存 + 1s TTL 派发后台重算」。**新欠**（同一族，本轮没动→**已还**，2026-10-06，§46）：命令面板的 `global_search` 仍是主线程一次 `LIKE '%q%'` 全表扫（同一份库约 150ms/次按键），那是搜索线的账，不在拖动路径上。
 * ~~**全局搜索每敲一个字卡一下**~~ **已搬出主线程**（2026-10-06，§46）：`Modal::GlobalSearch` 的按键处理原来同步跑 `AppState::global_search`（`name_lower LIKE '%词%' OR path LIKE '%词%'`，中缀通配用不上任何索引，58 万行实测约 150ms/次）；现在查询整趟派到 blocking 池，回来只对「趟号」——过期那趟落地即丢，关掉模态重新打开看不见上一次查询的行。`crates/mo-ui/tests/global_search_bg.rs` 三条钉住，两轮变异反验。**仍欠**：`FileIndex::search` 本身还是全表扫，后台化只是让它离开主线程；要真快得上 FTS/trigram，那是搜索线的下一笔账。
 * ~~**左下角任务卡片左右间距不一样**~~ **已修**（2026-10-07，§47）：卡片宽写在常量里是 176，壳的左边距是 10，侧栏宽 188——右边只剩 2px，肉眼就是「贴边」。`CARD_W` 改 168（188−10−10，与卡片 `left(10)`、状态栏 `px(10)` 同一条节奏），`tests/layout.rs::badge_is_centered_in_the_sidebar_column` 拿真实 bounds 把 `SIDEBAR_WIDTH`／`left`／`CARD_W` 三个常量绑在一起，谁改宽了卡片就红。
+* ~~**进度条改成环形、百分比放进环里**~~ **已改**（2026-10-07，§48）：卡片聚合条与浮层每行的细条都换成 kit 的 `ProgressCircle`，环内写完整「47%」；直径 36 由「9px 的『100%』实测宽 22px，净空要留得住」反推而来，卡片长到 42、行保底长到 70。`tests/layout.rs` 两条新判据（正圆 / 字不骑环壁 / 不撞 8px 圆角 / 两处同尺寸）四个变异反验。**剩真机看**：9px 字在 36px 环里够不够清楚、5px 笔画粗细与深色卡片的搭配、卡片长高后与状态栏的叠放观感——headless 判不了审美。
 
 
 ## 28. macOS 文件剪贴板「出去」补齐（2026-09-29，bf4519e）
@@ -949,3 +950,73 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **边界**：卡片壳是相对**窗口**摆位的（`left(10)`），隐藏侧栏时它照样贴窗口左缘——
   那没有「侧栏列」可对称，也没人报过；本轮没把卡片搬进侧栏子树，那会牵动浮层的弹出锚点
   （`POPOVER_W 440` 宽于侧栏，盖在内容区上本就是浮层的本分）。
+
+### §48：任务进度从细条改成环，百分比写进环里——直径是反推出来的（2026-10-07）
+
+* **来路**：用户一句话「progress_panel 里面的进度条改成环形进度条，然后百分比放到环形
+  里面」。两处追问定了范围：① 卡片那条通栏聚合条**和**浮层每一行的细条都换（不是只换
+  卡片）；② 环里写**完整**的「47%」（连百分号），卡片可以为此长高。
+* **用 kit 的环，没自拼**：`gpui_kit::component::progress::ProgressCircle`——`canvas` +
+  lyon 折线段 + `Window::paint_path` 真画弧。为什么不能拿渐变糊一个：这个 fork 的
+  `BackgroundTag` 只有 `Solid / LinearGradient / PatternSlash / Checkerboard`
+  （`gpui-pre-0.3.7/src/color.rs:745`），**没有 conic / radial**，糊不出环；
+  `svg().data(…)` 每次改值都要重解析一份文档，而进度是持续动的，不合适。
+* **组件四个 API 坑，每个都实测过**：
+  * `.value(f32)` 吃 **0~100**，不是 0~1 的比值（内部 clamp 到 `0..=100`）。传比值的话
+    环永远只画到 1% 都不到。
+  * 直径用 `Styled` 的 `.w/.h` 钉。`.size(px(…))` 与它等价（实测 `.size(px(48.))` 画
+    48）；**但 `Sizable::with_size` 不是**：`progress_circle.rs:175` 把 `Size::Size(s)`
+    折成 `this.size(s * 0.75)`，实测 `with_size(px(48.))` 画出来 **36**。
+  * `.color()` 要 `impl Into<Hsla>`（项目里到处是 `Rgba`，有 From impl 直接传）；底色
+    轨道是同一支色的 `opacity(0.2)`。children 由组件自己 `items_center/justify_center`
+    居中，环内文字塞一个 child 就行。
+  * 它读 `cx.theme()`，而 `Theme` 是 `gpui_kit::init` 装进 app 全局的：生产在 `run()`
+    里装了，`crate::theme::apply_component` 原来在**没有 Theme 时早退不装**。第一次全量
+    闸门因此红了 **24 条**（`column_drag` / `drag_feedback` / `grid_drag` / `os_drop` /
+    `internal_drag` / `column_refresh` / `session` 七个测试二进制，全是
+    `no state of type gpui_component::theme::Theme exists`）——我只在 `layout.rs` 的
+    harness 里补了 `gpui_kit::init` 就以为收工了。**修法不是挨个补 harness**：
+    `apply_component` 改成「缺就 `gpui_kit::init` 补装」（`theme.rs`），建 `RootView`
+    的入口立刻全好了，`layout.rs` 里那句补的 init 也撤了。判据：**一个约束要靠「每个
+    调用方都记得」才成立的，就该收到共同上游去**；七个二进制同一条 panic 就是它本来
+    不该由调用方记的证据。
+* **直径是算出来的，不是挑的**：笔画宽 = `min(0.15×直径, 5px)`，环内净空 = 直径 −
+  2×笔画。环里最宽的字是「100%」，9px 字号在 headless 实测宽 **22px**。直径 32 → 笔画
+  4.8 → 净空 22.4，只剩 **0.4px**：那是赌字体度量，换个字体/缩放字就骑到环壁上。直径
+  **36** → 笔画封顶 5 → 净空 26.0，留 4px。于是 `RING_D = 36`，卡片 `CARD_H` 30 →
+  **42**（36 + 上下各 3），行保底高 `ROW_H` 56 → **70**（`DESC_LINE_H 16 + gap 4 +
+  RING_D 36 + py 14`），`estimated_row_h` 的算式跟着换——滚动区高度是**算**出来的，
+  估算与布局必须同式。
+* **改了什么**：卡片的 `mo-ops-bar`（3px 通栏细条 + 行尾一个 `{:.0}%` 文字）整块删掉，
+  换成聚合环；行里原本是「描述 / 细条 + 百分比 / 速度·ETA」，现在第二行是「环（环内
+  百分比）+ 行尾速度 · 剩余时间」——**进行中的行不再有两处百分比**：环说「多少」，行尾
+  说「多快」。卡片与行共用同一处构造 `progress_ring()`，直径、字号、笔画算式只有一份。
+  卡片上那段「细条通栏会从 8px 圆角底下戳出去」的权衡注释随细条一起删了
+  （`.overflow_hidden()` 留着，卡片背景和边框本来就要裁）。
+* **测试**（`crates/mo-ui/tests/layout.rs`，两条新的，断言全打在真实 bounds 上）：
+  * `aggregate_ring_keeps_its_diameter_label_and_corners`：① 环是 `RING_D` 的正圆
+    （宽高差 ≤ 1px）；② 环内文字实测宽 ≤ 净空 + 0.5px；③ 环的方框不与卡片四个 8px
+    圆角块相交。种的任务是 100%，专门逼出最宽的「100%」。
+  * `popover_rows_use_the_same_ring_as_the_badge`：行里的环与卡片的环**同一尺寸**，
+    且环完整落在行框内。
+  * 判据要的直径/字号从 `mo_ui::progress_ring_geometry_for_tests()` 取，不在测试里抄
+    数字——§47 刚收过「注释里的几何数字对不上布局」这笔账，抄进测试是它的孪生写法。
+* **变异反验**（四个，每个都 `cp` 备份 → 种 → 跑 → `cp` 还原 + `touch` + `diff` 确认
+  RESTORED_OK；动的只有产品代码，测试一字未改）：
+  * `.w/.h` → `.with_size(px(RING_D))`：红在①，「环画成 Size { 27px × 27px } 了：要的
+    直径是 36 的正圆」——36×0.75=27，正是那条 API 坑本尊。
+  * `RING_D` 36 → 30：红在②，「环内文字宽 22px，环内净空只有 21.0px（直径 30，笔画
+    4.5）：字会骑到环壁上」。
+  * 卡片行 `px(px(10.0))` → `px(px(2.0))`：红在③，「环与卡片第 1 个 8px 圆角相交」并
+    打印两边 bounds（`flex_1` 的描述把环推到右缘，2px 内边距让它压进圆角）。
+  * 行里的环另加 `.w(px(24.)).h(px(24.))`：红在「同一尺寸」那条，「行里的环与卡片的环
+    尺寸不同：行=24px 卡片=36px」——防的就是两处各写一份尺寸后分家。
+  * **把自己写错的一条改回来了**：注释与报错原文写的是「用 `.size()` 会折成 0.75」，
+    那是把 `Styled::size`（就是 w+h）当成了 `Sizable::with_size`。实测 `.size(px(48.))`
+    画 48、`with_size(px(48.))` 才画 36。文案跟着证据改了——注释里的事实也得能被布局
+    验出来，不然和 §47 那条凭想象写的 6px 是同一种债。
+* **边界 / 剩真机看**：环的观感 headless 判不了——9px 的「100%」在 36px 的环里够不够
+  清楚、5px 笔画配这套深色卡片粗不粗、卡片长到 42px 后与状态栏（壳仍 `bottom(32)`）
+  叠不叠得好看，都要用户扫一眼。另外 `.value` 走 `transition(…)` 动画（时长取主题
+  motion token），headless 测不到「在动」这件事，只验了落地后的几何；环色就是
+  `status_color(op)`，完成/失败/进行中的区分度与细条时代一致。
