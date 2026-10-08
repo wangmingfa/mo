@@ -141,6 +141,12 @@ pub enum Endpoint {
     Local,
     /// 一条远程会话（同一会话可同时作为两端：远程目录内复制）。
     Remote(Arc<dyn FileSystem>),
+    /// 已挂载的系统网络盘（SMB / NFS）。路径是本机路径，但落在网络文件系统上，
+    /// 传输时按远程对待：走 `TransferOperation`（分块 / 续传 / 统一进度），移动走
+    /// 「复制后删源」而非 `std::fs::rename`（跨文件系统 rename 必败）。读写的
+    /// `FileSystem` 实现仍是 `LocalFileSystem`——挂载点对 `mo-fs` 来说就是本地目录，
+    /// 只是「网络」这个性质要拿去决定走哪条传输链。
+    NetworkMount(Arc<dyn FileSystem>),
 }
 
 impl Endpoint {
@@ -149,7 +155,9 @@ impl Endpoint {
     pub fn same_session(&self, other: &Endpoint) -> bool {
         match (self, other) {
             (Self::Local, Self::Local) => true,
-            (Self::Remote(a), Self::Remote(b)) => Arc::ptr_eq(a, b),
+            (Self::Remote(a), Self::Remote(b)) | (Self::NetworkMount(a), Self::NetworkMount(b)) => {
+                Arc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -316,12 +324,19 @@ fn resolve_transfer_leg(
 ) -> Option<TransferLeg> {
     match (src_ep, dest_ep) {
         (Endpoint::Local, Endpoint::Local) => None,
-        // 远程之间（同一会话内复制）。
-        (Endpoint::Remote(f), Endpoint::Remote(g)) => Some((f.clone(), g.clone(), "复制")),
-        // 远程 → 本地：下载。
-        (Endpoint::Remote(f), Endpoint::Local) => Some((f.clone(), local.clone(), "下载")),
-        // 本地 → 远程：上传。
-        (Endpoint::Local, Endpoint::Remote(f)) => Some((local.clone(), f.clone(), "上传")),
+        // 远程之间（同一会话内复制）／两块网络挂载之间／远程与网络挂载混搭：都按跨端复制。
+        (Endpoint::Remote(f), Endpoint::Remote(g))
+        | (Endpoint::NetworkMount(f), Endpoint::NetworkMount(g))
+        | (Endpoint::Remote(f), Endpoint::NetworkMount(g))
+        | (Endpoint::NetworkMount(f), Endpoint::Remote(g)) => Some((f.clone(), g.clone(), "复制")),
+        // 远程 / 网络挂载 → 本地：下载。
+        (Endpoint::Remote(f), Endpoint::Local) | (Endpoint::NetworkMount(f), Endpoint::Local) => {
+            Some((f.clone(), local.clone(), "下载"))
+        }
+        // 本地 → 远程 / 网络挂载：上传。
+        (Endpoint::Local, Endpoint::Remote(f)) | (Endpoint::Local, Endpoint::NetworkMount(f)) => {
+            Some((local.clone(), f.clone(), "上传"))
+        }
     }
 }
 
@@ -1785,6 +1800,38 @@ impl AppState {
     /// 作废网络盘的缓存（挂载 / 卸载之后立刻生效，不必等 TTL 过期）。
     fn invalidate_net_shares(&self) {
         self.net_shares.lock().unwrap().0 = std::time::Instant::now() - NET_SHARE_TTL;
+    }
+
+    /// 当前已挂载的 SMB / NFS 网络盘（权威读取，不依赖侧边栏缓存的 TTL）。
+    ///
+    /// 传输分发用它在 `transfer_between` 里判断「某个本地路径是否落在网络文件系统上」。
+    /// 直接读系统（`/proc/mounts` / `mount` / `net use`）而非走 [`AppState::network_shares`]
+    /// 的缓存：用户刚挂上一块盘就立刻往里拖文件时，侧边栏那层缓存可能还没刷新，
+    /// 漏判会让本该走 `TransferOperation` 的传输退化成本机复制。
+    async fn mounted_network_shares(&self) -> Vec<mo_remote::mount::NetworkShare> {
+        self.spawn_blocking(mo_remote::mount::mounted_shares)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 把「落在已挂载网络盘下的路径」升级成 [`Endpoint::NetworkMount`]，让传输走
+    /// `TransferOperation`（分块 / 续传 / 统一进度 / 跨文件系统移动安全）；纯本地
+    /// 路径原样返回 `base`。
+    ///
+    /// 挂载点对 `mo-fs` 就是本地目录，所以 `NetworkMount` 承载的 `FileSystem` 仍是
+    /// `LocalFileSystem`——只是「网络」这个性质决定了走哪条传输链。
+    fn net_endpoint(
+        &self,
+        base: &Endpoint,
+        path: &Path,
+        shares: &[mo_remote::mount::NetworkShare],
+        local: &Arc<dyn FileSystem>,
+    ) -> Endpoint {
+        if shares.iter().any(|s| path.starts_with(&s.path)) {
+            Endpoint::NetworkMount(local.clone())
+        } else {
+            base.clone()
+        }
     }
 
     /// 卸载一块网络盘（侧边栏那个「推出」）。
@@ -4252,6 +4299,9 @@ impl AppState {
         move_: bool,
     ) -> TransferOutcome {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
+        // 当前已挂载的 SMB / NFS 网络盘（权威读取，不依赖侧边栏缓存的 TTL）：
+        // 落在这些挂载点下的路径要按「网络端点」对待，走 TransferOperation。
+        let shares = self.mounted_network_shares().await;
 
         // 第一遍只探测、不提交：一批里只要有冲突或可续传的，就整批交给用户决策——
         // 要是先把没冲突的传了，用户选「跳过」时已经动过的那些就收不回来了。
@@ -4259,7 +4309,6 @@ impl AppState {
         // 其余已存在（完整同名 / 目录 / 空文件）算冲突。冲突优先弹卡。
         // 两端都本地时没有 leg，但探测照样做（见本函数文档：本机也要弹冲突卡），
         // 只是不判续传——本地没有「部分完成」这回事。
-        let both_local = matches!((&src_ep, &dest_ep), (Endpoint::Local, Endpoint::Local));
         let mut partial: Vec<PathBuf> = Vec::new();
         let mut conflicts: Vec<PathBuf> = Vec::new();
         for src in &paths {
@@ -4267,7 +4316,10 @@ impl AppState {
                 continue;
             };
             let to = dest.join(&name);
-            let (src_fs, dst_fs) = match resolve_transfer_leg(&src_ep, &dest_ep, &local) {
+            // 落在已挂载网络盘下的路径按网络端点对待（走 TransferOperation）。
+            let src_ep_for = self.net_endpoint(&src_ep, src, &shares, &local);
+            let dst_ep_for = self.net_endpoint(&dest_ep, &to, &shares, &local);
+            let (src_fs, dst_fs) = match resolve_transfer_leg(&src_ep_for, &dst_ep_for, &local) {
                 Some((s, d, _)) => (s, d),
                 None => (local.clone(), local.clone()),
             };
@@ -4275,7 +4327,11 @@ impl AppState {
             let (Ok(s), Ok(d)) = (src_fs.metadata(src).await, dst_fs.metadata(&to).await) else {
                 continue;
             };
-            if !both_local && d.size > 0 && d.size < s.size {
+            let this_local = matches!(
+                (&src_ep_for, &dst_ep_for),
+                (Endpoint::Local, Endpoint::Local)
+            );
+            if !this_local && d.size > 0 && d.size < s.size {
                 partial.push(to);
             } else {
                 conflicts.push(to);
@@ -4313,7 +4369,9 @@ impl AppState {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             let to = dest.join(&name);
-            let leg = resolve_transfer_leg(&src_ep, &dest_ep, &local);
+            let src_ep_for = self.net_endpoint(&src_ep, src, &shares, &local);
+            let dst_ep_for = self.net_endpoint(&dest_ep, &to, &shares, &local);
+            let leg = resolve_transfer_leg(&src_ep_for, &dst_ep_for, &local);
             let hid = self
                 .submit_transfer_entry(src, &to, dest, leg, move_, SubmitMode::Normal)
                 .await;
@@ -4336,6 +4394,7 @@ impl AppState {
         decision: ResumeDecision,
     ) -> Vec<u64> {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
+        let shares = self.mounted_network_shares().await;
         let mut ids = Vec::new();
         for src in &pending.paths {
             let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -4346,7 +4405,9 @@ impl AppState {
             if is_partial && decision == ResumeDecision::Skip {
                 continue;
             }
-            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
+            let src_ep_for = self.net_endpoint(&pending.src_ep, src, &shares, &local);
+            let dst_ep_for = self.net_endpoint(&pending.dest_ep, &to, &shares, &local);
+            let leg = resolve_transfer_leg(&src_ep_for, &dst_ep_for, &local);
             let mode = if is_partial && decision == ResumeDecision::Resume {
                 SubmitMode::Resume
             } else {
@@ -4372,6 +4433,7 @@ impl AppState {
         decision: ConflictDecision,
     ) -> Vec<u64> {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
+        let shares = self.mounted_network_shares().await;
         let mut ids = Vec::new();
         for src in &pending.paths {
             let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -4382,7 +4444,9 @@ impl AppState {
             if is_conflict && decision == ConflictDecision::Skip {
                 continue;
             }
-            let leg = resolve_transfer_leg(&pending.src_ep, &pending.dest_ep, &local);
+            let src_ep_for = self.net_endpoint(&pending.src_ep, src, &shares, &local);
+            let dst_ep_for = self.net_endpoint(&pending.dest_ep, &to, &shares, &local);
+            let leg = resolve_transfer_leg(&src_ep_for, &dst_ep_for, &local);
             let mode = if is_conflict {
                 match decision {
                     ConflictDecision::Overwrite => SubmitMode::Overwrite,
@@ -6143,5 +6207,47 @@ impl AppState {
         self.spawn_blocking(move || mo_operations::extract_archive(&archive, &dest))
             .await
             .map_err(|e| MoError::Other(format!("解压任务失败：{e}")))?
+    }
+}
+
+#[cfg(test)]
+mod transfer_net_tests {
+    use super::{resolve_transfer_leg, Endpoint};
+    use mo_fs::LocalFileSystem;
+    use std::sync::Arc;
+
+    #[test]
+    fn network_mount_routes_through_transfer_operation() {
+        let local: Arc<dyn mo_fs::FileSystem> = Arc::new(LocalFileSystem);
+        let net = Endpoint::NetworkMount(local.clone());
+
+        // 本地 → 网络挂载：应当产出一个 leg（走 TransferOperation，而非本机复制）。
+        assert!(
+            resolve_transfer_leg(&Endpoint::Local, &net, &local).is_some(),
+            "本地 → 网络挂载应走 TransferOperation"
+        );
+        // 网络挂载 → 本地同理。
+        assert!(
+            resolve_transfer_leg(&net, &Endpoint::Local, &local).is_some(),
+            "网络挂载 → 本地应走 TransferOperation"
+        );
+        // 两块网络挂载之间：仍产出 leg（跨端复制语义）。
+        assert!(
+            resolve_transfer_leg(&net, &Endpoint::NetworkMount(local.clone()), &local).is_some(),
+            "网络挂载之间应走 TransferOperation"
+        );
+        // 纯本机对：不产出 leg（继续走本机 CopyOperation / MoveOperation）。
+        assert!(
+            resolve_transfer_leg(&Endpoint::Local, &Endpoint::Local, &local).is_none(),
+            "纯本机对不应走 TransferOperation"
+        );
+    }
+
+    #[test]
+    fn network_mount_is_not_same_session_as_local() {
+        let local: Arc<dyn mo_fs::FileSystem> = Arc::new(LocalFileSystem);
+        let net = Endpoint::NetworkMount(local.clone());
+        // 网络挂载与本地不是「同一处」，拖放默认应当复制而非移动。
+        assert!(!net.same_session(&Endpoint::Local));
     }
 }

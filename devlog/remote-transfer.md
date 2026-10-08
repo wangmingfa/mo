@@ -250,8 +250,9 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   列表级 + 内容级都已做（§9：5s 轮询比对当前远程目录，键含 size/mtime，有差异才
   重读；「原地改写内容」不再靠手动刷新兜底）。远程 `ReadDirEntry` 现带 size/mtime，
   `load_path` 时 seed 进条目，模型侧与列表侧同源比对、epoch 一致不会误判。
-* SMB / NFS 仍走系统挂载（`mo_remote::mount`），挂载点对 `mo-fs` 来说就是本地路径，
-  不需要 `TransferOperation` 这条链。
+* ~~SMB / NFS 仍走系统挂载（`mo_remote::mount`），挂载点对 `mo-fs` 来说就是本地路径，
+  不需要 `TransferOperation` 这条链~~ **已做（§12）**：挂载点虽是本地路径，但落在网络
+  文件系统上，传输现已接入 `TransferOperation`——分块 / 续传 / 统一进度 / 跨文件系统移动安全。
 
 ## §10：本地对的冲突对话框（2026-09-29，38d711a）
 
@@ -305,3 +306,35 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 * **剩余账**：mtime 按秒比对，亚秒级改写（极少见）要等下一拍；FTP `LIST` 的 mtime 来自
   文本解析、个别服务器时区/精度不稳，可能偶发冗余刷新（无害，只是多一次重读）；本地
   目录仍走旧 scheduler 路径，不受影响。
+
+## §12：SMB / NFS 挂载接入 TransferOperation 链（2026-10-08）
+
+* **根因**：`mo_remote::mount` 把 SMB / NFS 交给系统挂载，挂载点对 `mo-fs` 来说就是本地
+  路径；`endpoint()` 对挂载点返回 `Endpoint::Local`，于是传输走本机 `CopyOperation` /
+  `MoveOperation`，不走 `TransferOperation`。两点由此吃亏：① 网络盘是网络文件系统，
+  **移动**用 `std::fs::rename` 跨文件系统必败；② 拿不到 `TransferOperation` 的分块流式
+  （大文件不整份进内存）、断点续传、统一进度 / 暂停 / 取消。
+* **修法**：给 `Endpoint` 加 `NetworkMount(Arc<dyn FileSystem>)`（承载 `LocalFileSystem`——
+  挂载点读写仍走 `std::fs`），传输分发里把「落在已挂载网络盘下的路径」升级成该变体：
+  1. `mo-remote/src/mount.rs` 加 `is_under_mounted_share(path, shares)`：按组件前缀匹配
+     `mounted_shares()` 的挂载点（`/Volumes/share` 不误命中 `/Volumes/shareX`）。
+  2. `mo-app/src/lib.rs` 加 `mounted_network_shares()`（权威读，绕过侧边栏 TTL 缓存——
+     刚挂上盘就拖文件时缓存可能没刷）与 `net_endpoint(base, path, shares, local)`（路径在
+     网络盘下 → `NetworkMount`，否则原样返回），`transfer_between` / `resolve_resume` /
+     `resolve_conflict` 的探测与提交循环都按路径逐条重分类。
+  3. `resolve_transfer_leg` 把 `NetworkMount` 与 `Remote` 同等待遇（`Local↔NetworkMount`
+     标「上传 / 下载」、两块挂载之间 / 与远程混搭标「复制」），于是走 `TransferOperation`。
+     `submit_transfer_entry` 的 leg 分支照旧：记录 `Reversible::RemoteCopy/Move`（用
+     `LocalFileSystem` 删挂载点上的落点，撤销正确）、`record_history(remote=true)`。
+  4. `MoveOperation` 的跨文件系统 rename 失败被彻底绕开：`TransferOperation` 是「复制后
+     删源」，对网络盘天然安全；`same_session(NetworkMount, Local)` 返回 false → 拖放默认
+     复制（保守、不丢数据）。
+* **验证**：`mo-remote` 加 `path_under_mounted_share_detects_network`（命中 / 挂载点本身 /
+  同名前缀不误判 / 无关路径不命中）；`mo-app` 加 `transfer_net_tests` 两个（`network_mount_
+  routes_through_transfer_operation`、`network_mount_is_not_same_session_as_local`）。
+  `remote_local`(27) / `resume`(5) / `conflict`(8) / `undo_remote`(5) / `drag_semantics`(6)
+  全部仍绿；fmt / clippy（`-D warnings`）干净。
+* **剩余账**：本机对（两端都真本地）仍走 `CopyOperation` / `MoveOperation`——这是对的，本机
+  复制不需要 `TransferOperation` 的开销；只有「任一端落在网络挂载下」才升级。网络盘与真
+  远程会话的语义差异（`Remote` 用各自 1-worker runtime、`NetworkMount` 用 `LocalFileSystem`
+  走系统挂载点）在传输层已统一为同一套分块 / 续传 / 进度逻辑。

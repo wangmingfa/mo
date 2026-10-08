@@ -117,6 +117,19 @@ pub fn is_mountable(scheme: &str) -> bool {
     matches!(scheme, "smb" | "cifs" | "samba" | "nfs")
 }
 
+/// 路径是否落在某个已挂载网络盘（`mounted_shares` 的结果）的挂载点之下
+/// （含挂载点本身）。
+///
+/// 传输分发用它在 `transfer_between` 里把「本地路径、但落在网络文件系统上」的端点
+/// 识别出来，从而走 [`TransferOperation`]（分块 / 续传 / 统一进度），移动也走
+/// 「复制后删源」而非 `std::fs::rename`（跨文件系统 rename 必败）。
+///
+/// 按**组件**比较（`Path::starts_with`），所以 `/Volumes/share` 不会误命中
+/// `/Volumes/shareX`。
+pub fn is_under_mounted_share(path: &Path, shares: &[NetworkShare]) -> bool {
+    shares.iter().any(|s| path.starts_with(&s.path))
+}
+
 /// 触发系统挂载：按协议把 `url` 交给操作系统，返回挂载点。
 ///
 /// 挂好之后调用方应当**当本地目录打开**（`AppState::open_local`）——这条路径上
@@ -623,5 +636,35 @@ mod tests {
         assert_eq!(mount_name(&u), "nas.local-public-sub");
         let bare = RemoteUrl::parse("smb://nas.local").expect("地址应当能解析");
         assert_eq!(mount_name(&bare), "nas.local");
+    }
+
+    /// 路径落在已挂载网络盘下时，`is_under_mounted_share` 命中（含挂载点本身）；
+    /// 同名前缀但不是同一组件（/Volumes/shareX）不被误命中。
+    #[test]
+    fn path_under_mounted_share_detects_network() {
+        let share = NetworkShare {
+            path: PathBuf::from("/Volumes/share"),
+            scheme: "smb".to_string(),
+            host: "nas".to_string(),
+            export: "public".to_string(),
+            label: "share".to_string(),
+        };
+        let shares = vec![share];
+        assert!(
+            is_under_mounted_share(&PathBuf::from("/Volumes/share/sub/a.txt"), &shares),
+            "子路径应当命中"
+        );
+        assert!(
+            is_under_mounted_share(&PathBuf::from("/Volumes/share"), &shares),
+            "挂载点本身应当命中"
+        );
+        assert!(
+            !is_under_mounted_share(&PathBuf::from("/Volumes/shareX/a.txt"), &shares),
+            "/Volumes/shareX 不应被 /Volumes/share 误命中"
+        );
+        assert!(
+            !is_under_mounted_share(&PathBuf::from("/Users/me/a.txt"), &shares),
+            "无关路径不应命中"
+        );
     }
 }
