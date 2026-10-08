@@ -71,8 +71,51 @@ impl FileIndex {
             CREATE TABLE IF NOT EXISTS indexed_roots (
                 root TEXT PRIMARY KEY,
                 at INTEGER NOT NULL
-            );",
+            );
+            -- FTS5 trigram 虚表：对 name_lower / path 做大小写不敏感的子串索引，
+            -- 取代原来 `name_lower LIKE '%词%' OR path LIKE '%词%'` 的前导 % 全表扫
+            -- （58 万行实测 ~150ms/次）。trigram 分词器对短语做中缀子串匹配，
+            -- 正好覆盖「文件名中间 / 路径任意段」这类前缀索引做不到的命中。
+            -- content='files' 把虚表绑到实体表，rowid 直接复用 files.id，
+            -- 数据只存一份，同步交给下面三个触发器。
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                name, path,
+                content='files',
+                content_rowid='id',
+                tokenize='trigram'
+            );
+            CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name_lower, new.path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, path)
+                VALUES('delete', old.id, old.name_lower, old.path);
+            END;
+            CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name, path)
+                VALUES('delete', old.id, old.name_lower, old.path);
+                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name_lower, new.path);
+            END;",
         )?;
+
+        // 旧版索引库（升级前没有 files_fts）一次性回填：把现有 files 灌进 FTS 虚表。
+        // 全新库 files 为空 → 跳过；升级后 files_fts 已非空 → 也跳过；只在「有数据却没 FTS」
+        // 这一刻跑一次（58 万行约一两秒，之后不再触发）。回填后所有 upsert/remove/rename
+        // 都走上面的触发器，fts 与 files 始终一致。
+        let needs_backfill: bool = self
+            .conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM files) > 0 AND (SELECT count(*) FROM files_fts) = 0",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if needs_backfill {
+            self.conn.execute(
+                "INSERT INTO files_fts(rowid, name, path) SELECT id, name_lower, path FROM files",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -248,29 +291,40 @@ impl FileIndex {
             .unwrap_or(0)
     }
 
-    /// 搜索：对 `name_lower` 与 `path` 做子串匹配（大小写不敏感），
+    /// 搜索：对 `name_lower` 与 `path` 做大小写不敏感的子串匹配，
     /// 按相关度排序后返回最多 `limit` 条。
     ///
+    /// 查找走 `files_fts` 这张 FTS5 trigram 虚表（`init` 里建好 + 三个触发器同步），
+    /// `MATCH` 直接落到 trigram 索引上，不再是前导 `%` 的全表扫——58 万行的库上
+    /// 从实测 ~150ms/次降到索引查找的量级。触发器的存在意味着 `upsert` / `remove` /
+    /// `rename` / `remove_under` 走实体表时 fts 自动跟着改，search 这边不用关心。
+    ///
     /// 排序规则：文件名以查询串开头的最相关，其次文件名包含，再次路径包含；
-    /// 同级优先路径更短（更靠近根）的结果。
+    /// 同级优先路径更短（更靠近根）的结果——这条 ORDER BY 只作用在 fts 已收窄的
+    /// 候选集上，量很小，不影响查找本身的开销。
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, SearchError> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Ok(Vec::new());
         }
-        let like = format!("%{q}%");
+        // 把查询包成带双引号的 FTS5 短语，规避括号 / `*` 等 FTS 语法字符在查询里炸开；
+        // 内部的双引号按 FTS 约定翻倍转义。trigram 对短语做大小写不敏感的子串匹配，
+        // 对应原来的 `name_lower LIKE '%q%' OR path LIKE '%q%'`。
+        let match_q = format!("\"{}\"", q.replace('"', "\"\""));
         let starts = format!("{q}%");
 
         let mut stmt = self.conn.prepare(
-            "SELECT path, name, size, modified, is_dir FROM files
-             WHERE name_lower LIKE ?1 OR path LIKE ?1
+            "SELECT f.path, f.name, f.size, f.modified, f.is_dir
+             FROM files_fts
+             JOIN files f ON f.id = files_fts.rowid
+             WHERE files_fts MATCH ?1
              ORDER BY
-               CASE WHEN name_lower LIKE ?2 THEN 0 ELSE 1 END,
-               length(path) ASC
+               CASE WHEN f.name_lower LIKE ?2 THEN 0 ELSE 1 END,
+               length(f.path) ASC
              LIMIT ?3",
         )?;
 
-        let rows = stmt.query_map(params![like, starts, limit as i64], |r| {
+        let rows = stmt.query_map(params![match_q, starts, limit as i64], |r| {
             let path: String = r.get(0)?;
             let name: String = r.get(1)?;
             let size: i64 = r.get(2)?;
@@ -377,6 +431,101 @@ mod tests {
         let by_path = i.search("nested", 10).unwrap();
         assert_eq!(by_path.len(), 1);
         assert!(by_path[0].path.ends_with("Secret.md"));
+    }
+
+    /// trigram 做的是真·中缀子串匹配：子串躲在文件名中段（不在开头）也要能命中，
+    /// 这正是换掉 `LIKE '%词%'` 全表扫之后仍要保住的能力。
+    #[test]
+    fn search_finds_substring_not_just_prefix() {
+        let mut i = idx();
+        i.upsert(
+            std::path::Path::new("/a/photograph.png"),
+            "photograph.png",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        i.upsert(
+            std::path::Path::new("/a/tograph.txt"),
+            "tograph.txt",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        // "togr" 不在任何文件名开头，只在中间 —— 前缀索引做不到，trigram 必须能中。
+        let hits = i.search("togr", 50).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.name.contains("togr")));
+    }
+
+    /// 性能红线：搜索必须走 fts5 索引，不能退化成 `files` 全表扫（那是 58 万行 ~150ms 的老账）。
+    #[test]
+    fn search_uses_fts_index_not_full_scan() {
+        let mut i = idx();
+        // 塞足够多条目，让「全表扫」与「索引查找」在 query plan 上能分出差别。
+        for n in 0..500u32 {
+            i.upsert(
+                std::path::Path::new(&format!("/a/file_{n}.txt")),
+                &format!("file_{n}.txt"),
+                1,
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        i.upsert(
+            std::path::Path::new("/a/needle_in_haystack.txt"),
+            "needle_in_haystack.txt",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let plan_rows: Vec<String> = i
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT f.path FROM files_fts
+                 JOIN files f ON f.id = files_fts.rowid
+                 WHERE files_fts MATCH ?1 LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params!["\"hay\"", 10i64], |r| {
+                // EXPLAIN QUERY PLAN 返回 4 列：id/parent/notused 是整数，detail 是文本。
+                let _id: i64 = r.get(0)?;
+                let _parent: i64 = r.get(1)?;
+                let _notused: i64 = r.get(2)?;
+                let detail: String = r.get(3)?;
+                Ok(detail)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan_rows.join(" | ");
+        // 命中即证明不是全表扫：files_fts 走 VIRTUAL TABLE INDEX（trigram MATCH），
+        // 基表 files 通过 rowid 主键查找（SEARCH ... INTEGER PRIMARY KEY）而非 SCAN。
+        assert!(
+            plan.contains("files_fts"),
+            "search 应当走 files_fts 虚表，实际 plan: {plan}"
+        );
+        assert!(
+            plan.contains("VIRTUAL TABLE INDEX"),
+            "search 应当用 trigram 索引匹配，实际 plan: {plan}"
+        );
+        assert!(
+            plan.contains("SEARCH f USING INTEGER PRIMARY KEY"),
+            "files 应通过 rowid 主键查找而非全表扫，实际 plan: {plan}"
+        );
+
+        // 行为面：含 'hay' 子串的文件要能命中。
+        let hits = i.search("hay", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.name.contains("hay")),
+            "应命中含 'hay' 子串的文件"
+        );
     }
 
     #[test]

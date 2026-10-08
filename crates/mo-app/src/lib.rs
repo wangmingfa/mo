@@ -3449,10 +3449,10 @@ impl AppState {
     /// 查询全局索引——**同步扫表，别在主线程调**，界面要用的是
     /// [`AppState::global_search_bg`]。
     ///
-    /// `FileIndex::search` 是 `name_lower LIKE '%词%' OR path LIKE '%词%'`：中缀通配
-    /// 用不上任何索引，58 万行的库上实测一次约 **150ms**，还要排在索引锁后面（锁的另一头
-    /// 是爬取与 §45 那套清理）。留这个同步门面给测试与非 UI 调用方（`tests/productivity.rs`、
-    /// `tests/global_index.rs` 都在直接问结果）。
+    /// `FileIndex::search` 走 FTS5 trigram 虚表（`name_lower` / `path` 的中缀子串索引），
+    /// 不再像早期那样 `LIKE '%词%'` 前导 % 全表扫（58 万行实测约 150ms/次）。仍保留这个
+    /// 同步门面给测试与非 UI 调用方（`tests/productivity.rs`、`tests/global_index.rs` 都
+    /// 在直接问结果），它也顺带把查询与索引锁、爬取/清理那头隔开。
     pub fn global_search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         self.index.lock().search(query, limit).unwrap_or_default()
     }

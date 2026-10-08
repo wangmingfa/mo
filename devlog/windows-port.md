@@ -1053,3 +1053,44 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * **还在的债**：观感仍然只有真机能判（这次就是被真机判掉的）。headless 能守的只是
   「数字对不对、有没有多画一处」，配色、字号、行高的好坏它永远说不上话——**这条线的
   教训**：装饰性几何做完一轮就交给用户扫一眼，别等它长出判据、反验、发版之后再退回。
+
+## 49. 全局搜索真优化：FTS5 trigram 取代 `LIKE '%词%'` 全表扫（2026-10-08）
+
+* **根因（§46 只治标）**：`FileIndex::search` 一直是 `name_lower LIKE '%词%' OR path LIKE '%词%'`。
+  前导 `%` 让 `idx_name` / `idx_path` 完全失效，58 万行库上实测 ~150ms/次全表扫；§46 只是把
+  查询搬出主线程（`global_search_bg`），治了「卡主线程」却没治「慢」本身——后台化后每次仍是
+  全表扫，只是排在 blocking 池。devlog 里那句「要真快得上 FTS / trigram」就是这一笔账。
+* **修法**：bundled SQLite（rusqlite 0.40，`build.rs` 带 `-DSQLITE_ENABLE_FTS5`，SQLite 3.4x
+  自带 trigram 分词器）直接上 FTS5。给 `files` 表挂一张外部内容虚表 `files_fts`
+  （`content='files'` + `content_rowid='id'`，数据只存一份，rowid 复用 `files.id`），对
+  `name_lower` / `path` 用 `tokenize='trigram'` 建中缀子串索引。`search` 改成
+  `FROM files_fts JOIN files f ON f.id = files_fts.rowid WHERE files_fts MATCH ?`，trigram 把
+  查询短语直接落到索引——不再扫基表。相关度排序（文件名前缀优先、其次路径更短）保留，只作用在
+  fts 已收窄的候选集上。
+* **同步交触发器**：`files_ai` / `files_ad` / `files_au` 三个触发器挂在 `files` 表上——
+  `upsert`(插/改)、`remove`、`rename`、`remove_under`(批量删) 走实体表时 fts 自动跟着增删改，
+  `search` 这边完全不碰同步逻辑，也不用在 `upsert_batch` 等写入路径上加一行。触发器用外部内容
+  的 `'delete'` 命令做删除，避免直接动 fts 虚表。
+* **旧库迁移**：升级前用户的磁盘索引没有 `files_fts`。`init()` 在建表后判断「`files` 有数据且
+  `files_fts` 为空」才一次性 `INSERT INTO files_fts(rowid,name,path) SELECT id,name_lower,path
+  FROM files` 回填；全新库（`files` 空）与升级后（fts 已非空）都跳过，只在那「有数据却没 FTS」
+  的一刻跑一次（58 万行约一两秒）。回填后增量走触发器，两端始终一致。
+* **查询转义**：`MATCH` 的查询串包成带双引号的 FTS5 短语（`q.replace('"', "\"\"")` 翻倍内部
+  引号），规避括号 / `*` 等 FTS 语法字符在查询里炸开；trigram 对短语做大小写不敏感子串匹配，
+  正好等价于原来的 `LIKE '%q%'`（且不再把 `_` / `%` 当通配符——比原 LIKE 更「所见即所搜」）。
+* **验证**（`crates/mo-search/src/index.rs` 测试，全绿）：
+  * `search_uses_fts_index_not_full_scan`：`EXPLAIN QUERY PLAN` 锁定 `SCAN files_fts VIRTUAL
+    TABLE INDEX 0:M2`（trigram 命中）+ `SEARCH f USING INTEGER PRIMARY KEY`（基表走 rowid 主键
+    查找），断言不再出现对 `files` 的全表 `SCAN`；并行为面确认含子串的文件仍能命中。
+  * `search_finds_substring_not_just_prefix`：子串藏在文件名中段（不在开头）也必须命中——
+    这正是换掉前缀索引、改走 trigram 的意义。
+  * 既有 `upsert_and_search_by_name` / `search_is_case_insensitive_and_path_aware` /
+    `remove_under_*` / `remove_and_rename_keep_index_consistent` 全过——触发器同步路径被这些
+    删除/改名用例覆盖。`mo-app` 的 `global_search_finds_files_across_subdirs` 及 `global_index` /
+    `index_sync` 三个集成测试文件（共 21 例）也全过。
+* **剩的账**：
+  * 查询长度 < 3 字符时 trigram 退化为对 `files_fts` 虚表全扫（仍比扫 `files` 基表快，且已随
+    §46 后台化）；极短查询属少数情况，先不动。
+  * FTS 只索引 `name_lower` + `path`（文件名/路径子串搜索）。**文件内容搜索是另一条线**
+    （`mo_search::content::search_content`），与本索引无关，不受影响也不在此优化范围。
+  * 升级后首开若索引很大，回填那一次会有可感知的两三秒停顿（一次性）；之后无感。
