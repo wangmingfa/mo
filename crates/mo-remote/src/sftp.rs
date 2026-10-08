@@ -187,7 +187,10 @@ fn collect_entries(rd: impl Iterator<Item = DirEntry>) -> Vec<ReadDirEntry> {
             FileType::File | FileType::Other => EntryKind::File,
         };
         let path = PathBuf::from(de.path());
-        ReadDirEntry::new(FileId::synthetic(&path), name, kind, path)
+        let m = de.metadata();
+        let size = m.size.unwrap_or(0);
+        let modified = m.mtime.map(system_time_from_unix);
+        ReadDirEntry::new(FileId::synthetic(&path), name, kind, path).with_metadata(size, modified)
     })
     .collect()
 }

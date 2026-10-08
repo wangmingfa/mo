@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use mo_app::{AppState, SessionRegistry};
@@ -74,6 +75,18 @@ impl PollFakeFs {
             EntryKind::File,
             path.clone(),
         )
+    }
+
+    /// 带 size / mtime 的条目：轮询泵比对内容级变化时用的「旧值 / 新值」。
+    fn file_with(name: &str, size: u64, modified: SystemTime) -> ReadDirEntry {
+        let path = PathBuf::from(format!("/{name}"));
+        ReadDirEntry::new(
+            FileId::synthetic(&path),
+            name.to_string(),
+            EntryKind::File,
+            path,
+        )
+        .with_metadata(size, Some(modified))
     }
 }
 
@@ -159,6 +172,11 @@ struct Scene {
 }
 
 async fn scene(tag: &str) -> Scene {
+    scene_with(vec![PollFakeFs::file("seed.txt")], tag).await
+}
+
+/// 与 [`scene`] 同款，但初始列表由调用方给定（用于带上 size / mtime 的内容级测试）。
+async fn scene_with(entries: Vec<ReadDirEntry>, tag: &str) -> Scene {
     // ⚠️ 独占的会话表（不是 `AppState::new` 的进程级那张）：同二进制的用例并行跑，
     // 同端点 + 同用户名在进程级表里会被去重成一行——后装的假后端把先装的顶掉，
     // 各用例的「外部改动」就互相窜了（单跑永远绿，一轮全红那种）。
@@ -171,7 +189,7 @@ async fn scene(tag: &str) -> Scene {
     let app = common::isolated(tag, || {
         AppState::with_sessions(trash, Arc::new(SessionRegistry::new()))
     });
-    let (fs, listing, reads, fail) = PollFakeFs::new(vec![PollFakeFs::file("seed.txt")]);
+    let (fs, listing, reads, fail) = PollFakeFs::new(entries);
     app.install_backend_for_test(Arc::new(fs), TEST_URL);
     app.open_directory(Path::new("/"))
         .await
@@ -307,3 +325,51 @@ async fn poll_survives_a_failing_backend() {
 /// 显式引用防「未用导入」告警（解析发生在 mo-app 内部）。
 #[allow(dead_code)]
 fn _url_is_used(_: RemoteUrl) {}
+
+/// 同一路径的文件被「原地改写」（size / mtime 变了、条目集合没变），下一拍应当
+/// 触发整目录重读——这是 §9 之前抓不到、靠列目录自带的 size/mtime 才补上的那一档。
+#[tokio::test]
+async fn poll_detects_in_place_content_change() {
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+    let s = scene_with(
+        vec![PollFakeFs::file_with("seed.txt", 100, t0)],
+        "poll-content",
+    )
+    .await;
+    let after_open = s.reads.load(Ordering::SeqCst);
+
+    // size / mtime 都没变 → 只比对，不触发整目录重读。
+    s.app.poll_remote_listing_once().await;
+    assert_eq!(
+        s.reads.load(Ordering::SeqCst),
+        after_open + 1,
+        "原地改写之前：size/mtime 没变应当只比对、不重读"
+    );
+
+    // 同一路径被改写：size 与 mtime 都变了，条目集合不变。
+    {
+        let mut l = s.listing.lock().unwrap();
+        let i = l
+            .iter()
+            .position(|e| e.path == Path::new("/seed.txt"))
+            .expect("seed 在列表里");
+        l[i] = PollFakeFs::file_with("seed.txt", 200, t1);
+    }
+    s.app.poll_remote_listing_once().await;
+    assert_eq!(
+        s.reads.load(Ordering::SeqCst),
+        after_open + 3,
+        "原地改写内容（size/mtime 变、集合没变）应当触发整目录重读（比对 + 重读）"
+    );
+
+    // 重读后模型拿到的是新 size。
+    let seed = s
+        .app
+        .current_entries()
+        .await
+        .into_iter()
+        .find(|e| e.path == Path::new("/seed.txt"))
+        .expect("seed 仍在");
+    assert_eq!(seed.size_or_zero(), 200, "刷新后应当反映新的大小");
+}

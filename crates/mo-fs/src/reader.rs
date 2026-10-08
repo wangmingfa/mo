@@ -1,5 +1,6 @@
 use mo_core::{EntryKind, FileId};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// `read_dir` 结果的单个条目：立即可得的轻量信息。
 #[derive(Debug, Clone)]
@@ -15,6 +16,13 @@ pub struct ReadDirEntry {
     /// 的目录多两万次 syscall 就是肉眼可见的停顿。用户在界面上切「显示隐藏文件」
     /// 时过滤的是这个字段，不需要重新读盘之外的任何 IO。
     pub hidden: bool,
+    /// 目录列表若一并返回的大小 / 修改时间（SFTP / FTP / WebDAV 的列表都带）。
+    ///
+    /// 本地后端不填（元数据走后台 scheduler 逐条 stat）；远程后端在 `read_dir`
+    /// 时就填进来，这样轮询比对「内容级变化」（size / mtime 变了、条目集合没变）
+    /// 零额外网络往返，不必逐条 stat。见 `AppState::poll_remote_listing_once`。
+    pub size: u64,
+    pub modified: Option<SystemTime>,
 }
 
 impl ReadDirEntry {
@@ -26,7 +34,16 @@ impl ReadDirEntry {
             kind,
             path,
             hidden,
+            size: 0,
+            modified: None,
         }
+    }
+
+    /// 携带列目录级的 size / modified（远程后端在 `read_dir` 时填入）。
+    pub fn with_metadata(mut self, size: u64, modified: Option<SystemTime>) -> Self {
+        self.size = size;
+        self.modified = modified;
+        self
     }
 }
 

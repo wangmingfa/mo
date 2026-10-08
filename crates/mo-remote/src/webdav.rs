@@ -305,12 +305,13 @@ fn entries_from(dir: &str, responses: Vec<ListResponse>) -> Vec<ReadDirEntry> {
         } else {
             EntryKind::File
         };
-        out.push(ReadDirEntry::new(
-            FileId::synthetic(&child_path),
-            name,
-            kind,
-            child_path,
-        ));
+        out.push(
+            ReadDirEntry::new(FileId::synthetic(&child_path), name, kind, child_path)
+                .with_metadata(
+                    prop.content_length.unwrap_or(0).max(0) as u64,
+                    prop.last_modified.map(system_time_from_utc),
+                ),
+        );
     }
     out
 }

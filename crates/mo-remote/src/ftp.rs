@@ -177,18 +177,22 @@ impl FtpFileSystem {
             .filter(|f| f.name() != "." && f.name() != "..")
             .map(|f| {
                 let path = parent.join(file_name_only(f.name()));
+                let kind = if f.is_directory() {
+                    EntryKind::Directory
+                } else if f.is_symlink() {
+                    EntryKind::Symlink
+                } else {
+                    EntryKind::File
+                };
+                // `File` 的 size / modified 来自 LIST/MLSD 解析，总是有值
+                // （无 mtime 时等于 UNIX_EPOCH）；直接用，不浪费一次 MDTM/SIZE 往返。
                 ReadDirEntry::new(
                     FileId::synthetic(&path),
                     file_name_only(f.name()).to_string(),
-                    if f.is_directory() {
-                        EntryKind::Directory
-                    } else if f.is_symlink() {
-                        EntryKind::Symlink
-                    } else {
-                        EntryKind::File
-                    },
+                    kind,
                     path,
                 )
+                .with_metadata(f.size() as u64, Some(f.modified()))
             })
             .collect())
     }

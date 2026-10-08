@@ -65,7 +65,7 @@ use std::time::Duration;
 use mo_cache::MetadataCache;
 use mo_core::{
     AppEvent, Bitmap, Directory, Entry, EventBus, FileId, FileMetadata, LightEntry, MetadataState,
-    MoError, NavigationState, SelectionModel, SortDir, SortKey, ThumbnailState,
+    MoError, NavigationState, Permissions, SelectionModel, SortDir, SortKey, ThumbnailState,
 };
 use mo_fs::{entry_at, FileSystem, FileSystemWatcher, LocalFileSystem, WatcherEvent};
 use mo_operations::{
@@ -1323,7 +1323,24 @@ impl AppState {
                             // 建视图**之前**，否则 `visible_count` / 分页 / 索引全都会
                             // 把藏起来的条目算进去（状态栏条数对不上、滚动条长度跳）。
                             .filter(|r| show_hidden || !r.hidden)
-                            .map(|r| Entry::new(r.id, r.name, r.kind, r.path))
+                            .map(|r| {
+                                let mut entry = Entry::new(r.id, r.name, r.kind, r.path);
+                                // 远程列目录（SFTP/FTP/WebDAV）已经一并返回 size /
+                                // mtime，直接 seed 进条目：省掉随后逐条远程 stat，
+                                // 也给了轮询泵一个可比对的「旧值」（否则远程元数据
+                                // 永远是 Loading，轮询每拍都误判有变化）。本地后端
+                                // 的 `ReadDirEntry` 不带这两项（size=0/modified=None），
+                                // 仍走后台 scheduler 逐条 stat，行为不变。
+                                if r.size > 0 || r.modified.is_some() {
+                                    entry.metadata = MetadataState::Loaded(FileMetadata {
+                                        size: r.size,
+                                        modified: r.modified,
+                                        created: None,
+                                        permissions: Permissions::default(),
+                                    });
+                                }
+                                entry
+                            })
                             .collect(),
                     );
                     // `set_entries` 已经把视图建好了，缓存预填才有「首屏」可按。
@@ -2413,9 +2430,11 @@ impl AppState {
     /// 闲着的目录每拍只花一次列目录的网络往返，零 UI 动作；本地目录有
     /// watcher，一拍都不花。
     ///
-    /// ⚠️ 比对只看「路径 + 类型」的集合：列表级变化（新增 / 删除 / 改名）能抓到；
-    /// 「原地改写内容」（大小 / mtime 变了、条目集合没变）抓不到——逐条 metadata
-    /// 是每条目一次网络往返，轮询干不起，交给打开 / 手动刷新兜底。
+    /// ⚠️ 比对看「路径 + 类型 + size + mtime」的集合：列表级变化（新增 / 删除 /
+    /// 改名）能抓到；**原地改写内容**（size 或 mtime 变了、条目集合没变）也能抓到——
+    /// 因为 SFTP/FTP/WebDAV 的目录列表本就一并返回 size/mtime，比较时直接拿来用，
+    /// 不必逐条 metadata（每条目一次网络往返，轮询干不起）。模型的「旧值」来自
+    /// `load_path` 时 seed 进条目的 size/mtime，与列表同源，epoch 一致不会误判。
     pub fn spawn_remote_poll_pump(&self) {
         let app = self.clone();
         self.spawn(async move {
@@ -2438,14 +2457,24 @@ impl AppState {
     /// （见 `mo-app/tests/remote_poll.rs`）。
     pub async fn poll_remote_listing_once(&self) {
         // 目录还在读（`loading`）时没有可比的稳定快照，这一轮跳过。
-        let (dir_path, seen): (PathBuf, std::collections::BTreeSet<(PathBuf, bool)>) = {
+        let (dir_path, seen): (
+            PathBuf,
+            std::collections::BTreeSet<(PathBuf, bool, u64, u64)>,
+        ) = {
             let inner = self.inner.read().await;
             match inner.directory.as_ref() {
                 Some(d) if !d.loading => (
                     d.path.clone(),
                     d.entries
                         .iter()
-                        .map(|e| (e.path.clone(), e.kind.is_dir()))
+                        .map(|e| {
+                            (
+                                e.path.clone(),
+                                e.kind.is_dir(),
+                                e.size_or_zero(),
+                                e.modified_or_zero(),
+                            )
+                        })
                         .collect(),
                 ),
                 _ => return,
@@ -2463,10 +2492,20 @@ impl AppState {
             return;
         };
         let show_hidden = self.show_hidden();
-        let fresh: std::collections::BTreeSet<(PathBuf, bool)> = raw
+        let fresh: std::collections::BTreeSet<(PathBuf, bool, u64, u64)> = raw
             .into_iter()
             .filter(|r| show_hidden || !r.hidden)
-            .map(|r| (r.path, r.kind.is_dir()))
+            .map(|r| {
+                (
+                    r.path,
+                    r.kind.is_dir(),
+                    r.size,
+                    r.modified
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+            })
             .collect();
         if fresh == seen {
             return;

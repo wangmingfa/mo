@@ -211,11 +211,14 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 * `spawn_remote_poll_pump`（与 `spawn_watcher_pump` 配对启动，四个标签页构造点
   + `run()`）：5s 一拍，只处理**当前远程目录**（`browsing_remote()` 不过就跳过，
   本地目录有 watcher，一拍都不花）。
-* **有差异才重读**：每拍一次列目录往返做「路径 + 类型」集合比对（`BTreeSet`），
-  集合没变直接返回——闲着 = 一次往返、零 UI 动作；集合变了才整目录 `refresh`。
-  ⚠️ 比对只看集合：列表级变化（新增 / 删除 / 改名）抓得到，「原地改写内容」
-  （大小 / mtime 变了、集合没变）抓不到——逐条 metadata 是每条目一次网络往返，
-  轮询干不起，交给打开 / 手动刷新兜底。间隔 5s 与闲置探活 30s 不同量级，互不干扰。
+* **有差异才重读**：每拍一次列目录往返做「路径 + 类型 + size + mtime」集合比对
+  （`BTreeSet<(PathBuf, bool, u64, u64)>`），集合没变直接返回——闲着 = 一次往返、
+  零 UI 动作；变了才整目录 `refresh`。
+  ⚠️ 比对不再只看待「路径 + 类型」：**原地改写内容**（大小 / mtime 变了、条目集合
+  没变）现在也抓得到**——因为 SFTP / FTP / WebDAV 的目录列表本就一并返回 size /
+  mtime，比对的「新值」直接从列表拿、「旧值」来自 `load_path` 时 seed 进条目的
+  size/mtime，零额外网络往返**；不必逐条 metadata（每条目一次网络往返，轮询干不起）。
+  间隔 5s 与闲置探活 30s 不同量级，互不干扰。
 * **三种跳过**：目录在读中（`loading`，没有可比的稳定快照）、读失败（连接抖了，
   不把坏连接刷成报错弹窗，自愈交给 `load_path` 的 revive 路径）、比对通过后用户
   已切走（refresh 前再验一次 `current_path`，别替别人白读一趟）。
@@ -244,8 +247,9 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 * ~~远程端点上的**撤销**（含删除）没有模型；`Reversible` 全是本地路径语义~~
   已做（§8：三个远程变体捕获后端；删除仍不可撤销——服务端没有回收站）。
 * ~~远程目录没有 watcher（改完必须重读）——其它改动仍要手动刷新~~
-  列表级变化已做（§9：5s 轮询比对当前远程目录，有差异才重读）；「原地改写
-  内容」仍靠打开 / 手动刷新兜底（逐条 metadata 轮询干不起）。
+  列表级 + 内容级都已做（§9：5s 轮询比对当前远程目录，键含 size/mtime，有差异才
+  重读；「原地改写内容」不再靠手动刷新兜底）。远程 `ReadDirEntry` 现带 size/mtime，
+  `load_path` 时 seed 进条目，模型侧与列表侧同源比对、epoch 一致不会误判。
 * SMB / NFS 仍走系统挂载（`mo_remote::mount`），挂载点对 `mo-fs` 来说就是本地路径，
   不需要 `TransferOperation` 这条链。
 
@@ -272,3 +276,32 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   反向验证：撤探测修复 → 四条全红；撤 `policy` 修复 → 覆盖那条红。
 * **UI 侧零改动**：`handle_transfer_outcome` 早就处理 `NeedsConflictConfirmation`，
   本地对只是以前**不返回**这个结局。
+
+## §11：远程内容级刷新落地（2026-10-08）
+
+* **根因**：`poll_remote_listing_once` 的「有差异才重读」只比对 `(path, kind)` 集合，
+  列表级变化（增 / 删 / 改名）能抓，「原地改写内容」（size / mtime 变了、集合没变）
+  抓不到。devlog 原记「逐条 metadata 轮询干不起」——但那是**列表之外再逐个 stat**。
+  远程目录列表（SFTP `readdir` / FTP `LIST/MLSD` / WebDAV `PROPFIND`）本就一并返回
+  size / mtime，被 `read_dir` 构造 `ReadDirEntry` 时丢掉了。
+* **修法**：
+  1. `mo-fs/src/reader.rs`：`ReadDirEntry` 加 `size: u64` / `modified: Option<SystemTime>`
+     （`new` 签名不变，加 `with_metadata` builder 以免波及既有调用点）。
+  2. 三个远程后端在列目录时就填：`sftp` `collect_entries` 取 `DirEntry::metadata()`
+     的 `size`/`mtime`；`ftp` `entries_in` 取 `File::size()`(usize)/`modified()`(SystemTime)；
+     `webdav` `entries_from` 取 `prop.content_length`/`last_modified`（与各自 `metadata()`
+     同款映射）。本地后端不填（走后台 scheduler 逐条 stat），行为不变。
+  3. `mo-app/src/lib.rs` `load_path`：条目带 size/modified 时用它 **seed `Entry.metadata`**
+     ——既让远程大小 / 日期能显示（原本 `MetadataScheduler` 用 `std::fs::metadata` 对远程
+     路径必失败、远程元数据一直是 Loading），又给轮询泵一个可比对的「旧值」。
+  4. 轮询泵比对键扩成 `(path, kind, size, mtime_secs)`，size 或 mtime 变即触发整目录
+     `refresh`。模型侧旧值取自 seed 的元数据、列表侧新值取自本轮 `read_dir`，**同源、
+     epoch 一致不会误判**；零额外网络往返。
+* **验证**：`mo-app/tests/remote_poll.rs` 加 `poll_detects_in_place_content_change`
+  （同路径 size/mtime 变、集合没变 → 比对 + 重读两拍、刷新后拿新 size）；原有 4 条
+  仍绿。fmt/clippy（`-D warnings`）干净。related：`resume`/`undo_remote`/`conflict`/
+  `remote_local` 共 37 例、`sort_metadata`/`thumbnail_carry`/`navigation`/`productivity`/
+  `column_refresh` 全绿。
+* **剩余账**：mtime 按秒比对，亚秒级改写（极少见）要等下一拍；FTP `LIST` 的 mtime 来自
+  文本解析、个别服务器时区/精度不稳，可能偶发冗余刷新（无害，只是多一次重读）；本地
+  目录仍走旧 scheduler 路径，不受影响。
