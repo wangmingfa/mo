@@ -1802,24 +1802,20 @@ impl AppState {
         self.net_shares.lock().unwrap().0 = std::time::Instant::now() - NET_SHARE_TTL;
     }
 
-    /// 当前已挂载的 SMB / NFS 网络盘（权威读取，不依赖侧边栏缓存的 TTL）。
-    ///
-    /// 传输分发用它在 `transfer_between` 里判断「某个本地路径是否落在网络文件系统上」。
-    /// 直接读系统（`/proc/mounts` / `mount` / `net use`）而非走 [`AppState::network_shares`]
-    /// 的缓存：用户刚挂上一块盘就立刻往里拖文件时，侧边栏那层缓存可能还没刷新，
-    /// 漏判会让本该走 `TransferOperation` 的传输退化成本机复制。
-    async fn mounted_network_shares(&self) -> Vec<mo_remote::mount::NetworkShare> {
-        self.spawn_blocking(mo_remote::mount::mounted_shares)
-            .await
-            .unwrap_or_default()
-    }
-
     /// 把「落在已挂载网络盘下的路径」升级成 [`Endpoint::NetworkMount`]，让传输走
     /// `TransferOperation`（分块 / 续传 / 统一进度 / 跨文件系统移动安全）；纯本地
     /// 路径原样返回 `base`。
     ///
     /// 挂载点对 `mo-fs` 就是本地目录，所以 `NetworkMount` 承载的 `FileSystem` 仍是
     /// `LocalFileSystem`——只是「网络」这个性质决定了走哪条传输链。
+    ///
+    /// ⚠️ `shares` 取自 [`AppState::network_shares`]（缓存），**不要**在这里做权威
+    /// 查询（spawn_blocking 跑 `mount`）：传输链的 await 必须都在 GPUI 执行器内联
+    /// 完成，一旦挂上真线程，`run_until_parked` 不等它（devlog 的老坑），列视图
+    /// 拖拽那组墙钟轮询测试当场全红；且每次传输起一个 `mount` 子进程不值当。
+    /// 缓存的新鲜度由侧栏兜底——用户能对挂载点做传输，前提是他先在界面上看到
+    /// 它，每帧渲染都在问 `network_shares()`、过期即触发后台单飞刷新；应用内
+    /// 挂载 / 卸载另有 [`AppState::invalidate_net_shares`] 立即作废。
     fn net_endpoint(
         &self,
         base: &Endpoint,
@@ -4299,9 +4295,10 @@ impl AppState {
         move_: bool,
     ) -> TransferOutcome {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
-        // 当前已挂载的 SMB / NFS 网络盘（权威读取，不依赖侧边栏缓存的 TTL）：
-        // 落在这些挂载点下的路径要按「网络端点」对待，走 TransferOperation。
-        let shares = self.mounted_network_shares().await;
+        // 当前已挂载的 SMB / NFS 网络盘（缓存读，零 IO）：落在这些挂载点下的路径
+        // 要按「网络端点」对待，走 TransferOperation。⚠️ 别换成权威查询，见
+        // `net_endpoint` 的文档。
+        let shares = self.network_shares();
 
         // 第一遍只探测、不提交：一批里只要有冲突或可续传的，就整批交给用户决策——
         // 要是先把没冲突的传了，用户选「跳过」时已经动过的那些就收不回来了。
@@ -4394,7 +4391,7 @@ impl AppState {
         decision: ResumeDecision,
     ) -> Vec<u64> {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
-        let shares = self.mounted_network_shares().await;
+        let shares = self.network_shares();
         let mut ids = Vec::new();
         for src in &pending.paths {
             let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
@@ -4433,7 +4430,7 @@ impl AppState {
         decision: ConflictDecision,
     ) -> Vec<u64> {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
-        let shares = self.mounted_network_shares().await;
+        let shares = self.network_shares();
         let mut ids = Vec::new();
         for src in &pending.paths {
             let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {

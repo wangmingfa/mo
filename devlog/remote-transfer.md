@@ -318,10 +318,15 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   挂载点读写仍走 `std::fs`），传输分发里把「落在已挂载网络盘下的路径」升级成该变体：
   1. `mo-remote/src/mount.rs` 加 `is_under_mounted_share(path, shares)`：按组件前缀匹配
      `mounted_shares()` 的挂载点（`/Volumes/share` 不误命中 `/Volumes/shareX`）。
-  2. `mo-app/src/lib.rs` 加 `mounted_network_shares()`（权威读，绕过侧边栏 TTL 缓存——
-     刚挂上盘就拖文件时缓存可能没刷）与 `net_endpoint(base, path, shares, local)`（路径在
-     网络盘下 → `NetworkMount`，否则原样返回），`transfer_between` / `resolve_resume` /
-     `resolve_conflict` 的探测与提交循环都按路径逐条重分类。
+  2. `mo-app/src/lib.rs` 加 `net_endpoint(base, path, shares, local)`（路径在网络盘下 →
+     `NetworkMount`，否则原样返回），`transfer_between` / `resolve_resume` /
+     `resolve_conflict` 的探测与提交循环都按路径逐条重分类。~~shares 走
+     `mounted_network_shares()` 权威读（绕过侧边栏 TTL 缓存）~~ **订正（同日晚，
+     全量 CI 抓的）**：权威读是 `spawn_blocking` 跑 `mount` 子进程——传输链的 await
+     一旦挂上真线程，`run_until_parked` 不等它（§45 老坑），`column_drag` 六条墙钟
+     轮询测试当场红了五条。改走 [`network_shares`] 缓存（纯锁读、零 IO；侧栏每帧
+     都在问、过期自动后台单飞，应用内挂载 / 卸载另有 `invalidate_net_shares` 立即
+     作废）——用户能对挂载点做传输的前提是他先在界面上看到它，缓存那时早已刷新。
   3. `resolve_transfer_leg` 把 `NetworkMount` 与 `Remote` 同等待遇（`Local↔NetworkMount`
      标「上传 / 下载」、两块挂载之间 / 与远程混搭标「复制」），于是走 `TransferOperation`。
      `submit_transfer_entry` 的 leg 分支照旧：记录 `Reversible::RemoteCopy/Move`（用

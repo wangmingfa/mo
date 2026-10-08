@@ -294,24 +294,48 @@ impl FileIndex {
     /// 搜索：对 `name_lower` 与 `path` 做大小写不敏感的子串匹配，
     /// 按相关度排序后返回最多 `limit` 条。
     ///
-    /// 查找走 `files_fts` 这张 FTS5 trigram 虚表（`init` 里建好 + 三个触发器同步），
-    /// `MATCH` 直接落到 trigram 索引上，不再是前导 `%` 的全表扫——58 万行的库上
-    /// 从实测 ~150ms/次降到索引查找的量级。触发器的存在意味着 `upsert` / `remove` /
-    /// `rename` / `remove_under` 走实体表时 fts 自动跟着改，search 这边不用关心。
+    /// ≥3 字符的查询走 `files_fts` 这张 FTS5 trigram 虚表（`init` 里建好 + 三个
+    /// 触发器同步），`MATCH` 直接落到 trigram 索引上，不再是前导 `%` 的全表扫
+    /// ——58 万行的库上从实测 ~150ms/次降到索引查找的量级。触发器的存在意味着
+    /// `upsert` / `remove` / `rename` / `remove_under` 走实体表时 fts 自动跟着改，
+    /// search 这边不用关心。
+    ///
+    /// ⚠️ **短于 3 字符的查询必须回退旧 LIKE**：trigram 以 3 字符为最小匹配单元，
+    /// 更短的 `MATCH` 一个 trigram 都产不出来，结果是空（不是扫虚表、是直接零行），
+    /// 而「敲一个 z 找 zeta-*.md」是真实场景（`global_search_bg` 测试钉的就是它）。
+    /// 短查询回退全表扫可接受：这条查询已随 §46 后台化，慢不压主线程。
     ///
     /// 排序规则：文件名以查询串开头的最相关，其次文件名包含，再次路径包含；
-    /// 同级优先路径更短（更靠近根）的结果——这条 ORDER BY 只作用在 fts 已收窄的
+    /// 同级优先路径更短（更靠近根）的结果——这条 ORDER BY 只作用在查找已收窄的
     /// 候选集上，量很小，不影响查找本身的开销。
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, SearchError> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Ok(Vec::new());
         }
+        let starts = format!("{q}%");
+        if q.chars().count() < 3 {
+            // 短查询：trigram 无从下手，走旧 LIKE 全表扫。
+            let like = format!("%{q}%");
+            let mut stmt = self.conn.prepare(
+                "SELECT path, name, size, modified, is_dir FROM files
+                 WHERE name_lower LIKE ?1 OR path LIKE ?1
+                 ORDER BY
+                   CASE WHEN name_lower LIKE ?2 THEN 0 ELSE 1 END,
+                   length(path) ASC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![like, starts, limit as i64], hit_from_row)?;
+            let mut hits = Vec::new();
+            for row in rows {
+                hits.push(row?);
+            }
+            return Ok(hits);
+        }
         // 把查询包成带双引号的 FTS5 短语，规避括号 / `*` 等 FTS 语法字符在查询里炸开；
         // 内部的双引号按 FTS 约定翻倍转义。trigram 对短语做大小写不敏感的子串匹配，
         // 对应原来的 `name_lower LIKE '%q%' OR path LIKE '%q%'`。
         let match_q = format!("\"{}\"", q.replace('"', "\"\""));
-        let starts = format!("{q}%");
 
         let mut stmt = self.conn.prepare(
             "SELECT f.path, f.name, f.size, f.modified, f.is_dir
@@ -324,28 +348,7 @@ impl FileIndex {
              LIMIT ?3",
         )?;
 
-        let rows = stmt.query_map(params![match_q, starts, limit as i64], |r| {
-            let path: String = r.get(0)?;
-            let name: String = r.get(1)?;
-            let size: i64 = r.get(2)?;
-            let modified: i64 = r.get(3)?;
-            let is_dir: i32 = r.get(4)?;
-            Ok(SearchHit {
-                path: PathBuf::from(path),
-                name,
-                kind: if is_dir != 0 {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
-                },
-                size: size as u64,
-                modified: if modified > 0 {
-                    Some(modified as u64)
-                } else {
-                    None
-                },
-            })
-        })?;
+        let rows = stmt.query_map(params![match_q, starts, limit as i64], hit_from_row)?;
 
         let mut hits = Vec::new();
         for row in rows {
@@ -353,6 +356,30 @@ impl FileIndex {
         }
         Ok(hits)
     }
+}
+
+/// 行 → [`SearchHit`] 的统一映射（fts 与 LIKE 回退两条查询共用同一列形状）。
+fn hit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
+    let path: String = r.get(0)?;
+    let name: String = r.get(1)?;
+    let size: i64 = r.get(2)?;
+    let modified: i64 = r.get(3)?;
+    let is_dir: i32 = r.get(4)?;
+    Ok(SearchHit {
+        path: PathBuf::from(path),
+        name,
+        kind: if is_dir != 0 {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        },
+        size: size as u64,
+        modified: if modified > 0 {
+            Some(modified as u64)
+        } else {
+            None
+        },
+    })
 }
 
 #[cfg(test)]
@@ -458,6 +485,38 @@ mod tests {
         let hits = i.search("togr", 50).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.name.contains("togr")));
+    }
+
+    /// 短于 3 字符的查询必须仍能命中：trigram 以 3 字符为最小匹配单元，更短的
+    /// `MATCH` 是零行（不是扫虚表），要回退旧 LIKE——「敲一个 z 找 zeta-*.md」
+    /// 是真实场景（`global_search_bg` 测试钉的就是它）。
+    #[test]
+    fn search_short_queries_still_hit_via_like_fallback() {
+        let mut i = idx();
+        i.upsert(
+            std::path::Path::new("/a/zeta.md"),
+            "zeta.md",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        i.upsert(
+            std::path::Path::new("/a/murky.txt"),
+            "murky.txt",
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        // 单字符：旧 LIKE 能中 zeta.md（murky.txt 里没有 z）。
+        let one = i.search("z", 50).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "zeta.md");
+        // 两字符同理。
+        let two = i.search("mu", 50).unwrap();
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].name, "murky.txt");
     }
 
     /// 性能红线：搜索必须走 fts5 索引，不能退化成 `files` 全表扫（那是 58 万行 ~150ms 的老账）。

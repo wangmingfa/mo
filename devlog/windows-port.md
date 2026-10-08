@@ -1104,8 +1104,11 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
     删除/改名用例覆盖。`mo-app` 的 `global_search_finds_files_across_subdirs` 及 `global_index` /
     `index_sync` 三个集成测试文件（共 21 例）也全过。
 * **剩的账**：
-  * 查询长度 < 3 字符时 trigram 退化为对 `files_fts` 虚表全扫（仍比扫 `files` 基表快，且已随
-    §46 后台化）；极短查询属少数情况，先不动。
+  * ~~查询长度 < 3 字符时 trigram 退化为对 `files_fts` 虚表全扫~~ **订正（2026-10-08 晚，
+    全量 CI 抓的）**：上句是**错的**——trigram 以 3 字符为最小匹配单元，更短的 `MATCH`
+    一个 trigram 都产不出来，结果是**零行**（不是扫虚表），`global_search_bg` 敲一个
+    `"z"` 找 `zeta-*.md` 的两条测试当场红。修法：短查询回退旧 LIKE 全表扫（已随 §46
+    后台化，慢不压主线程），`search_short_queries_still_hit_via_like_fallback` 钉住。
   * FTS 只索引 `name_lower` + `path`（文件名/路径子串搜索）。**文件内容搜索是另一条线**
     （`mo_search::content::search_content`），与本索引无关，不受影响也不在此优化范围。
   * 升级后首开若索引很大，回填那一次会有可感知的两三秒停顿（一次性）；之后无感。
