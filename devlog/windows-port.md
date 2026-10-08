@@ -190,6 +190,19 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
   ⚠️ **并发坑**（保留给后来人）：两条 `unshifted_key` 测试并行跑时各自进
   `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate`，这套 HIToolbox 布局查询在无 GUI
   会话的并发下会 **SIGABRT**；所以这条必须保持**单测**，别为了「分两条更清楚」而拆开。
+* **Linux 已补（2026-10-08）：** 用 **libxkbcommon** 读当前 XKB 布局的 Shift 变体映射
+  （`linux::unshifted_key`，`#[link(name = "xkbcommon")]` + 手写 `extern "C"`，进程级
+  `OnceLock` 缓存映射表）。对每个键码分别取「无 Shift / 按住 Shift」打出的字符
+  （`xkb_state_update_modifiers` 置 Shift 修饰位 + `xkb_state_key_get_utf8`，比直接查 level
+  更稳——自动处理各布局的 level/Shifts 数），建 `Shift 变体 → 基本键` 表。`XKB_DEFAULT_LAYOUT`
+  等环境变量可切布局（测试里靠它切德语）。拿不到 libxkbcommon / XKB 数据时 `build_map` 返 `None`、
+  `unshifted_key` 退化成 `None`（上层用 US 表），**不因此让二进制起不来**。
+  单测 `unshifted_key_follows_german_layout`：`XKB_DEFAULT_LAYOUT=de` 下 `?`→`ß`（US 布局则来自 `/`，
+  足以证布局感知）、`A`→`a`、`!`→`1`、基本键映射到自己；无 XKB 数据环境跳过重断言。
+  ⚠️ **交叉编译怪象**：从 macOS host 跑 `cargo clippy --target x86_64-unknown-linux-gnu`
+  `-D warnings` 偶发不套用 workspace 的 `unsafe_code = "warn"`，把 FFI 升成 deny；真机 Linux
+  native 构建与 macOS native 同行为（正常放行）。为保险 `linux.rs` 顶部加 `#![allow(unsafe_code)]`
+  兜底，纯 FFI 模块属合理范围。
 * **单测不碰真布局**：`fold_typographic_shift` 在 `#[cfg(test)]` 下把查询退化成 `None`（开发机插什么键盘不该决定断言红绿，与 §16/§21 同一类卫生）；非 US 的行为由 `fold_with` 那组测试喂**假布局**覆盖。`mo-platform` 侧按 KLID 显式 `ActivateKeyboardLayout` 后实测 US 与德语两列答案，装不上布局的机器跳过并 `eprintln!`。
 * **实机验证撞到的两件事**（记下来，免得下一个人重踩）：
     * gpui 算字符走 `ToUnicode(vk, lParam 高字节的扫描码, state)`，它只看**当前线程**的布局。而 `SetForegroundWindow` 一激活窗口，Windows 就把该线程的布局打回这个窗口登记的输入语言（本机是 `0x0804` 中文）；`WM_INPUTLANGCHANGEREQUEST` 想切德语（`00000407`）也不落地——不在用户「输入语言列表」里的布局，Shell 不给切。所以**没能让 Mo 的线程真变成德语键盘**，GUI 上的德语端到端这一轮没验成。
@@ -256,8 +269,10 @@ Mo 主打 macOS，Windows 这一路的规矩是：**契约不变，实现换**�
 * Windows 的 `windows_pdf` 别名是权宜：若哪天要把 Shell 那套也升到 0.62，一并把两个版本收成一个，别再叠第三份。
 * **§22 macOS 的「US 表」缺口已补**（2026-09-30，`dcbe702`）：macOS 也走 `TIS + UCKeyTranslate`
   查当前布局折符号键，非 US 布局不再串键；德语真值由 `unshifted_key_consults_current_layout`
-  在德语机器上断言（US 自动跳过）。Linux 侧连 §15 的实测都还没做（gpui 的 Linux 后端怎么报
-  Shift + 符号未验），只保证单测三平台跑得过。
+  在德语机器上断言（US 自动跳过）。**Linux 侧 §15 也补了（2026-10-08）：`linux::unshifted_key` 走
+  libxkbcommon 读 XKB 布局，非 US 布局不再串键；单测 `unshifted_key_follows_german_layout` 在真机
+  跑（`XKB_DEFAULT_LAYOUT=de` 下 `?`→`ß`）。gpui 的 Linux 后端怎么报 Shift+符号**这件事本身**仍只
+  在真机验过编译、未在真机点过——属「整体真机行为」验收项，不在本补丁范围。
 * **拖放「出去」的 Windows 实测仍欠着**（§24 进来、§25 出去，macOS 侧 §29 已补齐并统一成复制语义、用户真机已验）：按住文件真拖一次到资源管理器上松手，看它落不落子、结论是不是复制——headless 做不到，得人来。收账盘点见 §35。
 * ~~**应用内拖拽零 headless 覆盖**（§35）~~ **已补**（2026-10-01，§36）：`crates/mo-ui/tests/internal_drag.rs` 五条，含 Alt=移动。
 * ~~**网格 / 画廊没接应用内拖拽**（§35）~~ **已接**（2026-10-01，§37）：`grid::cell` 挂上 down→`begin_drag` / up→`drop_on_entry`，`tests/grid_drag.rs` 五条。

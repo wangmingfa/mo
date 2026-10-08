@@ -17,6 +17,8 @@
 //! 容量统计都只认系统那份。用 `trashItemAtURL:resultingItemURL:` 让系统搬、Mo
 //! 拿回落点记账才是正解（探针结论见 `devlog/trash-unify.md`）。
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
@@ -433,8 +435,9 @@ pub fn begin_file_drag(
 /// Windows 用 `VkKeyScanExW` + `MapVirtualKeyExW`（`windows::unshifted_key`），macOS 用
 /// `TISCopyCurrentKeyboardLayoutInputSource` + `UCKeyTranslate` 反查当前布局
 ///（`macos::unshifted_key`）——gpui 的 `Keystroke` 只给字符、不给虚拟键码，macOS 不能
-/// 像 Windows 那样直接反查键码，所以反过来枚举键码建表再查字符。两者语义对齐；其余
-/// 平台答 `None`，调用方继续用自己的 US 表。
+/// 像 Windows 那样直接反查键码，所以反过来枚举键码建表再查字符。两者语义对齐；
+/// Linux 用 libxkbcommon 读当前 XKB 布局的 Shift 变体表（`linux::unshifted_key`）。
+/// 其余平台答 `None`，调用方继续用自己的 US 表。
 pub fn unshifted_key(ch: char) -> Option<char> {
     #[cfg(target_os = "windows")]
     {
@@ -444,7 +447,11 @@ pub fn unshifted_key(ch: char) -> Option<char> {
     {
         macos::unshifted_key(ch)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::unshifted_key(ch)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = ch;
         None
