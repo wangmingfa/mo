@@ -132,7 +132,7 @@ fn manager_list_source_end_to_end() {
         std::fs::write(
             ext_dir.join("manifest.json"),
             format!(
-                r#"{{"id":"p4a","name":"P4夹具","provider":{{"run":[{},"ok"],"methods":["list"]}},"lists":[{{"id":"recent","title":"最近文件"}}]}}"#,
+                r#"{{"id":"p4a","name":"P4夹具","icon":"icon.png","provider":{{"run":[{},"ok"],"methods":["list"]}},"lists":[{{"id":"recent","title":"最近文件"}}]}}"#,
                 exe_json
             ),
         )
@@ -281,7 +281,7 @@ fn manager_end_to_end_classifies_stores_and_forgets() {
         std::fs::write(
             ext_dir.join("manifest.json"),
             format!(
-                r#"{{"id":"p3a","name":"P3夹具","provider":{{"run":[{},"ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
+                r#"{{"id":"p3a","name":"P3夹具","icon":"icon.png","provider":{{"run":[{},"ok"],"methods":["classify"]}},"capabilities":["read-contents"],"types":[{{"ext":[".p3x"],"label":"静态"}}]}}"#,
                 exe_json
             ),
         )

@@ -24,9 +24,10 @@ provider 用 **TypeScript（bun 运行，零编译）** 写——插件系统的
 
 ```
 plugin-srt-tools/
-├── manifest.json        # 清单（Mo 加载的全部依据）
+├── manifest.json        # 清单（Mo 加载的全部依据；icon 必填，没有装不进来）
+├── icon.png             # 扩展图标（扩展管理器卡片上画的那颗，必填）
 ├── bin/srt-tools.ts     # provider 进程（有 shebang + 可执行位，bun 直接跑）
-├── test_provider.ts     # 协议自测：不依赖 Mo，单独验证 provider 这一腿
+├── test-provider.ts     # 协议自测：不依赖 Mo，单独验证 provider 这一腿
 └── README.md
 ```
 
@@ -63,10 +64,15 @@ stdout **只能吐协议帧**——任何多余输出都会被宿主当成坏帧
 ```
 <配置目录>/mo/extensions/srt-tools/
 ├── manifest.json
+├── icon.png
 └── bin/srt-tools.ts
 ```
 
 - 配置目录即 `config.json` 所在目录（见 `mo_config`）。
+- 清单里的 `icon` 是**必填项**（相对扩展目录的图片路径，png/jpg/webp/gif 等），且文件
+  必须真的在目录里——缺了不允许安装。装好后扩展管理器的卡片上有「刷新」按钮
+  （循环箭头）：改完这个目录里的代码点一下即从来源重装，启停状态保留，开发迭代不用
+  卸了再装。
 - `bin/srt-tools.ts` 需要可执行位（`chmod +x`）；宿主按扩展目录解析 `run[0]`，靠 shebang
   `#!/usr/bin/env bun` 拉起。
 - 运行环境要求 **bun** 在 PATH 上（命令面板里的「统计字幕条目数」走的是 `sh`，不依赖 bun；

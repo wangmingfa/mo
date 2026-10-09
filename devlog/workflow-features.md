@@ -249,3 +249,88 @@
   回归钉死；`plugin-system.md` §5 协议段同步改。
 * **教训**：跨语言协议里「宿主自留的哨兵值」不能假设对端能无损表示——u64 空间里
   超过 2^53 的任何值对 JS 系实现都是另一个数。
+
+### ⑫ 扩展管理器改版：主色安装按钮 + Chrome 式宫格（2026-10-09）
+* **需求**：①「从磁盘安装 / 从 .moext 安装」从灰行改成有色按钮；②已装扩展从「行+展开」
+  改成 Chrome 扩展管理同款宫格卡。
+* **做法**：按钮置顶一行、`selected_bg`+`selected_text` 主色底；卡片 basis 300 + grow 随宽
+  换行（560 宽窗一行一张），选中卡亮 accent 边框、贡献清单摊进卡内；启用态胶囊改主色底
+  （扫一眼知道哪家在生效）。元素 ID（ext-row/toggle/detail/uninstall）与点击语义一字未动
+  ——既有 7 条扩展测试就是这次的回归网。
+* **踩坑（重要）**：宫格让内容变高，6+ 家扩展超出 560×520 窗口——headless 实测视口外的卡
+  `click` 报 not visible / 部分可见时点 bounds 中心落空（p29 测试并行必红由此而来）。
+  修法三件套：卡片紧凑化（p8 / gap3）+ 页内 `overflow_y_scrollbar` + 窗口加高到 640。
+* **排查法**：临时探针测试种 N 家扩展逐家打印 bounds + 点击后 ext_index——注意探针自身
+  的清单若是坏清单（`"menu": ["context"]` 不是合法槽位，合法值 palette / context:file /
+  context:blank / sidebar）会进 broken 列表，让「期望下标」整体错位，别把自己的错当成
+  布局的错。
+* **环境注**：全量 CI 期间 `layout.rs::clicking_blank_below_the_list_clears_the_selection`
+  稳定红，经 stash 基线 + 上午全绿提交的 worktree 双对照确认与本改动无关——headless
+  **drag 派发**在该时段系统性失效（扩展页的 click 派发同窗全绿），属环境抖动，稍后重跑。
+
+### ⑬ 扩展卡片：图标 / 开关 / 已禁用文案 / 一键刷新（2026-10-09）
+* **需求**：①卡片参考 Chrome 加插件图标，manifest 必须提供 icon，否则不允许安装；
+  ②「从磁盘安装」的插件加刷新按钮，从原来源目录重装（开发阶段免反复卸装）；③启停
+  改成开关样式，禁用的卡上显示「已禁用」；④安装时对必填项校验，不过不装。
+* **做法**：
+  - `Manifest` 新增 `icon`（相对扩展目录）。`validate` 三道门禁：非空、安全相对路径
+    （绝对路径 / `..` / 反斜杠都拒）、扩展名在 ICON_EXTS（png/jpg/jpeg/webp/gif/bmp/ico，
+    与 workspace image 解码 feature 同口径）；`install_from` 再验**文件真的在来源目录**
+    （`validate` 看串、安装看盘）。没写 icon 的清单 → broken，报错带修法。
+  - 刷新：账本 `installed.json` 的 `source` 是判据（`dev_source_of`），`reinstall(id, root)`
+    顺序有讲究——来源清单先**完整过门禁**（validate + 图标在盘），过了才删旧目录，
+    来源改坏就地拒、旧的分毫不动；装回来**保留原启停状态**（开发启用着，刷十次也开着）。
+    AppState 包装补 `forget_ext`（provider 内存账重装后清，与卸载同一条收尾）。
+  - UI：卡头改「图标 32×32（丢文件画内置拼图占位）｜名字+版本（停用加一行灰「已禁用」）
+    ｜刷新（ROTATE_CW，仅带账本的卡）+ 开关 34×20」。胶囊→开关沿用原 `ext-toggle-<id>`
+    （既有测试即回归网）；刷新按钮 `ext-refresh-<id>` 点了止泡。禁用卡的概要行改
+    「已禁用 · 贡献 N 项」。
+* **测试**：mo-app 5 条新（icon 三种坏法 / 装时图标文件缺失 / 刷新保留启用 / 来源坏或
+  手摆拒刷）；mo-ui 1 条新 headless（`refreshing_reinstalls_from_the_source_and_keeps_enabled`：
+  装的卡有刷新、手摆的没有，改来源→点刷新→面板当场新名字、仍停用）。既有 fixture 全部
+  补 `"icon": "icon.png"`（安装类还要真落一个文件）。
+* **坑**：`Div` 的 `.when` 不在 gpui_kit 根，要 `use gpui_kit::prelude::FluentBuilder as _`
+  （progress_panel.rs 早有先例）。
+
+### ⑭ 无效扩展的「删除」按钮（2026-10-09）
+* **需求**：扩展加载失败只显示原因、删除还得自己去文件管理器端目录——不友好。要在
+  扩展管理器里显示「无效」+ 原因，并给一颗删除按钮。
+* **做法**：坏清单行文案「（加载失败）」改「（无效）」，标题行右侧加警示红「删除」；
+  新确认卡 `Modal::ConfirmRemoveBrokenExt`——身份带**目录完整路径**而不是 id（坏清单
+  可能压根解析不出来，id 无从谈起，目录是唯一稳定坐标）。落点
+  `extensions::remove_broken_extension(dir)`：护栏=目录里必须有 `manifest.json` 才动手
+  （与 `load_report` 收 broken 的判据同口径），失败扩展从未注册 provider，无需清缓存。
+  键位/遮罩/主窗口三条路由全部与「卸载」确认卡同款接入（Esc/Enter/点遮罩）。
+* **测试**：mo-app 1 条（护栏拒绝无清单目录 / 整删 / 已删再删报错）；mo-ui 1 条 headless
+  （行+按钮在 → 点删除弹卡带目录路径 → 取消目录分毫不动 → 再删确认 → 目录没了、行当场
+  消失、模态清空）。既有 34 条扩展测试零改动全绿。
+
+### ⑮ 汉堡按钮挪到标签条行末 + rgba 位序修复（2026-10-09）
+* **用户报**：①汉堡（应用菜单）放地址栏左边不合适，应挪到标签页那一行最后，但要兼容
+  Windows（别跟最小化/最大化/关闭重叠）；②删除按钮还是看不清。
+* **根因（②）不是样式是位序**：gpui 的 `rgba(u32)` 按 **RRGGBBAA** 大端解析，
+  `rgba(0xd70015)` 六位被读成 `[00,d7,00,15]` = **绿色 + 8% 透明度**——实心红全画成了
+  半透明浅绿。全仓 7 处同病（卸载/启用确认键、删除按钮、进度条成败色 0x248a3d 同样是
+  半透明蓝）。统一补 `ff`。
+* **①的做法**：按钮抽成 `toolbar::app_menu_button`，`render_top_row` 插在标签条之后、
+  `drag_strip`/`window_controls` **之前**（Win 上就在窗口控制按钮左边，永不重叠）；
+  macOS 上按下时 `stop_propagation`（顶栏整行挂着 attach_titlebar_drag，按下汉堡不该
+  顺手拖窗口）。浮层锚点改右对齐：`app_menu_x(viewport_w) = vw - MENU_W - 8`，
+  `render_app_menu` 收视口宽（render 里有 window 可取）。
+* **测试**：锚点测试改右对齐期望；`titlebar_drag_filler` 断言改为「带子顶到汉堡左缘
+  （≤5px 容差）+ macOS 上汉堡贴行末（≤8px）」。app_menu 三条与 layout 顶栏三条全绿。
+### ⑯ 并行安装 zip 撞 staging 目录（2026-10-09）
+* **现象**：`installs_from_archive` 单测偶发红——同一进程并行两条 zip 安装，同一毫秒拿到
+  同一个 staging 目录（macOS `SystemTime` 纳秒 API 实为**毫秒级粒度**），flat42 顶层清单
+  混进 p28 的解压根，`locate_source` 认错布局，装出来是别家的 id。
+* **修法**：`unique_suffix` 改「进程内 `AtomicU64` 单调计数 × 4096 + 纳秒」，时间戳不再
+  单独当唯一值用。教训：时间戳当唯一值先查时钟粒度；「install Ok 但文件缺」先怀疑同名
+  staging 被两家共用。
+
+### ⑰ 列表源面板入场点击补重试（2026-10-09）
+* 满负载并行下 `list_source_panel` 的入场点击偶发整段丢失（headless 确定性调度与真线程
+  竞争，同 e006581 书签点击重试的家族病），轮询 100 轮也等不来行。
+* 修法：轮询到第 30 / 60 轮还没见行就补点一次——模态没开时这是唯一入场路径，模态开了
+  再点也只是重开同一个面板，幂等。另把「满载下单跑红且稳定也不可信、判回归先看 uptime」
+  写进长期判据。
+

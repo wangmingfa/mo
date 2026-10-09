@@ -287,7 +287,9 @@ fn toolbar_height_is_pinned_for_traffic_lights(cx: &mut TestAppContext) {
 ///
 /// 顶栏是自绘的 48px，而 macOS 的 AppKit 只认原生标题栏那一条带（≈28pt）；
 /// 没有应用层拖拽带时，下半截谁都不管——标签右侧的空白就拖不动窗口。
-/// 这里断言那条带子确实铺在「＋」右侧、且铺满整行高度（直到窗口右缘）。
+/// 这里断言那条带子确实铺在「＋」右侧、且铺满整行高度。行末的「应用菜单」
+/// （汉堡）插在带子与窗口右缘之间：带子到汉堡左缘为止，汉堡右侧那截由
+/// `attach_titlebar_drag` 挂在整行上的处理器兜底（macOS）。
 #[gpui_kit::test]
 fn titlebar_drag_filler_covers_the_area_right_of_new_tab(cx: &mut TestAppContext) {
     let (mut cx, _window) = open_app(size(px(1000.), px(700.)), cx);
@@ -295,6 +297,7 @@ fn titlebar_drag_filler_covers_the_area_right_of_new_tab(cx: &mut TestAppContext
     let toprow = bounds(&mut cx, "mo-toprow");
     let new_tab = bounds(&mut cx, "mo-tab-new");
     let filler = bounds(&mut cx, "mo-titlebar-drag");
+    let menu_btn = bounds(&mut cx, "mo-app-menu-btn");
 
     assert!(
         filler.origin.x >= new_tab.origin.x + new_tab.size.width,
@@ -309,12 +312,19 @@ fn titlebar_drag_filler_covers_the_area_right_of_new_tab(cx: &mut TestAppContext
         toprow.size.height - px(1.),
         "拖拽带没有铺满顶栏内容高度（行高减掉底部那条 1px 分隔线），死区还剩一条：filler={filler:?} toprow={toprow:?}"
     );
-    // macOS 顶栏右缘没有窗口控制按钮 → 必须一路铺到窗口右缘（右内边距也要吃掉）。
+    // 带子必须顶到汉堡按钮左缘（按钮 4px 外边距造成的缝隙在 macOS 由整行拖拽
+    // 兜底、Windows 上是 4px 死区，都可接受）——再往右就是按钮的地盘，压上去按钮
+    // 就点不到。
+    assert!(
+        (filler.origin.x + filler.size.width - menu_btn.origin.x).abs() <= px(5.),
+        "拖拽带与汉堡按钮之间有缝或重叠：filler={filler:?} menu_btn={menu_btn:?}"
+    );
+    // macOS 顶栏右缘没有窗口控制按钮 → 汉堡贴着行末（≤ 按钮 4px 外边距的余量）。
     if cfg!(target_os = "macos") {
-        assert_eq!(
-            filler.origin.x + filler.size.width,
-            toprow.origin.x + toprow.size.width,
-            "拖拽带没铺到窗口右缘，最右那条仍拖不动：filler={filler:?} toprow={toprow:?}"
+        assert!(
+            toprow.origin.x + toprow.size.width - (menu_btn.origin.x + menu_btn.size.width)
+                <= px(8.),
+            "汉堡按钮没有贴到窗口右缘：menu_btn={menu_btn:?} toprow={toprow:?}"
         );
     }
 }
@@ -2445,6 +2455,7 @@ fn contributed_type_label_shows_in_the_kind_column(cx: &mut TestAppContext) {
         r#"{
   "id": "p23-srt-tools",
   "name": "字幕工具",
+  "icon": "icon.png",
   "types": [{ "ext": [".SRT"], "label": "字幕" }]
 }"#,
     )

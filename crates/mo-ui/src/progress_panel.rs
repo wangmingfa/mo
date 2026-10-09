@@ -530,8 +530,8 @@ fn status_label(op: &OperationHandle) -> &'static str {
 fn status_color(op: &OperationHandle) -> Rgba {
     match op.status {
         OperationStatus::Pending | OperationStatus::Running => theme::selected_bg(),
-        OperationStatus::Completed => rgba(0x248a3d),
-        OperationStatus::Failed => rgba(0xd70015),
+        OperationStatus::Completed => rgba(0x248a3dff),
+        OperationStatus::Failed => rgba(0xd70015ff),
         OperationStatus::Paused | OperationStatus::Cancelled => theme::muted(),
     }
 }

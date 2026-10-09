@@ -5476,6 +5476,36 @@ impl AppState {
         result
     }
 
+    /// 「从磁盘安装」装进来的扩展，它账本（`installed.json`）里记的来源目录。
+    ///
+    /// `None` = 没有账本（手工摆放的扩展没有来源可刷）。扩展管理器拿它判「刷新」
+    /// 按钮的显隐——判据在 [`extensions::dev_source_of`]，这里只搬运。
+    pub fn extension_dev_source(&self, id: &str) -> Option<std::path::PathBuf> {
+        extensions::dev_source_of(id, &extensions::extensions_root(&Self::config_path()))
+    }
+
+    /// 「刷新」一个从磁盘安装的扩展：从账本记的来源目录重新安装（开发阶段迭代用）。
+    ///
+    /// 门禁与「来源坏了拒在删旧目录之前」都在 [`extensions::reinstall`]；这里补一条
+    /// 卸载同款的收尾——provider 的内存账（classify 表、活着的进程）目录指纹管不到，
+    /// 重装后一律清，下次用到时按新清单冷启动。
+    pub fn reinstall_extension(&self, id: &str) -> Result<extensions::Manifest, String> {
+        let result = extensions::reinstall(id, &extensions::extensions_root(&Self::config_path()));
+        if result.is_ok() {
+            self.providers().forget_ext(id);
+        }
+        result
+    }
+
+    /// 删除一个**加载失败**的扩展目录（扩展管理器「无效」卡上的删除按钮）。
+    ///
+    /// 失败的扩展从未注册过 provider，没有账要清——直接落到
+    /// [`extensions::remove_broken_extension`]（护栏在那边：目录里必须有
+    /// `manifest.json` 才动手）。
+    pub fn remove_broken_extension(&self, dir: &std::path::Path) -> Result<(), String> {
+        extensions::remove_broken_extension(dir)
+    }
+
     /// 扩展贡献的「种类文案」表（键：小写、不含点的扩展名）。
     ///
     /// 渲染路径的用法是**每帧取一次**、行循环里只做表查询（`mo_ui::file_list` 就是

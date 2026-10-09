@@ -18,8 +18,9 @@
 use gpui_kit::*;
 
 use crate::app::{
-    confirm_enable_ext, confirm_uninstall_ext, dismiss_enable_confirm, dismiss_uninstall_confirm,
-    render_enable_confirm, render_uninstall_confirm,
+    confirm_enable_ext, confirm_remove_broken_ext, confirm_uninstall_ext, dismiss_enable_confirm,
+    dismiss_remove_broken_confirm, dismiss_uninstall_confirm, render_enable_confirm,
+    render_remove_broken_confirm, render_uninstall_confirm,
 };
 use crate::theme;
 use crate::RootView;
@@ -106,6 +107,17 @@ impl Render for ExtensionsWindow {
                         root = root.child(render_uninstall_confirm(&m, &entity));
                     }
                 }
+                crate::app::Modal::ConfirmRemoveBrokenExt(dir) => {
+                    let reason = self
+                        .root
+                        .read(cx)
+                        .broken_exts
+                        .iter()
+                        .find(|b| b.path.parent() == Some(std::path::Path::new(&dir)))
+                        .map(|b| b.reason.clone())
+                        .unwrap_or_default();
+                    root = root.child(render_remove_broken_confirm(&dir, &reason, &entity));
+                }
                 _ => {}
             }
         }
@@ -115,7 +127,9 @@ impl Render for ExtensionsWindow {
         root.interactivity().on_key_down(move |ev, window, cx| {
             let confirm_open = matches!(
                 nav.read(cx).modal,
-                crate::app::Modal::ConfirmEnableExt(_) | crate::app::Modal::ConfirmUninstallExt(_)
+                crate::app::Modal::ConfirmEnableExt(_)
+                    | crate::app::Modal::ConfirmUninstallExt(_)
+                    | crate::app::Modal::ConfirmRemoveBrokenExt(_)
             );
             match ev.keystroke.key.as_str() {
                 "escape" => match nav.read(cx).modal.clone() {
@@ -123,12 +137,18 @@ impl Render for ExtensionsWindow {
                     crate::app::Modal::ConfirmUninstallExt(_) => {
                         dismiss_uninstall_confirm(&nav, cx)
                     }
+                    crate::app::Modal::ConfirmRemoveBrokenExt(_) => {
+                        dismiss_remove_broken_confirm(&nav, cx)
+                    }
                     // 没有确认卡：Esc 关掉整个扩展管理器窗口。
                     _ => window.remove_window(),
                 },
                 "enter" => match nav.read(cx).modal.clone() {
                     crate::app::Modal::ConfirmEnableExt(_) => confirm_enable_ext(&nav, cx),
                     crate::app::Modal::ConfirmUninstallExt(_) => confirm_uninstall_ext(&nav, cx),
+                    crate::app::Modal::ConfirmRemoveBrokenExt(_) => {
+                        confirm_remove_broken_ext(&nav, cx)
+                    }
                     _ => nav.update(cx, |v, cx| v.extension_toggle_selected(cx)),
                 },
                 // 确认卡开着**不**吃上下键——卡还开着就换选中行，等于确认的是别条扩展。

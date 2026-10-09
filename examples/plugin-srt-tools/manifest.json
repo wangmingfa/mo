@@ -2,6 +2,7 @@
   "id": "srt-tools",
   "name": "字幕工具",
   "version": "1.0.0",
+  "icon": "icon.png",
   "enabled": true,
   "when_ext": [".srt", ".vtt"],
   "capabilities": ["read-contents"],

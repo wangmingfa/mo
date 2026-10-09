@@ -119,6 +119,12 @@ pub struct Manifest {
     /// 版本号（仅展示与记录用）。
     #[serde(default)]
     pub version: String,
+    /// 图标文件路径，**相对扩展目录**（如 `"icon.png"`）。必填：扩展管理器的卡片
+    /// 是 Chrome 那种「图标 + 名字 + 概要」的宫格，没有图标画不出——所以这是
+    /// 必填项，[`validate`] 拒收空值与不安全的写法，[`install_from`] 还要验文件
+    /// 真的在盘上（「写了却指不到」比「没写」更难查）。
+    #[serde(default)]
+    pub icon: String,
     /// 是否启用（缺省启用；关掉后其命令整体消失）。
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -182,6 +188,75 @@ fn norm_ext(raw: &str) -> Option<String> {
         return None;
     }
     Some(s)
+}
+
+/// 清单 `icon` 认的图片扩展名（与 workspace `image` 依赖的解码 feature 同一口径，
+/// gpui 的 `img()` 也是这一套解码）。
+pub const ICON_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "ico"];
+
+/// `icon` 指到的文件在不在 `dir` 里。`validate` 只看字符串，**装的时候看盘**——
+/// 指着一个不存在的文件，卡片上就是一块永久空槽。
+fn ensure_icon_file(m: &Manifest, dir: &Path) -> Result<(), String> {
+    let p = dir.join(&m.icon);
+    if p.is_file() {
+        return Ok(());
+    }
+    Err(format!(
+        "扩展「{}」的 icon「{}」在来源目录里不存在（{}）——图标是必填项，文件也得真的在",
+        m.id,
+        m.icon,
+        dir.display()
+    ))
+}
+
+/// 校验一份清单的 `icon`；返回错误描述（`None` = 合法）。
+///
+/// 图标是**必填项**（扩展管理器的卡片没有图标画不出，Chrome 扩展页同款宫格的
+/// 前提）。三条门禁：
+/// * 不能空；
+/// * 必须是相对扩展目录的安全路径——绝对路径、`..`、反斜杠都拒（图标路径要拼进
+///   「扩展目录 + icon」，来源目录是用户选的，穿越等于读指哪打哪）；
+/// * 扩展名必须在 [`ICON_EXTS`] 里（写个 `.txt` 当图标，渲染侧永远解不出来）。
+fn validate_icon(m: &Manifest) -> Option<String> {
+    let raw = m.icon.trim();
+    if raw.is_empty() {
+        return Some(format!(
+            "扩展「{}」没写 icon（相对扩展目录的图片路径，如 \"icon.png\"）——没有图标，扩展管理器的卡片画不出，不装",
+            m.id
+        ));
+    }
+    let p = Path::new(raw);
+    let unsafe_path = p.is_absolute()
+        || raw.contains('\\')
+        || p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+    if unsafe_path {
+        return Some(format!(
+            "扩展「{}」的 icon「{raw}」不是安全的相对路径（要相对扩展目录，如 \"icon.png\"；绝对路径、..、反斜杠都不行）",
+            m.id
+        ));
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some(e) if ICON_EXTS.contains(&e) => {}
+        _ => {
+            return Some(format!(
+                "扩展「{}」的 icon「{raw}」不是认得的图片（只认 {}）",
+                m.id,
+                ICON_EXTS.join(" / ")
+            ))
+        }
+    }
+    None
 }
 
 /// 校验一份清单的 `types`；返回错误描述（`None` = 合法）。
@@ -360,6 +435,9 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
     if m.name.trim().is_empty() {
         return Some(format!("扩展「{}」缺少 name", m.id));
     }
+    if let Some(err) = validate_icon(m) {
+        return Some(err);
+    }
     for c in &m.commands {
         if let Some(err) = crate::usercmds::validate(c) {
             return Some(format!("扩展「{}」的命令有问题：{err}", m.id));
@@ -512,6 +590,8 @@ pub fn install_from(source: &Path, root: &Path) -> Result<Manifest, String> {
     if let Some(err) = validate(&m, None) {
         return Err(err);
     }
+    // 图标是必填项的另一半：字段写了、文件也得真的在来源目录里。
+    ensure_icon_file(&m, source)?;
     std::fs::create_dir_all(root)
         .map_err(|e| format!("建扩展目录 {} 失败：{e}", root.display()))?;
     // 来源已经在扩展目录里 → 它本来就是装好的扩展，再「装」一遍只会自己复制自己。
@@ -611,6 +691,75 @@ pub fn install_from_archive(archive: &Path, root: &Path) -> Result<Manifest, Str
     result
 }
 
+/// 「从磁盘 / .moext 安装」装进来的扩展带一份 `installed.json` 账本，记着来源目录。
+///
+/// 返回来源路径（`None` = 没有账本或读不出：手工摆进 `extensions/` 的扩展没有
+/// 来源可刷）。给扩展管理器的「刷新」按钮判显隐——判据在账本，UI 只搬运。
+pub fn dev_source_of(id: &str, root: &Path) -> Option<PathBuf> {
+    if !valid_id(id) {
+        return None;
+    }
+    let text = std::fs::read_to_string(root.join(id).join("installed.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let s = v.get("source")?.as_str()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// 「刷新」一个从磁盘安装的扩展（开发阶段迭代）：从账本记的来源目录重新安装。
+///
+/// 开发插件的循环是「改代码 → 回扩展管理器重装 → 再试」，每次都走「卸载 → 从磁盘
+/// 安装 → 重新启用」三步太磨人。刷新把这三步折成一键，且顺序有讲究：
+///
+/// 1. 来源清单先照 [`install_from`] 的门禁**完整过一遍**（validate + 图标文件在盘上）
+///    ——来源改坏了就地拒收，旧的那份一个字节都不动；
+/// 2. 过了门禁才删旧目录、重装；
+/// 3. 装回来**带上原来的启停状态**（开发时启用了，刷十次也还是启用的，不必每次
+///    回来点启用确认卡——那正是这道流程要省掉的步骤）。
+pub fn reinstall(id: &str, root: &Path) -> Result<Manifest, String> {
+    if !valid_id(id) {
+        return Err(format!("id「{id}」不合法（只允许小写字母、数字、_、-）"));
+    }
+    let source = dev_source_of(id, root).ok_or_else(|| {
+        format!("扩展「{id}」没有安装来源账本（installed.json）——手工摆放的扩展没有来源可刷新")
+    })?;
+    // 门禁先走全：来源坏了、图标丢了，都拒在删目录之前。
+    let raw = std::fs::read_to_string(source.join("manifest.json")).map_err(|e| {
+        format!(
+            "来源目录「{}」里读不到 manifest.json（{e}）——来源删了或挪走了？旧的那份没动",
+            source.display()
+        )
+    })?;
+    let m: Manifest = serde_json::from_str(&raw)
+        .map_err(|e| format!("来源改坏了，旧的那份没动：manifest.json 不是合法 JSON：{e}"))?;
+    if let Some(err) = validate(&m, None) {
+        return Err(format!("来源改坏了，旧的那份没动：{err}"));
+    }
+    if let Err(err) = ensure_icon_file(&m, &source) {
+        return Err(format!("来源改坏了，旧的那份没动：{err}"));
+    }
+    // 启停状态跟人走：删之前记下，装回来原样写回。
+    let was_enabled = std::fs::read_to_string(root.join(id).join("manifest.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Manifest>(&t).ok())
+        .map(|old| old.enabled)
+        .unwrap_or(false);
+    std::fs::remove_dir_all(root.join(id)).map_err(|e| format!("删旧扩展目录失败：{e}"))?;
+    let mut installed = install_from(&source, root)?;
+    if was_enabled && !installed.enabled {
+        installed.enabled = true;
+        std::fs::write(
+            root.join(&m.id).join("manifest.json"),
+            serde_json::to_string_pretty(&installed).map_err(|e| format!("清单写不回去：{e}"))?,
+        )
+        .map_err(|e| format!("清单写不回去：{e}"))?;
+    }
+    Ok(installed)
+}
+
 /// 卸载一个扩展：删掉 `root/<id>` 整个目录。
 ///
 /// 「卸载 = 删目录」是这张扩展模型的语义：一个扩展就是「一份清单 + 它带的文件」，
@@ -630,6 +779,25 @@ pub fn uninstall_extension(id: &str, root: &Path) -> Result<(), String> {
         return Err(format!("扩展目录里没有「{id}」（可能已经卸载了）"));
     }
     std::fs::remove_dir_all(&target).map_err(|e| format!("删 {} 失败：{e}", target.display()))
+}
+
+/// 删除一个**加载失败**的扩展目录（扩展管理器「删除」按钮的落点）。
+///
+/// 卸载走 id（[`uninstall_extension`]），这里的对象连 id 都未必有——清单可能根本
+/// 解析不出来，id 只能从目录名猜。所以按**目录路径**删。安全护栏：目录里必须真的
+/// 躺着一份 `manifest.json` 才动手；`load_report` 也只把「有清单但坏」的目录收进
+/// broken，两道判据同口径。传错路径顶多报「不是扩展目录」，不会把无关目录整个端走。
+///
+/// 失败的扩展从未注册过 provider，没有缓存行要清（与 [`uninstall_extension`] 的
+/// 差别只有这一处收尾）。
+pub fn remove_broken_extension(dir: &Path) -> Result<(), String> {
+    if !dir.join("manifest.json").is_file() {
+        return Err(format!(
+            "{} 不是扩展目录（里面没有 manifest.json），拒绝删除",
+            dir.display()
+        ));
+    }
+    std::fs::remove_dir_all(dir).map_err(|e| format!("删 {} 失败：{e}", dir.display()))
 }
 
 /// 解压一个 zip 到 `dest`（dst 必须不存在或为空）。
@@ -708,12 +876,22 @@ fn locate_source(extracted: &Path) -> Result<PathBuf, String> {
     )
 }
 
-/// 一个尽量不撞车的临时目录后缀：进程 id 不够（同一进程里多次安装会撞），补上纳秒。
+/// 一个尽量不撞车的临时目录后缀：进程 id 不够（同一进程里多次安装会撞），补上
+/// 纳秒 + 进程内单调计数。
+///
+/// ⚠️ 只靠纳秒不够：macOS 的系统时钟粒度是毫秒级，同一毫秒内的两次调用拿到**同一个
+/// 值**——两条并行测试的 .moext 解进同一个 staging 目录，`locate_source` 就会把 A 包
+/// 的布局认成 B 包的（实测：p28 子目录布局混进顶层清单后，装出来的是另一家的扩展）。
+/// 计数器在同进程内严格递增，跨进程还有 pid 兜底，纳秒只是让跨进程重合的概率再矮一截。
 fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    nanos.wrapping_mul(4096).wrapping_add(seq)
 }
 
 /// 把 `src` 整棵复制到 `dst`（dst 必须不存在或为空）。目录按名排序遍历，符号链接
@@ -1137,6 +1315,9 @@ mod tests {
             id: id.to_string(),
             name: "测试扩展".to_string(),
             version: "1.0".to_string(),
+            // validate 把 icon 当必填项；这里给一个形态合法的值，专门验 icon 的
+            // 测试会自己把它改坏。
+            icon: "icon.png".to_string(),
             enabled: true,
             commands: vec![UserCommand {
                 name: "统计".into(),
@@ -1529,7 +1710,7 @@ mod tests {
 
         std::fs::write(
             root.join("good/manifest.json"),
-            r#"{"id":"good","name":"好扩展","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+            r#"{"id":"good","name":"好扩展","icon":"icon.png","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
         )
         .unwrap();
         std::fs::write(root.join("bad/manifest.json"), "{ 不是 JSON").unwrap();
@@ -1557,7 +1738,7 @@ mod tests {
         }
         std::fs::write(
             root.join("good/manifest.json"),
-            r#"{"id":"good","name":"好扩展"}"#,
+            r#"{"id":"good","name":"好扩展","icon":"icon.png"}"#,
         )
         .unwrap();
         std::fs::write(root.join("badjson/manifest.json"), "{ 不是 JSON").unwrap();
@@ -1613,10 +1794,11 @@ mod tests {
         std::fs::create_dir_all(src.join("子目录")).unwrap();
         std::fs::write(
             src.join("manifest.json"),
-            r#"{"id":"p28","name":"安装来的扩展","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+            r#"{"id":"p28","name":"安装来的扩展","icon":"icon.png","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#,
         )
         .unwrap();
         std::fs::write(src.join("run.cmd"), "echo hi").unwrap();
+        std::fs::write(src.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
         std::fs::write(src.join("子目录/extra.txt"), "x").unwrap();
 
         let m = install_from(&src, &root).expect("应当装上");
@@ -1635,8 +1817,12 @@ mod tests {
         let files = record["files"].as_array().unwrap();
         assert_eq!(
             files.len(),
-            3,
-            "manifest.json + run.cmd + 子目录/extra.txt 都在账上：{files:?}"
+            4,
+            "manifest.json + icon.png + run.cmd + 子目录/extra.txt 都在账上：{files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f["path"] == "icon.png"),
+            "图标文件也进账本（重装时的门禁之一）：{files:?}"
         );
         assert!(
             files.iter().any(|f| f["path"] == "子目录/extra.txt"),
@@ -1681,7 +1867,12 @@ mod tests {
 
         let good = tmp.join("good");
         std::fs::create_dir_all(&good).unwrap();
-        std::fs::write(good.join("manifest.json"), r#"{"id":"p28b","name":"x"}"#).unwrap();
+        std::fs::write(
+            good.join("manifest.json"),
+            r#"{"id":"p28b","name":"x","icon":"icon.png"}"#,
+        )
+        .unwrap();
+        std::fs::write(good.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
         install_from(&good, &root).expect("第一次应当装上");
         assert!(install_from(&good, &root).is_err(), "同一个 id 装两次要拒");
         assert!(
@@ -1692,6 +1883,138 @@ mod tests {
             install_from(&root.join("p28b"), &root).is_err(),
             "来源就在扩展目录里 = 它已经是装好的"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 图标是必填项的三种写坏法（validate 拒收）：没写、不安全的路径、不是图片。
+    #[test]
+    fn rejects_manifests_without_a_usable_icon() {
+        let mut m = manifest("a");
+        m.icon = String::new();
+        let err = validate(&m, Some("a")).expect("没写 icon 应被拒");
+        assert!(err.contains("icon"), "{err}");
+
+        for bad in [
+            "../escape.png",
+            "/abs/icon.png",
+            "a\\b.png",
+            "icon",
+            "icon.txt",
+        ] {
+            let mut m2 = manifest("a");
+            m2.icon = bad.to_string();
+            let err = validate(&m2, Some("a")).expect("坏 icon 路径应被拒");
+            assert!(err.contains("icon"), "{bad}：{err}");
+        }
+    }
+
+    /// 装的时候图标文件必须真的在来源目录里；拒了不留半个目录。
+    #[test]
+    fn install_requires_the_icon_file_on_disk() {
+        let tmp = std::env::temp_dir().join(format!("mo-exticon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        let src = tmp.join("来源");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"p28c","name":"没有图标的","icon":"icon.png"}"#,
+        )
+        .unwrap();
+        let err = install_from(&src, &root).expect_err("图标文件不在应被拒");
+        assert!(err.contains("icon"), "{err}");
+        assert!(!root.join("p28c").exists(), "拒了就不该留东西");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 「刷新」：从账本记的来源目录重装，改过的内容跟进来，启停状态原样保留。
+    #[test]
+    fn reinstall_refreshes_from_the_ledger_source_and_keeps_enabled() {
+        let tmp = std::env::temp_dir().join(format!("mo-extre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        let src = tmp.join("来源");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"dev1","name":"第一版","icon":"icon.png"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
+
+        install_from(&src, &root).expect("先装上");
+        // 开发者启用它（走不走确认卡是 UI 的事，这里只管状态）。
+        std::fs::write(
+            root.join("dev1").join("manifest.json"),
+            r#"{"id":"dev1","name":"第一版","icon":"icon.png","enabled":true}"#,
+        )
+        .unwrap();
+
+        // 改来源：换名字、加一条命令（长度变化避开 mtime 精度盲区）。
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"dev1","name":"第二版","icon":"icon.png","commands":[{"name":"新命令","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+        let m = reinstall("dev1", &root).expect("刷新应当成功");
+        assert_eq!(m.name, "第二版", "刷新装回来的是来源的新内容");
+        assert!(m.enabled, "开发时启用了，刷十次也还是启用的");
+        let on_disk = std::fs::read_to_string(root.join("dev1").join("manifest.json")).unwrap();
+        assert!(
+            on_disk.contains("新命令") && on_disk.contains("\"enabled\": true"),
+            "盘上也是新内容 + 启用：{on_disk}"
+        );
+        // 账本照常重写（来源还是那个目录）。
+        assert!(root.join("dev1").join("installed.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 「刷新」的门禁：来源删了 / 来源清单改坏了，都拒在删旧目录之前；手工摆放的
+    /// 扩展（没账本）没有来源可刷。
+    #[test]
+    fn reinstall_refuses_when_the_source_is_broken_or_gone() {
+        let tmp = std::env::temp_dir().join(format!("mo-extrebad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("extensions");
+        let src = tmp.join("来源");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"dev2","name":"第一版","icon":"icon.png"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        install_from(&src, &root).expect("先装上");
+
+        // 来源清单改坏（id 都没了）→ 拒，旧的原地不动。
+        let old_manifest =
+            std::fs::read_to_string(root.join("dev2").join("manifest.json")).unwrap();
+        std::fs::write(src.join("manifest.json"), "{ 不是 JSON").unwrap();
+        let err = reinstall("dev2", &root).expect_err("来源改坏应被拒");
+        assert!(err.contains("没动"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dev2").join("manifest.json")).unwrap(),
+            old_manifest,
+            "旧的清单一个字节都没变"
+        );
+
+        // 来源整个删掉 → 拒，旧的原地不动。
+        std::fs::remove_dir_all(&src).unwrap();
+        let err = reinstall("dev2", &root).expect_err("来源没了应被拒");
+        assert!(err.contains("没动") || err.contains("读不到"), "{err}");
+        assert!(root.join("dev2").is_dir(), "旧的那份还在");
+
+        // 手工摆放（没账本）→ 没有来源可刷。
+        std::fs::create_dir_all(root.join("manual")).unwrap();
+        std::fs::write(
+            root.join("manual").join("manifest.json"),
+            r#"{"id":"manual","name":"手摆的","icon":"icon.png"}"#,
+        )
+        .unwrap();
+        let err = reinstall("manual", &root).expect_err("没账本应被拒");
+        assert!(err.contains("账本"), "{err}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2039,19 +2362,49 @@ mod tests {
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("p28/manifest.json", opts).unwrap();
             zw.write_all(
-                r#"{"id":"p28","name":"压缩包来的扩展","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#
+                r#"{"id":"p28","name":"压缩包来的扩展","icon":"icon.png","enabled":true,"commands":[{"name":"跑一下","shell":"pwd"}]}"#
                     .as_bytes(),
             )
             .unwrap();
             zw.start_file("p28/run.cmd", opts).unwrap();
             zw.write_all(b"echo hi").unwrap();
+            zw.start_file("p28/icon.png", opts).unwrap();
+            zw.write_all(&[0x89, b'P', b'N', b'G']).unwrap();
             zw.finish().unwrap();
         }
 
         let m = install_from_archive(&archive, &root).expect("应当从压缩包装上");
         assert!(!m.enabled, "从压缩包装出来也是停用的");
         let target = root.join("p28");
-        assert!(target.join("manifest.json").is_file());
+        let listed = || {
+            std::fs::read_dir(&root)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let inner = if e.path().is_dir() {
+                                std::fs::read_dir(e.path())
+                                    .map(|ird| {
+                                        ird.flatten()
+                                            .map(|ie| ie.file_name().to_string_lossy().to_string())
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            format!("{name}={inner:?}")
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            target.join("manifest.json").is_file(),
+            "装完 target 里应有 manifest.json：root={} contents={:?}",
+            root.display(),
+            listed()
+        );
         assert!(target.join("run.cmd").is_file());
         let on_disk = std::fs::read_to_string(target.join("manifest.json")).unwrap();
         assert!(
@@ -2078,8 +2431,10 @@ mod tests {
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("manifest.json", opts).unwrap();
-            zw.write_all(r#"{"id":"flat42","name":"顶层清单扩展"}"#.as_bytes())
+            zw.write_all(r#"{"id":"flat42","name":"顶层清单扩展","icon":"icon.png"}"#.as_bytes())
                 .unwrap();
+            zw.start_file("icon.png", opts).unwrap();
+            zw.write_all(&[0x89, b'P', b'N', b'G']).unwrap();
             zw.finish().unwrap();
         }
         let m = install_from_archive(&archive, &root).expect("应当装上");
@@ -2129,9 +2484,10 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(
             src.join("manifest.json"),
-            r#"{"id":"un1","name":"要被卸载的扩展"}"#,
+            r#"{"id":"un1","name":"要被卸载的扩展","icon":"icon.png"}"#,
         )
         .unwrap();
+        std::fs::write(src.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
         install_from(&src, &root).expect("先装上");
         assert!(root.join("un1").is_dir());
 
@@ -2142,6 +2498,42 @@ mod tests {
             uninstall_extension("un1", &root).is_err(),
             "目录不存在应当报错"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 删除无效扩展目录：目录里必须有 `manifest.json` 才动手——护栏保证传错路径
+    /// 顶多报错，不会把无关目录端走；对真扩展目录则整个删除。
+    #[test]
+    fn remove_broken_requires_a_manifest_and_deletes_the_whole_dir() {
+        let tmp = std::env::temp_dir().join(format!("mo-extbroken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // ① 普通目录（没有清单）：拒。
+        let plain = tmp.join("只是个目录");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("笔记.txt"), "x").unwrap();
+        let err = remove_broken_extension(&plain).unwrap_err();
+        assert!(
+            err.contains("manifest.json"),
+            "护栏的报错要点名缺什么：{err}"
+        );
+        assert!(plain.exists(), "拒了就不该动目录");
+
+        // ② 坏扩展目录（有清单、清单过不了 validate）：整个删掉。
+        let bad = tmp.join("p31bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            bad.join("manifest.json"),
+            r#"{"id":"other-name","name":"对不上目录","commands":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(bad.join("随便什么文件.txt"), "x").unwrap();
+        remove_broken_extension(&bad).expect("坏扩展目录应当能删");
+        assert!(!bad.exists(), "目录必须整个消失");
+
+        // ③ 目录已经不在了：报错而不是静默成功（与卸载同一条口径）。
+        assert!(remove_broken_extension(&bad).is_err(), "目录不存在应当报错");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -49,8 +49,6 @@ pub fn render(
     address: Option<&Entity<InputState>>,
     view_mode: ViewMode,
     in_trash: bool,
-    // 左上角「应用菜单」popover 是否展开（按钮点击切换；点外面 / Esc 收起）。
-    menu_open: bool,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -66,39 +64,6 @@ pub fn render(
         .border_color(theme::separator())
         // 测试用（release no-op）：tests/layout.rs 断言工具栏只有一行高
         .debug_selector(|| "mo-toolbar".to_string())
-        // 左上角「应用菜单」按钮：点开一个吸附在按钮下方的 popover（设置 / 扩展程序 /
-        // 命令面板等入口）。浮层本体由 `app.rs` 的 render 挂在根容器末尾（画在最上层，
-        // 同右键菜单 / 橡皮筋一套坐标约定）。按钮只管开合语义：
-        // - 按下（on_mouse_down）：记下「按下那一刻菜单是否开着」，开着就立即收起
-        //   （浮层的 `on_mouse_down_out` 在同一次按下里也会再触发一次，幂等无害）。
-        // - 抬起（on_click）：只有「按下时是关着的」才打开——否则这次按下已经把
-        //   菜单关掉了，再 toggle 就成了「怎么点都关不掉」。
-        .child({
-            let mut menu = div()
-                .id("app-menu")
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(28.0))
-                .rounded(px(6.0))
-                .flex_shrink_0()
-                .text_color(theme::text())
-                .hover(|s| s.bg(theme::hover_bg()))
-                .debug_selector(|| "mo-app-menu-btn".to_string());
-            if menu_open {
-                menu = menu.bg(theme::hover_bg());
-            }
-            let press_entity = entity.clone();
-            let click_entity = entity.clone();
-            menu.interactivity()
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    press_entity.update(cx, |v, cx| v.note_menu_press(cx));
-                });
-            menu.interactivity().on_click(move |_, _window, cx| {
-                click_entity.update(cx, |v, cx| v.app_menu_clicked(cx));
-            });
-            menu.child(icon(icons::MENU, 16.0, theme::text()))
-        })
         .child(icon_button("nav-back", icons::ARROW_LEFT, can_back, {
             let app = app.clone();
             let entity = entity.clone();
@@ -151,15 +116,65 @@ pub fn drag_strip() -> impl IntoElement {
         .window_control_area(WindowControlArea::Drag)
 }
 
-// ---- 左上角「应用菜单」浮层 ----------------------------------------------
+// ---- 「应用菜单」按钮 + 浮层 ----------------------------------------------
 
-/// 浮层锚点：工具栏左缘（`render` 的 `pl(8)`）第一个按钮正下方 2px。
+/// 「应用菜单」按钮（汉堡）：贴在**标签条行末**——Chrome 同位。点开一个吸附在
+/// 按钮下方的 popover（设置 / 扩展程序 / 命令面板等入口）。浮层本体由 `app.rs`
+/// 的 render 挂在根容器末尾（画在最上层，同右键菜单 / 橡皮筋一套坐标约定）。
+/// 按钮只管开合语义：
+/// - 按下（on_mouse_down）：记下「按下那一刻菜单是否开着」，开着就立即收起
+///   （浮层的 `on_mouse_down_out` 在同一次按下里也会再触发一次，幂等无害）；
+///   并**止泡**——macOS 顶栏整行挂着 `attach_titlebar_drag`，按下汉堡不该顺手
+///   发起窗口拖动。
+/// - 抬起（on_click）：只有「按下时是关着的」才打开——否则这次按下已经把
+///   菜单关掉了，再 toggle 就成了「怎么点都关不掉」。
+///
+/// Windows 兼容：本函数由 `render_top_row` 插在 `drag_strip` / `window_controls`
+/// **之前**——Win 的最小化 / 最大化 / 关闭贴行末右缘，汉堡在它们左边，永不重叠。
+pub(crate) fn app_menu_button(entity: &Entity<RootView>, menu_open: bool) -> impl IntoElement {
+    let mut menu = div()
+        .id("app-menu")
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(28.0))
+        .rounded(px(6.0))
+        .mx(px(4.0))
+        .flex_shrink_0()
+        .text_color(theme::text())
+        .hover(|s| s.bg(theme::hover_bg()))
+        .debug_selector(|| "mo-app-menu-btn".to_string());
+    if menu_open {
+        menu = menu.bg(theme::hover_bg());
+    }
+    let press_entity = entity.clone();
+    let click_entity = entity.clone();
+    menu.interactivity()
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            // ⚠️ 止泡：外层（顶栏整行）也挂了 on_mouse_down（macOS 拖拽）。
+            press_entity.update(cx, |v, cx| v.note_menu_press(cx));
+            cx.stop_propagation();
+        });
+    menu.interactivity().on_click(move |_, _window, cx| {
+        click_entity.update(cx, |v, cx| v.app_menu_clicked(cx));
+    });
+    menu.child(icon(icons::MENU, 16.0, theme::text()))
+}
+
+/// 浮层锚点：贴**窗口右缘**（按钮在标签条行末，浮层右对齐到按钮下），顶部对齐
+/// **标签条行**底缘之外——按钮就在那一行，浮层必须吸附在它正下方。
 ///
 /// 顶栏两行各钉死 [`TOOLBAR_HEIGHT`]（标签条 y=0..48、工具栏 y=48..96，见
-/// `app.rs::render_top_row` 注释），浮层贴工具栏底缘之外，所以 Y = 2×48 + 2。
+/// `app.rs::render_top_row` 注释）。汉堡在第 1 行，所以 Y = 48 + 2；
+/// ⚠️ 挪按钮时这里必须跟着改——锚点是常量推导，编译器不会提醒它错位。
 /// 与右键菜单同一套**窗口坐标**约定——浮层由 `app.rs` 的 render 挂在根容器末尾。
-pub(crate) const APP_MENU_X: f32 = 8.0;
-pub(crate) const APP_MENU_Y: f32 = TOOLBAR_HEIGHT * 2.0 + 2.0;
+pub(crate) const APP_MENU_MARGIN: f32 = 8.0;
+pub(crate) const APP_MENU_Y: f32 = TOOLBAR_HEIGHT + 2.0;
+
+/// 浮层左缘 x：视口宽 - 菜单宽 - 右缘留白（右对齐）。
+pub(crate) fn app_menu_x(viewport_w: f32) -> f32 {
+    viewport_w - crate::context_menu::MENU_W - APP_MENU_MARGIN
+}
 
 /// 「应用菜单」浮层里的一行。抽成枚举是为了**可单测**：行文案 / 图标可以列全，
 /// 点击落到哪个动作也能在 headless 里逐行断言。
@@ -208,13 +223,13 @@ pub(crate) const APP_MENU_ENTRIES: [AppMenuAction; 3] = [
 /// 画在最上层、命中链最前，与右键菜单 / 橡皮筋同套路。视觉与右键菜单一致
 /// （surface 底 + 分隔线描边 + 大圆角 + 阴影，行高 / 内衬复用 context_menu 常量）。
 /// 点行：先收起浮层再执行动作（浮层遮着的窗口不该同时变）。
-pub(crate) fn render_app_menu(entity: &Entity<RootView>) -> impl IntoElement {
+pub(crate) fn render_app_menu(entity: &Entity<RootView>, viewport_w: f32) -> impl IntoElement {
     use crate::context_menu::{ITEM_H, ITEM_RADIUS, MENU_W, PAD};
 
     let out_entity = entity.clone();
     let mut wrapper = div()
         .absolute()
-        .left(px(APP_MENU_X))
+        .left(px(app_menu_x(viewport_w)))
         .top(px(APP_MENU_Y))
         .w(px(MENU_W))
         // 阻止点击穿透到底下的文件行；`on_mouse_down_out`：点浮层外（含工具栏

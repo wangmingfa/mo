@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::prelude::FluentBuilder as _;
 // `on_prepaint` 挂在 `ElementExt` 上（回收站面板的斑马纹铺满一屏要靠它回写高度）。
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::Sizable as _;
@@ -330,6 +331,11 @@ pub(crate) enum Modal {
     /// 携带扩展 **id** 而不是第几行（与 [`Modal::ConfirmEnableExt`] 同一条纪律）；
     /// 卡画在扩展管理器窗口里，Esc / 取消 / 点遮罩都回到面板。
     ConfirmUninstallExt(String),
+    /// 「删除这个无效扩展」的确认卡（删它整个目录，不可恢复）。
+    ///
+    /// 携带**扩展目录完整路径**而不是 id：无效扩展的清单可能根本解析不出来，id
+    /// 无从谈起。卡画在扩展管理器窗口里，Esc / 取消 / 点遮罩都回到面板。
+    ConfirmRemoveBrokenExt(String),
     /// 连接到服务器（输入远程地址，进入 FTP 等远程浏览）。
     ConnectServer,
     /// 「服务器要求登录」——用户名 + 密码（星号）+ 记住密码。
@@ -1182,6 +1188,11 @@ pub struct RootView {
     ext_index: usize,
     /// 加载失败的清单（`extensions::load_report` 的另一半）：扩展页要亮出来并说原因。
     pub(crate) broken_exts: Vec<mo_app::extensions::BrokenExtension>,
+    /// 带安装来源账本（`installed.json`）的扩展 id：卡片上才亮「刷新」按钮。
+    ///
+    /// 打开扩展管理器 / 装完 / 刷完时重取一次（渲染路径不问盘），判据在
+    /// `AppState::extension_dev_source`，这里只存答案。
+    refreshable_exts: Vec<String>,
     /// 重复文件查找结果（`None` = 还没跑过）。
     dedup: Option<mo_operations::DedupReport>,
     /// 重复文件查找是否在跑。
@@ -1553,6 +1564,7 @@ impl RootView {
             cmd_usage: app.load_session().command_usage,
             extensions: Vec::new(),
             broken_exts: Vec::new(),
+            refreshable_exts: Vec::new(),
             history: Vec::new(),
             history_index: 0,
             clip_history: Vec::new(),
@@ -4957,6 +4969,7 @@ impl RootView {
         let (exts, broken) = self.app().extensions_report();
         self.extensions = exts;
         self.broken_exts = broken;
+        self.reload_refreshable_exts();
         self.ext_index = 0;
         self.keymap = keymap_from(&self.app());
         cx.notify();
@@ -4973,7 +4986,7 @@ impl RootView {
             self.extensions_window = None;
         }
 
-        let bounds = WindowBounds::centered(size(px(560.0), px(520.0)), cx);
+        let bounds = WindowBounds::centered(size(px(560.0), px(640.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(bounds),
             titlebar: Some(TitlebarOptions {
@@ -5011,6 +5024,19 @@ impl RootView {
         if let Some(handle) = &self.extensions_window {
             let _ = handle.update(cx, |_, _window, cx| cx.notify());
         }
+    }
+
+    /// 重取「哪些扩展带安装来源账本」（卡片上「刷新」按钮的显隐集合）。
+    ///
+    /// 打开扩展管理器 / 装完 / 刷完各取一次：每家问一次盘（读 installed.json），
+    /// 页面是低频面板，渲染路径保持零 IO。
+    fn reload_refreshable_exts(&mut self) {
+        self.refreshable_exts = self
+            .extensions
+            .iter()
+            .filter(|e| self.app().extension_dev_source(&e.manifest.id).is_some())
+            .map(|e| e.manifest.id.clone())
+            .collect();
     }
 
     /// 扩展窗口里 ↑↓ 换选中行（原 `handle_modal_key` 扩展分支的 up/down）。
@@ -5083,6 +5109,14 @@ impl RootView {
         cx.notify();
     }
 
+    /// 「删除这个无效扩展」：先过确认卡。身份带**目录路径**——无效扩展没有可信
+    /// 的 id（清单可能压根解析不出来），目录是唯一稳定坐标。
+    pub(crate) fn ask_remove_broken_extension(&mut self, dir: String, cx: &mut Context<Self>) {
+        self.modal = Modal::ConfirmRemoveBrokenExt(dir);
+        self.sync_extensions_window(cx);
+        cx.notify();
+    }
+
     /// 「从磁盘安装」：弹原生目录选择框，把选中的扩展目录装进配置目录。
     ///
     /// 来源必须由用户当面指认——没有命令行参数、没有配置项入口，那等于给陌生
@@ -5122,6 +5156,7 @@ impl RootView {
         match self.app().install_extension(source) {
             Ok(m) => {
                 self.extensions = self.app().extensions();
+                self.reload_refreshable_exts();
                 self.keymap = keymap_from(&self.app());
                 if let Some(i) = self.extensions.iter().position(|x| x.manifest.id == m.id) {
                     self.ext_index = i;
@@ -5165,6 +5200,29 @@ impl RootView {
         match self.app().install_extension_from_zip(archive) {
             Ok(m) => {
                 self.extensions = self.app().extensions();
+                self.reload_refreshable_exts();
+                self.keymap = keymap_from(&self.app());
+                if let Some(i) = self.extensions.iter().position(|x| x.manifest.id == m.id) {
+                    self.ext_index = i;
+                }
+            }
+            Err(err) => self.notice(err, None, cx),
+        }
+        self.sync_extensions_window(cx);
+        cx.notify();
+    }
+
+    /// 「刷新」一个从磁盘安装的扩展（卡片上的循环箭头按钮）：从账本记的来源目录
+    /// 重装，启停状态保留（判据与门禁都在 `extensions::reinstall`——来源改坏了
+    /// 拒在删旧目录之前，错误弹 notice、旧的那份原地不动）。
+    ///
+    /// 成功后与安装同一套收尾：面板重取、刷新集合重取、键表重取、选中原卡——
+    /// 开发者改完插件代码点一下刷新，看到的就是新声明。
+    fn reinstall_extension_at(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.app().reinstall_extension(id) {
+            Ok(m) => {
+                self.extensions = self.app().extensions();
+                self.reload_refreshable_exts();
                 self.keymap = keymap_from(&self.app());
                 if let Some(i) = self.extensions.iter().position(|x| x.manifest.id == m.id) {
                     self.ext_index = i;
@@ -5226,225 +5284,368 @@ impl RootView {
 
     /// 扩展管理器页面（独立窗口借渲染：状态住在本视图，监听器直接改本视图）。
     pub(crate) fn render_extensions(&self, entity: &Entity<RootView>) -> Div {
-        let mut body = div()
+        // —— 顶部安装行：两个主色按钮（Chrome 扩展管理同款置顶）。装出来默认**停用**
+        // （启用才走那张贡献确认卡），来源由用户在原生对话框里当面选；装完面板当场
+        // 重取并选中新卡（见 `install_extension_from`），不靠「关掉再开」才看到。
+        let mut install_row = div().flex().flex_row().flex_wrap().gap(px(8.0));
+        let mut install_btn = div()
+            .id("ext-install")
+            .debug_selector(|| "mo-ext-install".to_string())
             .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .gap(px(2.0))
-            .p(px(8.0));
+            .items_center()
+            .px(px(12.0))
+            .h(px(26.0))
+            .rounded(px(6.0))
+            .bg(theme::selected_bg())
+            .text_size(px(12.0))
+            .text_color(theme::selected_text())
+            .child(text!("从磁盘安装…"));
+        let install_ent = entity.clone();
+        install_btn
+            .interactivity()
+            .on_click(move |_ev, _window, cx| {
+                install_ent.update(cx, |v, cx| v.install_extension_from_disk(cx));
+            });
+        install_row = install_row.child(install_btn.test_support());
+
+        let mut moext_btn = div()
+            .id("ext-install-moext")
+            .debug_selector(|| "mo-ext-install-moext".to_string())
+            .flex()
+            .items_center()
+            .px(px(12.0))
+            .h(px(26.0))
+            .rounded(px(6.0))
+            .bg(theme::selected_bg())
+            .text_size(px(12.0))
+            .text_color(theme::selected_text())
+            .child(text!("从 .moext 安装…"));
+        let moext_ent = entity.clone();
+        moext_btn.interactivity().on_click(move |_ev, _window, cx| {
+            moext_ent.update(cx, |v, cx| v.install_extension_from_zip_disk(cx));
+        });
+        install_row = install_row.child(moext_btn.test_support());
+
+        // —— 已安装扩展：Chrome 扩展管理同款宫格。卡片 basis 300 + grow，随窗口宽度
+        // 换行；元素 ID 沿用行时代的约定（载荷带身份、不带可漂移的下标，见下方
+        // `ext-row` 注释——那条理由在卡片布局下一字不改）。
+        let mut grid = div().flex().flex_row().flex_wrap().gap(px(8.0));
         if self.extensions.is_empty() {
-            body = body.child(
+            grid = grid.child(
                 div()
+                    .flex_grow(1.0)
+                    .flex_basis(px(300.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
                     .text_color(theme::muted())
-                    .child(text!("（还没有扩展）".to_string())),
-            );
-            body = body.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme::muted())
-                    .child(text!(
-                        "点下面的「从磁盘安装」选一个含 manifest.json 的目录，或手工把目录放进配置目录下的 extensions/".to_string()
-                    )),
+                    .child(text!("（还没有扩展）"))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .child(text!(
+                                "点上面的「从磁盘安装」选一个含 manifest.json 的目录，或手工把目录放进配置目录下的 extensions/"
+                            )),
+                    ),
             );
         }
         for (i, e) in self.extensions.iter().enumerate() {
             let m = &e.manifest;
             let selected = i == self.ext_index;
-            // 元素 ID 用扩展 id，不用「第几行」：启停一个扩展、往目录里加/删一份清单都会
-            // 让位置号指到别的扩展上，而点胶囊这件事必须点对那一个扩展（与 P2-5 侧栏行
-            // 同一条理由，也是 §4.2「载荷带身份、不带可漂移的下标」）。选择器从 ID 派生，
-            // 两边不可能分叉。
+            // 元素 ID 用扩展 id，不用「第几张卡」：启停一个扩展、往目录里加/删一份清单
+            // 都会让位置号指到别的扩展上，而点胶囊这件事必须点对那一个扩展（与 P2-5
+            // 侧栏行同一条理由，也是 §4.2「载荷带身份、不带可漂移的下标」）。选择器从
+            // ID 派生，两边不可能分叉。
             let ext_id = m.id.clone();
             let contributes = m.commands.len() + m.workflows.len() + m.types.len();
-            // 右侧那颗状态胶囊就是「启用 / 停用」的按钮。**点行本身不翻状态**：这一页
-            // 现在的第一用途是「看清楚这个扩展要往界面里放什么」，而鼠标用户唯一能选中
-            // 一行的动作如果顺手把扩展关了，那「想了解」就成了「有代价」。
-            let pill_id = format!("ext-toggle-{}", m.id);
-            let pill_ent = entity.clone();
-            let mut pill = div()
-                .id(pill_id.clone())
-                .debug_selector(move || format!("mo-{pill_id}"))
+
+            // 右上那颗**开关**就是「启用 / 停用」的按钮（Chrome 扩展页同款）。**点卡
+            // 本身不翻状态**：这一页现在的第一用途是「看清楚这个扩展要往界面里放什么」，
+            // 而鼠标用户唯一能选中一张卡的动作如果顺手把扩展关了，那「想了解」就成了
+            // 「有代价」。启用态用主色底（selected_bg + selected_text 是保对比的一对），
+            // 滑块在右；停用态灰轨滑块在左，卡片上另有「已禁用」文案（见下）。
+            let switch_id = format!("ext-toggle-{}", m.id);
+            let switch_ent = entity.clone();
+            let mut ext_switch = div()
+                .id(switch_id.clone())
+                .debug_selector(move || format!("mo-{switch_id}"))
                 .flex()
                 .items_center()
-                .px(px(8.0))
-                .h(px(22.0))
-                .rounded(px(11.0))
-                .border_1()
-                .border_color(theme::separator())
-                .text_size(px(11.0))
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::muted()
+                .w(px(34.0))
+                .h(px(20.0))
+                .rounded(px(10.0))
+                .p(px(2.0))
+                .flex_shrink_0();
+            let mut knob = div().size(px(16.0)).rounded_full();
+            if m.enabled {
+                ext_switch = ext_switch.justify_end().bg(theme::selected_bg());
+                knob = knob.bg(theme::selected_text());
+            } else {
+                ext_switch = ext_switch.justify_start().bg(theme::separator());
+                knob = knob.bg(theme::surface());
+            }
+            // ⚠️ 滑块必须真的挂进轨道：只建不挂，开关就成了一颗空胶囊（一团灰）。
+            ext_switch = ext_switch.child(knob);
+            let switch_click_id = m.id.clone();
+            ext_switch
+                .interactivity()
+                .on_click(move |_ev, _window, cx| {
+                    // ⚠️ 必须止泡：外层卡片也有 on_click（选中），一起触发就是「点开关
+                    // 之前先换了选中卡」，看上去像点了别的那家。
+                    cx.stop_propagation();
+                    switch_ent.update(cx, |v, cx| v.toggle_extension(&switch_click_id, cx));
                 });
-            let pill_click_id = m.id.clone();
-            pill.interactivity().on_click(move |_ev, _window, cx| {
-                // ⚠️ 必须止泡：外层那一行也有 on_click（选中），一起触发就是「点胶囊
-                // 之前先换了选中行」，看上去像点了别的那条。
-                cx.stop_propagation();
-                pill_ent.update(cx, |v, cx| v.toggle_extension(&pill_click_id, cx));
-            });
-            let mut row = div()
+
+            // 「刷新」按钮：只有带安装来源账本（installed.json）的扩展才有得刷——
+            // 手工摆放的扩展没有来源。从来源目录重装、启停状态保留，是开发阶段
+            // 「改完插件代码 → 马上再试」的一键通道。
+            let refreshable = self.refreshable_exts.contains(&m.id);
+            let refresh_id = format!("ext-refresh-{}", m.id);
+            let refresh_click_id = m.id.clone();
+            let refresh_ent = entity.clone();
+            let mut refresh_btn = div()
+                .id(refresh_id.clone())
+                .debug_selector(move || format!("mo-{refresh_id}"))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.0))
+                .rounded(px(5.0))
+                .hover(|s| s.bg(theme::hover_bg()))
+                .child(crate::icons::icon(
+                    crate::icons::ROTATE_CW,
+                    13.0,
+                    theme::muted(),
+                ));
+            refresh_btn
+                .interactivity()
+                .on_click(move |_ev, _window, cx| {
+                    // 与开关同一条理由：点刷新不该顺手换选中卡。
+                    cx.stop_propagation();
+                    refresh_ent.update(cx, |v, cx| v.reinstall_extension_at(&refresh_click_id, cx));
+                });
+
+            // 图标：清单 `icon` 指的文件（相对扩展目录）。图标是安装门禁的必填项
+            // （`validate` + `install_from` 双关卡），正常都在；盘上真丢了就画内置
+            // 拼图占位，不空着那一格。
+            let icon_path = e
+                .path
+                .parent()
+                .map(|d| d.join(m.icon.trim()))
+                .unwrap_or_default();
+            let icon_slot: AnyElement = if icon_path.is_file() {
+                img(icon_path)
+                    .w(px(32.0))
+                    .h(px(32.0))
+                    .rounded(px(6.0))
+                    .flex_shrink_0()
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(32.0))
+                    .rounded(px(6.0))
+                    .bg(theme::hover_bg())
+                    .flex_shrink_0()
+                    .child(crate::icons::icon(
+                        crate::icons::EXTENSION,
+                        16.0,
+                        theme::muted(),
+                    ))
+                    .into_any_element()
+            };
+
+            let mut card = div()
                 .id(format!("ext-row-{ext_id}"))
                 .debug_selector(move || format!("mo-ext-row-{ext_id}"))
                 .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .rounded(px(4.0))
-                .bg(if selected {
-                    theme::selected_bg()
+                .flex_col()
+                .flex_grow(1.0)
+                .flex_basis(px(300.0))
+                .min_w(px(260.0))
+                .gap(px(3.0))
+                .p(px(8.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if selected {
+                    theme::accent()
                 } else {
-                    theme::surface()
+                    theme::separator()
                 })
-                .text_color(if selected {
-                    theme::selected_text()
-                } else {
-                    theme::text()
-                })
-                .child(text!(format!(
-                    "{}{}（{}）",
-                    m.name,
-                    if m.version.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {}", m.version)
-                    },
-                    if contributes == 0 {
-                        "不改动界面".to_string()
-                    } else {
-                        format!("贡献 {contributes} 项")
-                    }
-                )))
-                .child(
-                    pill.child(text!(if m.enabled { "已启用" } else { "已停用" }))
-                        .test_support(),
-                );
+                .bg(theme::surface())
+                .text_color(theme::text());
+            // 头一行：图标｜名字 + 版本（禁用加一行「已禁用」小字）｜刷新 + 开关。
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(8.0))
+                    .child(icon_slot)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(1.0))
+                            .child(text!(format!(
+                                "{}{}",
+                                m.name,
+                                if m.version.trim().is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {}", m.version)
+                                }
+                            )))
+                            .when(!m.enabled, |name_col| {
+                                name_col.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme::muted())
+                                        .child(text!("已禁用")),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .when(refreshable, |row| row.child(refresh_btn.test_support()))
+                            .child(ext_switch.test_support()),
+                    ),
+            );
+            // 没选中：一句话概要。选中后把「启用后界面上会多出什么」逐条摊开（P2-6）。
+            // 确认卡上是**同一批句子**，所以「先在卡里看清楚、再在卡上点头」不是两段措辞。
+            if !selected {
+                card = card.child(div().text_size(px(11.0)).text_color(theme::muted()).child(
+                    text!(match (m.enabled, contributes) {
+                        (false, _) => format!("已禁用 · 贡献 {contributes} 项"),
+                        (true, 0) => "不改动界面".to_string(),
+                        (true, n) => format!("贡献 {n} 项"),
+                    }),
+                ));
+            }
+            if selected {
+                for (k, line) in self
+                    .contribution_lines(&e.manifest.id)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let elem = format!("ext-detail-{}-{k}", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(elem.clone())
+                            .debug_selector(move || format!("mo-{elem}"))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(line)),
+                    );
+                }
+                if !e.manifest.when_ext.is_empty() {
+                    // `when_ext` 是清单级的开关，报出来免得用户对着一条「点了没出现」的命令猜。
+                    let elem = format!("ext-detail-{}-when", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(elem.clone())
+                            .debug_selector(move || format!("mo-{elem}"))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(format!(
+                                "只在选中这些扩展名时才给出它的命令：{}",
+                                e.manifest.when_ext.join(" / ")
+                            ))),
+                    );
+                }
+                // provider 进程的运行状况（P3）：退避停用期要亮在它自己那一家下面——
+                // 「类型标签怎么还是内置文案」这类疑问，答案在这里。判据在宿主
+                // （连续失败的账），这里只搬运，不重判。
+                if let Some(line) = self.app().provider_backoff_line(&e.manifest.id) {
+                    let elem = format!("ext-detail-{}-backoff", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(elem.clone())
+                            .debug_selector(move || format!("mo-{elem}"))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(line)),
+                    );
+                }
+                // 「这条绑定没生效」也要亮在它自己的那一家下面（P2-7）。判据在键表
+                // （`build` 收贡献键位时记录），这里只按清单路径对回是哪家，不重判。
+                for (k, line) in self.dropped_chord_lines(&e.path).into_iter().enumerate() {
+                    let elem = format!("ext-detail-{}-drop-{k}", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(elem.clone())
+                            .debug_selector(move || format!("mo-{elem}"))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(line)),
+                    );
+                }
+                // 类型标签撞车也要亮在输家那一家下面（P2 剩余 #2）。判据在缓存
+                // （`type_labels_report` 先到先得后记账），这里只按扩展 id 对回是哪家，
+                // 不重判——与上面那条「绑定没生效」同一个「界面上能查、不重判」的理由。
+                for (k, line) in self
+                    .type_label_conflict_lines(&e.manifest.id)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let elem = format!("ext-detail-{}-typelabel-{k}", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(elem.clone())
+                            .debug_selector(move || format!("mo-{elem}"))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(line)),
+                    );
+                }
+                // 「卸载…」：选中那张卡的动作，收进卡内而不是挤在卡头——先选中、看清
+                // 它贡献了什么、再决定删不删。点开的是确认卡（删目录不可恢复）。
+                let uninstall_id = e.manifest.id.clone();
+                let uninstall_name = e.manifest.name.clone();
+                let click_id = uninstall_id.clone();
+                let mut uninstall_btn = div()
+                    .id(format!("ext-uninstall-{uninstall_id}"))
+                    .debug_selector(move || format!("mo-ext-uninstall-{uninstall_id}"))
+                    .flex()
+                    .items_center()
+                    .self_start()
+                    .mt(px(2.0))
+                    .px(px(8.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
+                    // 卸载与「删除无效扩展」同级：都是删目录不可恢复 → 同一颗警示红。
+                    .bg(rgba(0xd70015ff))
+                    .text_size(px(11.0))
+                    .text_color(theme::selected_text())
+                    .hover(|s| s.bg(rgba(0xb80012ff)))
+                    .child(text!(format!("卸载「{uninstall_name}」…")));
+                let uninstall_ent = entity.clone();
+                uninstall_btn
+                    .interactivity()
+                    .on_click(move |_ev, _window, cx| {
+                        uninstall_ent.update(cx, |v, cx| v.ask_uninstall_extension(&click_id, cx));
+                    });
+                card = card.child(uninstall_btn.test_support());
+            }
             let ent = entity.clone();
-            row.interactivity().on_click(move |_ev, _window, cx| {
+            card.interactivity().on_click(move |_ev, _window, cx| {
                 ent.update(cx, |v, cx| v.select_extension(i, cx));
             });
-            body = body.child(row.test_support());
-            if !selected {
-                continue;
-            }
-            // 选中那一行把「启用后界面上会多出什么」逐条摊开（P2-6）。确认卡上是
-            // **同一批句子**，所以「先在面板里看清楚、再在卡上点头」不是两段措辞。
-            for (k, line) in self
-                .contribution_lines(&e.manifest.id)
-                .into_iter()
-                .enumerate()
-            {
-                let elem = format!("ext-detail-{}-{k}", e.manifest.id);
-                body = body.child(
-                    div()
-                        .id(elem.clone())
-                        .debug_selector(move || format!("mo-{elem}"))
-                        .pl(px(16.0))
-                        .pr(px(6.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::muted())
-                        .child(text!(line)),
-                );
-            }
-            if !e.manifest.when_ext.is_empty() {
-                // `when_ext` 是清单级的开关，报出来免得用户对着一条「点了没出现」的命令猜。
-                let elem = format!("ext-detail-{}-when", e.manifest.id);
-                body = body.child(
-                    div()
-                        .id(elem.clone())
-                        .debug_selector(move || format!("mo-{elem}"))
-                        .pl(px(16.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::muted())
-                        .child(text!(format!(
-                            "只在选中这些扩展名时才给出它的命令：{}",
-                            e.manifest.when_ext.join(" / ")
-                        ))),
-                );
-            }
-            // provider 进程的运行状况（P3）：退避停用期要亮在它自己那一家下面——
-            // 「类型标签怎么还是内置文案」这类疑问，答案在这里。判据在宿主
-            // （连续失败的账），这里只搬运，不重判。
-            if let Some(line) = self.app().provider_backoff_line(&e.manifest.id) {
-                let elem = format!("ext-detail-{}-backoff", e.manifest.id);
-                body = body.child(
-                    div()
-                        .id(elem.clone())
-                        .debug_selector(move || format!("mo-{elem}"))
-                        .pl(px(16.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::muted())
-                        .child(text!(line)),
-                );
-            }
-            // 「这条绑定没生效」也要亮在它自己的那一家下面（P2-7）。判据在键表
-            // （`build` 收贡献键位时记录），这里只按清单路径对回是哪家，不重判。
-            for (k, line) in self.dropped_chord_lines(&e.path).into_iter().enumerate() {
-                let elem = format!("ext-detail-{}-drop-{k}", e.manifest.id);
-                body = body.child(
-                    div()
-                        .id(elem.clone())
-                        .debug_selector(move || format!("mo-{elem}"))
-                        .pl(px(16.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::muted())
-                        .child(text!(line)),
-                );
-            }
-            // 类型标签撞车也要亮在输家那一家下面（P2 剩余 #2）。判据在缓存
-            // （`type_labels_report` 先到先得后记账），这里只按扩展 id 对回是哪家，
-            // 不重判——与上面那条「绑定没生效」同一个「界面上能查、不重判」的理由。
-            for (k, line) in self
-                .type_label_conflict_lines(&e.manifest.id)
-                .into_iter()
-                .enumerate()
-            {
-                let elem = format!("ext-detail-{}-typelabel-{k}", e.manifest.id);
-                body = body.child(
-                    div()
-                        .id(elem.clone())
-                        .debug_selector(move || format!("mo-{elem}"))
-                        .pl(px(16.0))
-                        .text_size(px(11.5))
-                        .text_color(theme::muted())
-                        .child(text!(line)),
-                );
-            }
-            // 「卸载…」：选中那行的动作，收进详情区而不是挤在行上——先选中、看清
-            // 它贡献了什么、再决定删不删。点开的是确认卡（删目录不可恢复）。
-            let uninstall_id = e.manifest.id.clone();
-            let uninstall_name = e.manifest.name.clone();
-            let click_id = uninstall_id.clone();
-            let mut uninstall_btn = div()
-                .id(format!("ext-uninstall-{uninstall_id}"))
-                .debug_selector(move || format!("mo-ext-uninstall-{uninstall_id}"))
-                .flex()
-                .items_center()
-                .ml(px(16.0))
-                .mt(px(4.0))
-                .px(px(8.0))
-                .h(px(22.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(theme::separator())
-                .text_size(px(11.0))
-                .text_color(theme::muted())
-                .hover(|s| s.text_color(theme::text()))
-                .child(text!(format!("卸载「{uninstall_name}」…")));
-            let uninstall_ent = entity.clone();
-            uninstall_btn
-                .interactivity()
-                .on_click(move |_ev, _window, cx| {
-                    uninstall_ent.update(cx, |v, cx| v.ask_uninstall_extension(&click_id, cx));
-                });
-            body = body.child(uninstall_btn.test_support());
+            grid = grid.child(card.test_support());
         }
         // 坏掉的清单排在能用的之后（P2-7）。它们没有可启停的状态、贡献不出任何东西，
-        // 唯一有用的信息就是「为什么没用上」——所以原因直接摊在行下，不用选中。
+        // 但**外形要与宫格里的卡一致**（同边框 / 圆角 / 内边距）——用户报过「看着以为
+        // 是一行文字」；右侧实心红「删除」，让用户不必去文件管理器里手删坏目录
+        // （先过确认卡，删除不可恢复）。
+        let mut broken_col = div().flex().flex_col().gap(px(6.0));
         for e in &self.broken_exts {
             let dir = e
                 .path
@@ -5453,91 +5654,110 @@ impl RootView {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| e.path.display().to_string());
             let row_id = format!("ext-broken-{dir}");
-            body = body.child(
+            let del_id = format!("ext-broken-del-{dir}");
+            let dir_path = e
+                .path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| e.path.display().to_string());
+            let del_ent = entity.clone();
+            let del_click_dir = dir_path.clone();
+            // 实心红底 + 白字：描边灰字那版真机上看不清，删除是不可恢复的动作，
+            // 它就该长得像「卸载」确认键那一档的警示级。
+            let mut del_btn = div()
+                .id(del_id.clone())
+                .debug_selector(move || format!("mo-{del_id}"))
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .h(px(24.0))
+                .rounded(px(6.0))
+                .bg(rgba(0xd70015ff))
+                .text_size(px(11.5))
+                .text_color(theme::selected_text())
+                .child(text!("删除"));
+            del_btn.interactivity().on_click(move |_ev, _window, cx| {
+                del_ent.update(cx, |v, cx| {
+                    v.ask_remove_broken_extension(del_click_dir.clone(), cx)
+                });
+            });
+            // 图标格：清单都解析不出来的东西没有图标可用，画内置拼图占位——
+            // 与有效卡的 32×32 同尺寸，两排卡站在一起不跳格。
+            let broken_icon = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(32.0))
+                .rounded(px(6.0))
+                .bg(theme::hover_bg())
+                .flex_shrink_0()
+                .child(crate::icons::icon(
+                    crate::icons::EXTENSION,
+                    16.0,
+                    theme::muted(),
+                ));
+            let why_id = format!("ext-broken-{dir}-why");
+            let reason = e.reason.clone();
+            broken_col = broken_col.child(
                 div()
                     .id(row_id.clone())
                     .debug_selector(move || format!("mo-{row_id}"))
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .p(px(6.0))
-                    .rounded(px(4.0))
+                    .flex_col()
+                    .gap(px(3.0))
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme::separator())
                     .bg(theme::surface())
-                    .text_color(theme::muted())
-                    .child(text!(format!("（加载失败）{dir}"))),
-            );
-            let why_id = format!("ext-broken-{dir}-why");
-            let reason = e.reason.clone();
-            body = body.child(
-                div()
-                    .id(why_id.clone())
-                    .debug_selector(move || format!("mo-{why_id}"))
-                    .pl(px(16.0))
-                    .pr(px(6.0))
-                    .text_size(px(11.5))
-                    .text_color(theme::muted())
-                    .child(text!(reason)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(broken_icon)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(theme::text())
+                                    .child(text!(format!("（无效）{dir}"))),
+                            )
+                            .child(del_btn.test_support()),
+                    )
+                    .child(
+                        div()
+                            .id(why_id.clone())
+                            .debug_selector(move || format!("mo-{why_id}"))
+                            .pl(px(40.0))
+                            .text_size(px(11.5))
+                            .text_color(theme::muted())
+                            .child(text!(reason)),
+                    ),
             );
         }
-        // 「从磁盘安装」：装出来默认**停用**（启用才走那张贡献确认卡），来源由
-        // 用户在原生对话框里当面选。装完面板当场重取并选中新行（见
-        // `install_extension_from`），不靠「关掉再开」才看到。
-        let mut install_btn = div()
-            .id("ext-install")
-            .debug_selector(|| "mo-ext-install".to_string())
-            .flex()
-            .items_center()
-            .mt(px(8.0))
-            .px(px(10.0))
-            .h(px(26.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme::separator())
-            .bg(theme::surface())
-            .text_size(px(12.0))
-            .text_color(theme::muted())
-            .hover(|s| s.text_color(theme::text()))
-            .child(text!("从磁盘安装…（选一个含 manifest.json 的目录）"));
-        let install_ent = entity.clone();
-        install_btn
-            .interactivity()
-            .on_click(move |_ev, _window, cx| {
-                install_ent.update(cx, |v, cx| v.install_extension_from_disk(cx));
-            });
-        body = body.child(install_btn.test_support());
 
-        // 「从 .moext 安装」：分发场景用的另一条正门——下载得到的是一份文件而不是
-        // 一坨散目录。点下去弹文件选择框指认 `.moext`（zip），解压后再走与「从磁盘安装」
-        // 同一套「装出来即停用」的路线。两个按钮并排，区分只在来源形态。
-        let mut moext_btn = div()
-            .id("ext-install-moext")
-            .debug_selector(|| "mo-ext-install-moext".to_string())
+        // 内容（宫格 + 坏清单行）可能比窗口高：在页内滚动，别把末尾的卡挤到看不见
+        // ——headless 实测：视口外的卡 `click` 直接报 not visible（坐标命中不到），
+        // 真人 likewise 点不到。滚动兜底，配合紧凑卡片让常见数量整屏放下。
+        let mut body = div()
+            .id("ext-page")
             .flex()
-            .items_center()
-            .mt(px(8.0))
-            .px(px(10.0))
-            .h(px(26.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme::separator())
-            .bg(theme::surface())
-            .text_size(px(12.0))
-            .text_color(theme::muted())
-            .hover(|s| s.text_color(theme::text()))
-            .child(text!("从 .moext 安装…（选一个 .moext / zip 扩展包）"));
-        let moext_ent = entity.clone();
-        moext_btn.interactivity().on_click(move |_ev, _window, cx| {
-            moext_ent.update(cx, |v, cx| v.install_extension_from_zip_disk(cx));
-        });
-        body = body.child(moext_btn.test_support());
-
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .gap(px(10.0))
+            .p(px(8.0));
+        body = body.child(install_row);
+        body = body.child(grid);
+        body = body.child(broken_col);
         central_view(
             "扩展",
             "",
             body,
-            "↑↓ 选择 · Enter 或点右侧那颗状态胶囊启用 / 停用（启用前会列出它贡献了什么）· Esc 关闭 · 扩展=清单+外部程序，不往进程里塞代码",
+            "↑↓ 选择 · Enter 或点卡片右上那颗开关启用 / 停用（启用前会列出它贡献了什么）· 循环箭头 = 从来源目录重装（开发迭代用）· Esc 关闭 · 扩展=清单+外部程序，不往进程里塞代码",
         )
     }
 
@@ -10044,7 +10264,9 @@ impl Render for RootView {
             // 扩展管理器已迁独立窗口（`extensions_window` 模块）：这档模态值只是
             // 状态账（确认卡画在扩展窗口里、页面状态在本视图上），主窗口对它们
             // **什么都不画**——浏览不被打断。
-            Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => div(),
+            Modal::ConfirmEnableExt(_)
+            | Modal::ConfirmUninstallExt(_)
+            | Modal::ConfirmRemoveBrokenExt(_) => div(),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::History => self.render_history(&entity),
             Modal::ClipboardHistory => self.render_clip_history(&entity),
@@ -10095,7 +10317,6 @@ impl Render for RootView {
                 // 回收站面板开着（含其上的确认卡）时，地址栏显示「回收站」，
                 // 不再回显进面板前的目录。
                 self.is_in_trash(),
-                self.menu_open,
             ))
             .child(body);
 
@@ -10412,6 +10633,18 @@ impl Render for RootView {
                     root = root.child(render_uninstall_confirm(m, &entity));
                 }
             }
+            // 「删除无效扩展」确认卡：同一形状的第四例。目录在这期间被别处删了就
+            // 没有这张卡可画，什么都不挂。
+            Modal::ConfirmRemoveBrokenExt(dir) => {
+                if let Some(reason) = self
+                    .broken_exts
+                    .iter()
+                    .find(|b| b.path.parent() == Some(std::path::Path::new(dir)))
+                    .map(|b| b.reason.clone())
+                {
+                    root = root.child(render_remove_broken_confirm(dir, &reason, &entity));
+                }
+            }
             Modal::TrashRename(entry) => {
                 root = root.child(dialogs::trash_rename(self, entry, &entity));
             }
@@ -10537,11 +10770,13 @@ impl Render for RootView {
             root = root.child(ghost);
         }
 
-        // 左上角「应用菜单」浮层（设置 / 扩展程序 / 命令面板）：绝对定位画在最上层、
-        // 命中链最前，与右键菜单 / 橡皮筋同套路。锚点常量在 toolbar（APP_MENU_X/Y），
-        // 对准工具栏左缘第一枚按钮的正下方；开合语义见按钮与 `note_menu_press`。
+        // 「应用菜单」浮层（设置 / 扩展程序 / 命令面板）：绝对定位画在最上层、
+        // 命中链最前，与右键菜单 / 橡皮筋同套路。锚点在 toolbar（Y 常量 + 右缘
+        // 对齐的 `app_menu_x`），对准标签条行末汉堡按钮的下方；开合语义见按钮与
+        // `note_menu_press`。
         if self.menu_open {
-            root = root.child(crate::toolbar::render_app_menu(&entity));
+            let vw = f32::from(window.viewport_size().width);
+            root = root.child(crate::toolbar::render_app_menu(&entity, vw));
         }
 
         root
@@ -10582,6 +10817,11 @@ fn render_top_row(view: &RootView, entity: &Entity<RootView>, is_maximized: bool
             row = row.child(render_tab_bar(view, i, entity).flex_1().min_w_0());
         }
     }
+
+    // 「应用菜单」（汉堡）贴标签条行末——Chrome 同位。⚠️ Windows 上必须插在
+    // `drag_strip` / `window_controls` **之前**：最小化 / 最大化 / 关闭贴行末右缘，
+    // 汉堡在它们左边才不会重叠（`app_menu_button` 的文档也记了这一条）。
+    row = row.child(toolbar::app_menu_button(entity, view.menu_open));
 
     if !is_macos {
         // 无系统标题栏：可拖拽空白（吃掉剩余宽度）紧随其后的是贴右缘的窗口控制按钮。
@@ -10961,9 +11201,11 @@ fn handle_modal_key(
 ) {
     let modal = entity.update(cx, |v, _cx| v.modal.clone());
     match modal {
-        // 扩展管理器（含两张确认卡）已迁独立窗口：按键在
+        // 扩展管理器（含三张确认卡）已迁独立窗口：按键在
         // `extensions_window::ExtensionsWindow` 里路由，主窗口对它们不响应。
-        Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => {}
+        Modal::ConfirmEnableExt(_)
+        | Modal::ConfirmUninstallExt(_)
+        | Modal::ConfirmRemoveBrokenExt(_) => {}
         Modal::CommandPalette => match key {
             "escape" => close_modal(entity, cx),
             // ↑ / ↓ / Enter：只在**输入框没拿到焦点**时才从这里走（面板刚开的那一帧、
@@ -14257,6 +14499,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_uninstall_confirm(entity, cx);
         return;
     }
+    // 「删除无效扩展」确认卡同理：点遮罩 = 不删，回到扩展页。
+    if matches!(entity.read(cx).modal, Modal::ConfirmRemoveBrokenExt(_)) {
+        dismiss_remove_broken_confirm(entity, cx);
+        return;
+    }
     // 续传确认卡同理：点遮罩 = **什么都不提交**（那批文件原样不动）。
     if matches!(entity.read(cx).modal, Modal::ConfirmResume) {
         dismiss_resume_confirm(entity, cx);
@@ -14314,7 +14561,7 @@ fn render_notice_overlay(msg: &str, ok_label: &str, entity: &Entity<RootView>) -
 /// 回收站危险操作确认卡（`Modal::ConfirmTrash`，目前只有「清空回收站」一档）。
 ///
 /// 与 [`render_notice_overlay`] 共用 [`dialog_overlay`] 外壳；差别是两颗按钮：
-/// 取消（中性）+ 确认（警示红 `rgba(0xd70015)`，项目没有危险色角色，用固定值）。
+/// 取消（中性）+ 确认（警示红 `rgba(0xd70015ff)`，项目没有危险色角色，用固定值）。
 /// 回收站面板保留在遮罩后面，Esc / 取消 / 点遮罩都回到面板——**不能**走
 /// [`close_modal`]，那会把面板整个关掉。
 fn render_trash_confirm(
@@ -14388,7 +14635,7 @@ fn render_trash_confirm(
                         .px(px(18.0))
                         .h(px(30.0))
                         .rounded(px(7.0))
-                        .bg(rgba(0xd70015))
+                        .bg(rgba(0xd70015ff))
                         .text_color(theme::selected_text())
                         .text_size(px(13.0))
                         .on_click(move |_, _window, cx| confirm_trash_action(&ok, cx))
@@ -15100,7 +15347,7 @@ pub(crate) fn render_uninstall_confirm(
                         .px(px(18.0))
                         .h(px(30.0))
                         .rounded(px(7.0))
-                        .bg(rgba(0xd70015))
+                        .bg(rgba(0xd70015ff))
                         .text_color(theme::selected_text())
                         .text_size(px(13.0))
                         .on_click(move |_, _window, cx| confirm_uninstall_ext(&ok, cx))
@@ -15158,6 +15405,144 @@ pub(crate) fn confirm_uninstall_ext(entity: &Entity<RootView>, cx: &mut App) {
 pub(crate) fn dismiss_uninstall_confirm(entity: &Entity<RootView>, cx: &mut App) {
     entity.update(cx, |v, cx| {
         if matches!(v.modal, Modal::ConfirmUninstallExt(_)) {
+            v.modal = Modal::None;
+            v.sync_extensions_window(cx);
+            cx.notify();
+        }
+    });
+}
+
+/// 「删除这个无效扩展」确认卡（`Modal::ConfirmRemoveBrokenExt`）。
+///
+/// 外壳与「卸载」那张同款：按钮警示红（删目录不可恢复）。正文说清两件事——它
+/// **已经没在生效**（删除不损失任何功能，损失的只是那份坏掉的文件）、以及原因行
+/// 会在卡上再亮一遍（对着一半屏的确认卡改清单，比回列表里翻原因快）。
+pub(crate) fn render_remove_broken_confirm(
+    dir: &str,
+    reason: &str,
+    entity: &Entity<RootView>,
+) -> impl IntoElement {
+    let cancel = entity.clone();
+    let ok = entity.clone();
+    let dir_name = std::path::Path::new(dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.to_string());
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .child(text!(format!("删除无效扩展「{dir_name}」？")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme::muted())
+                        .child(text!(
+                            "它加载失败、没有在生效，删除只是清掉这份坏掉的文件，不会影响其它扩展。此操作不可恢复。"
+                                .to_string()
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme::muted())
+                        .child(text!(format!("无效原因：{reason}"))),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .id("ext-broken-cancel")
+                        .debug_selector(|| "mo-ext-broken-cancel".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| {
+                            dismiss_remove_broken_confirm(&cancel, cx)
+                        })
+                        .child(text!("取消"))
+                        // ⚠️ `.test_support()` 最后包（与「卸载」那张同一条纪律）。
+                        .test_support(),
+                )
+                .child(
+                    div()
+                        .id("ext-broken-ok")
+                        .debug_selector(|| "mo-ext-broken-ok".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(rgba(0xd70015ff))
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| confirm_remove_broken_ext(&ok, cx))
+                        .child(text!("删除"))
+                        .test_support(),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 确认卡上点了「删除」（或按 Enter）：删目录，然后回扩展页重取。
+///
+/// 目录路径从模态里**取出来**（与 [`confirm_uninstall_ext`] 同一条纪律）：确认期间
+/// broken 列表可能已经变了，按位删等于删另一条。
+pub(crate) fn confirm_remove_broken_ext(entity: &Entity<RootView>, cx: &mut App) {
+    let dir = entity.update(cx, |v, _cx| {
+        match std::mem::replace(&mut v.modal, Modal::None) {
+            Modal::ConfirmRemoveBrokenExt(dir) => Some(dir),
+            other => {
+                // 不在确认卡上（重复触发）：原样放回，什么都不做。
+                v.modal = other;
+                None
+            }
+        }
+    });
+    let Some(dir) = dir else { return };
+    let app = entity.read(cx).app();
+    if let Err(err) = app.remove_broken_extension(std::path::Path::new(&dir)) {
+        entity.update(cx, |v, cx| {
+            v.notice(format!("删除无效扩展失败：{err}"), None, cx);
+        });
+        return;
+    }
+    entity.update(cx, |v, cx| {
+        let (exts, broken) = v.app().extensions_report();
+        v.extensions = exts;
+        v.broken_exts = broken;
+        v.keymap = keymap_from(&v.app());
+        v.sync_extensions_window(cx);
+        cx.notify();
+    });
+}
+
+/// 取消：回到扩展页（独立窗口开着，**不是**关窗）。
+pub(crate) fn dismiss_remove_broken_confirm(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if matches!(v.modal, Modal::ConfirmRemoveBrokenExt(_)) {
             v.modal = Modal::None;
             v.sync_extensions_window(cx);
             cx.notify();
@@ -15775,12 +16160,26 @@ mod tests {
         let menu = cx
             .debug_bounds("mo-app-menu")
             .expect("应用菜单浮层没有渲染");
+        let expected_x = crate::toolbar::app_menu_x(f32::from(
+            cx.update(|window, _cx| window.viewport_size().width),
+        ));
         assert!(
-            (f32::from(menu.origin.x) - crate::toolbar::APP_MENU_X).abs() < 1.0
+            (f32::from(menu.origin.x) - expected_x).abs() < 1.0
                 && (f32::from(menu.origin.y) - crate::toolbar::APP_MENU_Y).abs() < 1.0,
-            "浮层没有锚在按钮正下方：menu={menu:?}（期望 x={}, y={}）",
-            crate::toolbar::APP_MENU_X,
+            "浮层没有右对齐锚在汉堡按钮正下方：menu={menu:?}（期望 x={expected_x}，y={}）",
             crate::toolbar::APP_MENU_Y
+        );
+        // 锚点常量与按钮实际位置对齐（挪按钮忘改常量就是这么漏的）：浮层顶必须
+        // 贴在汉堡底缘之下、且还在顶栏第二行（工具栏行）底缘之上。
+        let menu_btn = cx
+            .debug_bounds("mo-app-menu-btn")
+            .expect("汉堡按钮没有渲染");
+        assert!(
+            f32::from(menu.origin.y) >= f32::from(menu_btn.origin.y + menu_btn.size.height)
+                && f32::from(menu.origin.y) < crate::toolbar::TOOLBAR_HEIGHT * 2.0,
+            "浮层没有吸附在汉堡按钮正下方：menu_y={} btn_bottom={}",
+            f32::from(menu.origin.y),
+            f32::from(menu_btn.origin.y + menu_btn.size.height)
         );
         assert_eq!(
             menu.size.width,
@@ -17128,6 +17527,7 @@ mod tests {
   "id": "mdstats",
   "name": "Markdown 统计",
   "version": "1.0",
+  "icon": "icon.png",
   "enabled": true,
   "commands": [{
     "name": "统计字数",
@@ -17783,6 +18183,7 @@ mod tests {
   "id": "p24chord",
   "name": "字幕工具",
   "version": "1.0",
+  "icon": "icon.png",
   "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "key": "cmd+alt+shift+j" }]
 }"#,
         )
@@ -17899,6 +18300,7 @@ mod tests {
   "id": "p25sidebar",
   "name": "字幕工具P25",
   "version": "1.0",
+  "icon": "icon.png",
   "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "menu": ["sidebar"] }]
 }"#,
         )
@@ -17981,6 +18383,7 @@ mod tests {
             r#"{
   "id": "p4list",
   "name": "列表源P4",
+  "icon": "icon.png",
   "provider": { "run": ["/no/such/p4"], "methods": ["list"] },
   "lists": [{ "id": "recent", "title": "最近文件" }]
 }"#,
@@ -18034,9 +18437,12 @@ mod tests {
 
         // 段2：点击 → 面板打开、行渲染。取数在 blocking 池（种子只是让结果现成，
         // 任务还是走那条线程），`run_until_parked` 不等它——轮询到行真的画出来。
+        // 满负载并行下这次点击偶发整段丢失（headless 调度与真线程竞争，同
+        // e006581 书签点击重试的家族病）：行迟迟不出来就补点一次——模态没开时
+        // 这是唯一入场路径，模态开了再点也只是重开同一个面板，幂等。
         cx.update(|window, cx| window.click("sidebar-ext-list-recent", cx));
         let mut rows_visible = false;
-        for _ in 0..100 {
+        for round in 0..100 {
             cx.run_until_parked();
             cx.update(|window, cx| window.render_frame(cx));
             if cx.debug_bounds("mo-list-row-0").is_some()
@@ -18044,6 +18450,9 @@ mod tests {
             {
                 rows_visible = true;
                 break;
+            }
+            if round == 30 || round == 60 {
+                cx.update(|window, cx| window.click("sidebar-ext-list-recent", cx));
             }
         }
         assert!(rows_visible, "面板行没渲染出来（mo-list-row-0/1）");
@@ -18152,6 +18561,7 @@ mod tests {
   "id": "p26manager",
   "name": "字幕工具P26",
   "version": "1.0",
+  "icon": "icon.png",
   "enabled": false,
   "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "menu": ["sidebar"] }],
   "types": [{ "ext": [".srt"], "label": "字幕" }]
@@ -18336,6 +18746,7 @@ mod tests {
   "id": "{id}",
   "name": "字幕工具{id}",
   "version": "1.0",
+  "icon": "icon.png",
   "enabled": false,
   "commands": [{{ "name": "统计字数", "shell": "wc -w {{file}}" }}]
 }}"#
@@ -18486,6 +18897,7 @@ mod tests {
             r#"{
   "id": "p27drop",
   "name": "字幕工具P27",
+  "icon": "icon.png",
   "commands": [{ "name": "统计字数", "shell": "wc -w {file}", "key": "cmd+t" }]
 }"#,
         )
@@ -18568,6 +18980,85 @@ mod tests {
         );
     }
 
+    /// 无效扩展不赶用户去文件管理器：行上有「删除」，过确认卡把坏目录当场删掉。
+    ///
+    /// 取消那条也要测——删除不可恢复，取消就必须**真的什么都没动**；这里用「取消后
+    /// 再删得掉」顺带钉住「确认卡收了、按钮还能再点」（卡是状态账，不是一次性标记）。
+    #[test]
+    fn removing_a_broken_extension_deletes_its_directory() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let dir_bad = ext_root.join("p30bad");
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        let modal_of = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_window, cx| root.update(cx, |v, _cx| v.modal.clone()))
+        };
+
+        // fixture：清单过得了 JSON、死在 validate（id 与目录名不一致，同 P2-7 口径）。
+        let _ = std::fs::remove_dir_all(&dir_bad);
+        std::fs::create_dir_all(&dir_bad).unwrap();
+        std::fs::write(
+            dir_bad.join("manifest.json"),
+            r#"{"id":"other-name","name":"对不上目录","commands":[]}"#,
+        )
+        .unwrap();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+
+        // ① 行与「删除」按钮都在（选择器按目录名，与渲染同一套判据）。
+        ex.debug_bounds("mo-ext-broken-p30bad")
+            .expect("无效扩展行没出现（选择器 mo-ext-broken-p30bad）");
+        ex.debug_bounds("mo-ext-broken-del-p30bad")
+            .expect("无效扩展行上没有「删除」按钮");
+
+        // ② 点删除 → 确认卡，身份带目录路径而不是 id（坏清单没有可信 id）。
+        ex.update(|window, cx| window.click("ext-broken-del-p30bad", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        assert_eq!(
+            modal_of(cx),
+            Modal::ConfirmRemoveBrokenExt(dir_bad.display().to_string()),
+            "点删除该弹确认卡，身份是目录路径"
+        );
+        ex.debug_bounds("mo-ext-broken-ok")
+            .expect("确认卡没画（选择器 mo-ext-broken-ok）");
+
+        // ③ 取消：目录分毫不动、卡收了。
+        ex.update(|window, cx| window.click("ext-broken-cancel", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        assert_eq!(modal_of(cx), Modal::None, "取消后确认卡应收起");
+        assert!(
+            dir_bad.join("manifest.json").is_file(),
+            "取消删除不该动坏目录"
+        );
+
+        // ④ 再点删除并确认：目录没了，行当场消失，模态清空。
+        ex.update(|window, cx| window.click("ext-broken-del-p30bad", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.update(|window, cx| window.click("ext-broken-ok", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        assert!(!dir_bad.exists(), "点了「删除」就该把坏目录整个端走");
+        assert!(
+            ex.debug_bounds("mo-ext-broken-p30bad").is_none(),
+            "删完那一行要当场消失，别等下次重取"
+        );
+        assert_eq!(
+            modal_of(cx),
+            Modal::None,
+            "删除后回到扩展页（modal 清空、窗口保持打开）"
+        );
+    }
+
     /// 「从磁盘安装」的后半段：装完面板当场重取、选中新行，新行是**停用**的，
     /// 盘上有账本。
     ///
@@ -18582,9 +19073,10 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(
             src.join("manifest.json"),
-            r#"{"id":"p28ui","name":"界面上装的","commands":[{"name":"看一眼","shell":"pwd"}]}"#,
+            r#"{"id":"p28ui","name":"界面上装的","icon":"icon.png","commands":[{"name":"看一眼","shell":"pwd"}]}"#,
         )
         .unwrap();
+        std::fs::write(src.join("icon.png"), [0x89u8, b'P', b'N', b'G']).unwrap();
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let app = AppState::new();
@@ -18640,6 +19132,98 @@ mod tests {
         );
     }
 
+    /// 「刷新」按钮的全链路：装进来的扩展卡上有循环箭头（手工摆放的没有）→ 改来源
+    /// → 点刷新 → 面板当场重取（新名字）、启停状态保留（装出来即停用，刷完仍停用）。
+    ///
+    /// 判据（账本、来源门禁、状态保留）都在 `extensions::reinstall`；这条钉的是
+    /// UI 半段——按钮只对可刷的扩展出现、点完当场看到新内容。
+    #[test]
+    fn refreshing_reinstalls_from_the_source_and_keeps_enabled() {
+        let ext_root = crate::isolate_user_dirs_for_tests().join("extensions");
+        let src = std::env::temp_dir().join(format!("mo-extreui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"p30ui","name":"第一版","icon":"icon.png","commands":[{"name":"看一眼","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("icon.png"), [0x89u8, b'P', b'N', b'G']).unwrap();
+        // 手工摆放的一家（没有账本）：不该有刷新按钮。
+        let manual = ext_root.join("p30man");
+        let _ = std::fs::remove_dir_all(&manual);
+        std::fs::create_dir_all(&manual).unwrap();
+        std::fs::write(
+            manual.join("manifest.json"),
+            r#"{"id":"p30man","name":"手摆的","icon":"icon.png","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.install_extension_from(&src, cx)));
+        ex.update(|window, cx| window.render_frame(cx));
+
+        ex.debug_bounds("mo-ext-refresh-p30ui")
+            .expect("装进来的扩展（有账本）卡上要有刷新按钮");
+        assert!(
+            ex.debug_bounds("mo-ext-refresh-p30man").is_none(),
+            "手工摆放的扩展没有来源，不该有刷新按钮"
+        );
+
+        // 改来源：换名字、加一条命令。然后点刷新。
+        std::fs::write(
+            src.join("manifest.json"),
+            r#"{"id":"p30ui","name":"第二版","icon":"icon.png","commands":[{"name":"看一眼","shell":"pwd"},{"name":"新命令","shell":"pwd"}]}"#,
+        )
+        .unwrap();
+        ex.update(|window, cx| window.click("ext-refresh-p30ui", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+
+        let (name, enabled, on_disk) = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                let e = v
+                    .extensions
+                    .iter()
+                    .find(|e| e.manifest.id == "p30ui")
+                    .expect("刷新后还在面板上");
+                (
+                    e.manifest.name.clone(),
+                    e.manifest.enabled,
+                    std::fs::read_to_string(ext_root.join("p30ui/manifest.json")).unwrap(),
+                )
+            })
+        });
+        assert_eq!(name, "第二版", "点完刷新，面板当场是来源的新内容");
+        assert!(!enabled, "装出来即停用；刷新保留启停状态，不弹启用确认卡");
+        assert!(on_disk.contains("新命令"), "盘上也是新清单：{on_disk}");
+        // 刷新后选中原卡、贡献展开（与安装同一套收尾）。
+        ex.debug_bounds("mo-ext-detail-p30ui-0")
+            .expect("刷完选中原卡，贡献清单当场展开");
+
+        let cleaned = std::fs::remove_dir_all(&src);
+        let cleaned_installed = std::fs::remove_dir_all(ext_root.join("p30ui"));
+        let cleaned_manual = std::fs::remove_dir_all(&manual);
+        assert!(
+            cleaned.is_ok() && cleaned_installed.is_ok() && cleaned_manual.is_ok(),
+            "清理 fixture 失败：{cleaned:?} {cleaned_installed:?} {cleaned_manual:?}"
+        );
+    }
+
     /// 「从 .moext 安装」的后半段：解压 → 装 → 面板重取、选中新行，新行停用、盘上有账本。
     ///
     /// 前半段（原生文件选择框）headless 弹不出来，所以这里直接调选择框之后的
@@ -18660,10 +19244,12 @@ mod tests {
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("p28zip/manifest.json", opts).unwrap();
             zw.write_all(
-                r#"{"id":"p28zip","name":"压缩包装的","commands":[{"name":"看一眼","shell":"pwd"}]}"#
+                r#"{"id":"p28zip","name":"压缩包装的","icon":"icon.png","commands":[{"name":"看一眼","shell":"pwd"}]}"#
                     .as_bytes(),
             )
             .unwrap();
+            zw.start_file("p28zip/icon.png", opts).unwrap();
+            zw.write_all(&[0x89u8, b'P', b'N', b'G']).unwrap();
             zw.finish().unwrap();
         }
 
@@ -18735,7 +19321,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("manifest.json"),
-            r#"{"id":"unui","name":"要卸载的扩展","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
+            r#"{"id":"unui","name":"要卸载的扩展","icon":"icon.png","commands":[{"name":"跑一下","shell":"pwd"}]}"#,
         )
         .unwrap();
 
@@ -18860,6 +19446,7 @@ mod tests {
             r#"{
   "id": "p29keys",
   "name": "字幕工具P29",
+  "icon": "icon.png",
   "commands": [
     { "name": "数一数", "shell": "wc -w {file}", "key": "cmd+alt+shift+y" },
     { "name": "键串写错", "shell": "pwd", "key": "p29-不是键" }
@@ -18946,7 +19533,7 @@ mod tests {
             std::fs::write(
                 d.join("manifest.json"),
                 format!(
-                    r#"{{ "id": "{}", "name": "{}", "types": [ {{ "ext": [".p29z"], "label": "{}" }} ] }}"#,
+                    r#"{{ "id": "{}", "name": "{}", "icon": "icon.png", "types": [ {{ "ext": [".p29z"], "label": "{}" }} ] }}"#,
                     d.file_name().unwrap().to_string_lossy(),
                     label,
                     label
