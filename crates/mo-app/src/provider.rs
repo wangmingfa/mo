@@ -50,6 +50,13 @@ use crate::AppState;
 /// 协议版本。清单里的 `provider` 段不写版本——握手时问。
 pub const PROTOCOL_VERSION: u64 = 1;
 
+/// 握手帧 id 的起点：`2^53 - 1`，即 JS `Number.MAX_SAFE_INTEGER`。
+///
+/// 协议帧 id 是 u64，但 provider 可能是任何语言写的——JS 系（bun/node）的 number
+/// 只能无损表示 ≤2^53 的整数。握手 id 从这里往下数，既保住「与调用帧（从 0 起）
+/// 不撞车」的初衷，又保证 JS 系 provider 能原样回显。
+pub const JS_SAFE_ID: u64 = (1u64 << 53) - 1;
+
 /// 握手超时缺省（清单 `startup_timeout_ms` 可覆盖）。
 pub const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 2000;
 /// 单次调用超时缺省（清单 `call_timeout_ms` 可覆盖）。
@@ -449,9 +456,12 @@ impl Host {
             child,
             stdin,
             rx,
-            // 握手帧用 id 空间的最顶端（往下数）：与调用帧（从 0 递增）永不撞车——
-            // 迟到的握手应答不会被误认成某次调用的回答。
-            next_id: u64::MAX,
+            // 握手帧用 id 空间的最高「JS 安全整数」（2^53-1，往下数）：与调用帧（从 0
+            // 递增）在实际时间尺度上永不撞车——迟到的握手应答不会被误认成某次调用的
+            // 回答。**不能用 u64::MAX**：JS/bun 实现的 provider 里 number 是 double，
+            // 超过 2^53 的整数会被舍入（u64::MAX → 18446744073709552000），宿主按
+            // 「id 对不上」把正确回包丢掉，握手白等到超时（2026-10-09 srt-tools 实案）。
+            next_id: JS_SAFE_ID,
         };
         // 握手：initialize → {name, version, methods[]}。
         let params = serde_json::json!({ "protocol": PROTOCOL_VERSION });

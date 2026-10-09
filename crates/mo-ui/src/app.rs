@@ -1291,6 +1291,11 @@ pub struct RootView {
     pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
     /// 左下角传输浮层是否展开（小块点击切换；点外面 / Esc 收起）。
     pub(crate) ops_open: bool,
+    /// 左上角「应用菜单」popover 是否展开（按钮点击切换；点外面 / Esc 收起）。
+    pub(crate) menu_open: bool,
+    /// 「应用菜单」按钮**按下那一刻**浮层是否开着——抬起时据此决定「只收起」
+    /// 还是「打开」，避免按下（关）+ 抬起（开）互相抵消成「怎么点都关不掉」。
+    pub(crate) menu_press_was_open: bool,
     /// 底部暂存区抽屉是否展开（收集时自动展开，让用户看见收进去了什么）。
     pub(crate) staging_open: bool,
     /// 「打开方式」二级菜单的候选应用（菜单打开时对文件目标异步查询注册表）。
@@ -1603,6 +1608,8 @@ impl RootView {
             header_cells_owner: (0, 0),
             context_menu: None,
             ops_open: false,
+            menu_open: false,
+            menu_press_was_open: false,
             staging_open: false,
             open_with_apps: Vec::new(),
             app_picker: None,
@@ -2202,6 +2209,34 @@ impl RootView {
     pub(crate) fn close_ops_popover(&mut self, cx: &mut Context<Self>) {
         if self.ops_open {
             self.ops_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 「应用菜单」按钮**按下**时记档：按下那一刻若浮层开着就立即收起（浮层自己的
+    /// `on_mouse_down_out` 在同一次按下里也会再触发一次，幂等无害）。
+    pub(crate) fn note_menu_press(&mut self, cx: &mut Context<Self>) {
+        self.menu_press_was_open = self.menu_open;
+        if self.menu_open {
+            self.menu_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 「应用菜单」按钮**抬起**（click）：只有「按下时是关着的」才打开——否则
+    /// 这次按下已经把菜单关掉了，再开回去就成了「怎么点都关不掉」。
+    pub(crate) fn app_menu_clicked(&mut self, cx: &mut Context<Self>) {
+        let was_open = std::mem::take(&mut self.menu_press_was_open);
+        if !was_open {
+            self.menu_open = true;
+            cx.notify();
+        }
+    }
+
+    /// 点外面 / Esc 收起「应用菜单」popover（已关则无事可做）。
+    pub(crate) fn close_menu_popover(&mut self, cx: &mut Context<Self>) {
+        if self.menu_open {
+            self.menu_open = false;
             cx.notify();
         }
     }
@@ -7280,6 +7315,19 @@ impl RootView {
         .detach();
     }
 
+    /// 打开命令面板（与 `palette.open` 键位同一条刷新逻辑：重取用户命令 / 工作流 /
+    /// 键表，清空查询与高亮下标，再切到 [`Modal::CommandPalette`]）。
+    pub(crate) fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        let exts = selected_ext_names(self.panel());
+        self.user_commands = self.app().user_commands(&exts);
+        self.workflows = self.app().workflows();
+        self.keymap = keymap_from(&self.app());
+        self.modal = Modal::CommandPalette;
+        self.cmd_query.clear();
+        self.palette_index = 0;
+        cx.notify();
+    }
+
     /// 打开统一设置窗口并停在某个标签页（各标签页光标复位语义与原选择器一致）。
     pub(crate) fn open_settings(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         match tab {
@@ -10047,6 +10095,7 @@ impl Render for RootView {
                 // 回收站面板开着（含其上的确认卡）时，地址栏显示「回收站」，
                 // 不再回显进面板前的目录。
                 self.is_in_trash(),
+                self.menu_open,
             ))
             .child(body);
 
@@ -10106,6 +10155,10 @@ impl Render for RootView {
                     }
                     if v.ops_open {
                         v.ops_open = false;
+                        consumed = true;
+                    }
+                    if v.menu_open {
+                        v.menu_open = false;
                         consumed = true;
                     }
                     if consumed {
@@ -10482,6 +10535,13 @@ impl Render for RootView {
                 );
             }
             root = root.child(ghost);
+        }
+
+        // 左上角「应用菜单」浮层（设置 / 扩展程序 / 命令面板）：绝对定位画在最上层、
+        // 命中链最前，与右键菜单 / 橡皮筋同套路。锚点常量在 toolbar（APP_MENU_X/Y），
+        // 对准工具栏左缘第一枚按钮的正下方；开合语义见按钮与 `note_menu_press`。
+        if self.menu_open {
+            root = root.child(crate::toolbar::render_app_menu(&entity));
         }
 
         root
@@ -11289,7 +11349,7 @@ fn handle_modal_key(
                         },
                         // 搜索页只有一个文本输入框：↑↓ / Enter 等交给输入框自己处理，
                         // 这里不抢——抢了文字就打不进去了。
-                        SettingsTab::Search => {},
+                        SettingsTab::Search => {}
                     }
                 }
                 _ => {}
@@ -15687,6 +15747,151 @@ mod tests {
             list_before, list_after,
             "右键菜单挤动了文件列表：绝对定位浮层不应当影响根容器的 flex 布局"
         );
+    }
+
+    /// 左上角「应用菜单」浮层：必须锚在工具栏左缘第一枚按钮的正下方
+    /// （`toolbar::APP_MENU_X/Y`），宽度与右键菜单一致、条目画得出来，并且
+    /// **不能挤动**根容器的 flex 布局（同右键菜单那条的守护点）。
+    #[test]
+    fn app_menu_popover_anchors_below_the_toolbar_without_disturbing_layout() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|window, cx| window.render_frame(cx));
+        let list_before = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.menu_open = true;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let menu = cx
+            .debug_bounds("mo-app-menu")
+            .expect("应用菜单浮层没有渲染");
+        assert!(
+            (f32::from(menu.origin.x) - crate::toolbar::APP_MENU_X).abs() < 1.0
+                && (f32::from(menu.origin.y) - crate::toolbar::APP_MENU_Y).abs() < 1.0,
+            "浮层没有锚在按钮正下方：menu={menu:?}（期望 x={}, y={}）",
+            crate::toolbar::APP_MENU_X,
+            crate::toolbar::APP_MENU_Y
+        );
+        assert_eq!(
+            menu.size.width,
+            px(crate::context_menu::MENU_W),
+            "应用菜单宽度应当与右键菜单一致"
+        );
+        assert!(menu.size.height > px(0.0), "应用菜单高度为 0：条目没有渲染");
+
+        // 三行都真的画出来了（命令面板 / 扩展程序 / 设置）。
+        for action in crate::toolbar::APP_MENU_ENTRIES {
+            assert!(
+                cx.debug_bounds(action.selector()).is_some(),
+                "应用菜单「{:?}」行没有渲染",
+                action
+            );
+        }
+
+        let list_after = cx.debug_bounds("mo-file-list").expect("文件列表没有渲染");
+        assert_eq!(
+            list_before, list_after,
+            "应用菜单挤动了文件列表：绝对定位浮层不应当影响根容器的 flex 布局"
+        );
+    }
+
+    /// 「应用菜单」开合语义（按钮两段式）：关着时点击打开；**开着时按下立即收起**、
+    /// 抬起不再打开——否则按下（关）+ 抬起（开）互相抵消，按钮就成了「怎么点都关不掉」。
+    #[test]
+    fn app_menu_button_press_close_click_open_do_not_cancel_out() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                // 关着 → 点击：打开。
+                v.app_menu_clicked(cx);
+                assert!(v.menu_open, "关着时点击按钮应当打开浮层");
+
+                // 开着 → 按下：立即收起（与浮层 on_mouse_down_out 的收起等价、幂等）。
+                v.note_menu_press(cx);
+                assert!(!v.menu_open, "开着时按下应当立即收起");
+
+                // 同一次按下的抬起：不再打开。
+                v.app_menu_clicked(cx);
+                assert!(!v.menu_open, "抬起不应当把刚收起的浮层再打开");
+
+                // Esc / 点外面收起后再次点击：又能打开。
+                v.app_menu_clicked(cx);
+                assert!(v.menu_open);
+                v.close_menu_popover(cx);
+                assert!(!v.menu_open);
+                v.app_menu_clicked(cx);
+                assert!(v.menu_open);
+            });
+        });
+    }
+
+    /// 「应用菜单」各行点击要落到各自的目标：设置行开统一设置窗口、
+    /// 命令面板行开命令面板（浮层本身要先收起）。
+    #[test]
+    fn app_menu_rows_open_their_targets() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        // 行的元素 id 用动作的判别值（`render_app_menu` 里 `action as usize`），
+        // 与展示顺序无关——这里只锁「点哪行开哪扇门」的对应关系。
+        let settings_id = crate::toolbar::AppMenuAction::Settings as usize;
+        let palette_id = crate::toolbar::AppMenuAction::CommandPalette as usize;
+
+        let open_menu = |root: &Entity<RootView>, cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.menu_open = true;
+                    cx.notify();
+                });
+            });
+            cx.update(|window, cx| window.render_frame(cx));
+        };
+
+        open_menu(&root, cx);
+        cx.update(|window, cx| window.click(("mo-app-menu-item", settings_id), cx));
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                assert!(
+                    matches!(v.modal, Modal::Settings),
+                    "点「设置」行应当打开统一设置窗口，实际 modal={:?} menu_open={}",
+                    v.modal,
+                    v.menu_open
+                );
+                assert!(!v.menu_open, "执行动作前浮层应当先收起");
+            });
+        });
+
+        open_menu(&root, cx);
+        cx.update(|window, cx| window.click(("mo-app-menu-item", palette_id), cx));
+        cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                assert!(
+                    matches!(v.modal, Modal::CommandPalette),
+                    "点「命令面板」行应当打开命令面板"
+                );
+                assert!(!v.menu_open);
+            });
+        });
     }
 
     /// 对话框（B 类）必须是**带遮罩的浮层**，而不是「替换中央区那种」：

@@ -885,7 +885,10 @@ e2e 特意把 fixture 种在**窗口建好之后**，让「面板打开时重取
   给、不用写也会出现在能力清单里。
 * **协议**：JSON Lines，`{id, method, params}` / `{id, result|error}`；握手
   `initialize{protocol:1}` → `{name, version, methods[]}`，握手帧占 id 空间顶端
-  （u64::MAX 往下数），调用帧从 0 递增——迟到的握手应答**按构造**不会撞成某次调用的
+  （**2^53-1 = JS `Number.MAX_SAFE_INTEGER` 往下数**；2026-10-09 起由 u64::MAX 改来——
+  JS 系 provider 的 number 是 double，u64::MAX 会被舍成 18446744073709552000，
+  宿主按「id 对不上」丢掉正确回包、白等到超时），调用帧从 0 递增——迟到的握手
+  应答**按构造**不会撞成某次调用的
   回答。插件健康地拒答（error 帧）不计失败；超时 / 崩溃 kill 进程、记连续失败，
   3 次进指数退避（5s 起步翻倍、封顶 5 分钟），扩展管理器亮
   「provider 已停用 · 约 N 秒后自动恢复；日志：<host.log>」。stderr 全量落

@@ -1,0 +1,28 @@
+{
+  "id": "srt-tools",
+  "name": "字幕工具",
+  "version": "1.0.0",
+  "enabled": true,
+  "when_ext": [".srt", ".vtt"],
+  "capabilities": ["read-contents"],
+  "types": [
+    { "ext": [".srt", ".vtt"], "label": "字幕" }
+  ],
+  "commands": [
+    {
+      "name": "统计字幕条目数",
+      "category": "字幕工具",
+      "shell": "c=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]*$' {file}); echo \"{file} 约 $c 条字幕\"",
+      "menu": ["context:file", "palette"]
+    }
+  ],
+  "provider": {
+    "run": ["bin/srt-tools.ts"],
+    "methods": ["classify", "preview", "list"],
+    "startup_timeout_ms": 2000,
+    "call_timeout_ms": 800
+  },
+  "lists": [
+    { "id": "recent", "title": "最近字幕" }
+  ]
+}

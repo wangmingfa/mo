@@ -95,6 +95,19 @@ fn list_method_returns_rows_with_source_passthrough() {
     );
 }
 
+/// 回归（2026-10-09 srt-tools 实案）：JS 系 provider（bun/node）的 number 是
+/// double，帧 id 只能无损承载 ≤2^53 的整数。握手 id 一旦用 u64::MAX，应答会被
+/// 舍成 18446744073709552000，宿主按「id 对不上」丢掉正确回包、白等到超时——
+/// 表现为「插件功能全超时、host.log 一片空白」。握手 id 已改为 JS_SAFE_ID（2^53-1）。
+#[test]
+fn handshake_survives_js_number_rounding() {
+    let host = mo_app::provider::Host::new(spec("jsid", "js_id", 2000));
+    let result = host
+        .call("list", &mo_app::provider::list_params("recent"))
+        .expect("JS 舍入 id 之下握手与调用都应当成功");
+    assert_eq!(mo_app::provider::list_rows_from_result(&result).len(), 2);
+}
+
 /// Manager 级的 list 端到端（P4）：清单（provider.methods=["list"] + lists 成对声明）
 /// → 宿主 → 调用 → 解析 → **逐行 stat 补 is_dir**。带路径的行指向 /tmp（真目录），
 /// is_dir 必须被标出来——双击导航判「进目录还是开文件」靠它。

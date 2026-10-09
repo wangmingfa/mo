@@ -216,3 +216,36 @@
 * **现在**：设置窗口新增「搜索」标签页，单文本输入框编辑排除规则（逗号 / 空格分隔，实时写回
   `config.json`）。`AppState::save_config` 改为 `pub` 供 UI 复用；设置页新增 `SettingsTab::Search`
   （插在 `ALL` 末尾，不破坏「界面 / 外观 / 快捷键」的循环顺序与既有测试）。
+
+### ⑩ 左上角「应用菜单」浮层（2026-10-09）
+* **需求**：工具栏最左加一枚按钮，点开吸附在旁边的 popover，里面放设置 / 扩展程序 / 命令面板
+  等全局入口（Chrome 风格的应用菜单）。
+* **布局归属**：按钮在 `toolbar::render` 最左（28×28，汉堡图标）；浮层本体**不挂在按钮里**，
+  由 `app.rs` 的 render 在根容器**末尾**以窗口坐标挂上（`toolbar::APP_MENU_X/Y` = 8 / 98，
+  对准工具栏底缘）——绝对定位画在最上层、命中链最前，与右键菜单 / 橡皮筋同套路（gpui 无
+  z-index，浮层挂在前面会被正文盖住）。视觉复用 context_menu 常量（MENU_W / ITEM_H / 圆角 /
+  surface 底 + 阴影），三行：命令面板（⇧⌘P）/ 扩展程序 / 设置（⌘,）。
+* **开合语义（关键坑）**：浮层的 `on_mouse_down_out` 在「点按钮」那一下也会触发（按钮在浮层
+  外），若按钮用朴素 toggle，按下（关）+ 抬起（开）互相抵消 →「怎么点都关不掉」。修法是
+  按钮两段式：按下（`note_menu_press`）记下「按下时是否开着」并立即收起；抬起（`app_menu_clicked`）
+  只在「按下时是关着的」才打开。Esc / 点外面收起复用既有路由（`close_menu_popover`）。
+* **测试**：`app_menu_popover_anchors_below_the_toolbar_without_disturbing_layout`（锚点 / 宽度 /
+  三行都画出 / 不挤动布局）、`app_menu_button_press_close_click_open_do_not_cancel_out`（两段语义）、
+  `app_menu_rows_open_their_targets`（点行开对门：设置行 → `Modal::Settings`、面板行 →
+  `Modal::CommandPalette`，且浮层先收起）。行 id 用动作判别值（`AppMenuAction as usize`），
+  与展示顺序解耦——测试里拿展示序 position 去点会点错行（踩过一次，断言带出实际 modal 才定位）。
+
+### ⑪ 修 provider 握手对 JS 系插件必然超时（2026-10-09）
+* **现象**：srt-tools（bun 实现）在「最近字幕」面板恒报「调用超时（进程已被强制结束）」，
+  host.log 一片空白；换终端起 Mo（排除 PATH 问题）依旧。
+* **根因**：握手帧 id 用 `u64::MAX`。JS 系 provider 的 number 是 double，超过 2^53 的
+  整数被舍入——回包 id 变成 18446744073709552000，宿主 `roundtrip` 按「id 对不上」
+  把正确回包丢掉继续等，直到超时 kill。插件本身 38ms 就答了（独立探针实测）。
+* **排查法**：mo-app 集成探针（真实 `Host` 直打已装扩展）稳定复现超时；外部 bun 直拉
+  稳定通过 → 收敛到宿主代码路径；再让夹具回显 id 才现形（浮点舍入不留任何日志）。
+* **修法**：握手 id 起点改为 `JS_SAFE_ID`（2^53-1，`Number.MAX_SAFE_INTEGER`），
+  「与调用帧不撞车」的初衷不变（调用从 0 递增，实际时间尺度够不到 9×10^15）。
+  协议夹具加 `js_id` 模式（应答 id 过一遍 f64），`handshake_survives_js_number_rounding`
+  回归钉死；`plugin-system.md` §5 协议段同步改。
+* **教训**：跨语言协议里「宿主自留的哨兵值」不能假设对端能无损表示——u64 空间里
+  超过 2^53 的任何值对 JS 系实现都是另一个数。

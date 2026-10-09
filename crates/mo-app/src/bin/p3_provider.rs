@@ -4,6 +4,9 @@
 //! * `crash`：握手正常，第一次 `classify` 直接退出（测崩溃计数）。
 //! * `garbage`：答 `classify` 前先往 stdout 吐一行不成帧的人话（测「跳过垃圾行不炸」）。
 //! * `refuse`：`classify` 回协议级 error（测「健康地拒答不计失败」）。
+//! * `js_id`：握手应答的 id 先过一遍 f64（模拟 JS 系 provider 的 number 舍入）。
+//!   回归 2026-10-09 srt-tools 实案：握手 id 用 u64::MAX 时会被舍到 2^64 量级，
+//!   宿主按「id 对不上」丢掉正确回包、白等到超时；≤2^53 的 id 原样回来。
 
 use std::io::{stdin, BufRead};
 
@@ -16,9 +19,20 @@ fn main() {
         };
         let id = v["id"].as_u64().unwrap_or(0);
         match v["method"].as_str().unwrap_or("") {
-            "initialize" => println!(
-                r#"{{"id":{id},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview","list"]}}}}"#
-            ),
+            "initialize" => {
+                if mode == "js_id" {
+                    // JS 系 provider：number 是 double，id 经 f64 一来一回。≤2^53 的
+                    // id 原样回来；更大的（如旧的 u64::MAX 握手）被舍掉，宿主对不上。
+                    println!(
+                        r#"{{"id":{:.0},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview","list"]}}}}"#,
+                        id as f64
+                    );
+                } else {
+                    println!(
+                        r#"{{"id":{id},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview","list"]}}}}"#
+                    );
+                }
+            }
             "shutdown" => {
                 println!(r#"{{"id":{id},"result":null}}"#);
                 break;
