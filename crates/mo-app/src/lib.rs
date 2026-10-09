@@ -5231,7 +5231,11 @@ impl AppState {
         }
     }
 
-    fn save_config(&self, cfg: &mo_config::Config) {
+    /// 覆盖并持久化配置（写 `config.json` + 作废标签页标签缓存）。
+    ///
+    /// UI 改设置（如索引排除规则）走这个而不是自己写文件：路径、错误兜底、
+    /// 缓存失效都集中在这里。
+    pub fn save_config(&self, cfg: &mo_config::Config) {
         if let Err(e) = cfg.save(&Self::config_path()) {
             tracing::warn!("配置保存失败：{e}");
             return;

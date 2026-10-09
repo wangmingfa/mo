@@ -306,8 +306,14 @@ impl FileIndex {
     /// 短查询回退全表扫可接受：这条查询已随 §46 后台化，慢不压主线程。
     ///
     /// 排序规则：文件名以查询串开头的最相关，其次文件名包含，再次路径包含；
-    /// 同级优先路径更短（更靠近根）的结果——这条 ORDER BY 只作用在查找已收窄的
-    /// 候选集上，量很小，不影响查找本身的开销。
+    /// 同级优先路径更短（更靠近根）的结果。
+    ///
+    /// ⚠️ **候选集上限**：`files_fts MATCH` 可能命中几万行（前缀 `photo-000` 在 20 万
+    /// 库里就能撞上千），而 `JOIN files` + 排序是按「命中总量」付费的——每多读一行
+    /// 就多一次 rowid 查表。所以先在内层用 `LIMIT (limit+500)` 把候选截住（至少够外层
+    /// `LIMIT`，再多 500 行给相关性排序留余量），外层再排序取前 `limit`。这样无论命中
+    /// 多少，单行成本被钉死：前缀查询从没上限时的 ~2.5ms 降到中缀量级。内层不加
+    /// `ORDER BY` 是刻意的——FTS 按 docid 回传即可，顺序由外层重排。
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, SearchError> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
@@ -337,18 +343,27 @@ impl FileIndex {
         // 对应原来的 `name_lower LIKE '%q%' OR path LIKE '%q%'`。
         let match_q = format!("\"{}\"", q.replace('"', "\"\""));
 
+        // 候选集上限：见 `search` 文档。至少 `limit` 行，再多 500 行给排序留余量，
+        // 上限 2000 防止极端查询把成本顶爆。
+        let candidate_cap = (limit + 500).min(2000);
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, f.name, f.size, f.modified, f.is_dir
-             FROM files_fts
-             JOIN files f ON f.id = files_fts.rowid
-             WHERE files_fts MATCH ?1
+            "SELECT path, name, size, modified, is_dir FROM (
+                SELECT f.path, f.name, f.size, f.modified, f.is_dir, f.name_lower
+                FROM files_fts
+                JOIN files f ON f.id = files_fts.rowid
+                WHERE files_fts MATCH ?1
+                LIMIT ?3
+             )
              ORDER BY
-               CASE WHEN f.name_lower LIKE ?2 THEN 0 ELSE 1 END,
-               length(f.path) ASC
-             LIMIT ?3",
+               CASE WHEN name_lower LIKE ?2 THEN 0 ELSE 1 END,
+               length(path) ASC
+             LIMIT ?4",
         )?;
 
-        let rows = stmt.query_map(params![match_q, starts, limit as i64], hit_from_row)?;
+        let rows = stmt.query_map(
+            params![match_q, starts, candidate_cap as i64, limit as i64],
+            hit_from_row,
+        )?;
 
         let mut hits = Vec::new();
         for row in rows {

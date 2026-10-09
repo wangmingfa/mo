@@ -403,11 +403,21 @@ pub(crate) enum SettingsTab {
     Theme,
     /// 快捷键：重映射 / 解绑 / 捕获。
     Keys,
+    /// 搜索：索引排除规则（全局搜索跳过哪些名称的目录）。
+    Search,
 }
 
 impl SettingsTab {
     /// 全部标签页（顺序即 ← / → 循环切换的顺序）。
-    const ALL: [SettingsTab; 3] = [SettingsTab::Layout, SettingsTab::Theme, SettingsTab::Keys];
+    ///
+    /// `Search` 放最后：已有测试依赖 `Layout → Theme → Keys` 的相对循环顺序，新页插在
+    /// 末尾不破坏它们。
+    const ALL: [SettingsTab; 4] = [
+        SettingsTab::Layout,
+        SettingsTab::Theme,
+        SettingsTab::Keys,
+        SettingsTab::Search,
+    ];
 
     /// 标签栏上的显示名。
     fn label(self) -> &'static str {
@@ -415,6 +425,7 @@ impl SettingsTab {
             SettingsTab::Layout => "界面",
             SettingsTab::Theme => "外观",
             SettingsTab::Keys => "快捷键",
+            SettingsTab::Search => "搜索",
         }
     }
 }
@@ -1210,6 +1221,11 @@ pub struct RootView {
     pub(crate) prop_sub: Option<Subscription>,
     pub(crate) archive_input: Option<Entity<InputState>>,
     pub(crate) archive_sub: Option<Subscription>,
+    /// 设置「搜索」页的「索引排除规则」编辑框（单字段，实时写回 config.json）。
+    ///
+    /// 与归档 / 属性框同一套路：每帧在 `update` 里按需创建并订阅，离开该页就清空。
+    pub(crate) index_exclude_input: Option<Entity<InputState>>,
+    pub(crate) index_exclude_sub: Option<Subscription>,
     pub(crate) trash_rename_input: Option<Entity<InputState>>,
     pub(crate) trash_rename_sub: Option<Subscription>,
     /// 行内重命名（资源管理器式）：正在改名的目标路径，`None` = 没在编辑。
@@ -1493,6 +1509,8 @@ impl RootView {
             prop_sub: None,
             archive_input: None,
             archive_sub: None,
+            index_exclude_input: None,
+            index_exclude_sub: None,
             trash_rename_input: None,
             trash_rename_sub: None,
             inline_rename: None,
@@ -3293,6 +3311,49 @@ impl RootView {
                 self.archive_sub = Some(sub);
             }
             if let Some(state) = self.archive_input.clone() {
+                if !state.read(cx).focus_handle(cx).is_focused(window) {
+                    state.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+        }
+
+        // ---- 设置：搜索页的「索引排除规则」编辑框（实时写回 config.json） ----
+        if !(self.modal == Modal::Settings && self.settings_tab == SettingsTab::Search) {
+            self.index_exclude_input = None;
+            self.index_exclude_sub = None;
+        } else {
+            if self.index_exclude_input.is_none() {
+                // 逗号分隔的当前规则做初值；输入里改一个字符就解析回 Vec<String> 写回
+                // 配置——体验和「界面 / 快捷键」页的「改动即时生效」一致。
+                let seed = self.app().config().index_exclude.join(", ");
+                let state = cx.new(|cx| InputState::new(window, cx));
+                if !seed.is_empty() {
+                    state.update(cx, |s, cx| s.set_value(seed, window, cx));
+                }
+                let sub = cx.subscribe_in(
+                    &state,
+                    window,
+                    |this: &mut Self, _s, ev: &InputEvent, _w, cx| {
+                        if matches!(ev, InputEvent::Change) {
+                            if let Some(s) = this.index_exclude_input.as_ref() {
+                                let raw = s.read(cx).value().to_string();
+                                let rules: Vec<String> = raw
+                                    .split(|c: char| c.is_whitespace() || c == ',')
+                                    .map(|p| p.trim().to_string())
+                                    .filter(|p| !p.is_empty())
+                                    .collect();
+                                let mut cfg = this.app().config();
+                                cfg.index_exclude = rules;
+                                this.app().save_config(&cfg);
+                                cx.notify();
+                            }
+                        }
+                    },
+                );
+                self.index_exclude_input = Some(state);
+                self.index_exclude_sub = Some(sub);
+            }
+            if let Some(state) = self.index_exclude_input.clone() {
                 if !state.read(cx).focus_handle(cx).is_focused(window) {
                     state.update(cx, |s, cx| s.focus(window, cx));
                 }
@@ -7236,6 +7297,9 @@ impl RootView {
                 self.keys_index = 0;
                 self.keys_capturing = None;
             }
+            SettingsTab::Search => {
+                // 搜索页没有光标态，无需复位。
+            }
         }
         self.settings_tab = tab;
         self.modal = Modal::Settings;
@@ -7454,6 +7518,7 @@ impl RootView {
             SettingsTab::Layout => self.layout_body(entity),
             SettingsTab::Theme => self.theme_body(entity),
             SettingsTab::Keys => self.keys_body(entity),
+            SettingsTab::Search => self.search_body(entity),
         };
         let body = div()
             .flex()
@@ -7483,6 +7548,9 @@ impl RootView {
             SettingsTab::Keys => {
                 "↑↓ 选择 · Enter 捕获 · Delete 解绑 · R 复位 · ←→ 换页 · Esc 关闭"
             }
+            SettingsTab::Search => {
+                "编辑后即时写入 config.json · Esc 关闭"
+            }
         };
         dialog_overlay_sized(
             entity,
@@ -7492,6 +7560,59 @@ impl RootView {
             hint,
             px(620.0),
         )
+    }
+
+    /// 设置「搜索」页正文：索引排除规则编辑框。
+    ///
+    /// 全局搜索爬取时会跳过这些名称的目录（整棵子树），默认已含 node_modules /
+    /// target 等。多个规则用逗号或空格分隔，改一个字符就实时写回 `config.json`
+    /// （订阅逻辑在 `update` 里 `index_exclude_input` 的建块内）。
+    fn search_body(&self, _entity: &Entity<RootView>) -> Div {
+        let mut body = div().flex().flex_col().gap(px(8.0));
+        body = body.child(
+            div()
+                .text_size(px(13.0))
+                .text_color(theme::text())
+                .child(text!(
+                    "索引排除规则（全局搜索跳过这些名称的目录，整棵子树不进索引）"
+                )),
+        );
+        body = body.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .child(text!(
+                    "默认已含 node_modules / target / dist / build / __pycache__ / .venv / DerivedData。多个用逗号或空格分隔，改完即时生效。"
+                )),
+        );
+        if let Some(state) = self.index_exclude_input.as_ref() {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h(px(28.0))
+                    .px(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::separator())
+                    .debug_selector(|| "index-exclude-input".to_string())
+                    .child(
+                        div().flex_1().min_w(px(0.0)).flex().items_center().child(
+                            Input::new(state)
+                                .appearance(false)
+                                .bordered(false)
+                                .small()
+                                .text_size(px(13.0))
+                                .p(px(0.0)),
+                        ),
+                    ),
+            );
+        }
+        body
     }
 
     // ------------------------------------------------------------ 列视图
@@ -11166,6 +11287,9 @@ fn handle_modal_key(
                             "r" => entity.update(cx, |v, cx| v.keys_reset_one(cx)),
                             _ => {}
                         },
+                        // 搜索页只有一个文本输入框：↑↓ / Enter 等交给输入框自己处理，
+                        // 这里不抢——抢了文字就打不进去了。
+                        SettingsTab::Search => {},
                     }
                 }
                 _ => {}
