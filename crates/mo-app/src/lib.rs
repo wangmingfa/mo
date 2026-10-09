@@ -58,7 +58,7 @@ pub use workflows::{run_workflow, StepResult, WorkflowReport};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -428,6 +428,12 @@ pub struct AppState {
     indexed: Arc<PlMutex<(std::time::Instant, usize)>>,
     /// 重算那个数的单飞标志：有一趟在途就不再往 blocking 池塞第二趟。
     indexed_pumping: Arc<AtomicBool>,
+    /// 上一轮爬取**因排除规则跳过了几个目录**（`mo_config::Config::index_exclude`）。
+    ///
+    /// 状态栏拿它回答「为什么那个目录搜不到」——排除是静默的，不给这个数，用户
+    /// 只能猜。用 `AtomicUsize` 而不是塞进 `indexed` 那份 `(时刻, 数)` 缓存：它
+    /// 不需要按 TTL 重算，爬完是多少就是多少。
+    index_excluded: Arc<AtomicUsize>,
     /// 「系统里挂了哪些网络盘」的缓存：`(上次查的时刻, 结果)`。
     ///
     /// 侧边栏**每帧**都会问一次，而发现是真要去读 `/proc/mounts` 或跑一次 `mount`
@@ -462,6 +468,9 @@ pub struct AppState {
     redo_stack: Arc<PlMutex<Vec<Reversible>>>,
     /// 应用内剪贴板（⌘C / ⌘X / ⌘V 的文件复制与剪切）。
     clipboard: Arc<Mutex<Option<Clipboard>>>,
+    /// 剪贴板历史（最近在前，最多 [`CLIP_HISTORY_MAX`] 条）。见 [`ClipHistoryEntry`]
+    /// 里与暂存区的分工。
+    clip_history: Arc<Mutex<Vec<ClipHistoryEntry>>>,
     /// 暂存区（收集夹）：**进程级**共享的一份清单，见 [`staging`] 的模块文档。
     ///
     /// 之所以与剪贴板同层但不是一个东西：剪贴板是「替换 + 立刻粘贴」，这里是
@@ -1151,6 +1160,7 @@ impl AppState {
             index: Arc::new(PlMutex::new(Self::open_index())),
             indexed: Arc::new(PlMutex::new((std::time::Instant::now(), usize::MAX))),
             indexed_pumping: Arc::new(AtomicBool::new(false)),
+            index_excluded: Arc::new(AtomicUsize::new(0)),
             net_shares: Arc::new(std::sync::Mutex::new((
                 // 起点放到「很久以前」，好让第一次问就真的去查一次。
                 std::time::Instant::now() - NET_SHARE_TTL,
@@ -1169,6 +1179,7 @@ impl AppState {
             undo_stack: Arc::new(PlMutex::new(Vec::new())),
             redo_stack: Arc::new(PlMutex::new(Vec::new())),
             clipboard: Arc::new(Mutex::new(None)),
+            clip_history: Arc::new(Mutex::new(Vec::new())),
             staging,
             opening: Arc::new(std::sync::Mutex::new(None)),
             show_hidden: Arc::new(AtomicBool::new(
@@ -3482,6 +3493,10 @@ impl AppState {
             stop.store(false, Ordering::Relaxed);
             // 闭包是 `move` 且要进 blocking 池，判据得在派发前算好。
             let skip_hidden = !app.show_hidden();
+            // 排除规则（node_modules / target / dist …）：**派发前**取好，别在
+            // blocking 闭包里读配置——那要过配置锁，而爬几万条的时间里它可能
+            // 被别处改，规则中途换掉会让同一次索引前后两半行为不一致。
+            let exclude = app.config().index_exclude;
             let bus_p = bus.clone();
             // ⚠️ 锁**不再**横跨整棵遍历：`crawl` 内部每攒满一批才短暂取锁写入。
             // 旧写法全程握着 `index.lock()` 爬几万条，而 UI 主线程的事件总线循环
@@ -3496,11 +3511,13 @@ impl AppState {
                         max_depth,
                         // 与列表同一条判据：列表里看不到的，搜索也不该搜得到。
                         skip_hidden,
+                        &exclude,
                         limit,
                         &stop,
                         |n| {
                             bus_p.publish(AppEvent::IndexUpdated {
                                 indexed: n,
+                                excluded: 0,
                                 root: root.clone(),
                             });
                         },
@@ -3513,10 +3530,14 @@ impl AppState {
                 })
                 .await;
             match result {
-                Ok(Ok(n)) => bus.publish(AppEvent::IndexUpdated {
-                    indexed: n,
-                    root: root_after,
-                }),
+                Ok(Ok(stats)) => {
+                    app.index_excluded.store(stats.excluded, Ordering::Relaxed);
+                    bus.publish(AppEvent::IndexUpdated {
+                        indexed: stats.indexed,
+                        excluded: stats.excluded,
+                        root: root_after,
+                    });
+                }
                 Ok(Err(e)) => tracing::warn!("索引失败：{e}"),
                 Err(e) => tracing::warn!("索引任务异常：{e}"),
             }
@@ -3566,6 +3587,14 @@ impl AppState {
     /// 现在：进程内第一次仍然就地数（「重开应用后索引还在」的判据要当场成立，
     /// 见 `tests/global_index.rs`），此后按 [`INDEX_COUNT_TTL`] 派发后台重算，
     /// 调用方拿到的值最多旧这么一拍。
+    /// 上一轮爬取因排除规则（`mo_config::Config::index_exclude`）跳过了几个目录。
+    ///
+    /// 状态栏在「已索引 N」旁边带一句「排除 M」，好让「某个目录搜不到」有解释：
+    /// 排除是静默的，不给这个数就只能靠猜。
+    pub fn index_excluded_count(&self) -> usize {
+        self.index_excluded.load(Ordering::Relaxed)
+    }
+
     pub fn index_count(&self) -> usize {
         let (at, cached) = *self.indexed.lock();
         if cached == usize::MAX {
@@ -5124,6 +5153,33 @@ pub struct Clipboard {
     pub src: Endpoint,
 }
 
+/// 剪贴板历史里的一条：某次复制 / 剪切装的那批路径。
+///
+/// 与暂存区（[`crate::staging`]）的分工：
+/// * **暂存区**是**主动**的——用户明确「收进去」，跨目录一点点凑一批，凑完再一起
+///   复制或移动；它是清单，可以增删。
+/// * **剪贴板历史**是**被动**的——每次复制 / 剪切自动留一条，只留最近 N 条，
+///   用来「刚才复制的那批再粘一次 / 粘到另一个目录」。它不可编辑，也正因为
+///   不可编辑，才不会把「当前这一批」和「之前那几批」混在一起。
+///
+/// 记 `src`（那批路径在哪一端）与剪贴板本身同理：粘贴时读它们的那一头，不能用
+/// 「此刻浏览的那一端」顶替。
+#[derive(Clone)]
+pub struct ClipHistoryEntry {
+    pub paths: Vec<PathBuf>,
+    /// true = 剪切（粘贴后移动），false = 复制。
+    pub cut: bool,
+    pub src: Endpoint,
+    /// 复制 / 剪切发生的时间（unix 秒），列表按它倒序。
+    pub at: i64,
+}
+
+/// 剪贴板历史最多留几条。
+///
+/// 20 条是「够找回刚才那一批」和「不至于变成第二个文件管理器」之间的折中：
+/// 再长就没人翻到底，而且每条都揣着一整批路径。
+pub const CLIP_HISTORY_MAX: usize = 20;
+
 /// 磁盘用量的一行结果（某个子树的汇总）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirUsage {
@@ -5817,12 +5873,70 @@ impl AppState {
         if paths.is_empty() {
             return Vec::new();
         }
+        let src = self.endpoint();
         *self.clipboard.lock().await = Some(Clipboard {
             paths: paths.clone(),
             cut,
-            src: self.endpoint(),
+            src: src.clone(),
         });
+        self.remember_clip(paths.clone(), cut, src).await;
         paths
+    }
+
+    /// 把这一批记进剪贴板历史（**去重只跟最新一条比**）。
+    ///
+    /// 连着两次复制同一批（最常见的就是复制完发现没粘上、又按一次 ⌘C）不该在历史
+    /// 里留两条一模一样的——那会把「刚才那批」挤到第二行去。只跟最新一条比就够了：
+    /// 更早的同名条目是另一次操作，用户可能真要找它。
+    ///
+    /// 采纳**系统**剪贴板那批不进历史：那是外部应用给的，会随每次前台切换反复
+    /// 触发，几秒钟就能把 20 条全占满。
+    async fn remember_clip(&self, paths: Vec<PathBuf>, cut: bool, src: Endpoint) {
+        let mut history = self.clip_history.lock().await;
+        if history
+            .first()
+            .is_some_and(|e| e.paths == paths && e.cut == cut)
+        {
+            return;
+        }
+        history.insert(
+            0,
+            ClipHistoryEntry {
+                paths,
+                cut,
+                src,
+                at: now_secs(),
+            },
+        );
+        history.truncate(CLIP_HISTORY_MAX);
+    }
+
+    /// 剪贴板历史（最近在前）。
+    pub async fn clipboard_history(&self) -> Vec<ClipHistoryEntry> {
+        self.clip_history.lock().await.clone()
+    }
+
+    /// 清空剪贴板历史（**不动**当前剪贴板里那批）。
+    pub async fn clear_clipboard_history(&self) {
+        self.clip_history.lock().await.clear();
+    }
+
+    /// 把历史里第 `index` 条**当成当前剪贴板**再粘到 `dest`（空 = 当前目录）。
+    ///
+    /// 走一遍当前剪贴板是为了复用粘贴那条路上所有既有规矩：源端点、剪切一次性
+    /// 消耗、冲突 / 续传确认、可逆项与 ⌘Z 全都在那条路上。另写一条「直接按历史
+    /// 粘贴」会把这些规矩复制一遍，然后两边慢慢长歪。
+    pub async fn paste_history_entry(&self, index: usize) -> TransferOutcome {
+        let entry = self.clip_history.lock().await.get(index).cloned();
+        let Some(entry) = entry else {
+            return TransferOutcome::Started(Vec::new());
+        };
+        *self.clipboard.lock().await = Some(Clipboard {
+            paths: entry.paths,
+            cut: entry.cut,
+            src: entry.src,
+        });
+        self.paste_clipboard(None).await
     }
 
     /// 采纳**系统**剪贴板里的文件（资源管理器 / 访达里复制、剪切的那批），返回有没有采纳。

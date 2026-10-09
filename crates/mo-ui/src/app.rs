@@ -283,6 +283,12 @@ pub(crate) enum Modal {
     /// 操作历史面板（B，2026-09-29）：列出这一轮做过的复制 / 移动 / 删除 /
     /// 重命名，点一条跳到那次操作的落点目录。
     History,
+    /// 剪贴板历史：最近 N 次复制 / 剪切装的那批路径，挑一条粘到当前目录。
+    ///
+    /// 与 [`Modal::History`] 是两件事：那条记**做过的动作**（事后回看），这条记
+    /// **待粘的批次**（当时要用）。也别和暂存区混——暂存区是主动凑一批，这条是
+    /// 被动留下来的最近几次。
+    ClipboardHistory,
     /// 文件 / 文件夹比较结果。
     Diff,
     /// 属性与权限。
@@ -491,6 +497,8 @@ pub(crate) enum CommandId {
     OpenTrash,
     /// 操作历史面板。
     OpenHistory,
+    /// 剪贴板历史面板：挑最近复制 / 剪切过的某一批，粘到当前目录。
+    ClipboardHistory,
     OpenTerminal,
     AddBookmark,
     RemoveBookmark,
@@ -793,6 +801,11 @@ fn commands_in(users: &[mo_app::UserCommand], workflows: &[mo_app::Workflow]) ->
         CmdDef {
             id: CommandId::OpenHistory,
             title: "操作历史…".to_string(),
+            category: "操作".to_string(),
+        },
+        CmdDef {
+            id: CommandId::ClipboardHistory,
+            title: "剪贴板历史…（最近复制 / 剪切过的批次）".to_string(),
             category: "操作".to_string(),
         },
         CmdDef {
@@ -1146,6 +1159,12 @@ pub struct RootView {
     pub(crate) history: Vec<mo_app::HistoryEntry>,
     /// 历史面板的键盘光标位。
     history_index: usize,
+    /// 剪贴板历史（面板数据源，最近在前）。**只取当前标签页那一份**：与操作历史
+    /// 不同，剪贴板是「此刻要粘什么」，别的标签页复制的那批放到这里只会让人粘错
+    /// —— 要跨页搬运请用暂存区（那里才是「凑一批」的地方）。
+    clip_history: Vec<mo_app::ClipHistoryEntry>,
+    /// 剪贴板历史面板的光标位。
+    clip_history_index: usize,
     /// 会话（窗口布局）去抖写盘是否已经有任务在等（`true` = 别再排一个）。
     session_saving: bool,
     /// 扩展管理器的光标位。
@@ -1160,6 +1179,8 @@ pub struct RootView {
     dedup_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 已索引文件数（状态栏展示，取最近一次同步的值）。
     indexed: usize,
+    /// 上一轮索引排除掉的目录数（状态栏「排除 M」，0 时不显示）。
+    excluded: usize,
     /// 回收站条目快照（回收站面板数据源）。`pub(crate)` 仅为测试注入。
     pub(crate) trash_entries: Vec<TrashEntry>,
     /// 回收站面板内容区高度（prepaint 回写）——「斑马纹铺满一屏」算补足行数用，
@@ -1511,6 +1532,8 @@ impl RootView {
             broken_exts: Vec::new(),
             history: Vec::new(),
             history_index: 0,
+            clip_history: Vec::new(),
+            clip_history_index: 0,
             session_saving: false,
             ext_index: 0,
             workflows: Vec::new(),
@@ -1525,6 +1548,7 @@ impl RootView {
             dedup_running: false,
             dedup_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexed: 0,
+            excluded: 0,
             trash_entries: Vec::new(),
             trash_body_h: 0.0,
             trash_view_mode: ViewMode::List,
@@ -2263,6 +2287,69 @@ impl RootView {
         self.history_index = 0;
         self.modal = Modal::History;
         cx.notify();
+    }
+
+    /// 打开剪贴板历史面板。
+    ///
+    /// 取数是异步的（`AppState::clipboard_history` 要过那把锁），所以先开面板、
+    /// 数据回来再整块回填——与「先画占位」同一套路，别让面板在等数据那一下空白。
+    pub(crate) fn open_clip_history(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        self.clip_history.clear();
+        self.clip_history_index = 0;
+        self.modal = Modal::ClipboardHistory;
+        cx.notify();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let entries = app.clipboard_history().await;
+            this.update(cx, |v, cx| {
+                v.clip_history = entries;
+                v.clip_history_index = 0;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把剪贴板历史里光标那条**粘到当前目录**。
+    ///
+    /// 走 `AppState::paste_history_entry` 而不是自己拼传输：源端点、剪切一次性
+    /// 消耗、冲突 / 续传确认、⌘Z 全在那条路上，另写一遍迟早长歪。
+    fn paste_clip_history_entry(&mut self, cx: &mut Context<Self>) {
+        let index = self.clip_history_index;
+        if self.clip_history.is_empty() {
+            return;
+        }
+        let app = self.app();
+        self.modal = Modal::None;
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let _ = app.paste_history_entry(index).await;
+            let _ = weak.update(cx, |_v, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// 清空剪贴板历史（面板的「清空」按钮）：**不动**当前剪贴板里那批——那批是
+    /// 「下一次 ⌘V 要粘什么」，清历史不该把它一起带走。
+    fn clear_clip_history(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        self.clip_history.clear();
+        self.clip_history_index = 0;
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            app.clear_clipboard_history().await;
+            let _ = weak.update(cx, |_v, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn clip_history_move_cursor(&mut self, delta: i32) {
+        if self.clip_history.is_empty() {
+            return;
+        }
+        let i = self.clip_history_index as i32 + delta;
+        self.clip_history_index = i.clamp(0, self.clip_history.len() as i32 - 1) as usize;
     }
 
     /// 清空操作历史（历史面板的「清空」按钮）：所有标签页一起清——只清当前页
@@ -6277,6 +6364,132 @@ impl RootView {
         )
     }
 
+    /// 剪贴板历史面板：一行一批，↑↓ 选、Enter 粘到当前目录。
+    fn render_clip_history(&self, entity: &Entity<RootView>) -> Div {
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar();
+        if self.clip_history.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .text_color(theme::muted())
+                    .child(text!("（这一轮还没复制 / 剪切过）".to_string())),
+            );
+        }
+        for (i, e) in self.clip_history.iter().enumerate() {
+            let selected = i == self.clip_history_index;
+            // 三个以内报名字，再多只报个数——一屏要能放下十几条。
+            let names = if e.paths.len() <= 3 {
+                e.paths
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            } else {
+                format!("{} 项", e.paths.len())
+            };
+            let mut row = div()
+                .id(format!("clip-history-row-{i}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(6.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .text_size(px(12.0));
+            row = if selected {
+                row.bg(theme::selected_bg())
+                    .text_color(theme::selected_text())
+            } else {
+                row.hover(|s| s.bg(theme::hover_bg()))
+            };
+            row = row
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(56.0))
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(if e.cut {
+                            "剪切".to_string()
+                        } else {
+                            "复制".to_string()
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(132.0))
+                        .text_color(if selected {
+                            theme::selected_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(text!(crate::file_item::format_modified(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.at as u64)
+                        ))),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(text!(names)));
+            let ent = entity.clone();
+            // 单击 = 把光标放到这一行；**双击才粘**——粘贴会真的动文件，单击就动手
+            // 太容易误触（历史里第一条往往就是刚复制的那批，点一下就复制一份）。
+            row.interactivity().on_click(move |ev, _window, cx| {
+                ent.update(cx, |v, _cx| v.clip_history_index = i);
+                if ev.click_count() >= 2 {
+                    ent.update(cx, |v, cx| v.paste_clip_history_entry(cx));
+                }
+            });
+            list = list.child(row);
+        }
+
+        let ent2 = entity.clone();
+        let mut clear = div()
+            .id("clip-history-clear")
+            .flex_shrink_0()
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .text_size(px(11.0))
+            .text_color(theme::muted())
+            .hover(|s| s.bg(theme::selected_bg()))
+            .child(text!("清空".to_string()));
+        clear.interactivity().on_click(move |_ev, _window, cx| {
+            ent2.update(cx, |v, cx| v.clear_clip_history(cx));
+        });
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(4.0))
+            .p(px(8.0));
+        body = body.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::muted())
+                .child(text!(format!("最近 {} 条", self.clip_history.len()))),
+        );
+        body = body.child(list);
+        central_view_with_action(
+            "剪贴板历史",
+            "",
+            body,
+            "↑↓ 选择 · Enter 粘到当前目录 · 双击也可 · Esc 关闭",
+            clear,
+        )
+    }
+
     fn render_dedup(&self, entity: &Entity<RootView>) -> Div {
         let mut body = div()
             .flex()
@@ -9419,6 +9632,7 @@ async fn sync_panel(
     let can_forward = app.can_go_forward().await;
     let ops = app.operations_snapshot().await;
     let indexed = app.index_count();
+    let excluded = app.index_excluded_count();
     let trash_entries = app.trash_list();
     // app 侧选择是唯一事实来源；⌘A / 键盘移动等改动都从这里回灌 UI。
     let selection_ids = app.selection_ids().await;
@@ -9429,6 +9643,7 @@ async fn sync_panel(
             None => return None,
         };
         v.indexed = indexed;
+        v.excluded = excluded;
         // 回收站多选挂在行下标上：内容**真的变了**（还原 / 删除 / 清空，长度
         // 必变）才作废多选与游标——任何总线事件都会重跑 sync，见事件就清会把
         // 刚点出来的选择立刻吹掉。
@@ -9663,6 +9878,7 @@ impl Render for RootView {
             Modal::ConfirmEnableExt(_) | Modal::ConfirmUninstallExt(_) => div(),
             Modal::Duplicates => self.render_dedup(&entity),
             Modal::History => self.render_history(&entity),
+            Modal::ClipboardHistory => self.render_clip_history(&entity),
             Modal::Workflow => self.render_workflow(),
             Modal::List => self.render_list_panel(&entity),
             Modal::Sync => self.render_sync(&entity),
@@ -9730,6 +9946,7 @@ impl Render for RootView {
                     count: panel.visible_count,
                     selection_count,
                     indexed: self.indexed,
+                    excluded: self.excluded,
                     can_undo,
                     can_redo,
                     staged: self.app().staged_count(),
@@ -11026,6 +11243,19 @@ fn handle_modal_key(
             "enter" => history_jump(entity, cx),
             _ => {}
         },
+        Modal::ClipboardHistory => match key {
+            "escape" => close_modal(entity, cx),
+            "up" | "arrowup" => entity.update(cx, |v, cx| {
+                v.clip_history_move_cursor(-1);
+                cx.notify();
+            }),
+            "down" | "arrowdown" => entity.update(cx, |v, cx| {
+                v.clip_history_move_cursor(1);
+                cx.notify();
+            }),
+            "enter" => entity.update(cx, |v, cx| v.paste_clip_history_entry(cx)),
+            _ => {}
+        },
         Modal::Diff | Modal::Info(_) => match key {
             "escape" | "space" => close_modal(entity, cx),
             _ => {}
@@ -11376,6 +11606,9 @@ fn on_palette_enter(entity: &Entity<RootView>, cx: &mut App) {
         }
         Some(CommandId::OpenHistory) => {
             entity.update(cx, |v, cx| v.open_history_panel(cx));
+        }
+        Some(CommandId::ClipboardHistory) => {
+            entity.update(cx, |v, cx| v.open_clip_history(cx));
         }
         Some(CommandId::StageSelection) => {
             entity.update(cx, |v, cx| v.stage_selection(cx));
@@ -11813,6 +12046,7 @@ async fn run_command(id: CommandId, app: &AppState) {
         | CommandId::CompareSelection
         | CommandId::OpenTrash
         | CommandId::OpenHistory
+        | CommandId::ClipboardHistory
         | CommandId::OpenTerminal
         | CommandId::AddBookmark
         | CommandId::RemoveBookmark

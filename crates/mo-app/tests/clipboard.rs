@@ -187,3 +187,93 @@ async fn a_different_batch_on_the_system_clipboard_replaces_the_internal_one() {
         "内部那批旧的该作废，不该跟着粘出来"
     );
 }
+
+// ---- 剪贴板历史（被动记录最近 N 批，与暂存区的分工见 `mo_app::ClipHistoryEntry`）----
+
+/// 每次复制留一条，**最近在前**；连着复制同一批只留一条。
+#[tokio::test]
+async fn history_records_each_copy_newest_first() {
+    let dir = tmp("hist-record");
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.join("b.txt"), b"b").unwrap();
+
+    let app = app("hist-record");
+    app.open_directory(&dir).await.expect("打开目录失败");
+
+    app.select_all_visible().await;
+    app.copy_selection_to_clipboard().await;
+    // 只选一条再复制（选区模型按路径选，这里直接换一批路径）。
+    app.clear_selection().await;
+    app.select_path(&dir.join("b.txt")).await;
+    app.copy_selection_to_clipboard().await;
+
+    let h = app.clipboard_history().await;
+    assert_eq!(h.len(), 2, "两次复制该留两条：{:?}", h.len());
+    assert_eq!(h[0].paths, vec![dir.join("b.txt")], "最新的在前");
+    assert!(!h[0].cut);
+    assert!(h.iter().all(|e| e.at > 0), "每条都该带时间");
+}
+
+/// 连着两次复制同一批：历史里只留一条（否则「刚才那批」被挤到第二行）。
+#[tokio::test]
+async fn repeating_the_same_copy_does_not_add_a_second_entry() {
+    let dir = tmp("hist-dup");
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+
+    let app = app("hist-dup");
+    app.open_directory(&dir).await.expect("打开目录失败");
+    for _ in 0..3 {
+        app.select_all_visible().await;
+        app.copy_selection_to_clipboard().await;
+    }
+    assert_eq!(
+        app.clipboard_history().await.len(),
+        1,
+        "同一批连按三次只该留一条"
+    );
+}
+
+/// 采纳**系统**剪贴板不进历史：那会随每次前台切换反复触发，几秒就占满 20 条。
+#[tokio::test]
+async fn adopting_the_system_clipboard_stays_out_of_history() {
+    let dir = tmp("hist-sys");
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+
+    let app = app("hist-sys");
+    app.open_directory(&dir).await.expect("打开目录失败");
+    app.adopt_system_clipboard(vec![dir.join("a.txt")], false)
+        .await;
+    assert!(
+        app.clipboard_history().await.is_empty(),
+        "外部那批不该进历史"
+    );
+}
+
+/// 从历史里粘**第二条**（更早那批）：粘的是那一批自己，不是当前剪贴板那条。
+#[tokio::test]
+async fn pasting_an_older_history_entry_pastes_that_batch() {
+    let src = tmp("hist-paste-src");
+    let dst = tmp("hist-paste-dst");
+    std::fs::write(src.join("older.txt"), b"o").unwrap();
+    std::fs::write(src.join("newer.txt"), b"n").unwrap();
+
+    let app = app("hist-paste");
+    app.open_directory(&src).await.expect("打开源目录失败");
+    app.select_all_visible().await;
+    app.copy_selection_to_clipboard().await; // 第 0 条（等下会被顶到第二）
+    app.clear_selection().await;
+    app.select_path(&src.join("newer.txt")).await;
+    app.copy_selection_to_clipboard().await; // 现在最新是 newer
+
+    let h = app.clipboard_history().await;
+    assert_eq!(h.len(), 2);
+
+    app.open_directory(&dst).await.expect("打开目标目录失败");
+    // 第二条 = 更早就复制的那批（含 older.txt）。
+    let ids = app.paste_history_entry(1).await;
+    assert!(!ids.started_ids().is_empty(), "历史里有条目，粘贴不该空手");
+    assert!(
+        wait_exists(&dst.join("older.txt")).await,
+        "粘的该是历史里那一批"
+    );
+}

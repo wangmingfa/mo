@@ -10,11 +10,16 @@ mo-core.workspace = true
 mo-fs.workspace = true
 mo-cache.workspace = true
 mo-thumbnails.workspace = true
+mo-search.workspace = true
 criterion.workspace = true
 image.workspace = true
 
 [[bench]]
 name = "directory"
+harness = false
+
+[[bench]]
+name = "search"
 harness = false
 
 [[bench]]

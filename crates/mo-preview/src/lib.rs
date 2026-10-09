@@ -14,6 +14,12 @@ use std::path::Path;
 use mo_core::types::PreviewClass;
 use mo_core::MoError;
 
+pub mod highlight;
+pub mod markdown;
+
+pub use highlight::{highlight, Token, TokenKind};
+pub use markdown::markdown;
+
 /// 预览类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {

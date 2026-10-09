@@ -36,6 +36,10 @@ pub enum AppEvent {
     /// 全局搜索索引进度更新（后台爬取时周期性广播）。
     IndexUpdated {
         indexed: usize,
+        /// 本轮**因排除规则被跳过的目录数**（整棵子树都不进索引，见
+        /// `mo_config::Config::index_exclude`）。带出来是为了让状态栏能回答
+        /// 「为什么我那个目录搜不到」——排除是静默的，没有这个数就全靠猜。
+        excluded: usize,
         root: PathBuf,
     },
 

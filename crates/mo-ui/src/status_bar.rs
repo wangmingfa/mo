@@ -12,6 +12,9 @@ pub struct Stats {
     pub count: usize,
     pub selection_count: usize,
     pub indexed: usize,
+    /// 上一轮索引因排除规则跳过的目录数（`AppState::index_excluded_count`）。
+    /// `0` 时不显示——排除没生效时那句话是噪音。
+    pub excluded: usize,
     pub can_undo: bool,
     pub can_redo: bool,
     /// 暂存区里的条数：**始终**显示入口（哪怕为 0）——暂存区没有别的常驻入口，
@@ -30,6 +33,7 @@ pub fn render(
         count,
         selection_count,
         indexed,
+        excluded,
         can_undo,
         can_redo,
         staged,
@@ -48,6 +52,11 @@ pub fn render(
     }
 
     let mut right = format!("已索引 {indexed}");
+    // 「排除 M」：索引是静默跳过依赖目录的，不给这个数，「为什么搜不到
+    // node_modules 里的东西」就只能靠猜。
+    if excluded > 0 {
+        right.push_str(&format!(" · 排除 {excluded}"));
+    }
     if can_undo || can_redo {
         right.push_str(&format!(" · {} 撤销", crate::keys::hint("edit.undo")));
         if can_redo {

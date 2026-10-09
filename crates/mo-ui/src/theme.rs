@@ -351,6 +351,46 @@ pub fn accent() -> Rgba {
     current().accent
 }
 
+/// 语法着色：关键字。
+///
+/// 这几色**不进调色板**（`current()` 里没有对应字段）：它们是装饰色，用户换主题
+/// 时期望的是「跟着深浅走」，而不是「每个主题再配一套代码配色」——所以按
+/// [`is_dark`] 两档挑一对对比度够的值即可（与成功 / 失败那两色同一套路）。
+pub fn syntax_keyword() -> Rgba {
+    if is_dark() {
+        rgba(0xc5, 0x86, 0xc0)
+    } else {
+        rgba(0x9a, 0x2f, 0x8f)
+    }
+}
+
+/// 语法着色：字符串字面量。
+pub fn syntax_string() -> Rgba {
+    if is_dark() {
+        rgba(0xce, 0x91, 0x78)
+    } else {
+        rgba(0x9c, 0x3b, 0x00)
+    }
+}
+
+/// 语法着色：注释。
+pub fn syntax_comment() -> Rgba {
+    if is_dark() {
+        rgba(0x6a, 0x99, 0x55)
+    } else {
+        rgba(0x4d, 0x7a, 0x3a)
+    }
+}
+
+/// 语法着色：数字字面量。
+pub fn syntax_number() -> Rgba {
+    if is_dark() {
+        rgba(0xb5, 0xce, 0xa8)
+    } else {
+        rgba(0x1a, 0x6b, 0x2f)
+    }
+}
+
 /// 当前是否深色基底。
 pub fn is_dark() -> bool {
     current().dark

@@ -4899,6 +4899,7 @@ dependencies = [
  "mo-cache",
  "mo-core",
  "mo-fs",
+ "mo-search",
  "mo-thumbnails",
 ]
 

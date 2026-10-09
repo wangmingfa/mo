@@ -177,6 +177,33 @@ pub struct Config {
     /// 记住的远程服务器（最近使用的在前）。**不含密码**——密码在系统钥匙串。
     #[serde(default)]
     pub remote_servers: Vec<SavedServer>,
+    /// 全局搜索索引的**排除规则**：条目名 glob，命中的整棵子树都不进索引。
+    ///
+    /// 为什么要有这张表：爬取的既有判据只有「隐藏条目不进索引」（`mo_search::crawl`），
+    /// 但 `node_modules` / `target` / `dist` 这些**不点开头**的目录照样被整棵收进来——
+    /// 一个项目根里它们能占九成条目，索引体积与爬取时间全耗在永远不会有人搜的
+    /// 依赖上。默认表见 [`default_index_exclude`]。
+    ///
+    /// ⚠️ 语义是「搜不到」而不是「看不到」：列表照旧显示这些目录，只有全局搜索
+    /// 的结果里没有它们。这是刻意的——排除的是搜索噪音，不是文件。
+    #[serde(default = "default_index_exclude")]
+    pub index_exclude: Vec<String>,
+}
+
+/// [`Config::index_exclude`] 的默认值：依赖目录与构建产物。
+///
+/// 刻意**写进**配置文件（而不是空着、运行时再套默认）：用户看得见才能改，
+/// 「为什么搜不到 node_modules 里的东西」有地方可查。
+fn default_index_exclude() -> Vec<String> {
+    vec![
+        "node_modules".to_string(),
+        "target".to_string(),
+        "dist".to_string(),
+        "build".to_string(),
+        "__pycache__".to_string(),
+        ".venv".to_string(),
+        "DerivedData".to_string(),
+    ]
 }
 
 /// 一条动作出现在**哪些界面**（插件系统 P2 的投递声明）。
@@ -491,6 +518,7 @@ impl Default for Config {
             workflows: Vec::new(),
             sync_pairs: HashMap::new(),
             remote_servers: Vec::new(),
+            index_exclude: default_index_exclude(),
         }
     }
 }

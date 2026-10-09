@@ -22,12 +22,59 @@ use mo_preview::{Preview, PreviewKind};
 use crate::theme;
 use crate::RootView;
 
+/// 记号取色（语法着色与 Markdown 渲染共用一张表）。
+fn token_color(kind: mo_preview::TokenKind) -> gpui_kit::Rgba {
+    use mo_preview::TokenKind as K;
+    match kind {
+        K::Keyword => theme::syntax_keyword(),
+        K::String | K::InlineCode => theme::syntax_string(),
+        K::Comment => theme::syntax_comment(),
+        K::Number => theme::syntax_number(),
+        K::Link | K::ListMarker => theme::accent(),
+        K::Quote | K::Rule => theme::muted(),
+        // 标题用强调色：正文是黑的，标题不换色只放大仍然会混在段落里。
+        K::Heading(_) | K::Bold => theme::accent(),
+        K::Punct | K::Plain => theme::text(),
+    }
+}
+
+/// 记号字号（正文 13px；标题按级别放大，一级最大）。
+fn token_size(kind: mo_preview::TokenKind) -> f32 {
+    match kind {
+        mo_preview::TokenKind::Heading(level) => match level {
+            1 => 22.0,
+            2 => 19.0,
+            3 => 17.0,
+            4 => 15.0,
+            _ => 14.0,
+        },
+        _ => 13.0,
+    }
+}
+
 /// 预览窗口的根视图。
 pub struct PreviewWindow {
     preview: Preview,
+    /// 文本预览的着色结果（**按行分组的记号**），换内容时算一次。
+    ///
+    /// 不在这里每帧重算：渲染每帧都跑，而着色是逐字符扫描——一个 128KB 的文件
+    /// 每帧扫一遍等于把浮窗钉死。空 = 这段文本没着色（纯文本或超上限）。
+    highlighted: Vec<Vec<mo_preview::Token>>,
     focus: FocusHandle,
     /// 主窗口视图：方向键要通过它移动列表焦点并换预览内容。
     root: Entity<RootView>,
+}
+
+/// 给一段预览文本做结构化着色（代码 / JSON / Markdown）。
+///
+/// 纯文本**不动**：它没有约定的记号，随手一个 `#` 或引号都会被当成结构，
+/// 涂得五颜六色反而更难读——那类的正文就是给人读的散文。
+fn highlight_for(kind: PreviewKind, text: &str) -> Vec<Vec<mo_preview::Token>> {
+    match kind {
+        PreviewKind::Code | PreviewKind::Json => mo_preview::highlight(text).unwrap_or_default(),
+        PreviewKind::Markdown => mo_preview::markdown(text).unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 impl Focusable for PreviewWindow {
@@ -38,8 +85,10 @@ impl Focusable for PreviewWindow {
 
 impl PreviewWindow {
     pub fn new(preview: Preview, root: Entity<RootView>, cx: &mut Context<Self>) -> Self {
+        let highlighted = highlight_for(preview.kind, preview.text.as_deref().unwrap_or_default());
         Self {
             preview,
+            highlighted,
             focus: cx.focus_handle(),
             root,
         }
@@ -50,6 +99,7 @@ impl PreviewWindow {
     /// 标题在这里一起改：内容换了标题没换，窗口管理器与 ⌘Tab 里就会指错文件。
     pub fn set_preview(&mut self, preview: Preview, window: &mut Window, cx: &mut Context<Self>) {
         let title = preview.title.clone();
+        self.highlighted = highlight_for(preview.kind, preview.text.as_deref().unwrap_or_default());
         self.preview = preview;
         window.set_window_title(&title);
         cx.notify();
@@ -141,6 +191,34 @@ impl Render for PreviewWindow {
                     )
                     .into_any_element()
             }
+            // 代码 / JSON：按行渲染着色后的记号（行内多段不同色）。
+            //
+            // 一行一个 `flex_row`：行间仍是一个个块级盒子（滚动、换行照旧），
+            // 行内才是多段同排。空行给一个空格撑住行高——空 `text!` 没有行盒，
+            // 空行会直接塌掉，代码看起来会挤在一起。
+            _ if !self.highlighted.is_empty() => div()
+                .flex_1()
+                .min_h_0()
+                .p(px(12.0))
+                .overflow_y_scrollbar()
+                .children(self.highlighted.iter().map(|line| {
+                    if line.iter().all(|t| t.text.is_empty()) {
+                        return div().child(text!(" ".to_string())).into_any_element();
+                    }
+                    div()
+                        .flex_row()
+                        .children(line.iter().map(|t| {
+                            // 色挂在包一层的小 div 上：`text!` 返回的是 `Text`，
+                            // 它本身没有 `text_color`（那套样式方法在元素上）。
+                            div()
+                                .text_color(token_color(t.kind))
+                                .text_size(px(token_size(t.kind)))
+                                .child(text!(t.text.clone()))
+                                .into_any_element()
+                        }))
+                        .into_any_element()
+                }))
+                .into_any_element(),
             _ => div()
                 .flex_1()
                 .min_h_0()

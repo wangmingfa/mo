@@ -71,6 +71,31 @@ impl ExternalFormat {
     }
 }
 
+/// 按扩展名判断一个**待创建的**归档是否要交给外部工具。
+///
+/// 与 [`external_extract_format`] 成对：解压早就认 7z / rar，而**创建**只认
+/// zip / tar / tar.gz——用户把目标名写成 `x.7z`，拿到的却是一个 zip 内容的文件
+/// （`ArchiveFormat::from_path` 对认不出的后缀一律回落 zip）。现在两边对称了。
+///
+/// 同样**不探测工具是否存在**：菜单该不该给「压缩」不随用户有没有装 7z 而闪烁，
+/// 缺工具在真正打包时说人话（见 [`create_external`]）。
+pub fn external_create_format(path: &Path) -> Option<ExternalFormat> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())?;
+    if name.ends_with(".7z") {
+        return Some(ExternalFormat::SevenZip);
+    }
+    if name.ends_with(".tar.bz2")
+        || name.ends_with(".tbz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".txz")
+    {
+        return Some(ExternalFormat::Bsdtar);
+    }
+    None
+}
+
 /// 按扩展名判断一个归档是否**需要外部工具**解（不看内容、不探测工具是否存在）。
 pub fn external_extract_format(path: &Path) -> Option<ExternalFormat> {
     let name = path
@@ -93,11 +118,86 @@ pub fn external_extract_format(path: &Path) -> Option<ExternalFormat> {
 ///
 /// `sources` 里每个条目归档为「自身的相对名」：目录递归打包。
 pub fn create_archive(dest: &Path, sources: &[PathBuf]) -> Result<(), MoError> {
+    // 先判外部格式：`.7z` 落进 `from_path` 会被当成 zip（它对认不出的后缀一律
+    // 回落 zip），那就变成「名叫 .7z 的 zip」——与解压侧的判据保持一致。
+    if let Some(fmt) = external_create_format(dest) {
+        return create_external(dest, sources, fmt);
+    }
     match ArchiveFormat::from_path(dest) {
         ArchiveFormat::Zip => write_zip(dest, sources),
         ArchiveFormat::Tar => write_tar(dest, sources, false),
         ArchiveFormat::TarGz => write_tar(dest, sources, true),
     }
+}
+
+/// 用外部工具打包（7z / 系统 tar）。
+///
+/// ⚠️ **切到源所在目录再传名字**：`7z a` / `tar -c` 会把传进去的路径**原样存进
+/// 归档**，传绝对路径的话解开会多套一整串目录（`Users/…/…/a.txt`）。所以这里
+/// `current_dir` 设成第一个源的父目录，只传文件名——与内置 `write_zip/write_tar`
+/// 里 `relative_name` 的效果对齐。
+fn create_external(dest: &Path, sources: &[PathBuf], fmt: ExternalFormat) -> Result<(), MoError> {
+    let Some(first) = sources.first() else {
+        return Err(MoError::Other("没有要打包的条目".to_string()));
+    };
+    let base = first.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let names: Vec<String> = sources
+        .iter()
+        .map(|s| {
+            s.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| s.to_string_lossy().to_string())
+        })
+        .collect();
+
+    for bin in fmt.binaries() {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(&base);
+        match fmt {
+            ExternalFormat::SevenZip => {
+                // `a` = 加进归档；`-y` = 全部确认；`--` 之后全是路径（防文件名
+                // 以 `-` 开头被当成开关）。
+                cmd.arg("a").arg("-y").arg(dest).arg("--");
+                cmd.args(&names);
+            }
+            ExternalFormat::Bsdtar => {
+                // `-a` = 按目标后缀自选压缩（bz2 / xz），省得记两套开关。
+                cmd.arg("-caf").arg(dest).arg("--");
+                cmd.args(&names);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            // 127 = 「命令不存在」：候选二进制是个**转发脚本**（包管理器 shim、
+            // 沙箱里的拦截脚本）时，真身的缺席会以这个退出码冒出来。别把它当成
+            // 打包失败——继续试下一个候选，都没有才给「请先安装」的提示。
+            Ok(out) if out.status.code() == Some(127) => continue,
+            Ok(out) => {
+                let msg = String::from_utf8_lossy(&out.stderr);
+                return Err(MoError::Other(format!(
+                    "用 {} 打包 {} 失败（退出码 {}）：{}",
+                    bin,
+                    dest.display(),
+                    out.status,
+                    first_lines(&msg, 3)
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue; // 试下一个候选二进制（7z 不在就试 7za）
+            }
+            Err(e) => return Err(MoError::Other(format!("启动 {} 失败：{e}", bin))),
+        }
+    }
+    Err(MoError::Other(format!(
+        "找不到能创建 {} 的工具。请先安装 {}，再重试这一操作（内置只覆盖 zip/tar/tar.gz/tgz）。",
+        dest.display(),
+        fmt.tool_hint()
+    )))
 }
 
 fn write_zip(dest: &Path, sources: &[PathBuf]) -> Result<(), MoError> {
@@ -363,6 +463,55 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub").join("b.txt"), b"bbbb").unwrap();
         dir
+    }
+
+    /// `.7z` / `.tar.xz` 必须走外部工具这条判据，而不是落进 `from_path` 的
+    /// 「认不出就当 zip」兜底——那是「名叫 .7z 的 zip」。
+    #[test]
+    fn external_create_formats_are_recognized_by_extension() {
+        assert_eq!(
+            external_create_format(Path::new("/x/a.7z")),
+            Some(ExternalFormat::SevenZip)
+        );
+        assert_eq!(
+            external_create_format(Path::new("/x/a.tar.xz")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        assert_eq!(
+            external_create_format(Path::new("/x/a.tbz2")),
+            Some(ExternalFormat::Bsdtar)
+        );
+        // 内置覆盖的三个**不**走外部。
+        assert_eq!(external_create_format(Path::new("/x/a.zip")), None);
+        assert_eq!(external_create_format(Path::new("/x/a.tar.gz")), None);
+        assert_eq!(external_create_format(Path::new("/x/a.tar")), None);
+    }
+
+    /// 创建 7z：结果取决于这台机器装没装 7-Zip——**两种都算对**。
+    ///
+    /// 这条钉的是**分派**（`.7z` 不再被写成 zip 内容），不是外部工具本身：
+    /// 装了就应当成功落盘，没装就应当给一句「请先安装 7-Zip」而不是悄悄产出一个
+    /// 假的 .7z。断言工具可用性会把这条变成「换台机器就红」的坏测试。
+    #[test]
+    fn creating_a_7z_never_silently_writes_a_zip() {
+        let src = fixture("7z");
+        let out = src.join("pack.7z");
+        match create_archive(&out, &[src.join("a.txt")]) {
+            Ok(()) => {
+                // 真成了：头两个字节必须是 7z 的魔数，不是 zip 的 `PK`。
+                let head = std::fs::read(&out).unwrap_or_default();
+                assert!(
+                    !head.starts_with(b"PK"),
+                    "产出了 zip 内容的文件，说明 .7z 没走外部工具"
+                );
+                assert_eq!(&head[..6], b"7z\xbc\xaf\x27\x1c", "7z 魔数不对");
+            }
+            Err(e) => assert!(
+                e.to_string().contains("7-Zip"),
+                "没装工具时应当提示装什么，实际：{e}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]
