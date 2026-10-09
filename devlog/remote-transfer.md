@@ -343,3 +343,21 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   复制不需要 `TransferOperation` 的开销；只有「任一端落在网络挂载下」才升级。网络盘与真
   远程会话的语义差异（`Remote` 用各自 1-worker runtime、`NetworkMount` 用 `LocalFileSystem`
   走系统挂载点）在传输层已统一为同一套分块 / 续传 / 进度逻辑。
+
+## §13 FTPS（2026-10-09）
+
+`ftps://` 从「Unsupported」变成一等公民。明文 FTP 的注释里欠了两周的账，落地比预想省：
+
+* **握手二分**：990（协议缺省端口）是隐式 TLS——TCP 连上即 TLS，没有明文 banner
+  可读（`connect_secure_implicit`）；其余端口走显式 AUTH TLS——先明文连上读 banner
+  再原地升级（`connect_with_stream` + `into_secure`）。与 curl 的判法一致。
+* **流类型统一**：开 rustls feature 后 TLS 流是独立类型（`AsyncRustlsFtpStream`），
+  但它不升级时就是纯 TCP——`FtpFileSystem` 整体换成这个类型，明文 ftp 走同一条
+  代码路径，整个 `FileSystem` impl 不用复制两份。
+* **证书校验走平台**（rustls-platform-verifier）：系统信任库里的企业自签 CA 也认；
+  显式指定 aws-lc-rs provider，不赌「进程默认 provider 恰好只有一个」。
+* **零上层改动**：`url.rs` 的缺省端口表和 UI 的协议图标早埋好了 ftps；凭据的
+  endpoint key 天然区分 ftp/ftps；断连分类、探活、续传、轮询、撤销模型全部继承。
+* **测试**：`ftps_is_a_supported_scheme`——白名单收 ftps，两种握手打到本机没人听的
+  端口必须报 Transport 而非 Unsupported（钉住「看起来该支持却不支持」不再回来）。
+  真服务器的端到端留给 real-machine-checklist。

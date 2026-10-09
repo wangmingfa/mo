@@ -3858,6 +3858,32 @@ impl RootView {
         .detach();
     }
 
+    /// 收藏 / 取消收藏：写 config（blocking 池），成功后重取快照——收藏的会排到最前。
+    pub(crate) fn connect_toggle_favorite(
+        &mut self,
+        endpoint: String,
+        favorite: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let app2 = app.clone();
+            let result = app
+                .spawn_blocking(move || app2.set_server_favorite(&endpoint, favorite))
+                .await;
+            this.update(cx, |v, cx| {
+                // 排序变了（收藏的提前），重取快照给下一帧渲染。
+                v.connect_servers = v.app().saved_servers();
+                if let Ok(Err(e)) = result {
+                    v.connect_error = Some(e);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 连接结果的统一落点（地址回车 / 点列表 / 认证提交都会走到）。
     ///
     /// * `Ok` —— 关掉对话框（记住服务器由调用方另行处理）；
@@ -4104,6 +4130,8 @@ impl RootView {
                 // 测试用（release no-op）：断言列表确实渲染出来了。
                 .debug_selector(|| "mo-connect-servers".to_string())
                 .child({
+                    // 收藏的排最前（saved_servers 的排序保证）；两组之间一条分隔线。
+                    let fav_count = self.connect_servers.iter().filter(|s| s.favorite).count();
                     let mut rows = div()
                         .flex()
                         .flex_col()
@@ -4111,6 +4139,9 @@ impl RootView {
                         .max_h(px(120.0))
                         .overflow_y_scrollbar();
                     for (i, server) in self.connect_servers.iter().enumerate() {
+                        if i == fav_count && fav_count > 0 && fav_count < count {
+                            rows = rows.child(div().h(px(1.0)).w_full().bg(theme::separator()));
+                        }
                         rows = rows.child(self.saved_server_row(i, count, server, entity));
                     }
                     rows
@@ -4228,6 +4259,30 @@ impl RootView {
                     .child(text!(server.user.clone())),
             );
         }
+
+        // ☆/★：收藏这台——收藏的排最前（saved_servers 的排序），重开对话框还在。
+        let ent_fav = entity.clone();
+        let endpoint_fav = server.endpoint.clone();
+        let fav = server.favorite;
+        let mut star = div()
+            .id(("mo-connect-fav", index))
+            // 测试用（release no-op）：断言星标按钮渲染出来了。
+            .debug_selector(move || format!("mo-connect-fav-{index}"))
+            .px(px(4.0))
+            .rounded(px(3.0))
+            .text_size(px(12.0))
+            .text_color(if fav { theme::accent() } else { theme::muted() })
+            .hover(|s| s.bg(theme::hover_bg()))
+            .child(text!((if fav { "★" } else { "☆" }).to_string()));
+        star.interactivity().on_click(move |_, _window, cx| {
+            // 别让星标顺带触发整行的「连接」。
+            cx.stop_propagation();
+            let endpoint = endpoint_fav.clone();
+            ent_fav.update(cx, |v, cx| v.connect_toggle_favorite(endpoint, !fav, cx));
+        });
+        // test_support：headless 的 window.click 只认包过它的元素（行本身不走点击
+        // 测试，不用包；星标按钮的点击链路要测）。
+        row = row.child(star.test_support());
 
         // ✕：忘掉这台——列表与钥匙串里的密码一起清掉。
         let ent_forget = entity.clone();
@@ -5109,6 +5164,35 @@ impl RootView {
         cx.notify();
     }
 
+    /// 改一条扩展设置（卡片设置区里开关 / 分段点选的落点）：写 config.json
+    /// （blocking 池）并让宿主 forget 掉这家 provider——新值在下一次握手生效。
+    /// 写盘在后台，成败都回到主线程再说话（失败弹 notice），与收藏星标同一模式。
+    pub(crate) fn set_extension_setting_value(
+        &mut self,
+        ext_id: String,
+        key: String,
+        value: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let app2 = app.clone();
+            let result = app
+                .spawn_blocking(move || app2.set_extension_setting(&ext_id, &key, value))
+                .await;
+            this.update(cx, |v, cx| {
+                if let Ok(Err(e)) = result {
+                    v.notice(format!("保存设置失败：{e}"), None, cx);
+                }
+                // 下一帧读新值重画（overrides 是现取的，落盘后这里才有变化）。
+                v.sync_extensions_window(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 「删除这个无效扩展」：先过确认卡。身份带**目录路径**——无效扩展没有可信
     /// 的 id（清单可能压根解析不出来），目录是唯一稳定坐标。
     pub(crate) fn ask_remove_broken_extension(&mut self, dir: String, cx: &mut Context<Self>) {
@@ -5560,6 +5644,162 @@ impl RootView {
                                 e.manifest.when_ext.join(" / ")
                             ))),
                     );
+                }
+                // —— 设置区（P5）：清单声明了 settings 的扩展把可调项摊在卡里。
+                // 当前值 = 用户改过的 override，没改过 = 清单缺省。bool 是开关
+                // （同卡头启停那颗胶囊），enum 是分段点选，其余 kind 只读展示
+                // （string/int/float 没有安全的行内输入框形态，先报值不改）。
+                if !m.settings.is_empty() {
+                    let overrides = self.app().extension_setting_overrides(&m.id);
+                    let header = format!("ext-settings-{}", e.manifest.id);
+                    card = card.child(
+                        div()
+                            .id(header.clone())
+                            .debug_selector(move || format!("mo-{header}"))
+                            .mt(px(2.0))
+                            .text_size(px(11.0))
+                            .text_color(theme::muted())
+                            .child(text!("设置")),
+                    );
+                    for decl in &m.settings {
+                        let current = overrides
+                            .get(&decl.key)
+                            .cloned()
+                            .unwrap_or_else(|| decl.default.clone());
+                        let setting_id = format!("ext-setting-{}-{}", e.manifest.id, decl.key);
+                        // 行外壳：标题在左，控件在右（bool）或紧跟其后（enum）。
+                        let title_text = decl.title.clone();
+                        match decl.kind.as_str() {
+                            "bool" => {
+                                let on = current.as_bool().unwrap_or(false);
+                                let click_ext = e.manifest.id.clone();
+                                let click_key = decl.key.clone();
+                                let mut sw = div()
+                                    .id(setting_id.clone())
+                                    .debug_selector(move || format!("mo-{setting_id}"))
+                                    .flex()
+                                    .items_center()
+                                    .w(px(34.0))
+                                    .h(px(20.0))
+                                    .rounded(px(10.0))
+                                    .p(px(2.0))
+                                    .flex_shrink_0();
+                                let mut knob = div().size(px(16.0)).rounded_full();
+                                if on {
+                                    sw = sw.justify_end().bg(theme::selected_bg());
+                                    knob = knob.bg(theme::selected_text());
+                                } else {
+                                    sw = sw.justify_start().bg(theme::separator());
+                                    knob = knob.bg(theme::surface());
+                                }
+                                sw = sw.child(knob);
+                                let sw_ent = entity.clone();
+                                let new_val = serde_json::Value::Bool(!on);
+                                sw.interactivity().on_click(move |_ev, _window, cx| {
+                                    // 与卡头开关同一条理由：点设置不该顺手换选中卡。
+                                    cx.stop_propagation();
+                                    sw_ent.update(cx, |v, cx| {
+                                        v.set_extension_setting_value(
+                                            click_ext.clone(),
+                                            click_key.clone(),
+                                            new_val.clone(),
+                                            cx,
+                                        )
+                                    });
+                                });
+                                card = card.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(theme::text())
+                                                .child(text!(title_text)),
+                                        )
+                                        .child(sw.test_support()),
+                                );
+                            }
+                            "enum" => {
+                                // 分段点选：一行选项，选中的主色底。点谁写谁。
+                                let mut seg_row =
+                                    div().flex().flex_row().items_center().gap(px(4.0)).child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme::text())
+                                            .child(text!(title_text)),
+                                    );
+                                let current_str = current.as_str().map(str::to_string);
+                                for opt in &decl.options {
+                                    let opt_id = format!("{setting_id}-{}", opt);
+                                    let seg_ext = e.manifest.id.clone();
+                                    let seg_key = decl.key.clone();
+                                    let seg_val = opt.clone();
+                                    let selected = current_str.as_deref() == Some(opt.as_str());
+                                    let mut seg = div()
+                                        .id(opt_id.clone())
+                                        .debug_selector(move || format!("mo-{opt_id}"))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(8.0))
+                                        .h(px(20.0))
+                                        .rounded(px(5.0))
+                                        .text_size(px(11.0))
+                                        .bg(if selected {
+                                            theme::selected_bg()
+                                        } else {
+                                            theme::hover_bg()
+                                        })
+                                        .text_color(if selected {
+                                            theme::selected_text()
+                                        } else {
+                                            theme::text()
+                                        })
+                                        .child(text!(opt.clone()));
+                                    let seg_ent = entity.clone();
+                                    seg.interactivity().on_click(move |_ev, _window, cx| {
+                                        cx.stop_propagation();
+                                        seg_ent.update(cx, |v, cx| {
+                                            v.set_extension_setting_value(
+                                                seg_ext.clone(),
+                                                seg_key.clone(),
+                                                serde_json::Value::String(seg_val.clone()),
+                                                cx,
+                                            )
+                                        });
+                                    });
+                                    seg_row = seg_row.child(seg.test_support());
+                                }
+                                card = card.child(seg_row);
+                            }
+                            other => {
+                                let shown = match current {
+                                    serde_json::Value::String(s) => s,
+                                    other => other.to_string(),
+                                };
+                                let line_id = format!("{setting_id}-ro");
+                                card = card.child(
+                                    div()
+                                        .id(line_id.clone())
+                                        .debug_selector(move || format!("mo-{line_id}"))
+                                        .text_size(px(11.5))
+                                        .text_color(theme::muted())
+                                        .child(text!(format!(
+                                            "{}：{}（{}，暂不能在此改）",
+                                            title_text,
+                                            shown,
+                                            match other {
+                                                "int" => "整数",
+                                                "float" => "小数",
+                                                _ => "文本",
+                                            }
+                                        ))),
+                                );
+                            }
+                        }
+                    }
                 }
                 // provider 进程的运行状况（P3）：退避停用期要亮在它自己那一家下面——
                 // 「类型标签怎么还是内置文案」这类疑问，答案在这里。判据在宿主
@@ -15125,6 +15365,16 @@ fn contribution_line(c: &mo_app::extensions::Contribution) -> String {
                 .join("、");
             format!("进程：接管 {}；申请能力：{}", methods.join(" / "), caps)
         }
+        C::Setting { title, kind } => {
+            let kind_word = match kind.as_str() {
+                "bool" => "开关",
+                "enum" => "单选",
+                "int" => "整数",
+                "float" => "小数",
+                _ => "文本",
+            };
+            format!("设置「{title}」（{kind_word}）进 扩展设置区")
+        }
     }
 }
 
@@ -16839,6 +17089,7 @@ mod tests {
         cx.update(|_window, cx| {
             root.update(cx, |v, cx| {
                 v.connect_servers = vec![mo_app::SavedServer {
+                    favorite: false,
                     endpoint: "ftp://example.com:2121".to_string(),
                     user: "alice".to_string(),
                     last_used: 1,
@@ -16856,6 +17107,68 @@ mod tests {
         assert!(
             cx.debug_bounds("mo-connect-server-0").is_some(),
             "列表里没有第一行——点不了一键重连"
+        );
+    }
+
+    /// 星标即收藏：点☆写 config、行内星变★，收藏的排到最前（快照刷新可见）。
+    ///
+    /// 排序账本在 `mo-app::saved_servers`（引擎层单测钉过），这条钉 UI 半边：
+    /// 星标按钮渲染出来了、点了真的会重排快照。
+    #[test]
+    fn starring_a_server_favorites_it_and_moves_it_to_the_top() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        // 收藏走 blocking 池 + 真线程写 config，不开豁免会挂 headless 执行器。
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        // 两台服务器：先连的 host-a、后连的 host-b（不收藏时 host-b 排第一）。
+        app.remember_server("sftp://host-a", "alice", None).unwrap();
+        app.remember_server("sftp://host-b", "bob", None).unwrap();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| v.open_connect_dialog(cx));
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let first_endpoint = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.connect_servers.first().map(|s| s.endpoint.clone())
+            })
+        });
+        assert_eq!(
+            first_endpoint.as_deref(),
+            Some("sftp://host-b"),
+            "起点：最近的排第一"
+        );
+        assert!(
+            cx.debug_bounds("mo-connect-fav-0").is_some(),
+            "行尾的星标按钮没渲染出来"
+        );
+
+        // 点第二行（host-a）的☆：写盘 + 重取快照，host-a 该带着★跳到第一行。
+        cx.update(|window, cx| window.click(("mo-connect-fav", 1usize), cx));
+        let mut starred = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let ok = cx.update(|_w, cx| {
+                root.update(cx, |v, _cx| {
+                    v.connect_servers
+                        .first()
+                        .is_some_and(|s| s.favorite && s.endpoint == "sftp://host-a")
+                })
+            });
+            if ok {
+                starred = true;
+                break;
+            }
+        }
+        assert!(
+            starred,
+            "点星后收藏没生效：servers={:?} error={:?}",
+            cx.update(|_w, cx| root.update(cx, |v, _cx| v.connect_servers.clone())),
+            cx.update(|_w, cx| root.update(cx, |v, _cx| v.connect_error.clone()))
         );
     }
 
@@ -16890,6 +17203,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (endpoint, user))| mo_app::SavedServer {
+                    favorite: false,
                     endpoint: endpoint.to_string(),
                     user: user.to_string(),
                     last_used: i as i64,
@@ -18476,6 +18790,108 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// 扩展设置区（P5）：选中卡摊出设置行（bool 开关 + enum 分段）；点开关 →
+    /// 落 config.json（`extension_settings`）。当前值 = override，没改过 = 清单缺省
+    /// ——「起点无 override」先钉住，点完再钉「真写进去了」，两头都不许装样子。
+    ///
+    /// 写盘在 blocking 池真线程（同收藏星标），不开 `allow_parking` 会挂 headless
+    /// 执行器；落盘轮询 config.json，不猜回调时序。
+    #[test]
+    fn extension_settings_render_and_persist_through_the_card() {
+        let dir = crate::isolate_user_dirs_for_tests()
+            .join("extensions")
+            .join("p27settings");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{
+  "id": "p27settings",
+  "name": "设置夹具P27",
+  "version": "1.0",
+  "icon": "icon.png",
+  "enabled": true,
+  "commands": [{ "name": "问候", "shell": "echo hi", "menu": ["sidebar"] }],
+  "settings": [
+    { "key": "verbose", "kind": "bool", "default": false, "title": "详细输出" },
+    { "key": "tone", "kind": "enum", "default": "dark", "title": "色调", "options": ["dark", "light"] }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let mut cx = TestAppContext::single();
+        cx.dispatcher.allow_parking();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        cx.update(|_w, cx| root.update(cx, |v, cx| v.open_extensions_picker(cx)));
+        cx.run_until_parked();
+        let ext_handle = cx.update(|_w, cx| {
+            root.update(cx, |v, _cx| {
+                v.extensions_window.expect("扩展管理器窗口应当已经打开")
+            })
+        });
+        let mut ex = gpui_kit::VisualTestContext::from_window(ext_handle.into(), cx);
+        ex.update(|window, cx| window.render_frame(cx));
+
+        // 选中卡：设置区与三枚控件都在渲染帧里。
+        ex.update(|window, cx| window.click("ext-row-p27settings", cx));
+        ex.update(|window, cx| window.render_frame(cx));
+        ex.debug_bounds("mo-ext-settings-p27settings")
+            .expect("选中卡的设置区没渲染（选择器 mo-ext-settings-p27settings）");
+        ex.debug_bounds("mo-ext-setting-p27settings-verbose")
+            .expect("bool 开关没渲染（选择器 mo-ext-setting-p27settings-verbose）");
+        ex.debug_bounds("mo-ext-setting-p27settings-tone-dark")
+            .expect("enum 分段（dark）没渲染");
+        ex.debug_bounds("mo-ext-setting-p27settings-tone-light")
+            .expect("enum 分段（light）没渲染");
+
+        let config_file = crate::isolate_user_dirs_for_tests().join("config.json");
+        let read_setting = |key: &str| -> serde_json::Value {
+            let text = std::fs::read_to_string(&config_file).unwrap_or_default();
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)["extension_settings"]
+                ["p27settings"][key]
+                .clone()
+        };
+        assert!(
+            read_setting("verbose").is_null(),
+            "起点：用户没改过设置，config.json 不该有这家的值：{:?}",
+            std::fs::read_to_string(&config_file)
+        );
+
+        // 点 bool 开关 → "verbose": true 落 config.json。
+        ex.update(|window, cx| window.click("ext-setting-p27settings-verbose", cx));
+        let mut written = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if read_setting("verbose").as_bool() == Some(true) {
+                written = true;
+                break;
+            }
+        }
+        assert!(
+            written,
+            "点开关后 config.json 里没有 verbose=true：{:?}",
+            std::fs::read_to_string(&config_file)
+        );
+
+        // 点 enum 的 light 段 → "tone": "light" 落 config.json；dark 段还在（点回去的路）。
+        ex.update(|window, cx| window.click("ext-setting-p27settings-tone-light", cx));
+        let mut toned = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if read_setting("tone").as_str() == Some("light") {
+                toned = true;
+                break;
+            }
+        }
+        assert!(toned, "点 light 段后 config.json 里没有 tone=light");
     }
 
     /// 三类贡献各一句话的**措辞**（P2-6 的展开区与确认卡共用同一批句子）。

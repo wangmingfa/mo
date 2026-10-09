@@ -1,4 +1,4 @@
-//! FTP 后端：把 [`AsyncFtpStream`] 包装成 [`mo_fs::FileSystem`]。
+//! FTP / FTPS 后端：把 [`AsyncRustlsFtpStream`] 包装成 [`mo_fs::FileSystem`]。
 //!
 //! ## 路径约定
 //!
@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
 use suppaftp::list::{File, ListParser};
-use suppaftp::tokio::AsyncFtpStream;
+use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::FtpResult;
 use tokio::sync::Mutex;
 
@@ -52,7 +52,7 @@ pub struct FtpFileSystem {
     /// FTP 控制连接：所有命令都要 `&mut`，而 trait 只给 `&self`。
     ///
     /// `Arc` 同理——`run` 里的 future 要自己拿一份锁的句柄。
-    conn: Arc<Mutex<AsyncFtpStream>>,
+    conn: Arc<Mutex<AsyncRustlsFtpStream>>,
 }
 
 impl FtpFileSystem {
@@ -72,6 +72,23 @@ impl FtpFileSystem {
             .map_err(|e| RemoteError::transport("创建 runtime", e))
     }
 
+    /// 平台证书校验的 TLS 连接器：走系统信任库（企业自签 / 系统装过的 CA 都认），
+    /// SNI 用主机名。显式 / 隐式握手共用同一份配置。
+    fn tls_connector() -> AsyncRustlsConnector {
+        use rustls_platform_verifier::BuilderVerifierExt;
+        use suppaftp::tokio_rustls::rustls;
+        // 显式指定 provider：进程里可能还装着别的默认 provider（SFTP 的 russh 系），
+        // 依赖「恰好只有一个」的隐式约定会在某个依赖升级后变成 panic。
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("TLS 协议版本是常量集合，不会失败")
+            .with_platform_verifier()
+            .expect("平台证书校验器初始化失败")
+            .with_no_client_auth();
+        AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)))
+    }
+
     /// 建连接并登录。
     ///
     /// 用户名 / 密码缺省时按匿名登录（`anonymous`）——多数公共 FTP 都接受，
@@ -86,10 +103,32 @@ impl FtpFileSystem {
             .clone()
             .unwrap_or_else(|| "anonymous@example.com".to_string());
 
+        // ftps:// 的两种握手：990（协议缺省端口）是**隐式 TLS**——TCP 连上就是
+        // TLS 握手，没有明文 banner 可读；其余端口走**显式 AUTH TLS**——先明文
+        // 连上读 banner，再原地升级。与 curl 的判法一致。明文 ftp 不升级。
+        let implicit_tls = url.scheme == "ftps" && url.port_or_default() == Some(990);
+        let explicit_tls = url.scheme == "ftps" && !implicit_tls;
+        let host = url.host.clone();
         let conn = rt.block_on(async {
-            let mut stream = AsyncFtpStream::connect(&addr)
-                .await
-                .map_err(|e| transport_error("连接", e))?;
+            let mut stream = if implicit_tls {
+                AsyncRustlsFtpStream::connect_secure_implicit(&addr, Self::tls_connector(), &host)
+                    .await
+                    .map_err(|e| transport_error("连接", e))?
+            } else {
+                let tcp = tokio::net::TcpStream::connect(&addr)
+                    .await
+                    .map_err(|e| RemoteError::transport("连接", e))?;
+                let mut stream = AsyncRustlsFtpStream::connect_with_stream(tcp)
+                    .await
+                    .map_err(|e| transport_error("连接", e))?;
+                if explicit_tls {
+                    stream = stream
+                        .into_secure(Self::tls_connector(), &host)
+                        .await
+                        .map_err(|e| transport_error("TLS 握手", e))?;
+                }
+                stream
+            };
             stream.login(&user, &password).await.map_err(login_error)?;
             Ok::<_, RemoteError>(stream)
         })?;

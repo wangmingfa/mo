@@ -7,11 +7,16 @@
 //! * `js_id`：握手应答的 id 先过一遍 f64（模拟 JS 系 provider 的 number 舍入）。
 //!   回归 2026-10-09 srt-tools 实案：握手 id 用 u64::MAX 时会被舍到 2^64 量级，
 //!   宿主按「id 对不上」丢掉正确回包、白等到超时；≤2^53 的 id 原样回来。
+//! * `settings`：initialize 时把宿主传来的 params.settings 记下来，classify 的
+//!   label 回显其中的 `tone` 键——端到端验证「设置经握手传到进程」。
 
 use std::io::{stdin, BufRead};
+use std::sync::Mutex;
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "ok".into());
+    // settings 模式下记下握手参数（Mutex：闭包外所有权进 match，进程单线程其实用不上锁）。
+    let tone = Mutex::new(String::new());
     for line in stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -28,6 +33,12 @@ fn main() {
                         id as f64
                     );
                 } else {
+                    if mode == "settings" {
+                        *tone.lock().unwrap() = v["params"]["settings"]["tone"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                    }
                     println!(
                         r#"{{"id":{id},"result":{{"name":"p3-provider","version":"1.0","methods":["classify","preview","list"]}}}}"#
                     );
@@ -51,6 +62,13 @@ fn main() {
                 }
                 // 健康地拒答：协议级 error，不计失败。
                 "refuse" => println!(r#"{{"id":{id},"error":"我不想答这一问"}}"#),
+                // settings 模式：label 回显握手时记下的 tone——宿主传没传设置，一问便知。
+                "settings" => {
+                    let t = tone.lock().unwrap().clone();
+                    println!(
+                        r#"{{"id":{id},"result":{{"label":"设置回显：{t}","group":"ignored"}}}}"#
+                    )
+                }
                 _ => println!(
                     r#"{{"id":{id},"result":{{"label":"P3测试种类","group":"ignored","icon_key":"x"}}}}"#
                 ),

@@ -16,9 +16,10 @@ chrono.workspace = true
 tracing.workspace = true
 
 # FTP / FTPS 客户端（Rust 实现，无本机依赖）。
-# ⚠️ 刻意只开 `tokio`、关掉默认特性：默认会引 TLS 实现（OpenSSL / ring），
-# 在三个目标平台上都是额外的本机构建负担。明文 FTP 先跑通，FTPS 后置。
+# TLS 用 rustls + aws-lc-rs（与 SFTP 的 russh 同族，不新增本机构建负担；
+# 刻意避开 OpenSSL / native-tls），证书校验走系统信任库。
 suppaftp.workspace = true
+rustls-platform-verifier.workspace = true
 
 # SFTP 后端：纯 Rust SSH（russh），默认 aws-lc-rs 加密后端，无本机系统依赖。
 russh.workspace = true

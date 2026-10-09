@@ -2144,11 +2144,16 @@ impl AppState {
         }
     }
 
-    /// 「记住的服务器」列表（最近使用的在前）。
+    /// 「记住的服务器」列表（收藏的在前，组内最近使用的在前）。
     pub fn saved_servers(&self) -> Vec<SavedServer> {
         let mut list = self.config().remote_servers;
-        // 最近的在前（`Reverse` 是因为默认是升序）。
-        list.sort_by_key(|s| std::cmp::Reverse(s.last_used));
+        // 收藏优先、组内最近在前（`Reverse` 是因为默认是升序）。
+        list.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.favorite),
+                std::cmp::Reverse(s.last_used),
+            )
+        });
         list
     }
 
@@ -2167,6 +2172,13 @@ impl AppState {
         password: Option<&str>,
     ) -> Result<(), String> {
         let mut cfg = self.config();
+        // 收藏状态跟地址走：重连（重记）不丢星标。
+        let favorite = cfg
+            .remote_servers
+            .iter()
+            .find(|s| s.endpoint == endpoint)
+            .map(|s| s.favorite)
+            .unwrap_or(false);
         cfg.remote_servers.retain(|s| s.endpoint != endpoint);
         cfg.remote_servers.insert(
             0,
@@ -2174,6 +2186,7 @@ impl AppState {
                 endpoint: endpoint.to_string(),
                 user: user.to_string(),
                 last_used: now_secs(),
+                favorite,
             },
         );
         // 只留最近的一批，免得配置文件被连过的临时地址撑爆。
@@ -2192,6 +2205,25 @@ impl AppState {
         cfg.remote_servers.retain(|s| s.endpoint != endpoint);
         self.save_config(&cfg);
         credentials::forget(endpoint)
+    }
+
+    /// 收藏 / 取消收藏一台记住的服务器（config.json 持久化）。
+    ///
+    /// 只对**已经记住**的服务器有意义：没连过的地址没有条目可标，返回 Err。
+    /// 重复点同一颗星是幂等的，不写盘。
+    pub fn set_server_favorite(&self, endpoint: &str, favorite: bool) -> Result<(), String> {
+        let mut cfg = self.config();
+        let server = cfg
+            .remote_servers
+            .iter_mut()
+            .find(|s| s.endpoint == endpoint)
+            .ok_or_else(|| format!("没有「{endpoint}」的连接记录，无从收藏"))?;
+        if server.favorite == favorite {
+            return Ok(());
+        }
+        server.favorite = favorite;
+        self.save_config(&cfg);
+        Ok(())
     }
 
     /// 断开一条远程连接：把它从注册表里摘掉（连接随之关闭）。
@@ -5606,6 +5638,41 @@ impl AppState {
         self.providers().seed_label_for_tests(path, label);
     }
 
+    /// 一个扩展被用户改过的设置值（config.json 里的 keyed map；没改过 = 空表）。
+    ///
+    /// 与清单声明的 defaults 的合并在 provider 侧做（[`provider::Manager::host`]）。
+    pub fn extension_setting_overrides(
+        &self,
+        ext_id: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        self.config()
+            .extension_settings
+            .get(ext_id)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// 写一条扩展设置：落 config.json（blocking 池调用）并让 provider 宿主重建
+    /// ——新值在下一次握手生效。
+    pub fn set_extension_setting(
+        &self,
+        ext_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        {
+            let mut cfg = self.config();
+            cfg.extension_settings
+                .entry(ext_id.to_string())
+                .or_default()
+                .insert(key.to_string(), value);
+            self.save_config(&cfg);
+        }
+        // 宿主进程还在用旧设置：摘掉，下一次调用重新起进程、带着新值握手。
+        self.providers().forget_ext(ext_id);
+        Ok(())
+    }
+
     /// 调一个扩展的 `list` 方法取一页行（P4）。
     ///
     /// **阻塞**（进程 IO + 每行一次 stat）——只许在 blocking 池里调
@@ -5616,8 +5683,9 @@ impl AppState {
         ext_id: &str,
         source_id: &str,
     ) -> Result<Vec<provider::ListRow>, String> {
+        let overrides = self.extension_setting_overrides(ext_id);
         self.providers()
-            .list(ext_id, source_id, &Self::config_path())
+            .list(ext_id, source_id, &Self::config_path(), &overrides)
             .map_err(|e| match e {
                 provider::CallError::Timeout => "调用超时（进程已被强制结束）".to_string(),
                 provider::CallError::Crashed(m) => format!("进程崩溃：{m}"),

@@ -971,6 +971,43 @@ headless 里 Enter 导航进**空目录**后 `run_until_parked` 永不返回（�
 生产上用户进空目录同样是每帧一次 `list_window` 的 CPU 空转。反向验证：变异体
 （短路改 `if false &&`）挂死重现。
 
+### 4.16 P5：设置存储 —— ✅ 已落地（2026-10-09）
+
+清单声明 + 宿主存储 + 握手下发 + 卡片 UI 四段全链。设计上三处关键取舍：
+
+* **config.json 只存「用户改过的值」**。`Config::extension_settings` 是
+  `ext_id → {key: JSON}` 的 keyed map，`set_extension_setting` 逐键写（save 前补
+  Default 构造，顺手把 config 落盘改成 tmp+rename 原子写——先例 mo-thumbnails）。
+  不存全量缺省的原因：清单升级换了 default 后，「存过的旧值」会悄悄压过新缺省，
+  只存 override 就永远以清单为缺省源。读取走 `extension_setting_overrides`（没改过
+  = 空表），合并规则在 provider 侧（`SpawnSpec.settings` 先填 `settings_defaults`，
+  `Manager::host` 再 `extend` overrides 覆盖）。
+* **新值下次握手生效**。改设置后 `providers().forget_ext(ext_id)` 让宿主重建这家
+  provider——进程已经跑着的会话不热更，与「设置是启动参数」的语义一致；manifest
+  声明了 settings 的扩展在确认卡上也报一句（`Contribution::Setting`，措辞「进
+  扩展设置区」），启用前知道自己将得到可调项。
+* **UI 控件形态按 kind 定**：bool = 开关（同卡头启停那颗胶囊，`stop_propagation`
+  防误选卡）、enum = 分段点选（选中主色底）、string/int/float = 只读展示行——
+  「暂不能在此改」写进文案，留个诚实的口子而不是假装能输入。落点选中卡展开区
+  （贡献清单之后），点改经 `set_extension_setting_value`（spawn_blocking 写盘，
+  失败弹 notice，与收藏星标同一模式）。
+
+**validate 门禁**（「写了不生效的声明当场拒」的延续）：key 非空不重复、title 非空、
+kind ∈ bool/string/int/float/enum、enum 的 options 非空、default 的 JSON 类型与
+kind 匹配（enum 的 default 还要落在 options 里；null = 没写，按 kind 补零值）。
+`settings_defaults` 负责补零值：bool=false、int/float=0、enum=options[0]、string=""。
+
+**验收**：mo-app 侧单测两枚（validate 坏法逐条 + 零值补全）+ provider_host 端到端
+（夹具新增 `settings` 模式：握手时记下 `params.settings.tone`、classify 回显进
+label——缺省家答 `设置回显：dark`、override 家答 `设置回显：light`，传没传、传的
+哪份一问便知）；mo-ui 侧 headless 一条钉 UI 半边：选中卡设置区渲染 + 点 bool 开关
+→ config.json 出现 `"verbose": true` + 点 enum 的 light 段 → `"tone": "light"`
+（起点先钉「没改过 = 无记录」，落盘轮询 config.json，不猜回调时序）。
+
+**已知缺口**：string/int/float 三种 kind 暂无行内输入框（只读展示）；设置改动对
+**正在跑的** provider 进程不热更（下次握手生效，见上）；分类缓存里已落的 label
+不会因设置改动自动失效重算。
+
 ## 5. provider 协议（stdio）—— ✅ 全部落地（2026-09-28，P3 见 §4.14；`list` 见 §4.15）
 
 * **传输**：换行分隔 JSON（JSON Lines）。请求 `{id, method, params}`，响应 `{id, result | error}`。
@@ -1076,6 +1113,10 @@ capability 模型就是破的（插件想读什么自己发个路径即可）。
   的行）+ 失败态重试。§9 风险 1 点名的不变量（选中集 / 分组 / 隐藏过滤 / 分页）一概
   未碰；`next` / `query` / `cursor` 收下不发不消费。反向验证六条变异体各红预判句。
   **至此 §5 三个方法全部落地，插件系统 P1–P4 收口。**
+* **P5 设置存储 ✅（2026-10-09，见 §4.16）**：清单 `settings` 声明 + validate 门禁 +
+  config.json keyed override 存储（原子写）+ 握手下发（defaults ⊕ overrides）+ 卡片
+  设置区（bool 开关 / enum 分段 / 其余只读）。验收：夹具 `settings` 模式回显 +
+  provider_host 端到端（缺省 vs override 两路）+ mo-ui headless 点开关落盘。
 
 ## 9. 现在就不看好的三点（留档，别到时候当意外）
 

@@ -35,6 +35,7 @@ fn spec(tag: &str, mode: &str, call_ms: u64) -> SpawnSpec {
         log_path: dir.join("host.log"),
         startup_timeout: Duration::from_millis(2000),
         call_timeout: Duration::from_millis(call_ms),
+        settings: Default::default(),
     }
 }
 
@@ -140,7 +141,7 @@ fn manager_list_source_end_to_end() {
 
         let manager = Manager::new();
         let rows = manager
-            .list("p4a", "recent", &config_json)
+            .list("p4a", "recent", &config_json, &Default::default())
             .expect("应当答上来");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "第一行 · recent");
@@ -302,7 +303,9 @@ fn manager_end_to_end_classifies_stores_and_forgets() {
             "没归属的扩展名不该有 owner"
         );
 
-        let host = manager.host("p3a", &config_json).expect("应有宿主");
+        let host = manager
+            .host("p3a", &config_json, &Default::default())
+            .expect("应有宿主");
         // capability 执行点：授了 read-contents，入参里带 head_b64。
         let md = std::fs::metadata(&file).unwrap();
         let head = mo_app::provider::read_head(&file);
@@ -344,4 +347,52 @@ fn manager_end_to_end_classifies_stores_and_forgets() {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     })
+}
+
+/// 设置端到端（P5）：宿主把「清单缺省 + 用户 override」经 initialize 握手传给进程。
+/// 夹具的 settings 模式把 `tone` 回显进 classify 的 label——传没传、传的是哪份，一问便知。
+#[test]
+fn host_hands_settings_to_the_provider() {
+    let tmp = spec_dir("p3set");
+    let config_json = tmp.join("config.json");
+    std::fs::write(&config_json, "{}").unwrap();
+    let exe_json = serde_json::to_string(&exe()).unwrap();
+
+    let file = tmp.join("movie.p3x");
+    std::fs::write(&file, b"P3X-FAKE-CONTENT").unwrap();
+    let params = build_classify_params(&file, 16, None);
+
+    // 两家清单：同一夹具进程（settings 模式）。缺省家走 settings_defaults（default=dark），
+    // 覆盖家经 `Manager::host` 的 overrides 把 tone 翻成 light。
+    for id in ["p3setd", "p3seto"] {
+        let dir = tmp.join("extensions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"id":"{id}","name":"P3设置夹具","icon":"icon.png","provider":{{"run":[{exe_json},"settings"],"methods":["classify"]}},"types":[{{"ext":[".p3x"],"label":"静态"}}],"settings":[{{"key":"tone","kind":"enum","default":"dark","title":"色调","options":["dark","light"]}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let manager = Manager::new();
+
+    // 缺省家：没 override，握手拿到的是清单缺省（dark）。
+    let host = manager
+        .host("p3setd", &config_json, &Default::default())
+        .expect("应有宿主");
+    let r = host.call("classify", &params).expect("应当答上来");
+    assert_eq!(r["label"], "设置回显：dark", "没改过 = 清单缺省 dark");
+
+    // 覆盖家：override 把 tone 翻成 light，握手带出去。
+    let mut overrides = serde_json::Map::new();
+    overrides.insert("tone".into(), serde_json::json!("light"));
+    let host = manager
+        .host("p3seto", &config_json, &overrides)
+        .expect("应有宿主");
+    let r = host.call("classify", &params).expect("应当答上来");
+    assert_eq!(r["label"], "设置回显：light", "override 要压过缺省");
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -113,7 +113,11 @@ impl Session {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path, s).map_err(|e| e.to_string())
+        // 原子写：先落临时文件再 rename。settings 类写入会由 UI 高频触发，
+        // 直接覆盖写撞上崩溃 / 断电就是半份 config（先例：mo-thumbnails 的缩略图缓存）。
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, s).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
 }
 
@@ -134,6 +138,9 @@ pub struct SavedServer {
     /// 上次使用的 unix 时间戳（秒）。列表按它倒序，越近用的越靠前。
     #[serde(default)]
     pub last_used: i64,
+    /// 用户收藏（☆→★）。收藏的排「最近」之前；旧配置缺这个字段默认 false。
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 /// 应用配置。
@@ -177,6 +184,11 @@ pub struct Config {
     /// 记住的远程服务器（最近使用的在前）。**不含密码**——密码在系统钥匙串。
     #[serde(default)]
     pub remote_servers: Vec<SavedServer>,
+    /// 扩展设置（ext_id → {设置 key: 值}）。只记**用户改过的**值；与清单声明合并
+    /// 后经 initialize 握手传给插件进程。声明没写 key 时用声明里的 default。
+    #[serde(default)]
+    pub extension_settings:
+        std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>,
     /// 全局搜索索引的**排除规则**：条目名 glob，命中的整棵子树都不进索引。
     ///
     /// 为什么要有这张表：爬取的既有判据只有「隐藏条目不进索引」（`mo_search::crawl`），
@@ -518,6 +530,7 @@ impl Default for Config {
             workflows: Vec::new(),
             sync_pairs: HashMap::new(),
             remote_servers: Vec::new(),
+            extension_settings: HashMap::new(),
             index_exclude: default_index_exclude(),
         }
     }

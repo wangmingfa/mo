@@ -22,6 +22,8 @@ gpui-kit.workspace = true
 image.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+# 扩展设置区（P5）：设置值是 JSON——开关/分段点选回写 `set_extension_setting` 的载荷。
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

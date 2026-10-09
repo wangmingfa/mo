@@ -192,7 +192,7 @@ pub fn text_looks_disconnected(detail: &str) -> bool {
 
 /// 是否已有可用于该协议的后端。
 pub fn supports(scheme: &str) -> bool {
-    matches!(scheme, "ftp" | "sftp" | "webdav" | "dav" | "davs")
+    matches!(scheme, "ftp" | "ftps" | "sftp" | "webdav" | "dav" | "davs")
 }
 
 /// 按给定地址建一条远程连接。
@@ -201,7 +201,7 @@ pub fn supports(scheme: &str) -> bool {
 /// 「路径在本文中必须是本地路径」这一假设由此打破的第一步。
 pub fn connect(url: &RemoteUrl) -> Result<Arc<dyn mo_fs::FileSystem>, RemoteError> {
     match url.scheme.as_str() {
-        "ftp" => Ok(Arc::new(ftp::FtpFileSystem::connect(url)?)),
+        "ftp" | "ftps" => Ok(Arc::new(ftp::FtpFileSystem::connect(url)?)),
         "sftp" => Ok(Arc::new(sftp::SftpFileSystem::connect(url)?)),
         "webdav" | "dav" | "davs" => Ok(Arc::new(webdav::WebDavFileSystem::connect(url)?)),
         s => Err(RemoteError::Unsupported(s.to_string())),
@@ -229,6 +229,27 @@ mod tests {
     fn plain_failures_are_not_disconnects() {
         let m: MoError = RemoteError::transport("列目录", "550 no such directory").into();
         assert!(!is_disconnected(&m));
+    }
+
+    /// ftps:// 必须被认账：协议白名单收它、分发不再报 Unsupported。
+    ///
+    /// 不带真服务器：打到本机没人听的端口，断言错误类别是 Transport（连接层
+    /// 真的发起过）而不是 Unsupported（白名单拒收）——这一条钉住「看起来该支持
+    /// 却不支持」的缺口不会再回来。
+    #[test]
+    fn ftps_is_a_supported_scheme() {
+        assert!(supports("ftps"));
+        for addr in ["ftps://127.0.0.1:2121", "ftps://127.0.0.1:990"] {
+            let url = RemoteUrl::parse(addr).expect("ftps 地址要能解析");
+            let err = match connect(&url) {
+                Ok(_) => panic!("{addr} 本机没人听，连接必须失败"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, RemoteError::Transport { .. }),
+                "{addr} 应报 Transport 而不是 Unsupported：{err:?}"
+            );
+        }
     }
 
     /// 文本判据是 SFTP 侧唯一能用的（`russh_sftp::Error::IO(String)` 不带 source），

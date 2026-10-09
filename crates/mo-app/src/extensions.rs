@@ -106,6 +106,26 @@ pub struct ListSource {
     pub title: String,
 }
 
+/// 一条扩展设置声明（P5）：key 在扩展内唯一，宿主负责持久化，并经 initialize
+/// 握手把整份设置对象传给插件进程。UI 第一版给 bool（开关）与 enum（分段点选）
+/// 两类可编辑控件；string / int / float 声明合法、值照透传，界面暂以只读行展示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingDecl {
+    /// 扩展内唯一；插件侧见到的就是 settings 对象里的这个键。
+    pub key: String,
+    /// 取值类型：bool / string / int / float / enum（enum 的 options 必填）。
+    pub kind: String,
+    /// 缺省值；缺字段时按 kind 补零值（bool=false、数值=0、enum=options[0]、
+    /// string=空串），见 [`settings_defaults`]。
+    #[serde(default)]
+    pub default: serde_json::Value,
+    /// UI 展示名。
+    pub title: String,
+    /// kind == "enum" 时的全部取值（有序，第一项是缺省）。
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 /// 清单 `capabilities` 认的四把钥匙（devlog §6）。`read-names` 缺省就给，不必写。
 pub const CAPABILITIES: &[&str] = &["read-names", "read-contents", "write", "net"];
 
@@ -151,6 +171,9 @@ pub struct Manifest {
     /// 只读列表源声明（P4）。非空 ⇒ provider 必须声明 `list` 方法（`validate` 把关）。
     #[serde(default)]
     pub lists: Vec<ListSource>,
+    /// 设置声明（P5）。宿主持久化取值并经 initialize 握手传给插件进程。
+    #[serde(default)]
+    pub settings: Vec<SettingDecl>,
 }
 
 fn default_true() -> bool {
@@ -293,6 +316,87 @@ fn validate_types(m: &Manifest) -> Option<String> {
         }
     }
     None
+}
+
+/// settings 声明的门禁：key 非空且不重复、title 非空、kind 认得出、enum 的
+/// options 非空、default 的 JSON 类型与 kind 匹配（enum 还要落在 options 里）。
+/// 「写了不生效的声明当场拒」——UI 画不出来的取值不该等装完才发现。
+fn validate_settings(m: &Manifest) -> Option<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for s in &m.settings {
+        if s.key.trim().is_empty() {
+            return Some(format!("扩展「{}」的 settings 有空 key", m.id));
+        }
+        if !seen.insert(s.key.as_str()) {
+            return Some(format!("扩展「{}」的 settings key「{}」重复", m.id, s.key));
+        }
+        if s.title.trim().is_empty() {
+            return Some(format!("扩展「{}」的设置「{}」缺少 title", m.id, s.key));
+        }
+        if !matches!(
+            s.kind.as_str(),
+            "bool" | "string" | "int" | "float" | "enum"
+        ) {
+            return Some(format!(
+                "扩展「{}」的设置「{}」kind「{}」不认识（bool / string / int / float / enum）",
+                m.id, s.key, s.kind
+            ));
+        }
+        if s.kind == "enum" && s.options.is_empty() {
+            return Some(format!(
+                "扩展「{}」的设置「{}」是 enum 却没写 options",
+                m.id, s.key
+            ));
+        }
+        if s.default.is_null() {
+            continue; // 缺省值按 kind 补零值，免检。
+        }
+        let ok = match s.kind.as_str() {
+            "bool" => s.default.is_boolean(),
+            "string" => s.default.is_string(),
+            "int" => s.default.as_i64().is_some(),
+            "float" => s.default.is_number(),
+            "enum" => {
+                s.default.is_string()
+                    && s.options
+                        .iter()
+                        .any(|o| Some(o.as_str()) == s.default.as_str())
+            }
+            _ => false,
+        };
+        if !ok {
+            return Some(format!(
+                "扩展「{}」的设置「{}」default 与 kind「{}」不匹配",
+                m.id, s.key, s.kind
+            ));
+        }
+    }
+    None
+}
+
+/// 一份清单设置的**缺省值表**（key → 值）：声明写了 default 用 default，没写的按
+/// kind 补零值。宿主在握手时把它与用户改过的值合并成最终 settings 对象。
+pub fn settings_defaults(m: &Manifest) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for s in &m.settings {
+        let v = if !s.default.is_null() {
+            s.default.clone()
+        } else {
+            match s.kind.as_str() {
+                "bool" => serde_json::Value::Bool(false),
+                "int" | "float" => serde_json::json!(0),
+                "enum" => s
+                    .options
+                    .first()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .unwrap_or_else(|| serde_json::json!("")),
+                _ => serde_json::json!(""),
+            }
+        };
+        out.insert(s.key.clone(), v);
+    }
+    out
 }
 
 /// 校验一份清单的 `provider` 与 `capabilities`；返回错误描述（`None` = 合法）。
@@ -471,6 +575,9 @@ pub fn validate(m: &Manifest, expect_id: Option<&str>) -> Option<String> {
         }
     }
     if let Some(err) = validate_types(m) {
+        return Some(err);
+    }
+    if let Some(err) = validate_settings(m) {
         return Some(err);
     }
     if let Some(err) = validate_provider(m) {
@@ -1033,6 +1140,9 @@ pub enum Contribution {
         methods: Vec<String>,
         capabilities: Vec<String>,
     },
+    /// 一组设置声明（P5）：卡片展开区出现设置区，取值经 initialize 握手传给
+    /// 插件进程——确认卡要说到这件事。
+    Setting { title: String, kind: String },
 }
 
 /// 把一份清单摊成「它会改动界面上的哪些地方」。
@@ -1075,6 +1185,10 @@ pub fn contributions(m: &Manifest) -> Vec<Contribution> {
     }));
     out.extend(m.lists.iter().map(|l| Contribution::ListSource {
         title: l.title.clone(),
+    }));
+    out.extend(m.settings.iter().map(|s| Contribution::Setting {
+        title: s.title.clone(),
+        kind: s.kind.clone(),
     }));
     if let Some(p) = &m.provider {
         // `read-names` 缺省就给，不劳作者自己写；这里报的是**实际生效**的能力集合，
@@ -1333,6 +1447,7 @@ mod tests {
             provider: None,
             capabilities: Vec::new(),
             lists: Vec::new(),
+            settings: Vec::new(),
         }
     }
 
@@ -2559,5 +2674,149 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// settings 声明的门禁：key 空 / 重复、title 空、kind 不认识、enum 无 options、
+    /// default 与 kind 不匹配——全都要当场拒；合法声明放行（P5）。
+    #[test]
+    fn validates_settings_declarations() {
+        let base = || SettingDecl {
+            key: "tone".into(),
+            kind: "enum".into(),
+            default: serde_json::json!("dark"),
+            title: "色调".into(),
+            options: vec!["dark".into(), "light".into()],
+        };
+
+        // 合法：enum + default 在 options 里。
+        let mut m = manifest("a");
+        m.settings = vec![base()];
+        assert!(validate(&m, Some("a")).is_none(), "合法声明应放行");
+
+        // 空 key / 重复 key。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.key = "  ".into();
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("空 key 应被拒");
+        assert!(err.contains("key"), "{err}");
+        let mut m = manifest("a");
+        m.settings = vec![base(), base()];
+        let err = validate(&m, Some("a")).expect("重复 key 应被拒");
+        assert!(err.contains("重复"), "{err}");
+
+        // title 空。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.title = String::new();
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("空 title 应被拒");
+        assert!(err.contains("title"), "{err}");
+
+        // kind 不认识。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.kind = "colour".into();
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("不认识的 kind 应被拒");
+        assert!(err.contains("kind"), "{err}");
+
+        // enum 没有 options。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.options = Vec::new();
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("enum 无 options 应被拒");
+        assert!(err.contains("options"), "{err}");
+
+        // default 与 kind 不匹配：bool 写了字符串、enum 的 default 不在 options 里。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.kind = "bool".into();
+        d.options = Vec::new();
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("bool 配字符串 default 应被拒");
+        assert!(err.contains("default"), "{err}");
+        let mut m = manifest("a");
+        let mut d = base();
+        d.default = serde_json::json!("mid");
+        m.settings = vec![d];
+        let err = validate(&m, Some("a")).expect("enum default 出 options 应被拒");
+        assert!(err.contains("default"), "{err}");
+
+        // int 配 float 值也不行（int 要 i64 可表示；float 收一切数）。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.kind = "int".into();
+        d.default = serde_json::json!(1.5);
+        d.options = Vec::new();
+        m.settings = vec![d];
+        assert!(validate(&m, Some("a")).is_some(), "int 配 1.5 应被拒");
+        let mut m = manifest("a");
+        let mut d = base();
+        d.kind = "float".into();
+        d.default = serde_json::json!(1.5);
+        d.options = Vec::new();
+        m.settings = vec![d];
+        assert!(validate(&m, Some("a")).is_none(), "float 收 1.5");
+
+        // default 缺省（null）免检——零值由 settings_defaults 补。
+        let mut m = manifest("a");
+        let mut d = base();
+        d.default = serde_json::Value::Null;
+        d.kind = "string".into();
+        d.options = Vec::new();
+        m.settings = vec![d];
+        assert!(validate(&m, Some("a")).is_none(), "null default 应放行");
+    }
+
+    /// 缺省值表：声明写了 default 用 default，没写的按 kind 补零值
+    /// （bool=false、数值=0、enum=options[0]、string=空串）（P5）。
+    #[test]
+    fn settings_defaults_fill_zero_values() {
+        let mut m = manifest("a");
+        m.settings = vec![
+            SettingDecl {
+                key: "b".into(),
+                kind: "bool".into(),
+                default: serde_json::Value::Null,
+                title: "开关".into(),
+                options: Vec::new(),
+            },
+            SettingDecl {
+                key: "i".into(),
+                kind: "int".into(),
+                default: serde_json::Value::Null,
+                title: "数量".into(),
+                options: Vec::new(),
+            },
+            SettingDecl {
+                key: "e".into(),
+                kind: "enum".into(),
+                default: serde_json::Value::Null,
+                title: "色调".into(),
+                options: vec!["dark".into(), "light".into()],
+            },
+            SettingDecl {
+                key: "s".into(),
+                kind: "string".into(),
+                default: serde_json::Value::Null,
+                title: "名字".into(),
+                options: Vec::new(),
+            },
+            SettingDecl {
+                key: "f".into(),
+                kind: "float".into(),
+                default: serde_json::json!(0.5),
+                title: "比例".into(),
+                options: Vec::new(),
+            },
+        ];
+        let d = settings_defaults(&m);
+        assert_eq!(d["b"], serde_json::json!(false));
+        assert_eq!(d["i"], serde_json::json!(0));
+        assert_eq!(d["e"], serde_json::json!("dark"), "enum 零值 = options[0]");
+        assert_eq!(d["s"], serde_json::json!(""));
+        assert_eq!(d["f"], serde_json::json!(0.5), "写了 default 用 default");
     }
 }

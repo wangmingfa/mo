@@ -152,6 +152,9 @@ pub struct SpawnSpec {
     pub startup_timeout: Duration,
     /// 单次调用超时。
     pub call_timeout: Duration,
+    /// 握手时传给插件的设置对象：清单声明的 defaults 为底、用户改过的值覆盖
+    /// （合并在 [`Manager::host`] 做）。空对象 = 没声明设置。
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 impl SpawnSpec {
@@ -196,6 +199,7 @@ impl SpawnSpec {
             methods: p.methods.clone(),
             capabilities: ext.manifest.capabilities.clone(),
             covered_exts,
+            settings: crate::extensions::settings_defaults(&ext.manifest),
             log_path,
             startup_timeout: Duration::from_millis(
                 p.startup_timeout_ms.unwrap_or(DEFAULT_STARTUP_TIMEOUT_MS),
@@ -463,8 +467,13 @@ impl Host {
             // 「id 对不上」把正确回包丢掉，握手白等到超时（2026-10-09 srt-tools 实案）。
             next_id: JS_SAFE_ID,
         };
-        // 握手：initialize → {name, version, methods[]}。
-        let params = serde_json::json!({ "protocol": PROTOCOL_VERSION });
+        // 握手：initialize → {name, version, methods[]}。settings 随握手授予——
+        // 插件不读这个字段也不破坏（协议帧本来就是宽松解析）；改设置后宿主会
+        // forget_ext 重建进程，新值在下一次握手生效。
+        let params = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "settings": self.spec.settings,
+        });
         let deadline = Instant::now() + self.spec.startup_timeout;
         // 握手失败多半是进程坏了：kill 掉再上报（proc drop 时也会 kill，
         // 让「失败路径不留进程」与代码顺序无关）。
@@ -666,8 +675,16 @@ impl Manager {
             .unwrap_or_default()
     }
 
-    /// 取（或建）一个扩展的宿主。`config_json` 供规格缓存失效用。
-    pub fn host(&self, ext_id: &str, config_json: &Path) -> Option<Arc<Host>> {
+    /// 取（或建）一个扩展的宿主。`config_json` 供规格缓存失效用；`overrides`
+    /// 是用户改过的设置值（config.json 里的那份），与规格里清单声明的 defaults
+    /// 合并成握手要传的 settings——只在**建进程**时生效，改过设置要由调用方
+    /// `forget_ext` 让宿主重建。
+    pub fn host(
+        &self,
+        ext_id: &str,
+        config_json: &Path,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Arc<Host>> {
         self.sync_specs(config_json);
         let mut g = self.inner.lock().unwrap();
         if let Some(host) = g.hosts.get(ext_id) {
@@ -675,7 +692,12 @@ impl Manager {
         }
         let specs = &g.specs.as_ref()?.1;
         let spec = specs.get(ext_id)?;
-        let host = Arc::new(Host::new((**spec).clone()));
+        let mut spec = (**spec).clone();
+        if !overrides.is_empty() {
+            spec.settings
+                .extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let host = Arc::new(Host::new(spec));
         g.hosts.insert(ext_id.to_string(), host.clone());
         Some(host)
     }
@@ -802,6 +824,7 @@ impl Manager {
         ext_id: &str,
         source: &str,
         config_json: &Path,
+        overrides: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Vec<ListRow>, CallError> {
         // 测试种子优先（见 `seed_list_rows_for_tests`）。
         if let Some(rows) = self
@@ -814,7 +837,7 @@ impl Manager {
             return Ok(rows.clone());
         }
         let host = self
-            .host(ext_id, config_json)
+            .host(ext_id, config_json, overrides)
             .ok_or_else(|| CallError::Protocol(format!("扩展「{ext_id}」没有可用的 provider")))?;
         let result = host.call("list", &list_params(source))?;
         let mut rows = list_rows_from_result(&result);
@@ -1047,7 +1070,8 @@ pub(crate) fn classify_batch(app: &AppState, paths: Vec<PathBuf>) {
             .unwrap_or(0)
     };
     for (ext_id, group) in by_ext {
-        let host = app.providers().host(&ext_id, &config);
+        let overrides = app.extension_setting_overrides(&ext_id);
+        let host = app.providers().host(&ext_id, &config, &overrides);
         let host = match host {
             Some(h) if h.disabled_until().is_none() => h,
             _ => {
@@ -1103,7 +1127,8 @@ pub(crate) fn classify_batch(app: &AppState, paths: Vec<PathBuf>) {
 pub(crate) fn provider_preview(app: &AppState, path: &Path) -> Option<mo_preview::Preview> {
     let config = AppState::config_path();
     let ext_id = app.providers().owner_of(path, &config)?;
-    let host = app.providers().host(&ext_id, &config)?;
+    let overrides = app.extension_setting_overrides(&ext_id);
+    let host = app.providers().host(&ext_id, &config, &overrides)?;
     if !host.spec().methods.iter().any(|m| m == "preview") {
         return None;
     }
@@ -1308,6 +1333,7 @@ mod tests {
             log_path: std::env::temp_dir().join("mo-pv-test.log"),
             startup_timeout: Duration::from_millis(100),
             call_timeout: Duration::from_millis(100),
+            settings: Default::default(),
         };
         let host = Host::new(spec);
         assert!(host.disabled_until().is_none());

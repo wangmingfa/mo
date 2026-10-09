@@ -5007,6 +5007,7 @@ dependencies = [
  "reqwest_dav",
  "russh",
  "russh-sftp",
+ "rustls-platform-verifier",
  "suppaftp",
  "thiserror 2.0.21",
  "tokio",
@@ -5056,6 +5057,7 @@ dependencies = [
  "mo-preview",
  "mo-search",
  "objc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7418,6 +7420,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -8309,8 +8312,10 @@ dependencies = [
  "lazy-regex",
  "log",
  "pin-project",
+ "rustls-pki-types",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
