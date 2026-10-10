@@ -832,6 +832,19 @@ impl SessionRegistry {
             .cloned()
     }
 
+    /// 某个端点**当前连着的**会话上带的证书指纹（`None` = 没连 / 没钉）。
+    ///
+    /// 「记住这台服务器」时用它把指纹跟地址一起记下来——指纹在连接时经 URL
+    /// 进了会话，这里是从会话回捞的唯一出口。
+    fn fingerprint_for(&self, endpoint: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.url.endpoint() == endpoint)
+            .and_then(|s| s.url.tls_fingerprint.clone())
+    }
+
     /// 取一条会话的副本（`None` = 已经断开了）。
     fn entry(&self, id: SessionId) -> Option<RemoteSession> {
         self.sessions
@@ -1636,7 +1649,21 @@ impl AppState {
     /// 失败时保持原浏览态不变（不切 fs、不导航），并把失败分成两类返回，见
     /// [`ConnectFailure`]。
     pub async fn connect_remote(&self, input: &str) -> Result<(), ConnectFailure> {
+        self.connect_remote_with_pin(input, None).await
+    }
+
+    /// 带证书钉选指纹连接。
+    ///
+    /// `pin` 是连接对话框「TLS 指纹」框里的值（`None` / 空串 = 不钉，正常校验）。
+    /// 指纹不在地址串里、没法从文本解析出来，所以单独走一个参数；没显式给时
+    /// [`Self::finish_connect`] 会去查这台服务器**上次记下的**指纹（重连不用重钉）。
+    pub async fn connect_remote_with_pin(
+        &self,
+        input: &str,
+        pin: Option<String>,
+    ) -> Result<(), ConnectFailure> {
         let mut url = Self::parse_remote(input)?;
+        url.tls_fingerprint = pin.filter(|p| !p.trim().is_empty());
         if url.user.is_none() {
             if let Some((user, password)) = credentials::load(&url.endpoint()) {
                 url.user = Some(user);
@@ -1649,16 +1676,19 @@ impl AppState {
     /// 带上刚在认证框里填的凭据再连一次。
     ///
     /// `input` 是认证框对应的地址（`scheme://host:port`）；用户名 / 密码覆盖掉
-    /// 地址里可能写着的旧值。
+    /// 地址里可能写着的旧值。`pin` 是这次连接会话里填的证书指纹（见
+    /// [`Self::connect_remote_with_pin`]）——地址框里钉过的，认证重试这一轮不能丢。
     pub async fn connect_remote_with_credentials(
         &self,
         input: &str,
         user: &str,
         password: &str,
+        pin: Option<String>,
     ) -> Result<(), ConnectFailure> {
         let mut url = Self::parse_remote(input)?;
         url.user = Some(user.to_string());
         url.password = Some(password.to_string());
+        url.tls_fingerprint = pin.filter(|p| !p.trim().is_empty());
         self.finish_connect(url).await
     }
 
@@ -1684,7 +1714,19 @@ impl AppState {
     ///   都不重建，这是「切回本地不断开连接」省下的另一半；
     /// * 密码变了——真连一次，然后把那条会话的连接与凭据**原地**换掉。编号不变，
     ///   所以侧边栏还是那一行，不会多出一条来。
-    async fn finish_connect(&self, url: RemoteUrl) -> Result<(), ConnectFailure> {
+    async fn finish_connect(&self, mut url: RemoteUrl) -> Result<(), ConnectFailure> {
+        // 证书钉选：这次连接没显式给指纹（对话框留空 / 点记住的列表 / 闲置重连），
+        // 就用 config 里这台服务器**上次钉过的**——钉一次长期生效，不用每次重填。
+        // 显式给的优先：用户刚在对话框里改了指纹（比如服务器换证书后重钉）。
+        if url.tls_fingerprint.is_none() {
+            url.tls_fingerprint = self
+                .config()
+                .remote_servers
+                .iter()
+                .find(|s| s.endpoint == url.endpoint())
+                .and_then(|s| s.tls_fingerprint.clone());
+        }
+
         // SMB / NFS：不建远程会话，触发**系统挂载**，然后当本地目录打开。
         // 挂好之后读写全走 `LocalFileSystem`，所以侧边栏「远程」区也不会多出一行
         // ——它出现在「网络」区，跟系统挂的其它盘在一起。
@@ -2174,12 +2216,17 @@ impl AppState {
     ) -> Result<(), String> {
         let mut cfg = self.config();
         // 收藏状态跟地址走：重连（重记）不丢星标。
-        let favorite = cfg
+        let prior = cfg
             .remote_servers
             .iter()
             .find(|s| s.endpoint == endpoint)
-            .map(|s| s.favorite)
-            .unwrap_or(false);
+            .cloned();
+        let favorite = prior.as_ref().map(|s| s.favorite).unwrap_or(false);
+        // 证书指纹同理跟地址走：重记不丢；这台是**首次**记时，从刚建起来的会话
+        // 上取（连接时带进来的——显式填的或 finish_connect 从旧记录补上的）。
+        let tls_fingerprint = prior
+            .and_then(|s| s.tls_fingerprint)
+            .or_else(|| self.sessions.fingerprint_for(endpoint));
         cfg.remote_servers.retain(|s| s.endpoint != endpoint);
         cfg.remote_servers.insert(
             0,
@@ -2188,6 +2235,7 @@ impl AppState {
                 user: user.to_string(),
                 last_used: now_secs(),
                 favorite,
+                tls_fingerprint,
             },
         );
         // 只留最近的一批，免得配置文件被连过的临时地址撑爆。

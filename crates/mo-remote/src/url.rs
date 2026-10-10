@@ -52,6 +52,16 @@ pub struct RemoteUrl {
     pub port: Option<u16>,
     /// 远程绝对路径，**总是以 `/` 开头**。
     pub path: String,
+    /// TLS 证书钉选：叶子证书的 SHA-256 指纹（十六进制，冒号 / 空格 / 大小写都可）。
+    ///
+    /// 自签名 / 内网 FTPS 服务器过不了系统信任库校验，用户在连接对话框里粘上
+    /// 证书指纹即「信任此主机」：证书哈希对得上就放行，对不上照样拒绝——
+    /// **不是跳过校验**，服务器换证书（可能是被劫持）后必须重新钉一次。
+    ///
+    /// `None` = 正常走平台证书校验。它**不属于「位置」**（与用户名同理）：
+    /// 不进 [`Self::endpoint`] / [`Self::display`] / [`Self::authority`]，但参与
+    /// 相等比较——上层经会话保存/回放时原样跟着 URL 走。
+    pub tls_fingerprint: Option<String>,
 }
 
 impl RemoteUrl {
@@ -97,6 +107,7 @@ impl RemoteUrl {
             host,
             port,
             path,
+            tls_fingerprint: None,
         })
     }
 

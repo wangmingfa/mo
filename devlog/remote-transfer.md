@@ -389,3 +389,46 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
   回 d55b821 裸跑同样红（同位置同信号），恢复改动后 mo-ui 串行全绿（267 条含
   inline_rename）、其余 58 个测试二进制全绿。判定为文档化的 gpui 框架级 flake
   （测试二进制并行满载期持续触发），**非任务 B 回归**。
+
+## 任务 C：FTPS 自签名证书支持（指纹钉选，2026-10-10）
+
+问题：FTPS 证书校验走 rustls-platform-verifier（系统信任库），自签名 / 内网服务器
+握手必失败且无解法。
+
+方案：**「信任此主机」= 钉叶子证书 SHA-256 指纹**，不做「跳过校验」——对得上才放行，
+服务器换证书（可能被劫持）后握手照样失败，必须重钉；握手签名的密码学校验仍由
+crypto provider 做，一点没少。
+
+* **mo-remote**：`RemoteUrl` 加 `tls_fingerprint: Option<String>`（不属于「位置」，
+  不进 endpoint/display，但跟会话走）；ftp.rs `normalize_fingerprint`（冒号/空格/
+  大小写宽松收、64 位十六进制严格判）+ `PinnedVerifier`（`verify_server_cert`
+  只认哈希相等的叶子证书，其余报「证书指纹不匹配：出示 xx，钉选 yy」）；
+  `tls_connector(pin)` 双分支（None=平台校验、Some=钉选）。
+* **mo-config**：`SavedServer.tls_fingerprint`（serde default，指纹不是机密，
+  明文存同 SSH known_hosts 模型）。
+* **mo-app**：`connect_remote_with_pin(input, pin)` / `connect_remote_with_credentials`
+  加 pin 参数；`finish_connect` 显式指纹优先、否则补 config 里记的（钉一次长期生效）；
+  `remember_server` 重记不丢指纹、首次从会话回捞（`SessionRegistry::fingerprint_for`）。
+* **mo-ui**：连接对话框加「TLS 指纹（可选）」输入框（mo-connect-pin-field）；地址框
+  每帧抢焦点的行为加了守卫（指纹框握着焦点就不抢——两个框互抢=焦点乒乓无限重绘）；
+  指纹随连接进 ConnectAuthState（认证重试不丢）；使用说明补自签名 FTPS 一行。
+* 测试：归一化 7 断言、钉选 verifier 接受/拒绝（含错误消息带双方指纹）、
+  引擎层「记住并回放 / 显式盖过存档 / 空白=不钉」3 条、headless「指纹框渲染 +
+  焦点不被抢」1 条。
+
+## 任务 D：WebDAV 读侧 Range 探测缓存（2026-10-10）
+
+问题：`read_file_chunk` 每块都发 Range 头；不支持 Range 的服务器每次都无视它回
+整份 200——头白发、行为每块重复探测一遍。
+
+方案：**探一次就记住**。`WebDavFileSystem.range_support` 三态缓存（未知/支持/
+不支持，`Arc<AtomicU8>`——探测发生在 dispatch 的 'static future 里）：
+
+* 206 → 支持（继续按块发区间请求）；200 → 被无视（之后直接整份拉、本地切，
+  不再白发 Range 头）；**416 不翻案**——那是「认识 Range 但区间越界」；其余
+  状态码不改变认知；探明的结论粘住。
+* 判据表抽成纯函数 `range_support_after` / `should_send_range`，整份切出抽成
+  `slice_full_body`，都可脱离网络单测。
+* 刻意选**惰性探测**（第一块读顺带探）而不是 connect 时握手多打一发探针：
+  支持 Range 的服务器零额外请求，不支持的也只多走原路径一次。
+* 测试：判据表（206/200/416/401/粘住/should_send）+ 区间切出（中段/截尾/越界/空）。

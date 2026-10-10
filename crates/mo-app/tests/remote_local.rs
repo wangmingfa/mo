@@ -788,7 +788,7 @@ fn a_new_password_reconnects_the_same_row() {
     let (id, _, _) = connect_fake_at(&app, "ftp://alice@127.0.0.1:1");
 
     runtime().block_on(async {
-        app.connect_remote_with_credentials("ftp://127.0.0.1:1", "alice", "pw2")
+        app.connect_remote_with_credentials("ftp://127.0.0.1:1", "alice", "pw2", None)
             .await
             .expect("换了密码应当真连一次");
 
@@ -1473,4 +1473,146 @@ fn downloading_from_a_remote_endpoint_writes_locally() {
     });
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- 证书钉选（FTPS 自签名）
+
+/// 「记住这台服务器」时指纹要跟着地址一起记下，并在**下次连接**时自动补回 URL——
+/// 钉一次长期生效，用户不该每次重连都重填。三段式：带指纹连接 → 记住 → 重开应用
+/// 再连（不带指纹），connector 收到的 URL 必须带着存下的那份。
+#[test]
+fn a_pinned_fingerprint_is_remembered_and_replayed() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let connector = {
+        let seen = seen.clone();
+        Arc::new(move |url: &RemoteUrl| {
+            seen.lock().unwrap().push(url.tls_fingerprint.clone());
+            Ok(Arc::new(FakeRemoteFs {
+                ..Default::default()
+            }) as Arc<dyn FileSystem>)
+        })
+    } as mo_app::Connector;
+
+    let url = "ftps://10.0.0.9:2121";
+    let pin = "AB:cd 0123".to_string(); // 对话框里随便怎么粘，引擎原样透传
+    common::isolated("ftps-pin-replay", || {
+        let sessions = Arc::new(SessionRegistry::with_connector(connector.clone()));
+        let trash = std::env::temp_dir().join(format!("mo-trash-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&trash);
+        let app = AppState::with_sessions(trash, sessions);
+
+        runtime().block_on(async {
+            app.connect_remote_with_pin(url, Some(pin.clone()))
+                .await
+                .expect("带指纹的连接应当成功（假后端不校验指纹）");
+        });
+        // 连上了（第一个被看到的 URL 带着显式指纹）。
+        app.remember_server(url, "alice", None).unwrap();
+        let saved = app.saved_servers();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].tls_fingerprint.as_deref(),
+            Some(pin.as_str()),
+            "指纹必须跟地址一起记进 config"
+        );
+
+        // 重开应用（同一份 config），这次不带指纹连同一台——存下的指纹要被补上。
+        let trash2 = std::env::temp_dir().join(format!("mo-trash-pin2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&trash2);
+        let sessions2 = Arc::new(SessionRegistry::with_connector(connector.clone()));
+        let reopened = AppState::with_sessions(trash2, sessions2);
+        runtime().block_on(async {
+            reopened.connect_remote(url).await.expect("重连应当成功");
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "两次连接都该走到 connector");
+        assert_eq!(
+            seen[0].as_deref(),
+            Some(pin.as_str()),
+            "显式给的指纹原样到 URL"
+        );
+        assert_eq!(
+            seen[1].as_deref(),
+            Some(pin.as_str()),
+            "没给指纹时用记下的那份（钉一次长期生效）"
+        );
+    });
+}
+
+/// 这次连接**显式**给的指纹优先于 config 里存的那份——服务器换证书后重钉，
+/// 不能还拿旧指纹去对。
+#[test]
+fn an_explicit_pin_overrides_the_saved_one() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let connector = {
+        let seen = seen.clone();
+        Arc::new(move |url: &RemoteUrl| {
+            seen.lock().unwrap().push(url.tls_fingerprint.clone());
+            Ok(Arc::new(FakeRemoteFs {
+                ..Default::default()
+            }) as Arc<dyn FileSystem>)
+        })
+    } as mo_app::Connector;
+
+    let url = "ftps://10.0.0.10:990";
+    let old = "aaaa".repeat(16);
+    let new = "bbbb".repeat(16);
+    common::isolated("ftps-pin-override", || {
+        let sessions = Arc::new(SessionRegistry::with_connector(connector.clone()));
+        let trash = std::env::temp_dir().join(format!("mo-trash-pin3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&trash);
+        let app = AppState::with_sessions(trash, sessions);
+
+        runtime().block_on(async {
+            // ① 带旧指纹连上（会话建起来，config 里还没有记录）。
+            app.connect_remote_with_pin(url, Some(old.clone()))
+                .await
+                .expect("首次连接应当成功");
+        });
+        // ② 记下来：指纹从会话回捞进 config。
+        app.remember_server(url, "u", None).unwrap();
+        runtime().block_on(async {
+            // ③ 再连同一台，这次显式给新指纹。地址里带密码（与已存会话不同），
+            //    不会命中「同端点同用户名直接切过去」的短路，真的会走一次 connector。
+            let with_creds = "ftps://u:pw@10.0.0.10:990";
+            app.connect_remote_with_pin(with_creds, Some(new.clone()))
+                .await
+                .expect("重钉后的连接应当成功");
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "两次连接都该真的走到 connector");
+        assert_eq!(seen[0].as_deref(), Some(old.as_str()), "首次带的是旧指纹");
+        assert_eq!(
+            seen[1].as_deref(),
+            Some(new.as_str()),
+            "显式指纹要盖过存的那份（换证书后重钉的场景）"
+        );
+    });
+}
+
+/// 地址框里只敲了空格 / 什么都没填 = 不钉（`None`），不是拿空串去当指纹。
+#[test]
+fn an_empty_pin_means_no_pinning() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let connector = {
+        let seen = seen.clone();
+        Arc::new(move |url: &RemoteUrl| {
+            seen.lock().unwrap().push(url.tls_fingerprint.clone());
+            Ok(Arc::new(FakeRemoteFs {
+                ..Default::default()
+            }) as Arc<dyn FileSystem>)
+        })
+    } as mo_app::Connector;
+
+    let sessions = Arc::new(SessionRegistry::with_connector(connector));
+    let app = tab(&sessions);
+    runtime().block_on(async {
+        app.connect_remote_with_pin(TEST_URL, Some("   ".to_string()))
+            .await
+            .expect("空指纹按不钉处理，连接照常");
+    });
+    assert!(
+        matches!(seen.lock().unwrap().last(), Some(None)),
+        "空白指纹必须归一成 None（正常校验），而不是当真"
+    );
 }

@@ -696,9 +696,10 @@ fn render_row(row: Row, app: &AppState, entity: &Entity<RootView>) -> impl IntoE
                     match app.open_connection(id).await {
                         Ok(()) => {}
                         // 服务器拒了凭据（比如闲置期间那边改了密码）：直接弹认证框，
-                        // 别让用户对着一句错误发呆。
+                        // 别让用户对着一句错误发呆。这条路没有指纹可带（`None`）——
+                        // 记过的指纹引擎侧会自己补到 URL 上。
                         Err(f @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
-                            entity.update(cx, |v, cx| v.on_connect_result(Err(f), cx));
+                            entity.update(cx, |v, cx| v.on_connect_result(Err(f), None, cx));
                         }
                         Err(e) => {
                             entity.update(cx, |v, cx| {

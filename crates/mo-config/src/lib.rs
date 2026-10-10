@@ -141,6 +141,12 @@ pub struct SavedServer {
     /// 用户收藏（☆→★）。收藏的排「最近」之前；旧配置缺这个字段默认 false。
     #[serde(default)]
     pub favorite: bool,
+    /// FTPS 证书钉选：叶子证书的 SHA-256 指纹（十六进制，冒号可省）；`None` =
+    /// 正常走系统信任库校验。自签名 / 内网 FTPS 过不了系统校验，用户在连接
+    /// 对话框里粘一次指纹就长期生效。指纹是**公开证书**的哈希、不是机密，
+    /// 明文存这里没有「密码进 config.json」那种问题（同 SSH known_hosts 的模型）。
+    #[serde(default)]
+    pub tls_fingerprint: Option<String>,
 }
 
 /// 应用配置。

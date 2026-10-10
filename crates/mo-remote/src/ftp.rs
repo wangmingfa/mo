@@ -34,8 +34,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use sha2::{Digest, Sha256};
 use suppaftp::list::{File, ListParser};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
+use suppaftp::tokio_rustls::rustls;
 use suppaftp::FtpResult;
 use tokio::sync::Mutex;
 
@@ -72,21 +77,38 @@ impl FtpFileSystem {
             .map_err(|e| RemoteError::transport("创建 runtime", e))
     }
 
-    /// 平台证书校验的 TLS 连接器：走系统信任库（企业自签 / 系统装过的 CA 都认），
-    /// SNI 用主机名。显式 / 隐式握手共用同一份配置。
-    fn tls_connector() -> AsyncRustlsConnector {
+    /// TLS 连接器：显式 / 隐式握手共用同一份配置。
+    ///
+    /// * `pin = None` —— 平台证书校验：走系统信任库（企业自签 / 系统装过的 CA 都认），
+    ///   SNI 用主机名。
+    /// * `pin = Some(fp)` —— 「信任此主机」：只认叶子证书 SHA-256 恰好等于 `fp` 的
+    ///   服务器。**不是跳过校验**——换证书（可能被劫持）后握手照样失败，用户必须
+    ///   重新钉一次；握手签名的密码学校验仍由 crypto provider 做。
+    fn tls_connector(pin: Option<&[u8; 32]>) -> Result<AsyncRustlsConnector, RemoteError> {
         use rustls_platform_verifier::BuilderVerifierExt;
         use suppaftp::tokio_rustls::rustls;
         // 显式指定 provider：进程里可能还装着别的默认 provider（SFTP 的 russh 系），
         // 依赖「恰好只有一个」的隐式约定会在某个依赖升级后变成 panic。
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
-            .expect("TLS 协议版本是常量集合，不会失败")
-            .with_platform_verifier()
-            .expect("平台证书校验器初始化失败")
-            .with_no_client_auth();
-        AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)))
+            .expect("TLS 协议版本是常量集合，不会失败");
+        let config = match pin {
+            None => builder
+                .with_platform_verifier()
+                .expect("平台证书校验器初始化失败")
+                .with_no_client_auth(),
+            Some(fp) => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+                    provider,
+                    pinned: *fp,
+                }))
+                .with_no_client_auth(),
+        };
+        Ok(AsyncRustlsConnector::from(
+            suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)),
+        ))
     }
 
     /// 建连接并登录。
@@ -109,9 +131,21 @@ impl FtpFileSystem {
         let implicit_tls = url.scheme == "ftps" && url.port_or_default() == Some(990);
         let explicit_tls = url.scheme == "ftps" && !implicit_tls;
         let host = url.host.clone();
+        // 钉选指纹在握手前归一化：写错了（不是合法的 32 字节十六进制）当场报错，
+        // 别等用户对着一句不知所云的「握手失败」猜。
+        let pin = match &url.tls_fingerprint {
+            None => None,
+            Some(raw) => Some(normalize_fingerprint(raw).ok_or_else(|| {
+                RemoteError::transport(
+                    "证书指纹",
+                    format!("无法识别的 SHA-256 指纹（应为 64 位十六进制）：{raw}"),
+                )
+            })?),
+        };
+        let connector = Self::tls_connector(pin.as_ref())?;
         let conn = rt.block_on(async {
             let mut stream = if implicit_tls {
-                AsyncRustlsFtpStream::connect_secure_implicit(&addr, Self::tls_connector(), &host)
+                AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &host)
                     .await
                     .map_err(|e| transport_error("连接", e))?
             } else {
@@ -123,7 +157,7 @@ impl FtpFileSystem {
                     .map_err(|e| transport_error("连接", e))?;
                 if explicit_tls {
                     stream = stream
-                        .into_secure(Self::tls_connector(), &host)
+                        .into_secure(connector, &host)
                         .await
                         .map_err(|e| transport_error("TLS 握手", e))?;
                 }
@@ -289,6 +323,93 @@ fn login_error(e: suppaftp::FtpError) -> RemoteError {
             RemoteError::auth("登录", &e)
         }
         _ => transport_error("登录", e),
+    }
+}
+
+/// 把用户粘的指纹文本归一成 32 字节：冒号 / 空格 / 大小写都收（`AB:cd ef…` 与
+/// `abcdef…` 同一个），必须是**恰好 64 位**十六进制。`None` = 无法识别。
+///
+/// 抽成有单测的纯函数：连接对话框收的是人手粘的字符串，宽松收、严格判。
+fn normalize_fingerprint(raw: &str) -> Option<[u8; 32]> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .collect();
+    if cleaned.len() != 64 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 「信任此主机」的证书校验器：叶子证书 SHA-256 对上钉选指纹才放行。
+///
+/// 为什么还要实现签名校验那三个方法：TLS 握手本身的签名（TLS 1.2/1.3 各一次）
+/// 必须有人验，不然协议跑不起来。这里原样委托给 crypto provider——**钉选只是
+/// 免去「证书链要连到系统信任库」这一条，密码学层面的校验一点没少**。
+#[derive(Debug)]
+struct PinnedVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    pinned: [u8; 32],
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let got = Sha256::digest(end_entity.as_ref());
+        if got.as_slice() == self.pinned {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            Err(TlsError::General(format!(
+                "证书指纹不匹配：服务器出示 {}，钉选的是 {}（服务器换证书了？确认新指纹后重新信任）",
+                hex(&got),
+                hex(&self.pinned),
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -604,6 +725,84 @@ mod tests {
         assert!(
             matches!(got, Err(RemoteError::Unsupported(ref scheme)) if scheme == "smb"),
             "未实现的协议要给出明确错误，而不是连上去再炸"
+        );
+    }
+
+    /// 指纹归一：冒号 / 空格 / 大小写都收；长度或字符不对一律拒绝。
+    #[test]
+    fn fingerprints_are_normalized_liberally_but_validated_strictly() {
+        let ab = [0xabu8; 32];
+        let text = ab.iter().map(|b| format!("{b:02X}")).collect::<String>();
+        // 大写无分隔、小写、冒号分隔、空格分隔，全都同一个结果。
+        assert_eq!(normalize_fingerprint(&text), Some(ab));
+        assert_eq!(normalize_fingerprint(&text.to_ascii_lowercase()), Some(ab));
+        let coloned = ab
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(normalize_fingerprint(&coloned), Some(ab));
+        assert_eq!(
+            normalize_fingerprint(&format!("{}0", &coloned[..63])),
+            None,
+            "长度不对（63 位 + 1）要拒绝"
+        );
+        assert_eq!(
+            normalize_fingerprint(&"g".repeat(64)),
+            None,
+            "非十六进制要拒绝"
+        );
+        assert_eq!(normalize_fingerprint(""), None, "空串要拒绝");
+    }
+
+    /// 钉选校验器：证书哈希对得上就放行（哪怕这证书不来自任何 CA——这正是
+    /// 自签名场景），对不上就拒绝并给出两个指纹，用户照着重新钉就行。
+    #[test]
+    fn pinned_verifier_accepts_only_the_pinned_certificate() {
+        use suppaftp::tokio_rustls::rustls::pki_types::ServerName;
+        use suppaftp::tokio_rustls::rustls::pki_types::UnixTime;
+
+        let cert_der = vec![0xdeu8, 0xad, 0xbe, 0xef];
+        let digest = Sha256::digest(&cert_der);
+        let mut pinned = [0u8; 32];
+        pinned.copy_from_slice(digest.as_ref());
+        let verifier = PinnedVerifier {
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            pinned,
+        };
+        let name = ServerName::try_from("localhost".to_string()).expect("测试主机名");
+        let now = UnixTime::now();
+
+        let ok = verifier.verify_server_cert(
+            &CertificateDer::from(cert_der.clone()),
+            &[],
+            &name,
+            &[],
+            now,
+        );
+        assert!(ok.is_ok(), "钉选的证书要放行：{ok:?}");
+
+        let bad = verifier.verify_server_cert(
+            &CertificateDer::from(vec![0x01u8, 0x02, 0x03]),
+            &[],
+            &name,
+            &[],
+            now,
+        );
+        let err = format!("{}", bad.expect_err("别的证书必须拒绝"));
+        let mut shown_bytes = [0u8; 32];
+        shown_bytes.copy_from_slice(Sha256::digest(&cert_der).as_ref());
+        let shown = shown_bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert!(
+            err.contains("证书指纹不匹配"),
+            "拒绝消息要说清楚是指纹对不上：{err}"
+        );
+        assert!(
+            err.contains(&shown),
+            "拒绝消息要带服务器实际出示的指纹（{shown}）：{err}"
         );
     }
 }

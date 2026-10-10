@@ -451,6 +451,8 @@ pub(crate) struct ConnectAuthState {
     pub error: Option<String>,
     /// 用户名初值：地址里写了 `ftp://alice@host` 就带过来，别让用户再敲一遍。
     pub user_seed: String,
+    /// 这次连接带的证书指纹（地址框里填的）：提交时原样回传，认证重试这轮不能丢。
+    pub pin: Option<String>,
     /// 用户名输入框。
     pub user: Option<Entity<InputState>>,
     /// 密码输入框（`masked(true)`，绘制层显示成星号）。
@@ -471,13 +473,15 @@ pub(crate) struct ConnectAuthState {
 }
 
 impl ConnectAuthState {
-    /// 新建：`detail` 是上次尝试的失败原因（首次进来时是 `None`）。
-    fn new(endpoint: String, detail: Option<String>, user_seed: &str) -> Self {
+    /// 新建：`detail` 是上次尝试的失败原因（首次进来时是 `None`）；`pin` 是
+    /// 这次连接带的证书指纹（地址框里填的，没有就是 `None`）。
+    fn new(endpoint: String, detail: Option<String>, user_seed: &str, pin: Option<String>) -> Self {
         Self {
             endpoint,
             hint: detail,
             error: None,
             user_seed: user_seed.to_string(),
+            pin,
             user: None,
             pass: None,
             subs: Vec::new(),
@@ -1330,6 +1334,14 @@ pub struct RootView {
     /// ⚠️ 必须持有：gpui 的 `Subscription` 一旦 drop 就退订，回车那一下（对话框里
     /// 最主要的一个键）就再也收不到了。
     pub(crate) connect_sub: Option<Subscription>,
+    /// 连接对话框的「TLS 指纹（可选）」输入框（生命周期与地址框相同）。
+    ///
+    /// 自签名 / 内网 FTPS 过不了系统证书校验，用户粘一次叶子证书的 SHA-256 即
+    /// 「信任此主机」。留空 = 正常校验。**不每帧抢焦点**（地址框才那样）——
+    /// 两个框每帧互相抢就是焦点乒乓（无限重绘，见 `sync_connect_address`）。
+    pub(crate) connect_pin_input: Option<Entity<InputState>>,
+    /// `connect_pin_input` 的事件订阅句柄（同 `connect_sub` 的持有约定）。
+    pub(crate) connect_pin_sub: Option<Subscription>,
     /// 连接失败时的错误提示（保留对话框展示）。
     pub(crate) connect_error: Option<String>,
     /// 「连接到服务器」对话框里列出的**已记住的服务器**。
@@ -1633,6 +1645,8 @@ impl RootView {
             ctx_submenu_open: false,
             connect_input: None,
             connect_sub: None,
+            connect_pin_input: None,
+            connect_pin_sub: None,
             connect_error: None,
             connect_servers: Vec::new(),
             connect_auth: None,
@@ -3102,6 +3116,7 @@ impl RootView {
     /// * 关闭有多条路（Esc / 取消 / 点遮罩 / 连接成功），在这里统一收口不会漏。
     fn sync_connect_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_connect_address(window, cx);
+        self.sync_connect_pin(window, cx);
         self.sync_connect_auth(window, cx);
     }
 
@@ -3644,6 +3659,7 @@ impl RootView {
             // 撤销历史都不跟过来）。
             self.connect_input = None;
             self.connect_sub = None;
+            self.connect_pin_input = None;
             return;
         }
         if self.connect_input.is_none() {
@@ -3666,8 +3682,44 @@ impl RootView {
         let Some(state) = self.connect_input.clone() else {
             return;
         };
-        if !state.read(cx).focus_handle(cx).is_focused(window) {
+        // 焦点守卫：用户点进了「TLS 指纹」框时**不能**把焦点抢回地址框——
+        // 两个框每帧互相拉焦点就是焦点乒乓（无限重绘）。
+        let pin_focused = self
+            .connect_pin_input
+            .as_ref()
+            .is_some_and(|s| s.read(cx).focus_handle(cx).is_focused(window));
+        if !state.read(cx).focus_handle(cx).is_focused(window) && !pin_focused {
             state.update(cx, |s, cx| s.focus(window, cx));
+        }
+    }
+
+    /// 「TLS 指纹（可选）」输入框：开着就确保存在（**不**每帧抢焦点）。
+    ///
+    /// 与地址框同生命周期（关对话框一起丢），但聚焦策略相反：地址框是「每帧
+    /// 确保聚焦」（它是对话框的主输入），这个框只在用户点进去时持有焦点——
+    /// 每帧也抢就是两个框互相夺焦点，原地乒乓无限重绘（模态输入框共用的坑，
+    /// 见模块文档 `input_owns_focus` 那段）。
+    fn sync_connect_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal != Modal::ConnectServer {
+            self.connect_pin_input = None;
+            return;
+        }
+        if self.connect_pin_input.is_none() {
+            let state = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("TLS 指纹（可选）：自签名 FTPS 粘贴证书 SHA-256，冒号可省")
+            });
+            let sub = cx.subscribe_in(
+                &state,
+                window,
+                |this: &mut Self, _state, ev: &InputEvent, _window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.connect_submit(cx);
+                    }
+                },
+            );
+            self.connect_pin_input = Some(state);
+            self.connect_pin_sub = Some(sub);
         }
     }
 
@@ -3732,7 +3784,7 @@ impl RootView {
         }
     }
 
-    /// 用对话框里输入的地址发起连接。
+    /// 用对话框里输入的地址发起连接（指纹框一并带上，空 = 不钉）。
     pub(crate) fn connect_submit(&mut self, cx: &mut Context<Self>) {
         let text = self
             .connect_input
@@ -3742,19 +3794,26 @@ impl RootView {
         if text.is_empty() {
             return;
         }
-        self.start_connect(text, cx);
+        let pin = self
+            .connect_pin_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .filter(|p| !p.is_empty());
+        self.start_connect(text, pin, cx);
     }
 
     /// 点「已记住的服务器」里的一行：直接用存下的凭据连这台。
     pub(crate) fn connect_to(&mut self, endpoint: String, cx: &mut Context<Self>) {
-        self.start_connect(endpoint, cx);
+        // 指纹不在这条路上传：finish_connect 会把这台**记下的**指纹补到 URL 上。
+        self.start_connect(endpoint, None, cx);
     }
 
     /// 发起一次连接，把结果落到 UI 状态上。
     ///
     /// 地址框回车与点服务器列表共用这条路（真正的建 socket 在 `connect_remote`
-    /// 内部的 blocking 池里，这里只管等）。
-    fn start_connect(&mut self, address: String, cx: &mut Context<Self>) {
+    /// 内部的 blocking 池里，这里只管等）。`pin` 是地址框里填的证书指纹，
+    /// 连接要凭据时（弹认证框）得原样带过去，认证重试那一轮不能丢。
+    fn start_connect(&mut self, address: String, pin: Option<String>, cx: &mut Context<Self>) {
         let app = self.app();
         self.connect_error = None;
         if let Some(auth) = self.connect_auth.as_mut() {
@@ -3763,10 +3822,10 @@ impl RootView {
         cx.notify();
         let this = cx.entity().clone();
         cx.spawn(async move |_weak, cx| {
-            let outcome = app.connect_remote(&address).await;
+            let outcome = app.connect_remote_with_pin(&address, pin.clone()).await;
             let connected = outcome.is_ok();
             this.update(cx, |v, cx| {
-                v.on_connect_result(outcome, cx);
+                v.on_connect_result(outcome, pin, cx);
                 if connected {
                     // 连上了就把这台记进列表（**不写密码**——密码要不要记住由
                     // 认证弹窗里那个勾决定，这里不替用户做主）。
@@ -3784,6 +3843,7 @@ impl RootView {
         };
         let endpoint = auth.endpoint.clone();
         let remember = auth.remember;
+        let pin = auth.pin.clone();
         let user = auth
             .user
             .as_ref()
@@ -3811,11 +3871,12 @@ impl RootView {
         let this = cx.entity().clone();
         cx.spawn(async move |_weak, cx| {
             let outcome = app
-                .connect_remote_with_credentials(&endpoint, &user, &password)
+                .connect_remote_with_credentials(&endpoint, &user, &password, pin.clone())
                 .await;
             this.update(cx, |v, cx| {
                 let connected = outcome.is_ok();
-                v.on_connect_result(outcome, cx);
+                // 指纹原样回传：认证再来一轮（比如 530 之后密码又错了）不能丢。
+                v.on_connect_result(outcome, pin, cx);
                 if connected {
                     // 勾了「记住密码」才把密码交给钥匙串；没勾也照样把这台记进
                     // 列表——下次打开对话框只需补个密码。
@@ -3892,11 +3953,13 @@ impl RootView {
     /// 连接结果的统一落点（地址回车 / 点列表 / 认证提交都会走到）。
     ///
     /// * `Ok` —— 关掉对话框（记住服务器由调用方另行处理）；
-    /// * `NeedsCredentials` —— 换到认证弹窗，并带上这次用的用户名；
+    /// * `NeedsCredentials` —— 换到认证弹窗，并带上这次用的用户名与证书指纹
+    ///   （地址框里钉过的，认证重试这轮不能丢）；
     /// * `Message` —— 就地显示错误，对话框留着让用户改地址重试。
     pub(crate) fn on_connect_result(
         &mut self,
         outcome: Result<(), mo_app::ConnectFailure>,
+        pin: Option<String>,
         cx: &mut Context<Self>,
     ) {
         match outcome {
@@ -3914,6 +3977,7 @@ impl RootView {
                     endpoint,
                     (!detail.is_empty()).then_some(detail),
                     &user,
+                    pin,
                 ));
                 self.modal = Modal::ConnectAuth;
             }
@@ -4024,6 +4088,41 @@ impl RootView {
         }
         body = body.child(field);
 
+        // TLS 指纹（可选）：自签名 / 内网 FTPS 的「信任此主机」。留空 = 正常走
+        // 系统证书校验。钉的是叶子证书 SHA-256——不是跳过校验，服务器换证书
+        // （可能被劫持）后握手照样失败，必须重新钉。
+        let mut pin_field = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(28.0))
+            .px(px(6.0))
+            .rounded(px(6.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::separator())
+            // 测试用（release no-op）：定位指纹框。
+            .debug_selector(|| "mo-connect-pin-field".to_string());
+        if let Some(state) = &self.connect_pin_input {
+            pin_field = pin_field.child(
+                div()
+                    .debug_selector(|| "mo-connect-pin-input-box".to_string())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        Input::new(state)
+                            .appearance(false)
+                            .bordered(false)
+                            .small()
+                            .text_size(px(12.0))
+                            .p(px(0.0)),
+                    ),
+            );
+        }
+        body = body.child(pin_field);
+
         // 「使用说明」折叠区：默认收起，点一下展开各协议的地址写法。
         // 放在地址框正下方——用户敲地址卡住时最需要它，但平时不该占对话框高度。
         let ent_help = entity.clone();
@@ -4055,7 +4154,7 @@ impl RootView {
         if self.connect_help_open {
             // 每种已支持的协议一行：地址写法 + 说明。行各自带 .id()——同一 text!
             // 站点在循环里渲染多次时，祖先 ID 链不同才不会撞 a11y 节点（debug 会崩）。
-            const LINES: [(&str, &str); 5] = [
+            const LINES: [(&str, &str); 6] = [
                 (
                     "ftp://主机[:端口]",
                     "FTP，默认端口 21；匿名连接可不写用户名",
@@ -4072,6 +4171,10 @@ impl RootView {
                 (
                     "通用：协议://用户名:密码@主机[:端口]/路径",
                     "密码可不写，需要时会弹框询问；服务器子路径直接接在后面（如 /remote.php/dav）",
+                ),
+                (
+                    "自签名 FTPS",
+                    "握手报证书错误时，把服务器证书的 SHA-256 指纹粘进「TLS 指纹」框即信任此主机（钉一次长期生效）",
                 ),
             ];
             let mut panel = div()
@@ -4547,9 +4650,10 @@ impl RootView {
                     let _ = weak.update(cx, |v, cx| match outcome {
                         Ok(()) => v.remember_active_server(cx),
                         // 地址栏这条路没有对话框，但「需要登录」的处置一样——直接弹
-                        // 认证框（`on_connect_result` 负责把用户名带进去）。
+                        // 认证框（`on_connect_result` 负责把用户名带进去）。地址栏
+                        // 没有指纹框可带，`pin` 恒为 `None`（存过的指纹引擎会自己补）。
                         Err(failure @ mo_app::ConnectFailure::NeedsCredentials { .. }) => {
-                            v.on_connect_result(Err(failure), cx);
+                            v.on_connect_result(Err(failure), None, cx);
                         }
                         // 其余失败走信息提示：地址栏那边没有可以留在原地显示错误的
                         // 对话框。
@@ -17218,6 +17322,45 @@ mod tests {
         assert_eq!(files_selected, 0, "⌘A 不该选到后面的文件列表");
     }
 
+    /// 「TLS 指纹」框渲染出来，且**点进去之后焦点不被地址框抢走**。
+    ///
+    /// 地址框的 sync 是「每帧确保聚焦」；指纹框要是也那样，两个框就互相抢焦点
+    /// （原地乒乓无限重绘）。守卫是地址框那侧的「指纹框握着焦点就让」。
+    #[test]
+    fn the_pin_field_renders_and_keeps_focus_against_the_address_field() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        cx.update(|_window, cx| root.update(cx, |v, cx| v.open_connect_dialog(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        assert!(
+            cx.debug_bounds("mo-connect-pin-field").is_some(),
+            "连接对话框的 TLS 指纹框没有渲染出来"
+        );
+        let pin = cx.update(|_window, cx| {
+            root.read(cx)
+                .connect_pin_input
+                .clone()
+                .expect("打开对话框后指纹框应当已经建好")
+        });
+
+        use gpui_kit::Focusable as _;
+        // 模拟「用户点进了指纹框」：焦点给它，再过一帧 sync。
+        cx.update(|window, cx| pin.update(cx, |s, cx| s.focus(window, cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let pin_focused = cx.update(|window, cx| pin.read(cx).focus_handle(cx).is_focused(window));
+        assert!(
+            pin_focused,
+            "点进指纹框之后地址框把焦点抢回去了——两个输入框每帧互抢就是焦点乒乓"
+        );
+    }
+
     /// 认证弹窗的密码框是**掩码**的——「密码全部显示为星号」就落在这里。
     ///
     /// 掩码由输入组件的绘制层实现（每个字符画成圆点），`is_masked()` 正是那个
@@ -17239,6 +17382,7 @@ mod tests {
                     "ftp://example.com:2121".to_string(),
                     Some("530 Login incorrect.".to_string()),
                     "alice",
+                    None,
                 ));
                 v.modal = Modal::ConnectAuth;
                 cx.notify();
@@ -17304,6 +17448,7 @@ mod tests {
                     endpoint: "ftp://example.com:2121".to_string(),
                     user: "alice".to_string(),
                     last_used: 1,
+                    tls_fingerprint: None,
                 }];
                 v.modal = Modal::ConnectServer;
                 cx.notify();
@@ -17418,6 +17563,7 @@ mod tests {
                     endpoint: endpoint.to_string(),
                     user: user.to_string(),
                     last_used: i as i64,
+                    tls_fingerprint: None,
                 })
                 .collect();
                 v.modal = Modal::ConnectServer;
@@ -17612,6 +17758,7 @@ mod tests {
                     "ftp://example.com:2121".to_string(),
                     None,
                     "",
+                    None,
                 ));
                 v.modal = Modal::ConnectAuth;
                 cx.notify();
@@ -17719,6 +17866,7 @@ mod tests {
                     "ftp://example.com:2121".to_string(),
                     None,
                     "alice",
+                    None,
                 ));
                 v.modal = Modal::ConnectAuth;
                 cx.notify();

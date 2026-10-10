@@ -20,6 +20,8 @@ tracing.workspace = true
 # 刻意避开 OpenSSL / native-tls），证书校验走系统信任库。
 suppaftp.workspace = true
 rustls-platform-verifier.workspace = true
+# 证书钉选算叶子证书的 SHA-256（自签名 FTPS 的「信任此主机」，见 ftp.rs）。
+sha2.workspace = true
 
 # SFTP 后端：纯 Rust SSH（russh），默认 aws-lc-rs 加密后端，无本机系统依赖。
 russh.workspace = true

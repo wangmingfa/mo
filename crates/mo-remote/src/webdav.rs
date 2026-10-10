@@ -26,6 +26,7 @@
 //! 阶段就归成 `AuthRequired`，UI 才会弹「输入账号密码」的框，而不是浏览时才报错。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -50,6 +51,57 @@ pub struct WebDavFileSystem {
     /// 底层客户端：`Clone + Send + Sync`，方法都收 `&self`，连接池由 reqwest 自管，
     /// 因此不必像 FTP/SFTP 那样用 Mutex 串起来。
     client: reqwest_dav::Client,
+    /// 读侧 Range 支持的探测缓存（三态：[`RANGE_UNKNOWN`] / [`RANGE_YES`] /
+    /// [`RANGE_NO`]）。**探一次就记住**：第一次分块读若发现服务器无视 Range
+    /// 回了整份 200，之后每块都不再白发 Range 头（少一次注定落空的区间请求，
+    /// 内存行为不变）。`Arc` 是因为探测发生在 `dispatch` 的 `'static` future 里。
+    range_support: Arc<AtomicU8>,
+}
+
+/// [`WebDavFileSystem::range_support`] 的三态取值。
+const RANGE_UNKNOWN: u8 = 0;
+/// 服务器认识 Range（回过 206）——继续按块发区间请求。
+const RANGE_YES: u8 = 1;
+/// 服务器无视 Range（回过 200 整份）——之后直接整份拉、本地切。
+const RANGE_NO: u8 = 2;
+
+/// 这一读该不该带 Range 头（探测过「不支持」就不再带）。
+fn should_send_range(prior: u8) -> bool {
+    prior != RANGE_NO
+}
+
+/// 探测过这一读之后，Range 支持的新状态。
+///
+/// 判据表（写成有单测的纯函数）：只有 206 证明「支持」、200 证明「被无视」；
+/// 416 是「认识 Range 但区间越界」——**不能**因为越界就把支持记成不支持；
+/// 其余状态码（重定向 / 认证 / 错误）不改变认知。已探明的结论是粘的：
+/// 不因个别请求的怪应答翻回去。
+fn range_support_after(status: reqwest::StatusCode, prior: u8) -> u8 {
+    match prior {
+        RANGE_YES | RANGE_NO => prior,
+        _ => {
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                RANGE_YES
+            } else if status == reqwest::StatusCode::OK {
+                RANGE_NO
+            } else {
+                RANGE_UNKNOWN
+            }
+        }
+    }
+}
+
+/// 从「整份 200」里切出 `[offset, offset+len)` 区间；越界给空。
+///
+/// 服务器不支持 Range 时每块都走这里——行为仍正确，只是内存退回整份
+/// （服务器限制，devlog 已记）。
+fn slice_full_body(bytes: &[u8], offset: u64, len: u64) -> Vec<u8> {
+    let start = offset as usize;
+    if start >= bytes.len() {
+        return Vec::new();
+    }
+    let end = (start + len as usize).min(bytes.len());
+    bytes[start..end].to_vec()
 }
 
 /// 分块写时各块攒到本地的临时文件，最后整份 PUT。临时文件名由远端路径派生——
@@ -111,6 +163,7 @@ impl WebDavFileSystem {
             url: url.clone(),
             rt,
             client,
+            range_support: Arc::new(AtomicU8::new(RANGE_UNKNOWN)),
         })
     }
 
@@ -413,8 +466,11 @@ impl FileSystem for WebDavFileSystem {
 
     // 读侧也按块：发 `Range: bytes=offset-(offset+len-1)` 的 GET（206 即这一块），
     // 不再整份拉进内存。服务器若不支持 Range 会回 200 整份——这种情况按区间切出，
-    // 行为仍正确，只是内存退回整份（服务器限制，devlog 已记）。越界（offset>=大小）
-    // 回 416，直接给空，与 trait 默认语义一致。
+    // 行为仍正确，只是内存退回整份（服务器限制，devlog 已记）。
+    //
+    // 「支不支持 Range」**探一次就记住**（`range_support`）：第一块发现被无视后，
+    // 后面的块不再白发注定落空的 Range 头，直接整份拉、本地切。越界（offset>=大小）
+    // 回 416，直接给空，与 trait 默认语义一致——416 说明服务器认识 Range，不动缓存。
     async fn read_file_chunk(
         &self,
         path: &Path,
@@ -426,13 +482,18 @@ impl FileSystem for WebDavFileSystem {
         }
         let remote = Self::remote(path);
         let client = self.client.clone();
+        let range_support = self.range_support.clone();
+        let prior = self.range_support.load(Ordering::Relaxed);
+        let send_range = should_send_range(prior);
         self.dispatch("下载", async move {
             let end = offset + len - 1;
             let mut req = client
                 .start_request(reqwest::Method::GET, &remote)
                 .await
                 .map_err(|e| classify("下载", &e))?;
-            req = req.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+            if send_range {
+                req = req.header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+            }
             let resp = req
                 .send()
                 .await
@@ -440,6 +501,11 @@ impl FileSystem for WebDavFileSystem {
             let status = resp.status();
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                 return Ok(Vec::new());
+            }
+            // 探测结论落缓存：只在该变的时候写一笔（多数连接两次写后就稳定了）。
+            let next = range_support_after(status, prior);
+            if next != prior {
+                range_support.store(next, Ordering::Relaxed);
             }
             let bytes = resp
                 .bytes()
@@ -449,13 +515,7 @@ impl FileSystem for WebDavFileSystem {
                 Ok(bytes.to_vec())
             } else {
                 // 200：服务器忽略 Range，返回了整份。按区间切出。
-                let start = offset as usize;
-                if start >= bytes.len() {
-                    Ok(Vec::new())
-                } else {
-                    let end_idx = (start + len as usize).min(bytes.len());
-                    Ok(bytes[start..end_idx].to_vec())
-                }
+                Ok(slice_full_body(&bytes, offset, len))
             }
         })
         .await
@@ -748,6 +808,7 @@ mod tests {
                 .set_auth(Auth::Anonymous)
                 .build()
                 .unwrap(),
+            range_support: Arc::new(AtomicU8::new(RANGE_UNKNOWN)),
         };
         fs.cleanup_staging(Path::new(remote));
         assert!(
@@ -755,5 +816,51 @@ mod tests {
             "取消 / 失败后残留的 staging 临时文件应被清掉"
         );
         let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+    }
+
+    /// Range 支持的探测判据表：206=支持、200=被无视、**416 不翻案**（那是
+    /// 「认识 Range 但越界」）、其余状态不改变认知；探明的结论粘住不翻回去。
+    #[test]
+    fn range_support_is_probed_once_and_sticky() {
+        use reqwest::StatusCode;
+        // 未知起步：206 记成支持，200 记成不支持。
+        assert_eq!(
+            range_support_after(StatusCode::PARTIAL_CONTENT, RANGE_UNKNOWN),
+            RANGE_YES
+        );
+        assert_eq!(range_support_after(StatusCode::OK, RANGE_UNKNOWN), RANGE_NO);
+        // 416 是「认识 Range 但越界」——绝不能把支持记成不支持。
+        assert_eq!(
+            range_support_after(StatusCode::RANGE_NOT_SATISFIABLE, RANGE_UNKNOWN),
+            RANGE_UNKNOWN
+        );
+        // 重定向 / 认证失败这类应答不改变认知。
+        assert_eq!(
+            range_support_after(StatusCode::UNAUTHORIZED, RANGE_UNKNOWN),
+            RANGE_UNKNOWN
+        );
+        // 探明的结论是粘的：后面来什么应答都不翻回去。
+        assert_eq!(range_support_after(StatusCode::OK, RANGE_YES), RANGE_YES);
+        assert_eq!(
+            range_support_after(StatusCode::PARTIAL_CONTENT, RANGE_NO),
+            RANGE_NO
+        );
+        // 缓存驱动行为：探明「不支持」后不再发 Range 头；「支持」与未知照发。
+        assert!(should_send_range(RANGE_UNKNOWN));
+        assert!(should_send_range(RANGE_YES));
+        assert!(!should_send_range(RANGE_NO));
+    }
+
+    /// 服务器回了整份 200 时的区间切出：中段、跨到末尾截断、起点越界给空。
+    #[test]
+    fn full_body_responses_are_sliced_to_the_requested_window() {
+        let body: Vec<u8> = (0u8..=9).collect(); // 0 1 2 … 9
+        assert_eq!(slice_full_body(&body, 2, 3), vec![2, 3, 4]);
+        // 请求超出末尾：只给到结尾为止（与 206 的区间语义一致）。
+        assert_eq!(slice_full_body(&body, 8, 5), vec![8, 9]);
+        // 起点越界：空。
+        assert!(slice_full_body(&body, 100, 5).is_empty());
+        // len=0：空。
+        assert!(slice_full_body(&body, 0, 0).is_empty());
     }
 }

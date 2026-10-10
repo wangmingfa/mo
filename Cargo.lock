@@ -5008,6 +5008,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "rustls-platform-verifier",
+ "sha2 0.11.0",
  "suppaftp",
  "thiserror 2.0.21",
  "tokio",
