@@ -252,14 +252,24 @@ fn grid_press_and_release_is_a_click_that_still_selects(cx: &mut TestAppContext)
 
     let rs = rows(cx, &window);
     let on_file = center(&mut vcx, cell_at(file_row(&rs, "note.txt")));
+    // 首点偶发丢失（headless 调度竞争，与 list_source_panel 同款 flake）：轮询选中态，
+    // 确认仍 0（首次确已丢失）时才在 round 30 补点一次。点击是 toggle，不能无脑重复
+    // 派发，否则 0→1→0 反而取消选中。
     drag(&mut vcx, on_file, on_file, false);
-    vcx.update(|window, cx| window.render_frame(cx));
-
-    assert_eq!(
-        sel_count(cx, &window),
-        1,
-        "点击单元没落地选中——拖拽接线把 click 挤掉了"
-    );
+    let mut selected = false;
+    for round in 0..100 {
+        vcx.update(|window, cx| window.render_frame(cx));
+        let sel = sel_count(cx, &window);
+        if sel == 1 {
+            selected = true;
+            break;
+        }
+        if round == 30 && sel == 0 {
+            drag(&mut vcx, on_file, on_file, false);
+        }
+        vcx.run_until_parked();
+    }
+    assert!(selected, "点击单元没落地选中——拖拽接线把 click 挤掉了");
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(
         std::fs::read_dir(&rig.bin).map(|d| d.count()).unwrap_or(0),

@@ -270,3 +270,24 @@ for _ in 0..n - 1 { cx.simulate_keystrokes("down"); }
   连 panic 都没有，先见到「没 result 行」就该怀疑进程级死亡。
 * **验证**：`--nocapture --test-threads=4` 连跑 12 次全绿（36/36）；全量 CI 重跑不再出
   「N 行没画出来」。
+
+## 11. 点击类 flake 硬化（2026-10-10）
+
+* **根因（区别于 §9/§10 的 SIGABRT）**：`clicking_a_row_after_scrolling` /
+  `grid_press_and_release_is_a_click_that_still_selects` / `new_folder_goes_into_the_selected_directory`
+  这类测试，首点（press+release 同点当 click）在 headless 调度与真线程竞争下偶发整段丢失——
+  事件派发了但 `run_until_parked` 那一拍没处理完，断言时选中态还是 0。**这是点击丢失，不是
+  进程级 SIGABRT**（后者是 gpui 调度器清理阶段的随机 panic，落在哪条测试名都随机，测试侧无解，
+  见 run-ci.sh 文件头与 §9/§10）。
+* **修法（照 `list_source_panel` 范式，但加 toggle 保护）**：点击后轮询期望状态，确认仍 0
+  （首次确已丢失）时才在 round 30 补点一次。**点击是 toggle——补点前必须确认仍 0**，否则
+  0→1→0 反而取消选中，比不补还糟；不靠 round 60 二次补点（极延迟的首次 click 与补点重叠会
+  来回 toggle，只有 `list_source_panel` 那种「开模态幂等」才敢补两次）。
+* **涉及测试**：`tests/layout.rs::clicking_a_row_after_scrolling_still_selects_it`、
+  `tests/grid_drag.rs::grid_press_and_release_is_a_click_that_still_selects`、
+  `src/app.rs::new_folder_goes_into_the_selected_directory`。
+* **边界（必须说清）**：本批只消点击丢失类 flake。SIGABRT 框架级 panic 在满载机器上仍会概率性
+  出现，本地跑 `bash scripts/run-ci.sh --retry-flaky` 用整步重跑兜底；CI 上概率性红是已知的、
+  与 `ci.yml` 严格一致，不靠测试侧硬编码掩盖。
+* **验证**：三个目标测试 + `grid_drag` 全集（5）+ `new_folder` 系列（3）在 `--test-threads=1`
+  下全绿；低负载下整包 mo-ui lib（183）亦全绿。

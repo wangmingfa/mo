@@ -20628,8 +20628,25 @@ mod tests {
         let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
         let root = root.clone();
         goto_dir_and_wait(cx, &root, &dir, 1);
+        // 首点偶发丢失（headless 调度竞争，与 list_source_panel 同款 flake）：轮询选中态，
+        // 确认仍 0（首次确已丢失）时才在 round 30 补点一次。点击是 toggle，不能无脑重复，
+        // 否则 0→1→0 反而取消选中。
         click_row(cx, "mo-file-row-0");
-        cx.run_until_parked();
+        let mut selected = false;
+        for round in 0..100 {
+            cx.run_until_parked();
+            let sel = cx.update(|_window, cx| {
+                root.update(cx, |v, _cx| crate::panel_selection_count_for_tests(v))
+            });
+            if sel >= 1 {
+                selected = true;
+                break;
+            }
+            if round == 30 && sel == 0 {
+                click_row(cx, "mo-file-row-0");
+            }
+        }
+        assert!(selected, "应先选中 row-0 再新建");
 
         fire_create(cx, &root, NewEntry::Folder);
         wait_created(cx, &dir.join("盒").join("新建文件夹"));

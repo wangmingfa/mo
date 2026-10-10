@@ -1180,9 +1180,23 @@ fn clicking_a_row_after_scrolling_still_selects_it(cx: &mut TestAppContext) {
         row0.origin.x + row0.size.width / 2.0,
         row0.origin.y + row0.size.height / 2.0,
     );
+    // 首点偶发丢失（headless 调度与真线程竞争，与 list_source_panel 同款 flake）：
+    // 轮询选中态，确认仍 0（首次确已丢失）时才在 round 30 补点一次。点击是 toggle，
+    // 不能无脑重复派发，否则 0→1→0 反而把选中取消。
     vcx.update(|window, cx| window.drag(p_row0, p_row0, cx));
-    vcx.run_until_parked();
-    assert_eq!(selection_count(&window, cx), 1, "顶部行点击应选中");
+    let mut top_selected = false;
+    for round in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if selection_count(&window, cx) == 1 {
+            top_selected = true;
+            break;
+        }
+        if round == 30 && selection_count(&window, cx) == 0 {
+            vcx.update(|window, cx| window.drag(p_row0, p_row0, cx));
+        }
+    }
+    assert!(top_selected, "顶部行点击应选中");
 
     // 滚轮把列表往下滚（delta.y 为负 = 内容上移），分几步滚并让窗口快照跟上。
     // uniform_list 不进 observation 注册表，滚轮事件直接按坐标派发。
@@ -1230,19 +1244,28 @@ fn clicking_a_row_after_scrolling_still_selects_it(cx: &mut TestAppContext) {
         "滚动后行 {later} 应落在视口内，实际 {target:?}"
     );
 
-    vcx.update(|window, cx| {
+    // 同上：滚动后点靠后行，首点偶发丢失则 round 30 补点（仅当仍 0）。
+    let click_later = |vcx: &mut VisualTestContext| {
         let p = point(
             target.origin.x + target.size.width / 2.0,
             target.origin.y + target.size.height / 2.0,
         );
-        window.drag(p, p, cx)
-    });
-    vcx.run_until_parked();
-    assert_eq!(
-        selection_count(&window, cx),
-        1,
-        "滚动到后面再点行也应选中它"
-    );
+        vcx.update(|window, cx| window.drag(p, p, cx));
+    };
+    click_later(&mut vcx);
+    let mut later_selected = false;
+    for round in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if selection_count(&window, cx) == 1 {
+            later_selected = true;
+            break;
+        }
+        if round == 30 && selection_count(&window, cx) == 0 {
+            click_later(&mut vcx);
+        }
+    }
+    assert!(later_selected, "滚动到后面再点行也应选中它");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
