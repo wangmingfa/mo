@@ -16,23 +16,41 @@
 //!   本就不该碰异步 worker）。
 //! - 其余 `async` 方法：经 `rt.handle().spawn(...)` 把任务派到常驻 worker 上跑，
 //!   外层只 `await` 结果——既正确又不会阻塞 mo-app 的 runtime。
+//!
+//! ## 通道池
+//!
+//! 一条 SSH 连接可以开多条 sftp 通道（OpenSSH 默认 `MaxSessions 10`），这里开
+//! [`CHANNELS`] 条组成池：每个操作按轮转起点挑一条**空闲**通道，全忙才排队。
+//! 之前的单通道 + 全局锁把列目录 / 读块 / 写块 / stat 全串成一条队，批量传输
+//! 时宽带宽根本吃不满；池化后同一连接上的多个文件传输真并发（传输侧单个文件的
+//! 块仍严格按序，见 `transfer.rs`，所以不存在 truncate 竞态）。
+//! 通道跟着连接走：连接断了所有通道一起死，重建整份 [`SftpFileSystem`]（上层
+//! 闲置自愈已有），不做单通道级别的复活。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
-use russh::client::{connect, AuthResult, Config, Handler};
+use russh::client::{connect, AuthResult, Config, Handle, Handler};
 use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::fs::DirEntry;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileType, OpenFlags};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::{RemoteError, RemoteUrl};
+
+/// 一条 SSH 连接上并发的 sftp 通道数。
+///
+/// OpenSSH 默认 `MaxSessions 10`，取 4：够把批量传输的读块 / 写块 / 列目录岔开，
+/// 又不至于撞上收紧过配置的服务器。握手时逐条开，开不满（服务器限了）就用
+/// 已开成的——至少 1 条，退化成原来的串行行为。
+const CHANNELS: usize = 4;
 
 /// russh 需要的 Handler：这里只接管「是否信任服务器公钥」。
 ///
@@ -56,8 +74,14 @@ pub struct SftpFileSystem {
     url: RemoteUrl,
     /// 仅供本连接使用的 runtime（见模块文档）。
     rt: Arc<Runtime>,
-    /// SFTP 会话：`&mut` 才能发请求，而 trait 只给 `&self`，用锁包一层。
-    sftp: Arc<Mutex<SftpSession>>,
+    /// SSH 连接句柄：通道池的**宿主**。russh 把应答回执送到它手里的 receiver，
+    /// Handle 一 drop 调度任务就停、所有通道跟着死——必须活到连接结束
+    /// （Drop 里显式断开）。建完池后没有别的用处，但绝不能删。
+    client: StdMutex<Handle<ClientHandler>>,
+    /// SFTP 通道池：每条通道一把锁，操作按轮转起点挑空闲的，全忙才排队。
+    pool: Arc<Vec<Arc<Mutex<SftpSession>>>>,
+    /// 轮转游标：让各操作从不同通道开始找，避免都挤在第 0 条上。
+    next: AtomicUsize,
 }
 
 impl SftpFileSystem {
@@ -84,7 +108,7 @@ impl SftpFileSystem {
         let user = url.user.clone().unwrap_or_else(|| "anonymous".to_string());
         let password = url.password.clone().unwrap_or_default();
 
-        let sftp = rt.block_on(async {
+        let (client, pool) = rt.block_on(async {
             let config = Arc::new(Config::default());
             let mut client = connect(config, addr, ClientHandler)
                 .await
@@ -99,24 +123,26 @@ impl SftpFileSystem {
             if !matches!(auth, AuthResult::Success) {
                 return Err(RemoteError::auth("认证", "服务器拒绝提供的凭据"));
             }
-            let channel = client
-                .channel_open_session()
-                .await
-                .map_err(|e| transport_error("打开通道", e))?;
-            channel
-                .request_subsystem(true, "sftp")
-                .await
-                .map_err(|e| transport_error("启动 sftp 子系统", e))?;
-            let stream = channel.into_stream();
-            SftpSession::new(stream)
-                .await
-                .map_err(|e| transport_error("初始化 sftp", e))
+            let mut pool = Vec::new();
+            for _ in 0..CHANNELS {
+                match open_sftp_channel(&mut client).await {
+                    Ok(sftp) => pool.push(Arc::new(Mutex::new(sftp))),
+                    // 服务器限了 MaxSessions 之类：用已开成的，至少 1 条。
+                    Err(_) => break,
+                }
+            }
+            if pool.is_empty() {
+                return Err(RemoteError::transport("打开通道", "sftp 子系统启动失败"));
+            }
+            Ok((client, Arc::new(pool)))
         })?;
 
         Ok(Self {
             url: url.clone(),
             rt,
-            sftp: Arc::new(Mutex::new(sftp)),
+            client: StdMutex::new(client),
+            pool,
+            next: AtomicUsize::new(0),
         })
     }
 
@@ -132,9 +158,10 @@ impl SftpFileSystem {
     /// FIN 时请求会一直等（`russh-sftp` 自己的每请求超时是 10 秒，比这里长），
     /// 超时按「断了」处理，交给上层重建连接。
     pub fn is_alive(&self) -> bool {
+        let pool = self.pool.clone();
         self.rt.block_on(async {
             let probe = tokio::time::timeout(crate::PROBE_TIMEOUT, async {
-                let s = self.sftp.lock().await;
+                let s = acquire_slot(&pool, 0).await;
                 s.metadata(".".to_string()).await
             })
             .await;
@@ -161,6 +188,35 @@ impl SftpFileSystem {
     {
         self.rt.handle().spawn(f).await.expect("sftp 后台任务失败")
     }
+}
+
+/// 在一条 SSH 连接上开一条 sftp 通道（open session → request subsystem → SFTP 握手）。
+async fn open_sftp_channel(client: &mut Handle<ClientHandler>) -> Result<SftpSession, RemoteError> {
+    let channel = client
+        .channel_open_session()
+        .await
+        .map_err(|e| transport_error("打开通道", e))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| transport_error("启动 sftp 子系统", e))?;
+    SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| transport_error("初始化 sftp", e))
+}
+
+/// 从通道池挑一把锁：从 `start` 起轮转找**空闲**的，全忙则回起点排队。
+///
+/// 独立成泛型函数是为了脱离网络单测（拿 `T = usize` 模拟通道编号）。
+async fn acquire_slot<T>(pool: &[Arc<Mutex<T>>], start: usize) -> MutexGuard<'_, T> {
+    let n = pool.len();
+    for k in 0..n {
+        let i = (start + k) % n;
+        if let Ok(guard) = pool[i].try_lock() {
+            return guard;
+        }
+    }
+    pool[start % n].lock().await
 }
 
 /// 把 SFTP 侧的错误分成「连接断了」与「这一步没做成」。
@@ -203,10 +259,11 @@ impl FileSystem for SftpFileSystem {
 
     async fn read_dir(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         let rd = self
             .run(async move {
-                let sftp = sftp.lock().await;
+                let sftp = acquire_slot(&pool, start).await;
                 sftp.read_dir(remote).await
             })
             .await
@@ -216,11 +273,12 @@ impl FileSystem for SftpFileSystem {
 
     fn read_dir_blocking(&self, path: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         let rd = self
             .rt
             .block_on(async move {
-                let sftp = sftp.lock().await;
+                let sftp = acquire_slot(&pool, start).await;
                 sftp.read_dir(remote).await
             })
             .map_err(|e| MoError::from(transport_error("列目录", e)))?;
@@ -229,10 +287,11 @@ impl FileSystem for SftpFileSystem {
 
     async fn metadata(&self, path: &Path) -> Result<FileMetadata, MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         let meta = self
             .run(async move {
-                let s = sftp.lock().await;
+                let s = acquire_slot(&pool, start).await;
                 s.metadata(remote).await
             })
             .await
@@ -247,9 +306,10 @@ impl FileSystem for SftpFileSystem {
 
     async fn create_dir(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.create_dir(remote).await
         })
         .await
@@ -258,9 +318,10 @@ impl FileSystem for SftpFileSystem {
 
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.read(remote).await
         })
         .await
@@ -270,9 +331,10 @@ impl FileSystem for SftpFileSystem {
     async fn is_dir(&self, path: &Path) -> bool {
         // SFTP 的 attrs 自带类型位（不用启发式猜），一次 metadata 就能定。
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.metadata(remote)
                 .await
                 .map(|a| a.is_dir())
@@ -284,9 +346,10 @@ impl FileSystem for SftpFileSystem {
     async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let contents = contents.to_vec();
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             // 「目标已存在必须失败」由调用方保证（见 trait 文档）；SFTP 的 write 会覆盖，
             // 这里先探一次存在性：存在就拒绝，绝不静默覆盖远端数据。
             if s.try_exists(remote.clone())
@@ -310,9 +373,10 @@ impl FileSystem for SftpFileSystem {
     async fn write_file_chunk(&self, path: &Path, offset: u64, data: &[u8]) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let data = data.to_vec();
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             let flags = if offset == 0 {
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE
             } else {
@@ -340,9 +404,10 @@ impl FileSystem for SftpFileSystem {
 
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.remove_file(remote).await
         })
         .await
@@ -351,9 +416,10 @@ impl FileSystem for SftpFileSystem {
 
     async fn remove_dir(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.remove_dir(remote).await
         })
         .await
@@ -363,9 +429,10 @@ impl FileSystem for SftpFileSystem {
     async fn rename(&self, from: &Path, to: &Path) -> Result<(), MoError> {
         let from = Self::remote(from);
         let to = Self::remote(to);
-        let sftp = self.sftp.clone();
+        let pool = self.pool.clone();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         self.run(async move {
-            let s = sftp.lock().await;
+            let s = acquire_slot(&pool, start).await;
             s.rename(from, to).await
         })
         .await
@@ -375,9 +442,19 @@ impl FileSystem for SftpFileSystem {
 
 impl Drop for SftpFileSystem {
     fn drop(&mut self) {
-        // 尽量优雅地关掉 sftp 通道：失败无所谓（连接可能早就断了），但不能在 drop 里 panic。
-        if let Ok(sftp) = self.sftp.try_lock() {
-            let _ = self.rt.block_on(sftp.close());
+        // 尽量优雅地关掉每条空闲的 sftp 通道：失败无所谓（连接可能早就断了），
+        // 但不能在 drop 里 panic。忙着的通道不碰（等它自己随连接关闭）。
+        for slot in self.pool.iter() {
+            if let Ok(sftp) = slot.try_lock() {
+                let _ = self.rt.block_on(sftp.close());
+            }
+        }
+        // 显式断开 SSH 连接：Handle 手里的 receiver 是调度任务的应答出口，
+        // 静默 drop 会让对端等到超时才发现我们走了。
+        if let Ok(client) = self.client.lock() {
+            let _ =
+                self.rt
+                    .block_on(client.disconnect(russh::Disconnect::ByApplication, "bye", "en"));
         }
     }
 }
@@ -412,5 +489,82 @@ mod tests {
             matches!(got, Err(RemoteError::Unsupported(ref scheme)) if scheme == "smb"),
             "未实现的协议要给出明确错误，而不是连上去再炸"
         );
+    }
+
+    /// acquire_slot 返回的守卫拿着哪条通道：拿 `T = usize`（槽位编号）模拟，
+    /// 通道里的内容就是它在池里的下标。
+    fn slot_pool(n: usize) -> Vec<Arc<Mutex<usize>>> {
+        (0..n).map(|i| Arc::new(Mutex::new(i))).collect()
+    }
+
+    #[test]
+    fn acquire_prefers_an_idle_channel_scanning_from_the_start() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = slot_pool(3);
+            // 占住第 0 条：从 0 起找，应跳过它拿到第 1 条。
+            let held = pool[0].clone().lock_owned().await;
+            let got = {
+                let g = acquire_slot(&pool, 0).await;
+                *g
+            };
+            assert_eq!(got, 1, "被占的通道要跳过，拿下一条空闲的");
+            drop(held);
+            // 全空闲时从轮转起点拿：start=2 应直接拿第 2 条。
+            let got = {
+                let g = acquire_slot(&pool, 2).await;
+                *g
+            };
+            assert_eq!(got, 2);
+        });
+    }
+
+    #[test]
+    fn acquire_wraps_around_the_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = slot_pool(3);
+            let got = {
+                let g = acquire_slot(&pool, 5).await;
+                *g
+            };
+            assert_eq!(got, 2, "起点要按池长取模（5 % 3 = 2）");
+        });
+    }
+
+    #[test]
+    fn acquire_parks_on_the_start_slot_when_all_are_busy() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = Arc::new(slot_pool(2));
+            // 三把全占住（2 条全忙）。
+            let h0 = pool[0].clone().lock_owned().await;
+            let h1 = pool[1].clone().lock_owned().await;
+
+            let waiter = tokio::spawn({
+                let pool = pool.clone();
+                async move {
+                    let g = acquire_slot(&pool, 1).await;
+                    *g
+                }
+            });
+            // 释放起点那条（start=1 → pool[1]），等待者应拿到它而不是干等 pool[0]。
+            drop(h1);
+            let got = waiter.await.expect("等待任务不应 panic");
+            assert_eq!(got, 1, "全忙时回轮转起点排队，谁先释放拿谁");
+            drop(h0);
+        });
     }
 }

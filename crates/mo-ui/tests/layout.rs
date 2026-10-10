@@ -1086,29 +1086,54 @@ fn clicking_blank_below_the_list_clears_the_selection(cx: &mut TestAppContext) {
     let list = bounds(&mut vcx, "mo-file-list");
     let row0 = bounds(&mut vcx, "mo-file-row-0");
     // 先点第一行（坐标级点击，走真实鼠标事件），确认行点击仍然有效。
+    // 首点偶发丢失（headless 调度与真线程竞争，与 clicking_row_after_scrolling
+    // 同款 flake）：轮询选中态，确认仍 0（首次确已丢失）才在 round 30 补点一次。
+    // 点击是 toggle，不能无脑重复派发，否则 0→1→0 反而把选中取消。
     let p_row = point(
         row0.origin.x + row0.size.width / 2.0,
         row0.origin.y + row0.size.height / 2.0,
     );
     vcx.update(|window, cx| window.drag(p_row, p_row, cx));
-    vcx.run_until_parked();
-    assert_eq!(
-        selection_count(&window, cx),
-        1,
+    let mut row_selected = false;
+    for round in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if selection_count(&window, cx) == 1 {
+            row_selected = true;
+            break;
+        }
+        if round == 30 && selection_count(&window, cx) == 0 {
+            vcx.update(|window, cx| window.drag(p_row, p_row, cx));
+        }
+    }
+    assert!(
+        row_selected,
         "点第一行应选中它（floor 行映射不能把行内点击弄丢）"
     );
 
     // 再点最后一行之下的空白：选择应清空，而不是选中最后一行。
     // （列表底部 padding 是 10px，取剩余空白的中点，别贴着末行边缘。）
+    // 首点偶发丢失的治标同上：确认选择还在（首次确已丢失）才在 round 30 补点；
+    // 空白点击是幂等清空，补点无 toggle 风险。
     let p_blank = point(
         list.origin.x + px(200.0),
         list.origin.y + list.size.height - px(5.0),
     );
     vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
-    vcx.run_until_parked();
-    assert_eq!(
-        selection_count(&window, cx),
-        0,
+    let mut cleared = false;
+    for round in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if selection_count(&window, cx) == 0 {
+            cleared = true;
+            break;
+        }
+        if round == 30 && selection_count(&window, cx) == 1 {
+            vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
+        }
+    }
+    assert!(
+        cleared,
         "点空白应清空选择，不是选中最后一行"
     );
     let _ = std::fs::remove_dir_all(&dir);

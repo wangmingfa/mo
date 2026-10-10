@@ -440,3 +440,24 @@ crypto provider 做，一点没少。
   **机器级环境劣化**（窗口服务器 / HIToolbox 状态），非 C/D 回归。fmt / check /
   clippy / mo-remote 48 条 / 其余 58 个测试二进制全绿。待机器空闲后重跑
   `bash scripts/run-ci.sh --retry-flaky` 复核。
+
+## 任务 E1：SFTP 并发多通道池（2026-10-10）
+
+问题：`SftpFileSystem` 拿 `Arc<Mutex<SftpSession>>` 包单条通道，列目录 / 读块 /
+写块 / stat **全串一把锁**，批量多文件传输时宽带宽吃不满（连 await 都持锁）。
+
+方案：**一条 SSH 连接开多条 sftp 通道组成池**（russh `Handle` 可反复
+`channel_open_session`；OpenSSH 默认 MaxSessions 10，池取 4）：
+
+* 取槽判据 `acquire_slot`（泛型、可脱网单测）：从轮转起点起扫空闲通道
+  （`try_lock`），全忙才回起点排队；游标 `AtomicUsize::fetch_add` 让各操作
+  从不同通道开始找，不都挤第 0 条。
+* 握手逐条开池，开不满（服务器限了）用已开成的——至少 1 条，退化成原串行行为。
+* 通道跟着连接走：连接断则全池死，仍靠上层闲置自愈重建整份 `SftpFileSystem`，
+  不做单通道级复活。
+* `Handle` 手握 russh 调度任务的应答 receiver，**必须活到连接结束**——存成
+  结构体字段（`StdMutex` 包着），Drop 里显式 `disconnect(ByApplication)`；
+  通道池逐条 try_lock 优雅 close。
+* 竞态审查：传输侧单文件的块严格按序 await（`transfer.rs` 读块→写块链），
+  首块 TRUNCATE 不会和后续块赛跑；跨文件路径互不相干。
+* 测试：acquire 三判据（跳过被占通道 / 起点取模回绕 / 全忙回起点排队）。
