@@ -53,8 +53,9 @@ pub struct WebDavFileSystem {
 }
 
 /// 分块写时各块攒到本地的临时文件，最后整份 PUT。临时文件名由远端路径派生——
-/// 同一远端路径串行传输不会撞（传输循环对单目标是顺序的），残留的临时文件在
-/// `finalize_file_chunk` 里删掉，没走到 finalize（中途失败）的会留着等下次覆盖。
+/// 同一远端路径串行传输不会撞（传输循环对单目标是顺序的）。`finalize_file_chunk`
+/// 在**成功**路径删掉临时文件；取消 / 失败时由传输循环的 Drop guard 调
+/// `cleanup_staging` 兜底清掉，不再留着等下次覆盖。
 fn webdav_stage_path(remote: &str) -> PathBuf {
     let name: String = remote
         .chars()
@@ -552,6 +553,14 @@ impl FileSystem for WebDavFileSystem {
         .await
     }
 
+    // 取消 / 失败时清掉攒在本地临时文件的整份（`finalize_file_chunk` 只在成功路径删）。
+    // 与 `finalize_file_chunk` 同款临时文件名推导，同步删：Drop 不能 await，且是本机文件。
+    fn cleanup_staging(&self, path: &Path) {
+        let remote = Self::remote(path);
+        let tmp = webdav_stage_path(&remote);
+        let _ = std::fs::remove_file(tmp);
+    }
+
     async fn remove_file(&self, path: &Path) -> Result<(), MoError> {
         let remote = Self::remote(path);
         let client = self.client.clone();
@@ -712,5 +721,39 @@ mod tests {
         let entries = entries_from("/", vec![resp("/hello.txt", false)]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, PathBuf::from("/hello.txt"));
+    }
+
+    /// 取消 / 失败时残留的 staging 临时文件必须被清掉：模拟「写到一半的临时文件」，
+    /// 调一次 `cleanup_staging` 后它应消失（不需要真连网——只删本机文件）。
+    #[test]
+    fn cleanup_staging_removes_leftover_temp_file() {
+        let remote = "/pub/incoming/a.bin";
+        let tmp = webdav_stage_path(WebDavFileSystem::remote(Path::new(remote)).as_str());
+        std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert!(tmp.exists(), "预备：临时文件就位");
+
+        // 不需要真连网：cleanup_staging 只碰本机文件，rt / client 都不用。
+        let fs = WebDavFileSystem {
+            url: RemoteUrl::parse("http://example.invalid").unwrap(),
+            rt: Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            ),
+            client: ClientBuilder::new()
+                .set_host("http://example.invalid".to_string())
+                .set_auth(Auth::Anonymous)
+                .build()
+                .unwrap(),
+        };
+        fs.cleanup_staging(Path::new(remote));
+        assert!(
+            !tmp.exists(),
+            "取消 / 失败后残留的 staging 临时文件应被清掉"
+        );
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 }

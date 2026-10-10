@@ -55,6 +55,7 @@ pub use mo_config::{
 pub use thumbnail::ThumbnailScheduler;
 pub use workflows::{run_workflow, StepResult, WorkflowReport};
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -4482,13 +4483,17 @@ impl AppState {
         ids
     }
 
-    /// 冲突确认卡上用户选定后重提：冲突的按决策（覆盖 / 改名 / 跳过），
-    /// 非冲突的照常提交（`resume = true` 让批里可能并存的部分完成文件仍可续写——
-    /// `transfer_tree` 的 `can_resume` 判据会兜底，不满足就改名重传）。
-    pub async fn resolve_conflict(
+    /// 冲突确认卡上用户选定后重提：**逐文件决策**（`decisions` 按冲突路径索引）。
+    /// 冲突的按各自映射走覆盖 / 改名 / 跳过；非冲突的照常提交（`resume = true` 让批里
+    /// 可能并存的部分完成文件仍可续写——`transfer_tree` 的 `can_resume` 判据会兜底，
+    /// 不满足就改名重传）。
+    ///
+    /// 未显式指定的冲突路径回退到安全的「改名」，绝不静默覆盖 / 误删——用户没动的行
+    /// 永远走最保守的默认。
+    pub async fn resolve_conflict_map(
         &self,
         pending: PendingConflict,
-        decision: ConflictDecision,
+        decisions: &HashMap<PathBuf, ConflictDecision>,
     ) -> Vec<u64> {
         let local: Arc<dyn FileSystem> = Arc::new(LocalFileSystem);
         let shares = self.network_shares();
@@ -4499,16 +4504,27 @@ impl AppState {
             };
             let to = pending.dest.join(&name);
             let is_conflict = pending.conflicts.iter().any(|p| p == &to);
-            if is_conflict && decision == ConflictDecision::Skip {
-                continue;
+            if is_conflict {
+                // 逐文件决策：未指定的回退到安全的「改名」。
+                let d = decisions
+                    .get(&to)
+                    .copied()
+                    .unwrap_or(ConflictDecision::Rename);
+                if d == ConflictDecision::Skip {
+                    continue;
+                }
             }
             let src_ep_for = self.net_endpoint(&pending.src_ep, src, &shares, &local);
             let dst_ep_for = self.net_endpoint(&pending.dest_ep, &to, &shares, &local);
             let leg = resolve_transfer_leg(&src_ep_for, &dst_ep_for, &local);
             let mode = if is_conflict {
-                match decision {
+                match decisions
+                    .get(&to)
+                    .copied()
+                    .unwrap_or(ConflictDecision::Rename)
+                {
                     ConflictDecision::Overwrite => SubmitMode::Overwrite,
-                    // 改名：冲突文件走普通路径（free_path 改名，两边都留）。
+                    // 改名 / 未指定：冲突文件走普通路径（free_path 改名，两边都留）。
                     _ => SubmitMode::Normal,
                 }
             } else if leg.is_some() {
@@ -4528,6 +4544,20 @@ impl AppState {
             self.clear_staged();
         }
         ids
+    }
+
+    /// 整批统一一个决策的便捷封装（见 [`Self::resolve_conflict_map`]）：把所有冲突路径
+    /// 映射到同一个决策后转发。旧调用点（与单测）继续用这一种签名即可，行为不变。
+    pub async fn resolve_conflict(
+        &self,
+        pending: PendingConflict,
+        decision: ConflictDecision,
+    ) -> Vec<u64> {
+        let mut decisions = HashMap::new();
+        for c in &pending.conflicts {
+            decisions.insert(c.clone(), decision);
+        }
+        self.resolve_conflict_map(pending, &decisions).await
     }
 
     /// 提交单个条目的传输（远程 leg 走 [`TransferOperation`]，本地对走

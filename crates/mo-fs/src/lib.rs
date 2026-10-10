@@ -115,6 +115,16 @@ pub trait FileSystem: Send + Sync {
         Ok(())
     }
 
+    /// 分块写被打断（取消 / 失败）时清掉攒在本地临时区的整份，避免残留。
+    ///
+    /// 默认空操作——只有 WebDAV 这类「先把各块落本地临时文件、最后整份 PUT」的后端
+    /// 才有东西要清：`finalize_file_chunk` 只在**成功**路径删临时文件，取消 / 失败那段
+    /// 就留着了。调用方（传输循环）对每个目标挂一个 Drop guard，任意退出路径都会触发，
+    /// 因此成功路径 finalize 已删过的这里再删只是 `NotFound`，无害。
+    ///
+    /// 同步方法：Drop 不能 await，且临时文件是本机文件，`std::fs` 即可删，无需 runtime。
+    fn cleanup_staging(&self, _path: &Path) {}
+
     /// 删除文件。
     async fn remove_file(&self, path: &Path) -> Result<(), MoError>;
 

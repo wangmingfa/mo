@@ -27,6 +27,24 @@ use crate::{OpInner, Operation, OperationStatus};
 /// 装箱的递归 future（`async fn` 递归自身编译不过，只能手写 `Box::pin`）。
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// 文件分支中途退出（取消 / 失败）时清掉目标端点攒下的本地临时文件。
+///
+/// WebDAV 把分块写落本地临时文件、最后整份 PUT，`finalize` 成功才删；取消 / 失败那段
+/// 临时文件就留着了——靠这个 guard 在任意退出路径上兜底清掉（`transfer_tree` 的文件分支
+/// 提前 `return` 或走到函数尾返回时，局部变量都会 drop，guard 的 `Drop` 必跑）。同步删：
+/// Drop 不能 await，且临时文件是本机文件、`std::fs` 即可；成功路径 `finalize` 已删过，
+/// 这里再删只是 `NotFound`，无害。
+struct StagingGuard<'a> {
+    fs: &'a Arc<dyn FileSystem>,
+    dst: &'a Path,
+}
+
+impl<'a> Drop for StagingGuard<'a> {
+    fn drop(&mut self) {
+        self.fs.cleanup_staging(self.dst);
+    }
+}
+
 /// 传输时的分块大小（4 MiB）。整份读写会大文件整份进内存，分块后内存峰值降到这一档；
 /// 进度也按块累加，估算速度仍然平滑。
 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -280,6 +298,12 @@ fn transfer_tree(
                 dst_fs.create_dir(parent).await?;
             }
         }
+        // 任意退出路径（取消 / 失败）都清掉目标端点可能攒下的本地临时文件。
+        // 必须在首个 `write_file_chunk` 之前挂上：空文件也会先写一块、落临时文件。
+        let _staging = StagingGuard {
+            fs: &dst_fs,
+            dst: &dst,
+        };
         let already = if can_resume { dst_size.unwrap() } else { 0 };
         {
             let mut s = state.lock();
@@ -348,4 +372,79 @@ async fn free_path(dst_fs: &Arc<dyn FileSystem>, dst: &Path) -> PathBuf {
         }
     }
     dst.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use mo_core::FileMetadata;
+    use mo_fs::{FileSystem, ReadDirEntry};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// 只用来验证 `StagingGuard` 的 `Drop` 会调到 `cleanup_staging`——其余方法在测试里
+    /// 不会被执行，给个恒失败的实现即可（不触发网络 / IO）。
+    struct Probe {
+        cleanup_called: AtomicBool,
+    }
+
+    #[async_trait]
+    impl FileSystem for Probe {
+        async fn read_dir(&self, _p: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        fn read_dir_blocking(&self, _p: &Path) -> Result<Vec<ReadDirEntry>, MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn metadata(&self, _p: &Path) -> Result<FileMetadata, MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn create_dir(&self, _p: &Path) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn write_file(&self, _p: &Path, _c: &[u8]) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn write_file_chunk(&self, _p: &Path, _o: u64, _d: &[u8]) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn remove_file(&self, _p: &Path) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn remove_dir(&self, _p: &Path) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        async fn rename(&self, _f: &Path, _t: &Path) -> Result<(), MoError> {
+            Err(MoError::Other("unused".into()))
+        }
+        fn cleanup_staging(&self, _p: &Path) {
+            self.cleanup_called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// `StagingGuard` 在 drop（任意退出路径）时必须触发 `cleanup_staging`——这是取消 /
+    /// 失败时清掉 WebDAV 临时文件残留的兜底机制，丢了就会留垃圾文件。
+    #[test]
+    fn staging_guard_invokes_cleanup_on_drop() {
+        let probe = StdArc::new(Probe {
+            cleanup_called: AtomicBool::new(false),
+        });
+        let fs: StdArc<dyn FileSystem> = probe.clone();
+        {
+            let _g = StagingGuard {
+                fs: &fs,
+                dst: Path::new("/dst/a.bin"),
+            };
+            assert!(
+                !probe.cleanup_called.load(Ordering::SeqCst),
+                "drop 之前不应调用"
+            );
+        }
+        assert!(
+            probe.cleanup_called.load(Ordering::SeqCst),
+            "drop 必须触发 cleanup_staging"
+        );
+    }
 }

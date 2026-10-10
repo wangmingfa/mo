@@ -361,3 +361,31 @@ Foreign / 更大的文件照旧改名——绝不就地续写旧尾，与「永�
 * **测试**：`ftps_is_a_supported_scheme`——白名单收 ftps，两种握手打到本机没人听的
   端口必须报 Transport 而非 Unsupported（钉住「看起来该支持却不支持」不再回来）。
   真服务器的端到端留给 real-machine-checklist。
+
+## 传输增强：取消残留清理 + 逐文件冲突决策（2026-10-10，任务 B）
+
+* **WebDAV 临时文件残留**：`transfer_tree` 分块写时 WebDAV 把各块落本机
+  `temp_dir()/mo-webdav-staging/`，只有 `finalize_file_chunk` 成功才删。取消 / 失败
+  那段就留着了（旧注释自己承认「等下次覆盖」）。修法：
+  * `FileSystem` trait 加同步 `cleanup_staging`（`Drop` 不能 await，临时文件是本机文件，
+    `std::fs` 即可删），默认空操作；
+  * `WebDavFileSystem::cleanup_staging` 删对应远端路径的临时文件；
+  * `transfer_tree` 文件分支 `dst` 确定后挂 `StagingGuard`（Drop → `cleanup_staging`），
+    任意退出路径（取消 / 失败）都兜底清掉；成功路径 finalize 已删过，再删只是 `NotFound`。
+  * 测试：`transfer::tests::staging_guard_invokes_cleanup_on_drop`（guard 必触发）+
+    `webdav::tests::cleanup_staging_removes_leftover_temp_file`（残留被删，不连网）。
+* **逐文件冲突决策**：原先 `resolve_conflict(pending, single)` 把整批冲突套同一个决策。
+  拆成 `resolve_conflict_map(pending, &HashMap<path, decision>)`（未指定的冲突回退到安全的
+  「改名」，绝不静默覆盖）；`resolve_conflict` 退化为「全部映射到同一决策」的便捷封装，旧
+  调用点 / 单测零改动。
+* **UI（`Modal::ConfirmConflict`）按「逐行 + 确定」重做**：每个冲突文件一行，自带
+  覆盖 / 改名 / 跳过 三选（默认高亮改名）；`全部覆盖 / 全部改名 / 全部跳过` 快捷设全体；
+  底部 `确定` 才提交、`取消` 不提交。Enter 走「确定」。状态存在 `RootView::conflict_decisions`
+  （开卡预置为改名）。headless 测试 `conflict_confirm_dialog_closes_and_clears_without_submitting`
+  改为先点「全部跳过」再点「确定」断言收卡；新增 `per_file_decisions_route_each_conflict_independently`
+  钉住 a.bin 覆盖 / c.bin 跳过 / b.txt 照常 各走各的路。
+* 质量门：`fmt --all` / `check --workspace --all-features` / `clippy -D warnings` / 上述单测全绿。
+* 整包测试门（`run-ci.sh`）两次在 `inline_rename` SIGABRT：做基线对照——`git stash push -u`
+  回 d55b821 裸跑同样红（同位置同信号），恢复改动后 mo-ui 串行全绿（267 条含
+  inline_rename）、其余 58 个测试二进制全绿。判定为文档化的 gpui 框架级 flake
+  （测试二进制并行满载期持续触发），**非任务 B 回归**。

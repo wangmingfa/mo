@@ -15,7 +15,7 @@
 //! 远程用例直接传 `Endpoint::Remote(假后端)`，不需要 SessionRegistry 基建；
 //! 本地用例传 `Endpoint::Local` 加一对真实临时目录。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -303,6 +303,57 @@ async fn skip_decision_leaves_conflicts_the_rest() {
         dst.bytes("/a.bin").as_deref(),
         Some(FOREIGN),
         "冲突文件原样不动"
+    );
+}
+
+// ------------------------------------------------------------ 逐文件决策（per-path）
+
+/// 两个冲突（`/a.bin` + `/c.bin`）+ 一个无冲突（`/b.txt`）的探测场景。
+fn two_conflict_scene() -> (AppState, RecFs, RecFs) {
+    let app = common::isolated("conflict-map", AppState::new);
+    let src = RecFs::default();
+    src.put("/a.bin", PAYLOAD);
+    src.put("/b.txt", b"hello");
+    src.put("/c.bin", b"another");
+    let dst = RecFs::default();
+    dst.put("/a.bin", FOREIGN);
+    dst.put("/c.bin", b"preexisting c");
+    (app, src, dst)
+}
+
+/// 逐文件决策：a.bin 覆盖、c.bin 跳过、b.txt 照常——三个冲突文件各走各的路，
+/// 不再是「整批同一个决策」。
+#[tokio::test]
+async fn per_file_decisions_route_each_conflict_independently() {
+    let (app, src, dst) = two_conflict_scene();
+    let pending = match app
+        .transfer_between(
+            vec![
+                PathBuf::from("/a.bin"),
+                PathBuf::from("/b.txt"),
+                PathBuf::from("/c.bin"),
+            ],
+            Endpoint::Remote(Arc::new(src.clone())),
+            Path::new("/"),
+            Endpoint::Remote(Arc::new(dst.clone())),
+            false,
+        )
+        .await
+    {
+        TransferOutcome::NeedsConflictConfirmation(p) => *p,
+        _ => panic!("应等冲突确认"),
+    };
+    let mut decisions = HashMap::new();
+    decisions.insert(PathBuf::from("/a.bin"), ConflictDecision::Overwrite);
+    decisions.insert(PathBuf::from("/c.bin"), ConflictDecision::Skip);
+    let ids = app.resolve_conflict_map(pending, &decisions).await;
+    assert_eq!(ids.len(), 2, "只提交 a.bin 与 b.txt（c.bin 跳过）");
+    dst.wait_bytes("/a.bin", PAYLOAD).await;
+    dst.wait_bytes("/b.txt", b"hello").await;
+    assert_eq!(
+        dst.bytes("/c.bin").as_deref(),
+        Some(&b"preexisting c"[..]),
+        "跳过的 c.bin 原样不动"
     );
 }
 
