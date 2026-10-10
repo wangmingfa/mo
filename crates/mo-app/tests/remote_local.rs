@@ -1616,3 +1616,180 @@ fn an_empty_pin_means_no_pinning() {
         "空白指纹必须归一成 None（正常校验），而不是当真"
     );
 }
+
+// ---------------------------------------------------------------- 传输队列 journal（E2）
+
+/// journal 目录钉子：测试期间把 journal 指到本用例的临时目录（`set_dir_for_tests`
+/// 是进程级单槽，进出成对），盘上的账直接读文件断言。
+struct PinnedJournal(std::path::PathBuf);
+
+/// `set_dir_for_tests` 是进程级单槽：三个 journal 用例必须整段串行，
+/// 否则 A 刚把目录钉好，B 的 `set` 又把它指走，双方都在替对方读错账。
+static JOURNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn journal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl PinnedJournal {
+    fn at(tag: &str) -> Self {
+        let d = std::env::temp_dir().join(format!("mo-journal-it-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        mo_app::journal::set_dir_for_tests(Some(d.clone()));
+        Self(d)
+    }
+
+    /// 盘上的批次列表（直接读 journal 文件，绕开进程内桶缓存）。
+    fn on_disk(&self) -> Vec<mo_app::QueuedTransfer> {
+        let text = std::fs::read_to_string(self.0.join("transfer-queue.json")).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+}
+
+impl Drop for PinnedJournal {
+    fn drop(&mut self) {
+        mo_app::journal::set_dir_for_tests(None);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 提交一批本地复制：journal 应记一笔（两个 id 在册），操作逐个完成后摘 id、
+/// 摘空整批出列——崩掉 / 退出时留下的就是「没摘完」的那些。
+#[test]
+fn journal_records_a_batch_and_clears_it_when_ops_finish() {
+    let root = std::env::temp_dir().join(format!("mo-journal-e2a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("dst")).unwrap();
+    // 源文件给到 16 MiB：复制要走几十毫秒，`transfer_between` 返回（记账就在
+    // 返回前同步完成）之后紧跟着的断言才不会与「操作完成出列」竞速。
+    let blob = vec![0x5au8; 16 * 1024 * 1024];
+    std::fs::write(root.join("src/a.txt"), &blob).unwrap();
+    std::fs::write(root.join("src/b.txt"), &blob).unwrap();
+    // 先拿锁再钉目录：钉子是进程级单槽，钉完到用例结束都在锁的保护下。
+    let _lock = journal_test_lock();
+    let journal = PinnedJournal::at("e2a");
+
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    runtime().block_on(async {
+        let outcome = app
+            .transfer_between(
+                vec![root.join("src/a.txt"), root.join("src/b.txt")],
+                Endpoint::Local,
+                &root.join("dst"),
+                Endpoint::Local,
+                false,
+            )
+            .await;
+        let ids = match outcome {
+            mo_app::TransferOutcome::Started(ids) => ids,
+            _ => panic!("本地复制没有冲突应直接提交"),
+        };
+        assert_eq!(ids.len(), 2);
+    });
+    let on_disk = journal.on_disk();
+    assert_eq!(on_disk.len(), 1, "一批一账");
+    assert_eq!(on_disk[0].ids.len(), 2, "批内两个操作都应在册");
+
+    // 操作完成后逐 id 摘除；摘空整批出列（轮询等后台任务跑完）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if journal.on_disk().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "操作完成后批次应出列，journal={:?}",
+            journal.on_disk()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(root.join("dst/a.txt").exists(), "复制本身要真的完成");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 恢复：预置一份「上次崩掉留下」的账（直接写 journal 文件），恢复应把文件
+/// 复制到位并重新挂账（新批次的 id 摘空后出列）。
+#[test]
+fn recover_transfers_resubmits_a_journal_batch() {
+    let root = std::env::temp_dir().join(format!("mo-journal-e2b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("dst")).unwrap();
+    std::fs::write(root.join("src/keep.txt"), b"keep me").unwrap();
+    let _lock = journal_test_lock();
+    let journal = PinnedJournal::at("e2b");
+
+    std::fs::write(
+        journal.0.join("transfer-queue.json"),
+        serde_json::json!([{
+            "ids": [999],
+            "paths": [root.join("src/keep.txt")],
+            "src_ep": null,
+            "dest": root.join("dst"),
+            "dest_ep": null,
+            "move_": false,
+            "epoch": 1
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let pending = mo_app::AppState::pending_transfers();
+    assert_eq!(pending.len(), 1, "预置的批次应作为待处置弹出来");
+    let report = runtime().block_on(async { app.recover_transfers(pending).await });
+    assert_eq!(report.submitted_batches, 1);
+    assert_eq!(report.submitted_items, 1);
+    assert!(report.needs_login.is_empty());
+    assert!(
+        root.join("dst/keep.txt").exists(),
+        "恢复 = 按原描述重跑，文件要真的到位"
+    );
+
+    // 重跑的复制自己挂了新账，完成出列后账面清空。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if journal.on_disk().is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "恢复重跑的批次完成后应出列，journal={:?}",
+            journal.on_disk()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 端点连不上（缺凭据 / 拒连）：批次**留在册**，等用户登录后再次恢复——
+/// 恢复动作本身不该把还没传成的东西从账上抹掉。
+#[test]
+fn recover_keeps_the_batch_when_the_endpoint_cannot_connect() {
+    let _lock = journal_test_lock();
+    let journal = PinnedJournal::at("e2c");
+    std::fs::write(
+        journal.0.join("transfer-queue.json"),
+        serde_json::json!([{
+            "ids": [7],
+            "paths": ["/remote-only/a.bin"],
+            "src_ep": "sftp://127.0.0.1:1",
+            "dest": "/remote-only/dst",
+            "dest_ep": "sftp://127.0.0.1:1",
+            "move_": false,
+            "epoch": 1
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let pending = mo_app::AppState::pending_transfers();
+    assert_eq!(pending.len(), 1);
+    let report = runtime().block_on(async { app.recover_transfers(pending).await });
+    assert_eq!(report.submitted_batches, 0, "连不上就不该提交");
+    assert_eq!(report.needs_login.len(), 1, "回执要点名哪个批次没恢复成");
+    assert_eq!(journal.on_disk().len(), 1, "留在册：登录后可再次恢复");
+}

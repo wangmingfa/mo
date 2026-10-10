@@ -461,3 +461,32 @@ crypto provider 做，一点没少。
 * 竞态审查：传输侧单文件的块严格按序 await（`transfer.rs` 读块→写块链），
   首块 TRUNCATE 不会和后续块赛跑；跨文件路径互不相干。
 * 测试：acquire 三判据（跳过被占通道 / 起点取模回绕 / 全忙回起点排队）。
+
+## 任务 E2：传输队列持久化（2026-10-10）
+
+问题：断点续传（§5）靠盘上的部分文件判断，重启后**重发起**才能续；队列本身没有
+journal——排队的、进行中的任务崩掉后整个列表消失，用户得凭记忆把每批重新发起。
+
+方案：**批次级 journal**（`<配置目录>/transfer-queue.json`，与 session.json 同一
+「机器态不进 config.json」的理由）+ 启动恢复卡：
+
+* **记账形状** = `transfer_between` 的批次描述（paths / 端点键 / dest / move_）
+  + 各操作 handle id。恢复 = 按原描述**重跑 `transfer_between`**——端点重建、
+  挂载点重探、冲突 / 续传卡全部走既有链路，不发明第二条提交路径。
+* **三个提交点**（`transfer_between` / `resolve_conflict_map` / `resolve_resume`）
+  统一走 `journal_batch`；端点在记账时换成 `RemoteUrl::endpoint()` 字符串键
+  （`Endpoint::Remote` 握着的 Arc 落不了盘；网络挂载点记成 `None`——恢复时按
+  路径重探，不依赖会话实例）。
+* **出账**：每个操作完成（含取消 / 失败）时 `complete(id)` 从批次里摘 id，
+  摘空整批出列。**epoch 屏障**：条目带进程首用时刻，`complete` 只摘本轮的——
+  重启后操作 id 从 1 重数，不许碰上个进程的陈年批次。
+* **进程级单例**（按配置目录分桶的 `OnceLock<Mutex<HashMap<dir, entries>>>`）：
+  `AppState` 一页一个，两个标签页同时传文件各自重写同一份文件会互相覆盖。
+* **启动恢复卡**（`Modal::ResumeQueue`）：`pending_transfers()` 进程内只弹一次
+  （offered 标记只在内存——「没处置 = 再问」，卡开着崩掉下次还问）；「恢复」
+  自动重连记住的服务器（钥匙串凭据），连不上的批次留卡上等登录后再次恢复；
+  撞冲突 / 续传卡 = 旧批次已摘账、当场决策由决策路径重新挂账；「丢弃」显式出列。
+* save 只在账目真变时写盘（每个操作完成都会走 `complete`，无账可改不落盘）。
+* 测试：journal 单测 4 条（记账 / 摘除 / epoch 屏障 / 弹一次 + 跨重启）、
+  引擎集成 3 条（提交挂账+完成出列 / 恢复重跑 / 连不上留册）、
+  headless 恢复卡渲染 + 丢弃收卡 1 条。

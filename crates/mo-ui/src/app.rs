@@ -366,6 +366,13 @@ pub(crate) enum Modal {
     /// 放 [`RootView::conflict_pending`]，枚举里只是标记。Esc / 取消 / 点遮罩
     /// = **什么都不提交**。
     ConfirmConflict,
+    /// 「上次退出还有没传完的传输」恢复卡（E2）。
+    ///
+    /// 载荷（journal 里还没处置的批次，[`mo_app::QueuedTransfer`] 列表）放
+    /// [`RootView::resume_queue`]，枚举里只是标记。「恢复」按原批次描述重跑
+    /// `transfer_between`；「丢弃」从账里移除。Esc / 点遮罩 = 什么都不做
+    /// （批次还在盘上，下次启动再问）。
+    ResumeQueue,
     /// 扩展贡献的只读列表源面板（P4，devlog §5 表格 `list` 那行）。
     ///
     /// 状态（标题 / 行 / 加载中 / 错误）放在 [`RootView::list_panel`]，这里只是
@@ -1064,6 +1071,9 @@ pub struct RootView {
     /// 冲突确认卡（[`Modal::ConfirmConflict`]）的重提请求，套路同
     /// [`RootView::resume_pending`]（载荷带 `AppState` 进不了 Modal 枚举）。
     pub(crate) conflict_pending: Option<mo_app::PendingConflict>,
+    /// 启动恢复卡（[`Modal::ResumeQueue`]，E2）的批次载荷：journal 里没传完、
+    /// 等用户「恢复 / 丢弃」的传输。套路同上——载荷不进 Modal 枚举。
+    pub(crate) resume_queue: Option<Vec<mo_app::QueuedTransfer>>,
     /// 冲突确认卡里每个冲突文件的决策（按冲突路径索引）。开卡时全部预置为安全的
     /// 「改名」；用户在卡上逐个改成覆盖 / 跳过 / 改名。「确定」时按这份映射逐文件路由，
     /// 没动过的行沿用默认改名，绝不静默覆盖。
@@ -1530,6 +1540,7 @@ impl RootView {
             modal: Modal::None,
             resume_pending: None,
             conflict_pending: None,
+            resume_queue: None,
             conflict_decisions: HashMap::new(),
             resume_dest: None,
             cmd_query: String::new(),
@@ -1665,6 +1676,14 @@ impl RootView {
             .detach();
         } else {
             view.restore_session(app, session, cx);
+        }
+
+        // 传输队列恢复卡（E2）：journal 里还有没传完的批次就先问处置。
+        // 进程内只弹一次（`pending_transfers` 的 offered 闸门），多窗口不重复弹。
+        let queued = mo_app::AppState::pending_transfers();
+        if !queued.is_empty() {
+            view.resume_queue = Some(queued);
+            view.modal = Modal::ResumeQueue;
         }
 
         view
@@ -10538,6 +10557,7 @@ impl Render for RootView {
             | Modal::Settings
             | Modal::ConfirmResume
             | Modal::ConfirmConflict
+            | Modal::ResumeQueue
             | Modal::CommandPalette => {
                 let mut row = div().flex().flex_row().flex_1().min_w_0().min_h_0();
                 // 侧边栏可关（配置 `ui.sidebar`）；关掉时不参与宽度计算。
@@ -11005,6 +11025,7 @@ impl Render for RootView {
             }
             Modal::ConfirmResume => root = root.child(render_resume_confirm(self, &entity)),
             Modal::ConfirmConflict => root = root.child(render_conflict_confirm(self, &entity)),
+            Modal::ResumeQueue => root = root.child(render_resume_queue(self, &entity)),
             Modal::ConnectServer => root = root.child(self.render_connect(&entity)),
             Modal::ConnectAuth => root = root.child(self.render_connect_auth(&entity)),
             Modal::Properties => root = root.child(dialogs::properties(self, &entity)),
@@ -11731,6 +11752,12 @@ fn handle_modal_key(
         Modal::ConfirmConflict => match key {
             "escape" => dismiss_conflict_confirm(entity, cx),
             "enter" => submit_conflict_decisions(entity, cx),
+            _ => {}
+        },
+        // 恢复卡：Esc 收卡不处置（批次还在盘上，下次启动再问）；Enter 走主行动「恢复」。
+        Modal::ResumeQueue => match key {
+            "escape" => dismiss_resume_queue(entity, cx),
+            "enter" => recover_queued_transfers(entity, cx),
             _ => {}
         },
         Modal::TrashRename(_) => match key {
@@ -14864,6 +14891,11 @@ fn dismiss_modal(entity: &Entity<RootView>, cx: &mut App) {
         dismiss_resume_confirm(entity, cx);
         return;
     }
+    // 恢复卡同理：点遮罩 = 什么都不做（批次还在盘上，下次启动再问）。
+    if matches!(entity.read(cx).modal, Modal::ResumeQueue) {
+        dismiss_resume_queue(entity, cx);
+        return;
+    }
     // 冲突确认卡同理：点遮罩 = 什么都不提交。
     if matches!(entity.read(cx).modal, Modal::ConfirmConflict) {
         dismiss_conflict_confirm(entity, cx);
@@ -15169,6 +15201,173 @@ fn dismiss_resume_confirm(entity: &Entity<RootView>, cx: &mut App) {
             cx.notify();
         }
     });
+}
+
+// ---------- 传输队列恢复卡（Modal::ResumeQueue，E2） ----------
+
+/// 启动恢复卡：上次退出还有没传完的传输。「恢复」按原批次描述重跑
+/// `transfer_between`（撞冲突 / 可续传目标会接着弹既有决策卡）；「丢弃」从账里
+/// 移除。Esc / 点遮罩 = 什么都不做（批次还在盘上，下次启动再问）。
+///
+/// 连不上端点的批次留在卡上（`resume_queue` 更新成剩余的），全空就收卡。
+fn render_resume_queue(v: &RootView, entity: &Entity<RootView>) -> impl IntoElement {
+    let batches = v.resume_queue.as_deref().unwrap_or(&[]);
+    let mut listing = String::new();
+    for (i, b) in batches.iter().enumerate() {
+        if i == 6 {
+            listing.push_str(&format!("……等 {} 批\n", batches.len()));
+            break;
+        }
+        let verb = if b.move_ { "移动" } else { "复制" };
+        listing.push_str(&format!(
+            "{verb} {} 项 → {}\n",
+            b.paths.len(),
+            b.dest.display()
+        ));
+    }
+
+    let restore = entity.clone();
+    let discard = entity.clone();
+    let message = format!("从断点接着传，还是放弃这些任务？\n{}", listing.trim_end());
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(theme::text())
+                        .child(text!("上次退出还有未完成的传输")),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme::muted())
+                        .child(text!(message)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(10.0))
+                // 丢弃：中性描边按钮（账目移除，不再问）。
+                .child(
+                    div()
+                        .id("queue-discard")
+                        .test_support()
+                        .debug_selector(|| "queue-discard".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme::muted())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| discard_queued_transfers(&discard, cx))
+                        .child(text!("丢弃")),
+                )
+                // 恢复：主色按钮。
+                .child(
+                    div()
+                        .id("queue-restore")
+                        .test_support()
+                        .debug_selector(|| "queue-restore".to_string())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(18.0))
+                        .h(px(30.0))
+                        .rounded(px(7.0))
+                        .bg(theme::selected_bg())
+                        .text_color(theme::selected_text())
+                        .text_size(px(13.0))
+                        .on_click(move |_, _window, cx| recover_queued_transfers(&restore, cx))
+                        .child(text!("恢复")),
+                ),
+        );
+    dialog_overlay(entity, "", "", body, "")
+}
+
+/// 收掉恢复卡**什么都不做**（Esc / 点遮罩）：批次留在盘上，下次启动再问。
+fn dismiss_resume_queue(entity: &Entity<RootView>, cx: &mut App) {
+    entity.update(cx, |v, cx| {
+        if v.modal == Modal::ResumeQueue {
+            v.modal = Modal::None;
+            v.resume_queue = None;
+            cx.notify();
+        }
+    });
+}
+
+/// 恢复卡上点「丢弃」：账目移除，收卡。
+fn discard_queued_transfers(entity: &Entity<RootView>, cx: &mut App) {
+    let batches = entity.update(cx, |v, cx| {
+        if v.modal != Modal::ResumeQueue {
+            return Vec::new();
+        }
+        v.modal = Modal::None;
+        cx.notify();
+        v.resume_queue.take().unwrap_or_default()
+    });
+    if !batches.is_empty() {
+        mo_app::AppState::discard_transfers(&batches);
+    }
+}
+
+/// 恢复卡上点「恢复」：后台按原批次描述重跑 `transfer_between`。
+///
+/// 结果落点：连不上端点的批次留卡上继续显示（等用户登录后再按一次）；
+/// 撞上冲突 / 续传决策卡的批次已摘账、交回既有决策卡（载荷即重跑时的探测结果）。
+fn recover_queued_transfers(entity: &Entity<RootView>, cx: &mut App) {
+    let (app, batches) = entity.update(cx, |v, cx| {
+        if v.modal != Modal::ResumeQueue {
+            return (None, Vec::new());
+        }
+        // 卡先收起（恢复过程可能弹冲突 / 续传卡，别叠着）。
+        v.modal = Modal::None;
+        cx.notify();
+        (Some(v.app()), v.resume_queue.take().unwrap_or_default())
+    });
+    let Some(app) = app else {
+        return;
+    };
+    if batches.is_empty() {
+        return;
+    }
+    let entity = entity.clone();
+    cx.spawn(async move |cx| {
+        let report = app.recover_transfers(batches).await;
+        entity.update(cx, |v, cx| {
+            // 决策卡优先弹（载荷就是重跑时的探测结果，直接走既有收口）。
+            if let Some(p) = report.first_conflict {
+                let mut decisions = HashMap::new();
+                for c in &p.conflicts {
+                    decisions.insert(c.clone(), mo_app::ConflictDecision::Rename);
+                }
+                v.conflict_decisions = decisions;
+                v.conflict_pending = Some(*p);
+                v.modal = Modal::ConfirmConflict;
+            } else if let Some(p) = report.first_resume {
+                v.resume_pending = Some(*p);
+                v.modal = Modal::ConfirmResume;
+            } else if !report.needs_login.is_empty() {
+                // 连不上的批次继续问（用户登录后可再按一次恢复）。
+                v.resume_queue = Some(report.needs_login);
+                v.modal = Modal::ResumeQueue;
+            }
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 /// 续传确认卡上选定后的提交：取走请求 → 关卡 → 交回**发起那次传输的**
@@ -17065,6 +17264,66 @@ mod tests {
     /// 都只收卡清请求（跳过对「全是部分文件」的一批不提交任何东西，headless 里
     /// 零 IO）；「继续」会真提交操作（blocking 池 IO），headless 不点它——那条
     /// 链的行为由 mo-operations 的续传用例与 mo-app 的 resolve 用例钉住。
+    /// 恢复卡（E2）：预置批次 → 卡与两颗按钮都画出来；「丢弃」收卡清载荷
+    /// 并把账目移除。恢复按钮不在这里点（会真发起 `transfer_between`，走真 IO，
+    /// 引擎侧已有三条集成测试钉住）。
+    #[test]
+    fn resume_queue_card_renders_and_discard_clears_it() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app.clone(), cx));
+        let root = root.clone();
+        cx.run_until_parked();
+
+        // 预置一批（store pre-seeding，与 ConfirmResume 的测试同套路）：载荷
+        // 直接给到视图，不碰盘上的 journal 文件——进程里并行的其它测试不该
+        // 被「多出一张恢复卡」波及。
+        cx.update(|_window, cx| {
+            root.update(cx, |v, cx| {
+                v.resume_queue = Some(vec![mo_app::QueuedTransfer {
+                    ids: vec![7],
+                    paths: vec![PathBuf::from("/src/a.bin"), PathBuf::from("/src/b.bin")],
+                    src_ep: None,
+                    dest: PathBuf::from("/dst"),
+                    dest_ep: None,
+                    move_: false,
+                    epoch: 1,
+                    offered: true,
+                }]);
+                v.modal = Modal::ResumeQueue;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds("mo-dialog-overlay").is_some(),
+            "恢复卡应当用带遮罩的浮层"
+        );
+        assert!(
+            cx.debug_bounds("mo-file-list").is_some(),
+            "恢复卡是浮层，浏览区应当保留"
+        );
+        for id in ["queue-restore", "queue-discard"] {
+            assert!(
+                cx.debug_bounds(id).is_some(),
+                "恢复卡的按钮 {id} 应当渲染出来"
+            );
+        }
+
+        // 丢弃：收卡清载荷，账目移除（载荷不在册 → remove_batches 无账可改，
+        // 也不写盘）。
+        cx.update(|window, cx| window.click("queue-discard", cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let (modal_gone, payload_gone) = cx.update(|_window, cx| {
+            root.update(cx, |v, _cx| {
+                (v.modal != Modal::ResumeQueue, v.resume_queue.is_none())
+            })
+        });
+        assert!(modal_gone && payload_gone, "丢弃后卡与载荷都该清掉");
+    }
+
     #[test]
     fn resume_confirm_dialog_closes_and_clears_without_submitting() {
         crate::isolate_user_dirs_for_tests();

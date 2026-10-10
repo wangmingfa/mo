@@ -1132,10 +1132,7 @@ fn clicking_blank_below_the_list_clears_the_selection(cx: &mut TestAppContext) {
             vcx.update(|window, cx| window.drag(p_blank, p_blank, cx));
         }
     }
-    assert!(
-        cleared,
-        "点空白应清空选择，不是选中最后一行"
-    );
+    assert!(cleared, "点空白应清空选择，不是选中最后一行");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

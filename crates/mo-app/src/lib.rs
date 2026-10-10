@@ -16,6 +16,10 @@
 mod controller;
 /// 远程服务器的凭据存取（系统钥匙串）。
 mod credentials;
+/// 传输队列 journal（E2）：崩掉 / 退出时没传完的批次留在盘上，启动弹恢复卡。
+pub mod journal;
+// 恢复卡的批次类型要给 UI（载荷列条目），经应用层再导出。
+pub use journal::QueuedTransfer;
 /// 扩展系统：声明式清单 + 外部程序。
 pub mod extensions;
 /// 系统图标：渲染路径只查表，真去问系统放在后台（见模块文档）。
@@ -240,6 +244,22 @@ impl TransferOutcome {
     pub fn is_started(&self) -> bool {
         matches!(self, TransferOutcome::Started(_))
     }
+}
+
+/// [`AppState::recover_transfers`] 的回执：启动恢复卡上按「恢复」之后发生了什么。
+#[derive(Default)]
+pub struct RecoveryReport {
+    /// 成功重跑并重新挂账的批次数 / 条目数。
+    pub submitted_batches: usize,
+    pub submitted_items: usize,
+    /// 重跑撞上决策卡的批次数（旧批次已摘账；当场决策会由决策路径重新挂账）。
+    pub needs_decision: usize,
+    /// 撞上的第一张冲突卡（UI 弹既有冲突确认卡用；`None` = 没有或不是冲突）。
+    pub first_conflict: Option<Box<PendingConflict>>,
+    /// 撞上的第一张续传卡（同上）。
+    pub first_resume: Option<Box<PendingResume>>,
+    /// 连不上 / 缺凭据的批次（**留在册**，登录后可再次恢复；UI 继续显示）。
+    pub needs_login: Vec<journal::QueuedTransfer>,
 }
 
 /// [`TransferOutcome::NeedsResumeConfirmation`] 携带的重提请求。
@@ -843,6 +863,23 @@ impl SessionRegistry {
             .iter()
             .find(|s| s.url.endpoint() == endpoint)
             .and_then(|s| s.url.tls_fingerprint.clone())
+    }
+
+    /// 反查：这条后端实例是哪个端点的会话（journal 记账用——`Endpoint::Remote`
+    /// 里握着的 `Arc<dyn FileSystem>` 不能落盘，要换成 `RemoteUrl::endpoint()`
+    /// 这个字符串键才能进 journal 文件）。
+    fn endpoint_of_fs(&self, fs: &Arc<dyn FileSystem>) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| Arc::ptr_eq(&s.fs, fs))
+            .map(|s| s.url.endpoint())
+    }
+
+    /// 全部会话的快照（journal 恢复按端点键找活会话用）。
+    fn list(&self) -> Vec<RemoteSession> {
+        self.sessions.lock().unwrap().clone()
     }
 
     /// 取一条会话的副本（`None` = 已经断开了）。
@@ -3387,6 +3424,10 @@ impl AppState {
                 Ok(Ok(())) => {}
             }
             bus.publish(AppEvent::OperationFinished { id });
+            // journal（E2）：完成即从批次里摘 id（摘空整批出列）。取消 / 失败
+            // 也走这里——批次出列是对的：取消是用户明确放弃，失败重跑也不会
+            // 更好（续传卡的恢复路径另有兜底）。只动本轮纪元的条目。
+            journal::complete(id);
         });
 
         id
@@ -4484,6 +4525,9 @@ impl AppState {
                 .await;
             ids.push(hid);
         }
+        // journal（E2）：批次挂账，操作逐个完成时摘 id，全摘空出列；崩掉 / 退出
+        // 后由启动恢复卡按原描述重跑。
+        self.journal_batch(&paths, &src_ep, dest, &dest_ep, move_, &ids);
         TransferOutcome::Started(ids)
     }
 
@@ -4525,6 +4569,16 @@ impl AppState {
                 .await;
             ids.push(hid);
         }
+        // journal（E2）：续传卡重提的批次同样挂账（跳过的那些不在 ids 里，
+        // 重跑 `transfer_between` 的探测会把它们重新交回决策——见恢复卡文档）。
+        self.journal_batch(
+            &pending.paths,
+            &pending.src_ep,
+            &pending.dest,
+            &pending.dest_ep,
+            pending.move_,
+            &ids,
+        );
         if pending.clear_staging_on_resolve && pending.move_ {
             self.clear_staged();
         }
@@ -4588,6 +4642,15 @@ impl AppState {
                 .await;
             ids.push(hid);
         }
+        // journal（E2）：冲突卡重提的批次同样挂账。
+        self.journal_batch(
+            &pending.paths,
+            &pending.src_ep,
+            &pending.dest,
+            &pending.dest_ep,
+            pending.move_,
+            &ids,
+        );
         if pending.clear_staging_on_resolve && pending.move_ {
             self.clear_staged();
         }
@@ -4606,6 +4669,129 @@ impl AppState {
             decisions.insert(c.clone(), decision);
         }
         self.resolve_conflict_map(pending, &decisions).await
+    }
+
+    // ------------------------------------------------------------ 传输队列 journal（E2）
+
+    /// 把刚提交的一批传输挂进 journal（见 [`journal`] 模块文档）。
+    ///
+    /// 端点在这里换成**字符串键**：`Endpoint::Remote` 握着的 `Arc<dyn FileSystem>`
+    /// 落不了盘。网络挂载点记成 `None`（本机路径）——恢复时 `transfer_between`
+    /// 的 `net_endpoint` 会按路径重探挂载状态，不依赖会话实例。
+    fn journal_batch(
+        &self,
+        paths: &[PathBuf],
+        src_ep: &Endpoint,
+        dest: &Path,
+        dest_ep: &Endpoint,
+        move_: bool,
+        ids: &[u64],
+    ) {
+        journal::record_batch(
+            paths.to_vec(),
+            self.endpoint_key(src_ep),
+            dest.to_path_buf(),
+            self.endpoint_key(dest_ep),
+            move_,
+            ids.to_vec(),
+        );
+    }
+
+    /// 端点的 journal 键（`None` = 本机 / 网络挂载点，理由见 [`Self::journal_batch`]）。
+    fn endpoint_key(&self, ep: &Endpoint) -> Option<String> {
+        match ep {
+            Endpoint::Local | Endpoint::NetworkMount(_) => None,
+            Endpoint::Remote(fs) => self.sessions.endpoint_of_fs(fs),
+        }
+    }
+
+    /// 启动恢复卡的数据源：journal 里还没处置过的批次（进程内只弹一次，
+    /// 盘上的账在处置前不动——见 [`journal::pending_transfers`]）。
+    pub fn pending_transfers() -> Vec<journal::QueuedTransfer> {
+        journal::pending_transfers()
+    }
+
+    /// 恢复卡上点「丢弃」：这些批次从账里移除，不再恢复。
+    pub fn discard_transfers(batches: &[journal::QueuedTransfer]) {
+        journal::remove_batches(batches);
+    }
+
+    /// 恢复一批没传完的传输：按原批次描述重跑 [`Self::transfer_between`]。
+    ///
+    /// * 远程端点**当前没连**：按端点键查「记住的服务器」自动重连（钥匙串里的
+    ///   凭据是当初连接时存下的）；连不上 / 缺凭据的批次**留在册**，用户登录后
+    ///   再次恢复；
+    /// * 重跑撞上冲突 / 可续传目标：`transfer_between` 交回决策卡，旧批次已摘账。
+    ///   用户当场决策 → 决策路径自己重新挂账（新 id）；当场取消 / 卡开着崩掉 →
+    ///   批次丢失，但部分文件还在盘上，手动重发起会走既有续传探测兜底。
+    ///   UI 拿 [`RecoveryReport`] 弹既有冲突 / 续传卡（只弹第一张，其余丢弃账目、
+    ///   部分文件仍在，重发起即可续）。
+    pub async fn recover_transfers(&self, batches: Vec<journal::QueuedTransfer>) -> RecoveryReport {
+        let mut report = RecoveryReport::default();
+        for batch in batches {
+            let Some(src_ep) = self.endpoint_for_key(batch.src_ep.as_deref()).await else {
+                report.needs_login.push(batch.clone());
+                continue;
+            };
+            let Some(dest_ep) = self.endpoint_for_key(batch.dest_ep.as_deref()).await else {
+                report.needs_login.push(batch.clone());
+                continue;
+            };
+            // 先摘账再重跑：重跑自己会重新挂账（新 id）；摘到挂回之间崩掉 =
+            // 这批丢失——窗口极小，且「丢的是恢复动作本身」不是用户数据。
+            journal::remove_batches(std::slice::from_ref(&batch));
+            match self
+                .transfer_between(
+                    batch.paths.clone(),
+                    src_ep,
+                    &batch.dest,
+                    dest_ep,
+                    batch.move_,
+                )
+                .await
+            {
+                TransferOutcome::Started(ids) => {
+                    report.submitted_batches += 1;
+                    report.submitted_items += ids.len();
+                }
+                TransferOutcome::NeedsConflictConfirmation(pending) => {
+                    report.needs_decision += 1;
+                    if report.first_conflict.is_none() {
+                        report.first_conflict = Some(pending);
+                    }
+                }
+                TransferOutcome::NeedsResumeConfirmation(pending) => {
+                    report.needs_decision += 1;
+                    if report.first_resume.is_none() {
+                        report.first_resume = Some(pending);
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// 端点键 → 活会话端点。没连就按「记住的服务器」自动重连一次；连不上 /
+    /// 缺凭据返回 `None`（批次留册）。
+    async fn endpoint_for_key(&self, key: Option<&str>) -> Option<Endpoint> {
+        let Some(key) = key else {
+            return Some(Endpoint::Local);
+        };
+        if let Some(fs) = self.session_fs_by_endpoint(key) {
+            return Some(Endpoint::Remote(fs));
+        }
+        // 自动重连走与地址栏同一条路：凭据从钥匙串取（`connect_remote` 内部）。
+        self.connect_remote(key).await.ok()?;
+        self.session_fs_by_endpoint(key).map(Endpoint::Remote)
+    }
+
+    /// 按端点键找**当前连着的**会话后端（journal 恢复用；同一端点至多一条）。
+    fn session_fs_by_endpoint(&self, endpoint: &str) -> Option<Arc<dyn FileSystem>> {
+        self.sessions
+            .list()
+            .into_iter()
+            .find(|s| s.url.endpoint() == endpoint)
+            .map(|s| s.fs)
     }
 
     /// 提交单个条目的传输（远程 leg 走 [`TransferOperation`]，本地对走
