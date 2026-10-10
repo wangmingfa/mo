@@ -18656,14 +18656,19 @@ mod tests {
             "贡献行不在侧栏内：sidebar={sidebar:?} row={row:?}"
         );
 
-        // 再验「点击 → 执行」这一环。
+        // 再验「点击 → 执行」这一环。`run_user_command` 同步把 modal 设 `None`，
+        // 再由 detach 的异步任务填 `Info`——所以单次 `run_until_parked` 在满载下可能
+        // 还没等到那一下。更糟的是首点偶发没落到行上（`list_source_panel` 同款 flake，
+        // 那边在 round 30/60 补点），点不到就永远等不到 modal。这里先轮询 modal，
+        // 满载下首点丢失时在第 30 轮补点一次（仅一次，且夹具尚在、行还在树里）。
+        // ⚠️ 删夹具必须放到轮询之后：满载下兜底补点还会再 `click` 这一行，行随扩展
+        // 卸载而消失就会 `missing ElementId`，所以没确认交付前不能动夹具目录。
         cx.update(|window, cx| window.click(format!("sidebar-ext-cmd-{label}"), cx));
-        cx.run_until_parked();
 
-        let cleaned = std::fs::remove_dir_all(&dir);
-
-        match modal_of(cx) {
-            Modal::Info(text) => {
+        let mut delivered = false;
+        for round in 0..100 {
+            cx.run_until_parked();
+            if let Modal::Info(text) = modal_of(cx) {
                 assert!(
                     text.contains(label),
                     "信息卡上要点名是哪条命令，否则「点了没反应」与「点错了命令」分不出：{text}"
@@ -18672,11 +18677,20 @@ mod tests {
                     text.contains("未执行"),
                     "没有选中条目时应当停在占位符守卫那一层（既不 spawn 进程也不静默）：{text}"
                 );
+                delivered = true;
+                break;
             }
-            other => panic!(
-                "点侧栏那一行应当把那条命令送到执行层，实际 modal = {other:?}（点击臂没接上，或这一行没点到）"
-            ),
+            // 满载下首点偶发丢失：第 30 轮补点一次（行还在，夹具尚在）。
+            if round == 30 {
+                cx.update(|window, cx| window.click(format!("sidebar-ext-cmd-{label}"), cx));
+            }
         }
+        assert!(
+            delivered,
+            "点侧栏那一行应当把那条命令送到执行层，实际 modal = {:?}（点击臂没接上，或这一行没点到）",
+            modal_of(cx)
+        );
+        let cleaned = std::fs::remove_dir_all(&dir);
         assert!(cleaned.is_ok(), "清理 fixture 失败：{cleaned:?}");
     }
 
