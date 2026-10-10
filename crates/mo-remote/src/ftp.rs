@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mo_core::{EntryKind, FileId, FileMetadata, MoError, Permissions};
+use mo_core::{DirectoryError, EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -435,14 +435,40 @@ impl FileSystem for FtpFileSystem {
         self.run(async move {
             let mut conn = conn.lock().await;
             // 目录没有 SIZE 语义（多数服务器直接报错 550），失败即按目录处理。
-            let size = conn.size(&remote).await.ok().unwrap_or(0) as u64;
-            let modified = conn.mdtm(&remote).await.ok().map(system_time_from_naive);
-            Ok(FileMetadata {
-                size,
-                modified,
-                created: None,
-                permissions: Permissions::default(),
-            })
+            // ⚠️ 但 SIZE+MDTM **双双**失败还可能是「条目根本不存在」——冲突探测
+            // （transfer_between）靠 Err 区分「是目录」和「没有」，这里绝不能把
+            // 双失败吞成 Ok(size=0)：那会让 FTP 目标端粘贴任何文件都误报同名冲突。
+            let size = conn.size(&remote).await.ok();
+            let modified = conn.mdtm(&remote).await.ok();
+            if size.is_some() || modified.is_some() {
+                return Ok(FileMetadata {
+                    size: size.unwrap_or(0) as u64,
+                    modified: modified.map(system_time_from_naive),
+                    created: None,
+                    permissions: Permissions::default(),
+                });
+            }
+            // 都问不到：只剩「目录」和「不存在」两种可能（文件至少 SIZE 会成）。
+            // ⚠️ 裁决手段**只能用纯控制通道命令**（CWD），不能用 LIST/MLSD：
+            // 对不存在的路径，服务器（IIS 实测）PASV 照常应答、数据端口却拒绝
+            // 连接，suppaftp 在 connect 失败的路径上不消费后续应答，控制连接
+            // 从这一刻起整体错位一格——下一条命令读到 227、再下一条读到上一条
+            // 的真应答，全部答非所问。CWD 会动会话状态：先记 pwd、探完切回。
+            let here = conn.pwd().await.ok();
+            match conn.cwd(&remote).await {
+                Ok(()) => {
+                    if let Some(here) = here {
+                        let _ = conn.cwd(here).await;
+                    }
+                    Ok(FileMetadata {
+                        size: 0,
+                        modified: None,
+                        created: None,
+                        permissions: Permissions::default(),
+                    })
+                }
+                Err(_) => Err(MoError::Directory(DirectoryError::NotFound)),
+            }
         })
         .await
     }
@@ -452,9 +478,28 @@ impl FileSystem for FtpFileSystem {
         let conn = self.conn.clone();
         self.run(async move {
             let mut conn = conn.lock().await;
-            conn.mkdir(&remote)
-                .await
-                .map_err(|e| MoError::from(transport_error("建目录", e)))
+            match conn.mkdir(&remote).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // 已存在（MKD 对既有目录报 550）按建好处理，与
+                    // LocalFileSystem::create_dir_all 同一幂等语义。上传路径对
+                    // 目标父目录无条件 create_dir（transfer.rs），不幂等的话往
+                    // FTP 根目录（服务器多半不允许 MKD /，IIS 实测 550）传任何
+                    // 文件都会整体失败。用 CWD 验证（纯控制通道，见 metadata 的
+                    // 注释：LIST 对不存在路径会脏掉控制连接，这里同样不能用）；
+                    // CWD 会动会话状态，先记 pwd、验证完切回。
+                    let here = conn.pwd().await.ok();
+                    let is_dir = conn.cwd(&remote).await.is_ok();
+                    if is_dir {
+                        if let Some(here) = here {
+                            let _ = conn.cwd(here).await;
+                        }
+                        Ok(())
+                    } else {
+                        Err(MoError::from(transport_error("建目录", e)))
+                    }
+                }
+            }
         })
         .await
     }
