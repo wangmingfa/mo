@@ -432,3 +432,11 @@ crypto provider 做，一点没少。
 * 刻意选**惰性探测**（第一块读顺带探）而不是 connect 时握手多打一发探针：
   支持 Range 的服务器零额外请求，不支持的也只多走原路径一次。
 * 测试：判据表（206/200/416/401/粘住/should_send）+ 区间切出（中段/截尾/越界/空）。
+* ⚠️ 环境插曲（判定记录）：D 的整包 CI 两次、`--retry-flaky` 一次全在 inline_rename
+  SIGABRT；mo-ui 串行另有 `clicking_blank_below_the_list_clears_the_selection`
+  稳定红（约 55s，像内部等待超时）。三基线对照（d55b821 / c2571a1 / 581078c 原地切
+  换各跑一次）**全部同样红**，而 04:47 C 的整包 CI 同一批 mo-ui 代码还是全绿的；
+  期间机器负载一度冲到 49.85（14 核，ps/top 被沙箱挡住看不到元凶）——判定为
+  **机器级环境劣化**（窗口服务器 / HIToolbox 状态），非 C/D 回归。fmt / check /
+  clippy / mo-remote 48 条 / 其余 58 个测试二进制全绿。待机器空闲后重跑
+  `bash scripts/run-ci.sh --retry-flaky` 复核。
