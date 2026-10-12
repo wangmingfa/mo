@@ -30,8 +30,10 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Local, MappedLocalTime};
 use mo_core::{DirectoryError, EntryKind, FileId, FileMetadata, MoError, Permissions};
 use mo_fs::{FileSystem, ReadDirEntry};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
@@ -221,20 +223,38 @@ impl FtpFileSystem {
     }
 
     /// 列目录：优先 MLSD（机器可读、自带类型与大小），服务器不支持时回退 LIST。
-    async fn list_dir(&self, dir: &str) -> Result<Vec<File>, MoError> {
+    ///
+    /// 产物带 `time_is_server_local` 标记：LIST 行的时间是**服务器本地时间**
+    /// （协议无时区），要经 [`server_local_time`] 重解释；MLSD 的 `modify=`
+    /// 带 `Z` 是真 UTC，原样用（见该函数的注释）。
+    async fn list_dir(&self, dir: &str) -> Result<Vec<Listed>, MoError> {
         let dir = dir.to_string();
         let conn = self.conn.clone();
         self.run(async move {
             let mut conn = conn.lock().await;
             match conn.mlsd(Some(&dir)).await {
-                Ok(lines) => Ok(lines.iter().filter_map(|l| parse_mlsd(l)).collect()),
+                Ok(lines) => Ok(lines
+                    .iter()
+                    .filter_map(|l| parse_mlsd(l))
+                    .map(|file| Listed {
+                        file,
+                        time_is_server_local: false,
+                    })
+                    .collect()),
                 // 服务器不实现 MLSD 是常态（RFC 3659 是可选扩展），回退到 LIST。
                 Err(_) => {
                     let lines = conn
                         .list(Some(&dir))
                         .await
                         .map_err(|e| MoError::from(transport_error("列目录", e)))?;
-                    Ok(lines.iter().filter_map(|l| parse_list(l)).collect())
+                    Ok(lines
+                        .iter()
+                        .filter_map(|l| parse_list(l))
+                        .map(|file| Listed {
+                            file,
+                            time_is_server_local: true,
+                        })
+                        .collect())
                 }
             }
         })
@@ -247,8 +267,9 @@ impl FtpFileSystem {
             .list_dir(dir)
             .await?
             .into_iter()
-            .filter(|f| f.name() != "." && f.name() != "..")
-            .map(|f| {
+            .filter(|l| l.file.name() != "." && l.file.name() != "..")
+            .map(|l| {
+                let f = l.file;
                 let path = parent.join(file_name_only(f.name()));
                 let kind = if f.is_directory() {
                     EntryKind::Directory
@@ -259,15 +280,48 @@ impl FtpFileSystem {
                 };
                 // `File` 的 size / modified 来自 LIST/MLSD 解析，总是有值
                 // （无 mtime 时等于 UNIX_EPOCH）；直接用，不浪费一次 MDTM/SIZE 往返。
+                let modified = if l.time_is_server_local {
+                    Some(server_local_time(f.modified()))
+                } else {
+                    Some(f.modified())
+                };
                 ReadDirEntry::new(
                     FileId::synthetic(&path),
                     file_name_only(f.name()).to_string(),
                     kind,
                     path,
                 )
-                .with_metadata(f.size() as u64, Some(f.modified()))
+                .with_metadata(f.size() as u64, modified)
             })
             .collect())
+    }
+}
+
+/// [`FtpFileSystem::list_dir`] 的产物：解析出的条目 + 时间语义标记。
+struct Listed {
+    file: File,
+    /// `true` = 这个 `modified` 是 LIST 行的**服务器本地时间**，要用
+    /// [`server_local_time`] 重解释；`false` = MLSD 的真 UTC，原样用。
+    time_is_server_local: bool,
+}
+
+/// 把 LIST 行的「服务器本地时间」解释回正确的 [`SystemTime`]。
+///
+/// RFC 959 的 LIST 给的是**服务器本地时间**且不带时区信息，而 suppaftp 的
+/// 解析器（`parse_dos` / `parse_posix` / `parse_lstime`）一律 `and_utc()`
+/// 把它当 UTC 转 epoch——显示时再转本地时区，东八区服务器上「修改日期」
+/// 整体快 8 小时（真机实测：MDTM 原始值 13:39Z，界面显示次日 05:39）。
+/// 这里取回墙上时钟数字，按本地时区（chrono `Local`，自动含 DST）重新落地。
+///
+/// 假设服务器与用户同一时区：LIST 没有时区信息，这是唯一可用的假设；真要
+/// 跨时区服务器也准，只能逐条目发 MDTM（UTC），为一次列目录付 N 个往返不值。
+/// DST 歧义取较早的那个、不存在的时刻兜底用原值（偏一个偏移总比没有强）。
+fn server_local_time(t: SystemTime) -> SystemTime {
+    let wall = DateTime::<chrono::Utc>::from(t).naive_utc();
+    match wall.and_local_timezone(Local) {
+        MappedLocalTime::Single(dt) => dt.into(),
+        MappedLocalTime::Ambiguous(earliest, _) => earliest.into(),
+        MappedLocalTime::None => t,
     }
 }
 
@@ -666,6 +720,34 @@ mod tests {
         assert!(
             matches!(login_error(err), RemoteError::Transport { .. }),
             "421 不该被当成「需要凭据」"
+        );
+    }
+
+    /// LIST 行的时间是**服务器本地时间**，suppaftp 当 UTC 解析——重解释后
+    /// 按本地时区显示，必须还原 LIST 行上的墙上时钟（真机 IIS 的 DOS 行）。
+    #[test]
+    fn dos_list_time_is_reinterpreted_as_the_servers_wall_clock() {
+        let f = parse_list("09-21-26 06:05PM       <DIR>          1").expect("DOS 行应当能解析");
+        let corrected = server_local_time(f.modified());
+        let shown: DateTime<Local> = corrected.into();
+        assert_eq!(
+            shown.naive_local().to_string(),
+            "2026-09-21 18:05:00",
+            "修正后按本地时区显示应还原 LIST 行的墙上时钟"
+        );
+    }
+
+    /// POSIX 方言同理（老文件带显式年份的 `%b %d %Y` 形式，与「现在」无关）。
+    #[test]
+    fn posix_list_time_keeps_its_wall_clock_too() {
+        let f = parse_list("-rw-r--r-- 1 owner group 1024 Jan 05 2025 file.txt")
+            .expect("POSIX 行应当能解析");
+        let corrected = server_local_time(f.modified());
+        let shown: DateTime<Local> = corrected.into();
+        assert_eq!(
+            shown.naive_local().to_string(),
+            "2025-01-05 00:00:00",
+            "POSIX 行同样要还原墙上时钟"
         );
     }
 
