@@ -490,3 +490,35 @@ journal——排队的、进行中的任务崩掉后整个列表消失，用户�
 * 测试：journal 单测 4 条（记账 / 摘除 / epoch 屏障 / 弹一次 + 跨重启）、
   引擎集成 3 条（提交挂账+完成出列 / 恢复重跑 / 连不上留册）、
   headless 恢复卡渲染 + 丢弃收卡 1 条。
+
+## FTP 后端三处修复 + 串台判据（2026-10-12，commit 7491c82）
+
+问题：往 FTP 目标端粘贴任何文件都弹「已有同名文件」（远端明明没有）；往 FTP
+**根目录**传文件直接失败。两条都是真机（IIS FTP）用户报障暴露的。
+
+1. **metadata 吞「不存在」**：`FtpFileSystem::metadata` 对 SIZE/MDTM 双失败
+   （= 文件不存在，服务器 550）无条件返回 `Ok(size=0)`，把「没有」吞成
+   「存在但为空」。`transfer_between` 的冲突探测依赖「探测失败 = 当没有」
+   （`d.size > 0` 才算续传候选），于是 FTP 目标端粘贴必弹冲突卡。
+   修：双失败改用纯控制通道的 **CWD 裁决**（先 `PWD` 记位、探完切回）——
+   目录 Ok / 不存在 `Directory(NotFound)`。SFTP/WebDAV 本来就正确。
+2. **create_dir 不幂等**：上传路径对目标父目录无条件 `create_dir` 且 `?`
+   上抛（`transfer.rs:298`），IIS 不允许 `MKD /`（550 Access is denied）
+   → 往 FTP 根目录传任何文件必炸。修：MKD 失败 → CWD 确认是目录即按建好
+   处理，对齐 `LocalFileSystem::create_dir_all` 语义。
+
+⚠️ **FTP 控制连接串台判据（中间踩过一次，别再犯）**：对**不存在**的路径
+`LIST`/`MLSD`，IIS 照常回 227 PASV 但**数据端口拒绝连接**；suppaftp 12 在
+connect 失败路径上**不消费后续应答** → 控制连接从此错位一格（下一条命令
+读到 227、再下一条读到上一条的真应答，全部答非所问）。第一版修复就是用
+LIST 探存在性，把整条控制连接打歪、上传 0% 失败——症状是「修完反而更坏」
+。**FTP 的存在性/目录裁决只能用纯控制通道命令**（SIZE/MDTM/CWD/PWD）。
+
+顺带修对的既有隐性 bug（旧「恒 Ok」语义坑着）：`free_path` /
+`unique_remote_path` 在 FTP 上永远探不到空名（10k 轮空转后兜底返回原名，
+撤销记录会指错名）、`name_taken` 恒真（FTP 新建文件夹必加「 2」后缀）。
+
+验证：探针直连 IIS FTP（不存在条目 metadata → NotFound 且后续命令全部
+正常 / create_dir(/) → Ok / 1MB 实传+读回一致）；2GB 传输中途 `kill -9`
+→ 重启恢复卡 → 断点续传补完 → journal 出列。E2 全链路 + 本轮三修复
+真机闭环。
