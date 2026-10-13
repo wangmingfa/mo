@@ -153,3 +153,57 @@ async fn cursor_move_reports_both_spaces() {
     let row = app.move_cursor(1, false).await.expect("应有焦点");
     assert_eq!(row, 2, "move_cursor 返回列表行");
 }
+
+/// 回归：`locate_cursor` 的 `extend` 分支过去只 `select_range`（只 insert 不清空），
+/// 导致 Shift+↓ 多选 1→4 之后再按一下 ↑，4 号项因为 `select_range` 不清除而被留下，
+/// 表现为「按上方向键减不掉选中」。修复后整段替换选区，向上应收缩、且锚点保持在初次单击。
+#[tokio::test]
+async fn shift_arrow_up_shrinks_selection() {
+    let dir = tmp("shift-arrow-up");
+    for name in ["1.txt", "2.txt", "3.txt", "4.txt", "5.txt"] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    let app = common::isolated("shift-arrow-up", AppState::new);
+    app.open_directory(&dir).await.expect("打开目录失败");
+    assert_eq!(app.visible_count().await, 5);
+
+    // 单击选中 1 号（无修饰），建立连选锚点。
+    let entries = app.current_entries().await;
+    let id_of = |name: &str| entries.iter().find(|e| e.name == name).unwrap().id;
+    let first = id_of("1.txt");
+    app.select(first).await;
+    assert_eq!(app.selection_ids().await.len(), 1);
+
+    // 按住 Shift 按 3 次下方向键：1→2→3→4。
+    app.locate_cursor(1, true).await;
+    app.locate_cursor(1, true).await;
+    app.locate_cursor(1, true).await;
+    let ids = app.selection_ids().await;
+    assert_eq!(ids.len(), 4, "向下连选 1→4 应选中 4 个");
+    for name in ["1.txt", "2.txt", "3.txt", "4.txt"] {
+        assert!(ids.contains(&id_of(name)), "{name} 应被选中");
+    }
+
+    // 再按 1 次上方向键：应去掉 4 号，只剩 1/2/3。
+    app.locate_cursor(-1, true).await;
+    let ids = app.selection_ids().await;
+    assert_eq!(ids.len(), 3, "向上收缩后只剩 3 个选中");
+    assert!(!ids.contains(&id_of("4.txt")), "4 号应被取消选中");
+    for name in ["1.txt", "2.txt", "3.txt"] {
+        assert!(ids.contains(&id_of(name)), "{name} 应仍被选中");
+    }
+
+    // 锚点应始终是初次单击的 1 号，下一次 Shift 仍从 1 展开。
+    assert_eq!(
+        app.selection_anchor().await,
+        Some(first),
+        "连选锚点应始终是初次单击的 1 号"
+    );
+
+    // 继续向下：应从锚点 1 重新展开到 4（4 号回来，2/3/4 都在）。
+    app.locate_cursor(1, true).await;
+    let ids = app.selection_ids().await;
+    assert!(ids.contains(&id_of("4.txt")), "锚点保留后向下应重新含 4 号");
+    assert_eq!(ids.len(), 4);
+}

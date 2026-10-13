@@ -3313,6 +3313,15 @@ impl AppState {
         self.inner.write().await.selection.clear();
     }
 
+    /// 以某条目为「Shift 连选锚点」（只改锚点，不动已选集合）。
+    ///
+    /// 连选每步都会先清空再取 [锚点, 光标] 整段，锚点会被 `clear` 一并清掉；
+    /// 不恢复的话下一次 Shift 会以「最后的光标」而非「最初那次单击」为起点，
+    /// 连选方向会乱。语义与 `SelectionModel::set_anchor` 一致。
+    pub async fn set_anchor(&self, id: FileId) {
+        self.inner.write().await.selection.set_anchor(id);
+    }
+
     /// 按路径选中**当前目录**里的一个条目；返回是否真选中了。
     ///
     /// 选择模型只认 FileId，而搜索结果 / 回收站还原这类入口手上是路径——
@@ -4175,6 +4184,11 @@ impl AppState {
             .collect()
     }
 
+    /// 当前 Shift 连选锚点（无则返回 `None`）。测试 / 调试用。
+    pub async fn selection_anchor(&self) -> Option<FileId> {
+        self.inner.read().await.selection.anchor()
+    }
+
     /// 键盘 ↑↓ 移动焦点：`step` 为相对位移（-1 / +1），`extend` 为 Shift 连选。
     ///
     /// 返回移动后的**列表行下标**（列表视图直接用它滚屏；网格 / 画廊要用条目位，
@@ -4219,10 +4233,19 @@ impl AppState {
         };
 
         if extend {
-            let from = anchor
+            let anchor_id = anchor;
+            let from = anchor_id
                 .and_then(|a| ids.iter().position(|&i| i == a))
                 .unwrap_or(next);
+            // 连选是「从锚点到光标」的整段**替换**：必须先清再插，否则向上收缩选区时
+            // 先前向下多高亮的项（例如 4 号）只会被 `select_range` 的 insert 留着，
+            // 表现为「按上方向键减不掉选中」。清完锚点一并没了，故末尾再恢复成最初
+            // 那次单击，下一次 Shift 仍以它为基准。
+            self.clear_selection().await;
             self.select_range(from, next).await;
+            if let Some(a) = anchor_id {
+                self.set_anchor(a).await;
+            }
         } else {
             self.select(ids[next]).await;
         }
