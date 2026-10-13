@@ -3030,6 +3030,171 @@ impl RootView {
         .detach();
     }
 
+    /// 在新窗口打开某个目录（地址栏面包屑「在新窗口中打开」）。
+    ///
+    /// 重开一个独立的系统窗口：每个窗口有自己的一份 `AppState`（导航栈 / 选择 /
+    /// 滚动互相隔离，见 `RootView` 一页一个 `AppState` 的约定）。新窗口会照常走
+    /// `RootView::new` 的会话恢复 / Home 起步，随后把首标签页落到 `path`——
+    /// 与「新标签页打开」落到当前窗口某个标签页是同一套 `DirectoryController::open`。
+    pub(crate) fn open_new_window_at(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let app = mo_app::AppState::new();
+        app.spawn_watcher_pump();
+        app.spawn_remote_poll_pump();
+        app.spawn_refresh_pump();
+
+        // 与 `lib.rs` 主窗口一致的窗口外观：沉浸式红绿灯 + 标题栏应交应用层处理拖拽。
+        let (tl_x, tl_y) = crate::toolbar::traffic_light_position();
+        let options = gpui_kit::WindowOptions {
+            window_bounds: Some(gpui_kit::WindowBounds::centered(
+                size(px(1280.0), px(800.0)),
+                cx,
+            )),
+            titlebar: Some(gpui_kit::TitlebarOptions {
+                title: Some("Mo".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(tl_x), px(tl_y))),
+            }),
+            app_owns_titlebar_drag: true,
+            ..Default::default()
+        };
+
+        let win_app = app.clone();
+        let target = path.clone();
+        match cx.open_window(options, move |window, cx| {
+            let view = cx.new(|cx| RootView::new(app.clone(), cx));
+            // 关窗前存布局（同主窗口）：红绿灯 / Alt+F4 直接关窗不走退出路径。
+            let v = view.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                v.update(cx, |v, _cx| v.save_session());
+                true
+            });
+            view
+        }) {
+            Ok(handle) => {
+                let target = target.clone();
+                handle
+                    .update(cx, |_view, _window, cx| {
+                        cx.spawn(async move |_weak, _cx| {
+                            let _ = mo_app::DirectoryController::new(win_app.clone())
+                                .open(&target)
+                                .await;
+                        })
+                        .detach();
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                self.modal = Modal::Info(format!("打开新窗口失败：{e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 在新标签页打开**远程**目录（远程地址栏 crumb 的「在新标签页中打开」）。
+    ///
+    /// 与 [`RootView::open_in_new_tab`] 的区别只在于「怎么连上那个目录」：远程没有
+    /// 本机路径可开，得先复用进程级注册表里那条**活连接**（`open_connection` 原地接管，
+    /// 不重新登录——凭据只在钥匙串），再导航到 crumb 指向的远程路径。每个标签页各自
+    /// 一份 `AppState`，导航栈 / 选择互相隔离。
+    pub(crate) fn open_remote_in_new_tab(
+        &mut self,
+        pane_idx: usize,
+        session: u64,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app = mo_app::AppState::new();
+        app.spawn_watcher_pump();
+        app.spawn_remote_poll_pump();
+        app.spawn_refresh_pump();
+        let Some(pane) = self.panes.get_mut(pane_idx) else {
+            return;
+        };
+        let tab_idx = pane.tabs.len();
+        pane.tabs.push(panel_with_prefs(app.clone(), &self.ui));
+        pane.active = tab_idx;
+
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_weak, cx| {
+            // 复用当前进程的活连接：session 在进程级注册表里，切过去就是同一台服务器的
+            // 同一目录上下文，不用重新登录。失败（连接已被掐断且重连失败）就停在首页，
+            // 不抛错打扰用户——他可以手动从侧边栏重连。
+            if app.open_connection(session).await.is_ok() {
+                let _ = mo_app::DirectoryController::new(app.clone())
+                    .open(&path)
+                    .await;
+            }
+            tab_loop(app, weak, cx, pane_idx, tab_idx, false).await;
+        })
+        .detach();
+    }
+
+    /// 在新窗口打开**远程**目录（远程地址栏 crumb 的「在新窗口中打开」）。
+    ///
+    /// 与 [`RootView::open_new_window_at`] 一样重开一个独立系统窗口，但首标签页落到的是
+    /// 远程目录——先复用进程级活连接（`open_connection`），再 `DirectoryController::open`
+    /// 导航。窗口外观与 `open_new_window_at` 完全一致。
+    pub(crate) fn open_new_window_at_remote(
+        &mut self,
+        session: u64,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app = mo_app::AppState::new();
+        app.spawn_watcher_pump();
+        app.spawn_remote_poll_pump();
+        app.spawn_refresh_pump();
+
+        // 与 `lib.rs` 主窗口一致的窗口外观：沉浸式红绿灯 + 标题栏应交应用层处理拖拽。
+        let (tl_x, tl_y) = crate::toolbar::traffic_light_position();
+        let options = gpui_kit::WindowOptions {
+            window_bounds: Some(gpui_kit::WindowBounds::centered(
+                size(px(1280.0), px(800.0)),
+                cx,
+            )),
+            titlebar: Some(gpui_kit::TitlebarOptions {
+                title: Some("Mo".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(tl_x), px(tl_y))),
+            }),
+            app_owns_titlebar_drag: true,
+            ..Default::default()
+        };
+
+        let win_app = app.clone();
+        let target = path.clone();
+        match cx.open_window(options, move |window, cx| {
+            let view = cx.new(|cx| RootView::new(app.clone(), cx));
+            // 关窗前存布局（同主窗口）：红绿灯 / Alt+F4 直接关窗不走退出路径。
+            let v = view.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                v.update(cx, |v, _cx| v.save_session());
+                true
+            });
+            view
+        }) {
+            Ok(handle) => {
+                let target = target.clone();
+                handle
+                    .update(cx, |_view, _window, cx| {
+                        cx.spawn(async move |_weak, _cx| {
+                            if win_app.open_connection(session).await.is_ok() {
+                                let _ = mo_app::DirectoryController::new(win_app.clone())
+                                    .open(&target)
+                                    .await;
+                            }
+                        })
+                        .detach();
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                self.modal = Modal::Info(format!("打开新窗口失败：{e}"));
+                cx.notify();
+            }
+        }
+    }
+
     /// 切焦点窗格（分栏时才有意义）。
     pub(crate) fn switch_pane(&mut self, step: isize) {
         if self.panes.len() < 2 {
@@ -9897,6 +10062,8 @@ impl RootView {
             paths,
             remote,
             contributions,
+            remote_crumb: None,
+            kind: crate::context_menu::MenuKind::File,
         });
         self.ctx_submenu_open = false;
 
@@ -9926,6 +10093,47 @@ impl RootView {
             self.ctx_submenu_open = false;
             cx.notify();
         }
+    }
+
+    /// 在地址栏某个面包屑上右键：弹一个**仅三项**的菜单（复制地址 / 新标签页打开 /
+    /// 新窗口打开）。
+    ///
+    /// 复用文件右键那一套 `ContextMenu` 状态与渲染通道（`kind` 区分生成哪组条目），
+    /// 但**不**走 `open_context_menu`——那套会去列表里选中右键目标、查「打开方式」
+    /// 候选应用、重取贡献动作，面包屑用不上任何一步。这里只记下落点与要操作的目录。
+    ///
+    /// 面包屑指向的一定是个目录层级，所以 `is_dir = true`；本机专属动作（在访达中显示）
+    /// 不在这一组里，也就无所谓 `remote` 是不是真。
+    ///
+    /// `remote` 为 `Some((url, session))` 表示这是**远程**地址栏那条单级 URL crumb：
+    /// 复制地址复制的是 URL 文本，新标签页 / 新窗口走的是「复用进程级活连接 + 导航到
+    /// 该远程目录」的通道（见 [`RootView::open_remote_in_new_tab`] /
+    /// [`RootView::open_new_window_at_remote`]），而不是本机路径那套。
+    pub(crate) fn open_crumb_menu(
+        &mut self,
+        x: f32,
+        y: f32,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+        remote: Option<(String, u64)>,
+    ) {
+        // 先清掉可能开着的文件右键菜单 / 应用菜单浮层，避免两层叠着。
+        self.context_menu = None;
+        self.ctx_submenu_open = false;
+        self.open_with_apps.clear();
+        self.context_menu = Some(crate::context_menu::ContextMenu {
+            x,
+            y,
+            target: Some(path),
+            is_dir: true,
+            selected: 1,
+            paths: Vec::new(),
+            remote: remote.is_some(),
+            contributions: Default::default(),
+            kind: crate::context_menu::MenuKind::Crumb,
+            remote_crumb: remote,
+        });
+        cx.notify();
     }
 
     /// 展开「打开方式」二级菜单（hover 触发；已展开则幂等）。
@@ -10081,9 +10289,39 @@ impl RootView {
                 .detach();
             }
             A::OpenInNewTab => {
-                if let Some(p) = target {
+                if let Some((_, session)) = menu.remote_crumb {
+                    // 远程 crumb：复用当前进程里的活连接（session 在进程级注册表里），
+                    // 不重新登录，再导航到该远程目录。
+                    let pane = self.active_pane;
+                    self.open_remote_in_new_tab(
+                        pane,
+                        session,
+                        target.clone().unwrap_or_default(),
+                        cx,
+                    );
+                } else if let Some(p) = target {
                     let pane = self.active_pane;
                     self.open_in_new_tab(pane, p, cx);
+                }
+            }
+            A::CopyAddress => {
+                // 面包屑右键的「复制地址」：把该目录层级路径当纯文本写进系统剪贴板
+                // （不经过内部文件剪贴板，和「拷贝路径」同一条通道，只是源是单个 crumb）。
+                // 远程 crumb 复制的是 **URL 文本**（不是本机路径）。
+                if let Some((url, _)) = menu.remote_crumb {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url));
+                } else if let Some(p) = target {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        p.to_string_lossy().to_string(),
+                    ));
+                }
+            }
+            A::OpenInNewWindow => {
+                if let Some((_, session)) = menu.remote_crumb {
+                    // 远程 crumb：新窗口复用进程级活连接（见 `open_remote_in_new_tab`）。
+                    self.open_new_window_at_remote(session, target.clone().unwrap_or_default(), cx);
+                } else if let Some(p) = target.clone() {
+                    self.open_new_window_at(p, cx);
                 }
             }
             A::OpenInSplit => {
@@ -16778,6 +17016,111 @@ mod tests {
         assert_eq!(
             selected, value,
             "进入编辑态应当整条路径全选（选中能力就在这里）：value={value:?} selected={selected:?}"
+        );
+    }
+
+    /// 面包屑右键菜单：经 `open_crumb_menu` 落进去的 `ContextMenu` 必须是
+    /// `MenuKind::Crumb`，且 `items()` 只生成「复制地址 / 新标签页 / 新窗口」三项——
+    /// 与文件列表那套（重命名 / 移到废纸篓 / 打开方式…）彻底分开，挡住「面包屑也冒出
+    /// 文件动作」这类回归。
+    #[test]
+    fn crumb_menu_state_is_opened_with_address_items() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        root.update(cx, |v, cx| {
+            v.open_crumb_menu(12.0, 34.0, PathBuf::from("/Users/me/code/mo"), cx, None);
+        });
+
+        let m = cx
+            .update(|_window, cx| root.read(cx).context_menu.clone())
+            .expect("面包屑菜单应当已打开");
+        assert_eq!(
+            m.kind,
+            crate::context_menu::MenuKind::Crumb,
+            "kind 必须是 Crumb"
+        );
+        assert_eq!(m.target, Some(PathBuf::from("/Users/me/code/mo")));
+        let actions: Vec<crate::context_menu::MenuAction> = crate::context_menu::items(&m, &[])
+            .into_iter()
+            .map(|i| i.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                crate::context_menu::MenuAction::CopyAddress,
+                crate::context_menu::MenuAction::OpenInNewTab,
+                crate::context_menu::MenuAction::OpenInNewWindow,
+            ]
+        );
+    }
+
+    /// 远程地址栏 crumb 右键：同样三项，但 `remote_crumb` 要带 URL 文本 + 会话编号，
+    /// 且「复制地址」复制的是 **URL** 而不是本机路径。
+    #[test]
+    fn remote_crumb_menu_copies_url_and_carries_session() {
+        crate::isolate_user_dirs_for_tests();
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let app = AppState::new();
+        let (root, cx) = cx.add_window_view(|_, cx| RootView::new(app, cx));
+        let root = root.clone();
+
+        root.update(cx, |v, cx| {
+            v.open_crumb_menu(
+                12.0,
+                34.0,
+                PathBuf::from("/pub/files"),
+                cx,
+                Some(("ftp://user@example.com:2121/pub/files".to_string(), 7)),
+            );
+        });
+
+        let m = cx
+            .update(|_window, cx| root.read(cx).context_menu.clone())
+            .expect("远程 crumb 菜单应当已打开");
+        assert_eq!(
+            m.kind,
+            crate::context_menu::MenuKind::Crumb,
+            "kind 必须是 Crumb"
+        );
+        // target 仍是远程目录路径（新标签页 / 新窗口靠它导航到该目录）。
+        assert_eq!(m.target, Some(PathBuf::from("/pub/files")));
+        // 关键：remote_crumb 带着 URL 文本与会话编号。
+        assert_eq!(
+            m.remote_crumb,
+            Some(("ftp://user@example.com:2121/pub/files".to_string(), 7))
+        );
+        let actions: Vec<crate::context_menu::MenuAction> = crate::context_menu::items(&m, &[])
+            .into_iter()
+            .map(|i| i.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                crate::context_menu::MenuAction::CopyAddress,
+                crate::context_menu::MenuAction::OpenInNewTab,
+                crate::context_menu::MenuAction::OpenInNewWindow,
+            ]
+        );
+
+        // 「复制地址」复制的是 URL 文本，不是本机路径。
+        let clip = cx
+            .update(|_window, cx| {
+                root.update(cx, |v, cx| {
+                    v.run_menu_action(crate::context_menu::MenuAction::CopyAddress, cx);
+                    cx.read_from_clipboard()
+                })
+            })
+            .and_then(|item| item.text());
+        assert_eq!(
+            clip.as_deref(),
+            Some("ftp://user@example.com:2121/pub/files"),
+            "远程 crumb 复制的应当是 URL"
         );
     }
 

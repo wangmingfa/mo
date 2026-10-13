@@ -598,6 +598,25 @@ fn address_bar(
                 cx.stop_propagation();
                 entity_edit.update(cx, |v, cx| v.begin_address_edit(window, cx));
             });
+
+            // 远程地址栏是一条单级 URL crumb：右键同样弹「复制地址 / 新标签页 / 新窗口」
+            // 三项，但复制的是 URL、开的是远程会话（复用进程级活连接）。落点用鼠标窗口
+            // 坐标（与本地面包屑、文件右键同一套坐标约定）；`stop_propagation` 别让右键
+            // 冒泡到外层地址栏（那里只认左键进编辑）。
+            let crumb_entity = entity.clone();
+            let crumb_url = full.clone();
+            let crumb_path = p.clone();
+            let crumb_session = app.active_connection_id();
+            seg.interactivity()
+                .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    let remote = crumb_session.map(|s| (crumb_url.clone(), s));
+                    crumb_entity.update(cx, |v, cx| {
+                        v.open_crumb_menu(x, y, crumb_path.clone(), cx, remote);
+                    });
+                    cx.stop_propagation();
+                });
+
             seg = seg.child(div().flex_1().min_w_0().truncate().child(text!(full)));
             pill = pill.child(seg);
         } else {
@@ -630,6 +649,12 @@ fn address_bar(
                     })
                     .hover(|s| s.bg(theme::hover_bg()));
 
+                // 右键：在该面包屑上弹「复制地址 / 新标签页打开 / 新窗口打开」菜单。
+                // 落点用鼠标窗口坐标（与文件右键、应用菜单同一套坐标约定）。
+                // ⚠️ 必须在上面的 `on_click` 之前 clone：那段 `move` 闭包会把
+                // `seg_path` 整体捕获带走，之后再用就会报 use-after-move。
+                let crumb_entity = entity.clone();
+                let crumb_path = seg_path.clone();
                 seg.interactivity().on_click(move |_, _window, cx| {
                     // 阻断冒泡：别让外层「点击空白进入编辑」误触发。
                     cx.stop_propagation();
@@ -640,6 +665,16 @@ fn address_bar(
                     })
                     .detach();
                 });
+
+                seg.interactivity()
+                    .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        crumb_entity.update(cx, |v, cx| {
+                            v.open_crumb_menu(x, y, crumb_path.clone(), cx, None);
+                        });
+                        // 别让右键冒泡到外层（地址栏空白区只认左键进编辑，这里也顺手止泡）。
+                        cx.stop_propagation();
+                    });
 
                 // 段一律显示原始名称文本（不再给 Home 段换房子图标）。
                 seg = seg.child(text!(label));

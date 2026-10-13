@@ -72,6 +72,33 @@ pub(crate) struct ContextMenu {
     /// 「菜单看得到 / 点了不对」的来源。菜单自己带一份，渲染与执行读同一份，从结构上
     /// 就没有「镜像在菜单打开后被人重取」的空档。
     pub contributions: crate::actions::Contributions,
+    /// 菜单来源（文件列表 / 面包屑），决定 `items` 生成哪组条目。
+    pub kind: MenuKind,
+    /// 面包屑指向**远程**时，这里带着「要复制的 URL 文本」与「要复用的会话编号」。
+    ///
+    /// 远程地址栏是一条单级 URL crumb（没有多级本地面包屑），右键菜单依旧是
+    /// 「复制地址 / 新标签页 / 新窗口」三项，但它的语义与本地不同：
+    /// - 复制地址：复制这条 `URL` 文本（不是本机路径）；
+    /// - 新标签页 / 新窗口：复用进程级注册表里这条 `session` 活连接（不重新登录），
+    ///   再导航到 crumb 指向的远程目录（见 [`crate::RootView::open_remote_in_new_tab`]）。
+    ///
+    /// 本地面包屑这条为 `None`——`target` 就是目录路径，走普通本地打开通道。
+    pub remote_crumb: Option<(String, u64)>,
+}
+
+/// 菜单来源：决定 [`items`] 生成哪一组条目。
+///
+/// 同一套渲染 / 执行通道（[`ContextMenu`] + [`render`] + [`crate::RootView::run_menu_action`]）
+/// 既服务文件列表右键（目录级 / 条目级），也服务地址栏面包屑右键（仅「复制地址 /
+/// 新标签页 / 新窗口」三项）。两种上下文共用一个 `Option<ContextMenu>` 状态（同一时刻
+/// 只会开一个），靠 `kind` 区分生成哪组条目——与 [`items`] 里「空白处 → 目录级动作」
+/// 的分支是同一路数。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MenuKind {
+    /// 文件列表 / 空白处右键（默认）。
+    File,
+    /// 地址栏面包屑右键：复制地址 / 新标签页打开 / 新窗口打开。
+    Crumb,
 }
 
 /// 菜单里的一个动作。
@@ -85,6 +112,10 @@ pub(crate) enum MenuAction {
     OpenWithOther,
     /// 在**新标签页**里打开该目录。
     OpenInNewTab,
+    /// 把该路径（面包屑指向的目录）作为纯文本写进系统剪贴板。
+    CopyAddress,
+    /// 在**新窗口**里打开该目录（重开一个 macOS / 系统窗口）。
+    OpenInNewWindow,
     /// 在**第二个窗格**里打开该目录（分栏）。
     OpenInSplit,
     /// 快速预览（与空格键同语义）。
@@ -188,6 +219,17 @@ fn looks_like_archive(path: &std::path::Path) -> bool {
 /// 贡献进来的动作（用户命令 / 扩展命令 / 工作流）从 [`ContextMenu::contributions`] 读，
 /// 不再由调用方递一份进来——渲染与执行必须看的是同一份快照（字段上有理由）。
 pub(crate) fn items(menu: &ContextMenu, open_with: &[mo_app::shell::OpenWithApp]) -> Vec<MenuItem> {
+    // 面包屑右键：只给「复制地址 / 新标签页打开 / 新窗口打开」三项，绝不该冒出
+    // 重命名 / 移到废纸篓 / 打开方式这类要对着具体文件条目的动作——面包屑指向的是
+    // 一个目录层级，不是列表里某个被选中/右键的条目。
+    if let MenuKind::Crumb = menu.kind {
+        return vec![
+            MenuItem::new(MenuAction::CopyAddress, "复制地址", "", true),
+            MenuItem::new(MenuAction::OpenInNewTab, "在新标签页中打开", "", true).separated(),
+            MenuItem::new(MenuAction::OpenInNewWindow, "在新窗口中打开", "", true),
+        ];
+    }
+
     let specs = &menu.contributions.specs;
     let Some(target) = menu.target.as_ref() else {
         // ------------------------------------------------ 空白处：目录级动作
@@ -693,8 +735,8 @@ mod tests {
     // ⚠️ 不要 `use super::*`：本模块顶层有 `use gpui_kit::*`，它会把 gpui 的
     // `test` 属性宏一起带进来，把内置的 `#[test]` 顶掉，展开时直接撞递归上限。
     use super::{
-        items, looks_like_archive, panel_height, ContextMenu, MenuAction, MenuItem, ITEM_H, PAD,
-        SEP_H,
+        items, looks_like_archive, panel_height, ContextMenu, MenuAction, MenuItem, MenuKind,
+        ITEM_H, PAD, SEP_H,
     };
     use crate::actions::{ActionKind, ActionSpec, Slot};
     use std::path::{Path, PathBuf};
@@ -709,6 +751,8 @@ mod tests {
             paths: Vec::new(),
             remote: false,
             contributions: Default::default(),
+            kind: MenuKind::File,
+            remote_crumb: None,
         }
     }
 
@@ -743,6 +787,37 @@ mod tests {
 
     fn find(list: &[MenuItem], a: MenuAction) -> &MenuItem {
         list.iter().find(|i| i.action == a).expect("条目不存在")
+    }
+
+    /// 面包屑右键：只列「复制地址 / 在新标签页中打开 / 在新窗口中打开」三项，
+    /// 绝不能把文件列表那套（重命名 / 移到废纸篓 / 打开方式…）带进来——面包屑指向
+    /// 一个目录层级，不是列表里被右键的条目。
+    #[test]
+    fn crumb_menu_lists_only_address_and_open_actions() {
+        let m = ContextMenu {
+            kind: MenuKind::Crumb,
+            target: Some(PathBuf::from("/Users/me/code/mo")),
+            is_dir: true,
+            ..menu(Some("/Users/me/code/mo"), true, 1)
+        };
+        let list = items(&m, &[]);
+        let actions: Vec<MenuAction> = list.iter().map(|i| i.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                MenuAction::CopyAddress,
+                MenuAction::OpenInNewTab,
+                MenuAction::OpenInNewWindow,
+            ],
+            "面包屑菜单只有这三项"
+        );
+        // 文案与顺序对得上需求。
+        assert_eq!(list[0].label, "复制地址");
+        assert!(list[1].separator_before, "「新标签页」上方应有一条分隔线");
+        assert_eq!(list[1].label, "在新标签页中打开");
+        assert_eq!(list[2].label, "在新窗口中打开");
+        // 三项全部可用，不该被任何裁剪逻辑关掉。
+        assert!(list.iter().all(|i| i.enabled));
     }
 
     /// 空白处：只有目录级动作，绝不能出现「重命名 / 移到废纸篓」这类要对象的项。
