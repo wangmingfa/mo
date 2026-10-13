@@ -166,6 +166,17 @@ impl FtpFileSystem {
                 stream
             };
             stream.login(&user, &password).await.map_err(login_error)?;
+            // IIS 等 Windows FTP 服务器默认按**服务器本地代码页**（中文系统 = GBK）
+            // 解释控制通道里的文件名；只有客户端显式 `OPTS UTF8 ON` 才切换到 UTF-8。
+            // 不声明的话，建中文名目录的 UTF-8 字节在服务器侧映射不回代码页，IIS 回
+            // `451 No mapping for the Unicode character exists in the target
+            // multi-byte code page`。先问 FEAT、声明支持 UTF8 才发 OPTS（不认识
+            // OPTS 的老服务器会报 5xx，别硬发）；OPTS 失败容忍——最差退回旧表现。
+            if let Ok(features) = stream.feat().await {
+                if features.contains_key("UTF8") {
+                    let _ = stream.opts("UTF8", Some("ON")).await;
+                }
+            }
             Ok::<_, RemoteError>(stream)
         })?;
 
