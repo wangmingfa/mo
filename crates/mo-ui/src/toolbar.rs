@@ -571,54 +571,93 @@ fn address_bar(
 
     // 面包屑模式：一段一个可点击胶囊，中间夹「›」分隔符。
     if let Some(p) = path {
-        // **正在看**远程时：地址栏回显完整 URL（当前远程路径替换原路径）。
+        // **正在看**远程时：地址栏按**多段面包屑**回显（host 段 + 各级目录段）。
         // 用 `remote_url()`（**正在浏览**的那条）而不是 `live_connections()`（活着的
         // 全部连接）——切回本地后连接还活着，那时地址栏该显示本地路径，而不是拿本地
         // 路径去拼一个远程 URL。
-        // 整段可点击进入编辑（填新路径即在远程内跳转，填 `scheme://` 则切服务器）。
         if let Some(url) = app.remote_url() {
             // `address_at` 不回显用户名：地址栏要的是「哪台机器的哪个目录」，
             // 用户名只参与登录（用户明确要求过别显示）。
-            let full = url.address_at(&p.display().to_string());
-            let entity_edit = entity.clone();
-            let mut seg = div()
-                .id(("crumb", 0usize))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0))
-                .px(px(5.0))
-                .h(px(24.0))
-                .overflow_hidden()
-                .rounded(px(5.0))
-                .flex_shrink_0()
-                .text_color(theme::text())
-                .hover(|s| s.bg(theme::hover_bg()));
-            seg.interactivity().on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                entity_edit.update(cx, |v, cx| v.begin_address_edit(window, cx));
-            });
+            let session = app.active_connection_id();
+            // 段列表：(显示名, 点击导航的远程路径, 右键「复制地址」要复制的 URL 文本)。
+            // host 段先入：复制地址复制 endpoint（不含凭据 / 路径），开目录用远程根 `/`。
+            let mut segs: Vec<(String, PathBuf, String)> = Vec::new();
+            segs.push((url.endpoint(), PathBuf::from("/"), url.endpoint()));
+            // 路径各级目录段：从远程根往下逐级拼，每级一个可点击段。
+            let mut prefix = PathBuf::from("/");
+            for comp in p.components() {
+                match comp {
+                    // 根分隔符由 host 段代表，跳过；其余组件逐级累加。
+                    std::path::Component::RootDir => {}
+                    other => {
+                        prefix.push(other.as_os_str());
+                        let label = crate::path_label::last_segment(&prefix);
+                        let crumb_url = url.address_at(&prefix.display().to_string());
+                        segs.push((label, prefix.clone(), crumb_url));
+                    }
+                }
+            }
 
-            // 远程地址栏是一条单级 URL crumb：右键同样弹「复制地址 / 新标签页 / 新窗口」
-            // 三项，但复制的是 URL、开的是远程会话（复用进程级活连接）。落点用鼠标窗口
-            // 坐标（与本地面包屑、文件右键同一套坐标约定）；`stop_propagation` 别让右键
-            // 冒泡到外层地址栏（那里只认左键进编辑）。
-            let crumb_entity = entity.clone();
-            let crumb_url = full.clone();
-            let crumb_path = p.clone();
-            let crumb_session = app.active_connection_id();
-            seg.interactivity()
-                .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
-                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
-                    let remote = crumb_session.map(|s| (crumb_url.clone(), s));
-                    crumb_entity.update(cx, |v, cx| {
-                        v.open_crumb_menu(x, y, crumb_path.clone(), cx, remote);
-                    });
+            let n = segs.len();
+            for (i, (label, target, crumb_url)) in segs.into_iter().enumerate() {
+                let is_last = i + 1 == n;
+                if i > 0 {
+                    pill = pill.child(icon(icons::CHEVRON_RIGHT, 12.0, theme::muted()));
+                }
+                let seg_app = app.clone();
+                let seg_path = target.clone();
+                let mut seg = div()
+                    .id(("crumb", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(5.0))
+                    // 高度钉死：pill 高 32，段高 24 → hover 底色上下各留 4px，
+                    // 不会顶到外框（文字行高会浮动，不定高就会贴边）。
+                    .h(px(24.0))
+                    .overflow_hidden()
+                    .rounded(px(5.0))
+                    .flex_shrink_0()
+                    .text_color(if is_last {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
+                    .hover(|s| s.bg(theme::hover_bg()));
+
+                // 左键：点击该段跳到对应远程目录（与本地分支同语义，经 `open_directory`
+                // 按路径远程性路由；`stop_propagation` 别让外层空白区误进编辑态）。
+                seg.interactivity().on_click(move |_, _window, cx| {
                     cx.stop_propagation();
+                    let app = seg_app.clone();
+                    let target = seg_path.clone();
+                    cx.spawn(async move |_cx| {
+                        let _ = app.open_directory(&target).await;
+                    })
+                    .detach();
                 });
 
-            seg = seg.child(div().flex_1().min_w_0().truncate().child(text!(full)));
-            pill = pill.child(seg);
+                // 右键：该段弹「复制地址 / 新标签页 / 新窗口」三项，复制的是这一段对应的
+                // 远程 URL、开的是同一远程会话（复用进程级活连接）。落点用鼠标窗口坐标，
+                // 与本地分支、文件右键同一套坐标约定。
+                let crumb_entity = entity.clone();
+                let crumb_path = target.clone();
+                let crumb_url2 = crumb_url.clone();
+                let crumb_session = session;
+                seg.interactivity()
+                    .on_mouse_down(MouseButton::Right, move |ev, _window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let remote = crumb_session.map(|s| (crumb_url2.clone(), s));
+                        crumb_entity.update(cx, |v, cx| {
+                            v.open_crumb_menu(x, y, crumb_path.clone(), cx, remote);
+                        });
+                        cx.stop_propagation();
+                    });
+
+                seg = seg.child(text!(label));
+                pill = pill.child(seg);
+            }
         } else {
             let segs = segments(p);
             let n = segs.len();

@@ -10105,9 +10105,10 @@ impl RootView {
     /// 面包屑指向的一定是个目录层级，所以 `is_dir = true`；本机专属动作（在访达中显示）
     /// 不在这一组里，也就无所谓 `remote` 是不是真。
     ///
-    /// `remote` 为 `Some((url, session))` 表示这是**远程**地址栏那条单级 URL crumb：
-    /// 复制地址复制的是 URL 文本，新标签页 / 新窗口走的是「复用进程级活连接 + 导航到
-    /// 该远程目录」的通道（见 [`RootView::open_remote_in_new_tab`] /
+    /// `remote` 为 `Some((url, session))` 表示这是**远程**地址栏的某一段面包屑：
+    /// 复制地址复制的是 URL 文本（host 段是 `scheme://host[:port]`，目录段是带路径的
+    /// 完整远程 URL），新标签页 / 新窗口走的是「复用进程级活连接 + 导航到该远程目录」
+    /// 的通道（见 [`RootView::open_remote_in_new_tab`] /
     /// [`RootView::open_new_window_at_remote`]），而不是本机路径那套。
     pub(crate) fn open_crumb_menu(
         &mut self,
