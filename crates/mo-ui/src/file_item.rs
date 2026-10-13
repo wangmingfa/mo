@@ -183,12 +183,10 @@ pub fn view(
                 .items_center()
                 .debug_selector(|| "mo-inline-rename".to_string())
                 .child(
-                    Input::new(state)
-                        .appearance(false)
-                        .bordered(false)
-                        .small()
-                        .text_size(px(13.0))
-                        .p(px(0.0)),
+                    // 保留默认外观（白底 + 1px 边框 + 圆角 + 聚焦 ring）：行内改名
+                    // 必须长得像一个输入框，用户才知道在编辑。选中行的蓝底上裸画
+                    // 黑字既看不清也毫无「编辑中」的暗示（Finder 同款白框）。
+                    Input::new(state).small().text_size(px(13.0)),
                 ),
         );
     } else {

@@ -381,12 +381,9 @@ fn cell(
             .items_center()
             .debug_selector(|| "mo-inline-rename".to_string())
             .child(
-                Input::new(state)
-                    .appearance(false)
-                    .bordered(false)
-                    .small()
-                    .text_size(px(12.0 * label_k))
-                    .p(px(0.0)),
+                // 与 file_item 同款：保留默认外观（白底 + 边框 + 圆角），编辑态
+                // 要有输入框的样子，深色文字落在白底上才看得清。
+                Input::new(state).small().text_size(px(12.0 * label_k)),
             )
             .into_any_element(),
         None => div()

@@ -304,12 +304,9 @@ fn column_box(
                 .items_center()
                 .debug_selector(|| "mo-inline-rename".to_string())
                 .child(
-                    Input::new(state)
-                        .appearance(false)
-                        .bordered(false)
-                        .small()
-                        .text_size(px(13.0))
-                        .p(px(0.0)),
+                    // 与 file_item 同款：保留默认外观（白底 + 边框 + 圆角），
+                    // 编辑态要有输入框的样子。
+                    Input::new(state).small().text_size(px(13.0)),
                 )
                 .into_any_element(),
             None => div()
