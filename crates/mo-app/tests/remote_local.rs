@@ -1168,6 +1168,39 @@ fn a_new_folder_outside_the_current_page_still_dedupes() {
     });
 }
 
+/// 连续新建**文本文件**：`新建文本.txt`、`新建文本 2.txt` 都已被占时，第三次
+/// 必须跳到「新建文本 3.txt」。
+///
+/// 候选名的判重原来用本机 `Path::exists()`（`mo_operations::unique_path`）——
+/// 远程路径在本机不存在，候选循环永远选中第一个 ` 2` 原样返回，服务端上
+/// `create_new` 写入直接报「远端已存在——拒绝覆盖」（FTP 真机踩到：目录里
+/// 已有前两个名字时，第三次新建文本文件必失败）。
+#[test]
+fn a_third_new_text_file_skips_taken_numbers_on_remote() {
+    let app = tab(&Arc::new(SessionRegistry::new()));
+    let (_, _, _) = connect_fake_at(&app, TEST_URL);
+
+    runtime().block_on(async {
+        app.open_directory(Path::new("/"))
+            .await
+            .expect("进入远程 /");
+
+        let expected = ["新建文本.txt", "新建文本 2.txt", "新建文本 3.txt"];
+        for (i, name) in expected.iter().enumerate() {
+            let created = app
+                .create_file(Path::new("/sub"), "新建文本.txt")
+                .await
+                .expect("远程建文件");
+            assert_eq!(
+                created,
+                PathBuf::from(format!("/sub/{name}")),
+                "第 {} 次新建应当落到第一个没被占的名字上",
+                i + 1
+            );
+        }
+    });
+}
+
 /// SMB / NFS 走**系统挂载**，不是远程会话。
 ///
 /// 侧边栏因此分两区：Mo 自己建的会话在「远程」（点一下走连接 / 重连），操作系统

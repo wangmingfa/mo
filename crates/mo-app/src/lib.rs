@@ -4382,8 +4382,7 @@ impl AppState {
     /// 在 `dir` 下解析出一个**不冲突**的新名字（仅算路径，不落盘）。
     ///
     /// `name` 为空时用 `fallback`。注意**先判断目标是否存在再决定是否去重**：
-    /// [`mo_operations::unique_path`] 总是从 ` 2` 起编号，直接拿它会把一个
-    /// 本来不冲突的名字变成「新建文件夹 2」。
+    /// 直接从 ` 2` 起编号，会把一个本来不冲突的名字变成「新建文件夹 2」。
     ///
     /// 「存在」的判据走 [`AppState::name_taken`]（问列表 / 后端），不是
     /// `Path::exists()`——后者在远程目录里恒为 `false`。
@@ -4391,10 +4390,20 @@ impl AppState {
         let name = name.trim();
         let name = if name.is_empty() { fallback } else { name };
         let base = dir.join(name);
-        if self.name_taken(&base).await {
-            mo_operations::unique_path(&base)
+        if !self.name_taken(&base).await {
+            return base;
+        }
+        // 候选名的「存在」判据必须和 base **同一个后端**：本地走
+        // `mo_operations::unique_path`（本机磁盘），远程走 [`unique_remote_path`]
+        // （问后端 metadata，与传输引擎同一套 `stem N.ext` 命名）。远程路径在本机
+        // 不存在——拿本机判据去重，候选循环第一个 ` 2` 就会被选中并原样返回，
+        // 目录里已有「新建文本 2.txt」时 `create_new` 写入直接报
+        // 「远端已存在——拒绝覆盖」（FTP 真机踩到：新建文本.txt 与
+        // 新建文本 2.txt 都在时，第三次新建必失败）。
+        if self.browsing_remote() {
+            unique_remote_path(&self.active_fs(), &base).await
         } else {
-            base
+            mo_operations::unique_path(&base)
         }
     }
 
