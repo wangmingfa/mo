@@ -20,6 +20,44 @@ use mo_app::{AppState, Grouping, WindowRow};
 use mo_core::{LightEntry, SelectionModel, SortDir, SortKey};
 use mo_operations::OperationHandle;
 
+/// 删除退场动画的一项：被删条目的路径快照 + 捕获瞬间的下标。
+///
+/// 真正删除延迟到动画结束才提交（`AppState::delete_paths`），所以这里只需抓一份
+/// 轻量快照，不必持有整个 `Entry`。三视图共用同一份进度（见 [`exit_progress`]）：
+/// * **列表 / 网格**：`uniform_list` 逐索引绝对定位条目（见 gpui-pre
+///   `uniform_list.rs` 的 `prepaint_at(item_origin)`），且唯一裁剪是列表级
+///   ContentMask——所以被删项的内容可以在自己槽位里原地收缩淡出，**下方条目的
+///   内容用相对定位上顶**（`rise` 个槽位）。t=1 时下方恰好落在真实删除后的
+///   布局上，动画与重排无缝衔接、不跳变。
+/// * **列视图**：taffy flex 布局，行高直接缩到 0，下方由 flex 自然顶上来。
+pub(crate) struct ExitingItem {
+    pub started_at: std::time::Instant,
+    pub duration_ms: u64,
+    /// 动画结束才提交删除的路径快照（避免动画期间 selection 变化误删别的文件）。
+    pub paths: Vec<PathBuf>,
+    /// 捕获瞬间该项在**当前视图条目空间**里的下标：列表 = 窗口行号（含组头行），
+    /// 网格 / 画廊 = 数据下标；列视图用不到（填 0）。下方条目的上顶量 =
+    /// 「下标小于它的退场项个数」，批量多选删除时各自累加。
+    pub index: usize,
+}
+
+/// 退场动画进度（0..1，已加 smoothstep 缓动）：由 `started_at` 现算，超过时长即 1。
+///
+/// 三视图都读这一个值，保证「被删行收缩」与「下方上顶」严格同帧同步。
+/// 重绘由 `RootView::render` 在动画未走完时每帧 `request_animation_frame` 驱动。
+pub(crate) fn exit_progress(items: &[ExitingItem]) -> f32 {
+    let Some(first) = items.first() else {
+        return 0.0;
+    };
+    let ms = first.started_at.elapsed().as_secs_f32() * 1000.0;
+    let t = (ms / first.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+    // smoothstep：起停都快不起来，收缩 + 上顶不会「一顿一顿」。
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 删除退场动画时长（毫秒）。访达同款：文件缩一下就消失，不长。
+pub(crate) const DELETE_ANIM_MS: u64 = 180;
+
 /// 面板的呈现方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -171,6 +209,9 @@ pub(crate) struct Panel {
     /// 而列数只在渲染路径上知道（要容器宽度），所以渲染时把它记下来给滚动用。
     /// 列表 / 列视图不使用（恒为 1）。
     pub grid_cols: usize,
+    /// 正在播放删除退场动画的条目（按路径命中）。动画期间这些条目的内容在各自
+    /// 视图里收缩淡出、下方条目上顶；动画结束才真正提交删除并清空本表。
+    pub exiting: Vec<ExitingItem>,
     /// 分栏对比时**这一页**里每条的状态（按绝对路径查）。`None` = 没在对比。
     ///
     /// 放在 Panel 而不是 RootView：行渲染拿到的是 `&Panel`，四个视图都要按路径
@@ -233,6 +274,7 @@ impl Panel {
             can_forward: false,
             view_mode: ViewMode::default(),
             grid_cols: 1,
+            exiting: Vec::new(),
             diff: None,
             address_editing: false,
             address: None,

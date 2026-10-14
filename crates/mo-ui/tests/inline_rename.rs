@@ -369,6 +369,25 @@ fn columns_click_then_f2_renames_the_clicked_row(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
+/// 删除现在带退场动画（收缩 + 下方上顶，180ms 后才真正提交 `delete_paths`）。
+/// 动画的定时器走 GPUI 的**可控时钟**，headless 下必须显式 `advance_clock` 才会
+/// 到点；真实落盘又发生在 mo 的真实 runtime 上，所以要「推时钟 + 泵帧 + 让出
+/// 真实时间」三件事一起做。
+fn wait_gone_with_frames(vcx: &mut VisualTestContext, p: &Path) -> bool {
+    for _ in 0..60 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        if !p.exists() {
+            return true;
+        }
+        // 退场定时器（180ms）走可控时钟，推过去它才 ready。
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        // 真磁盘删除在 mo 的进程级 runtime 上跑，让出一点真实时间给它。
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    !p.exists()
+}
+
 /// §40 缺口 1 的硬判据：列表里选中 `keep.txt` 切进列视图，再点 `note.txt` 行、
 /// 按删除——进回收站的必须是**刚点的 note.txt**，`keep.txt` 一根毛都不能掉。
 /// 接同步之前这里删的是看不见选中的旧文件。
@@ -389,7 +408,7 @@ fn columns_click_replaces_stale_selection_before_trashing(cx: &mut TestAppContex
 
     cx.simulate_keystrokes(window.into(), TRASH_KEY);
     assert!(
-        wait_exists(true, &rig.here.join("note.txt")),
+        wait_gone_with_frames(&mut vcx, &rig.here.join("note.txt")),
         "列视图按删除没把刚点的 note.txt 移走——多半还打在旧选区上"
     );
     assert!(
@@ -399,6 +418,75 @@ fn columns_click_replaces_stale_selection_before_trashing(cx: &mut TestAppContex
     assert!(
         rig.trash_root().exists(),
         "回收站根没建出来：删除没走 trash 那条记账链路"
+    );
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
+/// 删除退场动画的两段式判据（列表视图）：
+/// ① 按下 ⌘⌫ 之后条目**立刻**进入退场态，而盘上那条还在——真正删除被推迟到
+///    动画时长走完（否则动画期间一旦选区变了，删的就不是当初那几条）；
+/// ② 把动画时长推过去，条目才真被删掉、且退场态**自动清空**（不清的话条目
+///    永远占着收缩后的空槽，同一面板后续删除还会被「动画进行中」挡掉）。
+///
+/// ⚠️ 动画定时器走 GPUI 的可控时钟：`run_until_parked()` 不会推进时间，
+/// 所以断言 ① 之前不能 `advance_clock`，否则 180ms 会被瞬间跨过去。
+#[gpui_kit::test]
+fn trash_defers_the_delete_until_the_collapse_animation_ends(cx: &mut TestAppContext) {
+    let rig = Rig::new("trash-defer");
+    let (mut vcx, window) = open_in_view(
+        &rig,
+        4,
+        "view-mode-list",
+        Some("note.txt"),
+        "mo-file-row-0",
+        cx,
+    );
+
+    cx.simulate_keystrokes(window.into(), TRASH_KEY);
+
+    // ① 退场态建立（`selection_paths` 是真 IO，要泵一会儿；这里不推时钟）。
+    let mut exits = 0;
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        exits = window
+            .update(cx, |root, _w, _cx| mo_ui::exit_anim_for_tests(root))
+            .expect("读退场态")
+            .0;
+        if exits > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(exits, 1, "按删除后应先进退场动画（1 项），而不是立刻删");
+    assert!(
+        rig.here.join("note.txt").exists(),
+        "动画没走完就删了：删除应推迟到退场动画结束"
+    );
+
+    // ② 推过动画时长 → 真正删除 + 自动清空退场态。
+    assert!(
+        wait_gone_with_frames(&mut vcx, &rig.here.join("note.txt")),
+        "退场动画走完后应真正把条目删掉"
+    );
+    let mut cleared = false;
+    for _ in 0..40 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        let n = window
+            .update(cx, |root, _w, _cx| mo_ui::exit_anim_for_tests(root))
+            .expect("读退场态")
+            .0;
+        if n == 0 {
+            cleared = true;
+            break;
+        }
+        vcx.executor().advance_clock(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        cleared,
+        "删除落地后退场态没清空（条目会永远占着收缩后的空槽）"
     );
     let _ = std::fs::remove_dir_all(&rig.base);
 }

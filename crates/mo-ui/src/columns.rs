@@ -17,7 +17,7 @@ use mo_app::AppState;
 use mo_core::EntryKind;
 use std::path::{Path, PathBuf};
 
-use crate::panel::{ColumnData, ViewMode};
+use crate::panel::{exit_progress, ColumnData, ExitingItem, ViewMode};
 use crate::{theme, RootView};
 
 /// 单列最多渲染的条目数（超出给出「省略」提示）。
@@ -45,7 +45,12 @@ pub fn render(
     // 拖拽悬停认领的落点路径（§42）：命中的目录行高亮。列视图没有 draw 期
     // 闭包可读 `RootView`，由 `render_pane` 算好传进来（与 list / grid 同一判据）。
     drag_target: Option<&Path>,
+    // 退场动画中的条目（`LightEntry` 没有 id 字段，用路径命中）。
+    exiting: &[ExitingItem],
 ) -> impl IntoElement {
+    let exiting_paths: Vec<PathBuf> = exiting.iter().map(|e| e.paths[0].clone()).collect();
+    // 进度与列表 / 网格同一份（`panel::exit_progress`，由 `started_at` 现算）。
+    let exit_prog = exit_progress(exiting);
     let mut row = div()
         .flex()
         .flex_row()
@@ -73,6 +78,8 @@ pub fn render(
             diff,
             renaming,
             drag_target,
+            &exiting_paths,
+            exit_prog,
         ));
     }
     row
@@ -91,6 +98,10 @@ fn column_box(
     renaming: Option<(&PathBuf, &Entity<InputState>)>,
     // 拖拽悬停认领的落点路径（§42）：命中的目录行高亮。
     drag_target: Option<&Path>,
+    // 退场动画中的条目路径（`LightEntry` 没有 id 字段，用路径命中）。
+    exiting_paths: &[PathBuf],
+    // 退场动画进度（0..1，无动画为 0）：命中的行把行高从 ROW_HEIGHT 收到 0。
+    exit_prog: f32,
 ) -> Stateful<Div> {
     let mut col = div()
         // ⚠️ 多列并存，且列头 / 空列 / 截断提示文本都挂在无 ID 的容器上：
@@ -315,7 +326,20 @@ fn column_box(
                 .child(text!(mo_core::display_name(&e.name).to_string()))
                 .into_any_element(),
         });
-        body = body.child(line);
+        // 删除退场：被删行在列视图（taffy flex 布局）里**原地缩高**到 0，
+        // 下方的行由 flex 自然平滑顶上来——这是列视图相对列表 / 网格（uniform_list
+        // 固定行高）能真正做到「行缩小、下方上顶」的唯一视图：这里没有虚拟化，
+        // 行高就是行高，收掉它 taffy 会把后面所有行重新排上来。
+        // 进度与列表 / 网格同一份（`panel::exit_progress`），三视图观感一致。
+        let line_el: AnyElement = if exit_prog > 0.0 && exiting_paths.contains(&e.path) {
+            line.overflow_hidden()
+                .h(px(ROW_HEIGHT * (1.0 - exit_prog)))
+                .opacity(1.0 - exit_prog)
+                .into_any_element()
+        } else {
+            line.into_any_element()
+        };
+        body = body.child(line_el);
     }
     if data.entries.len() > MAX_PER_COLUMN {
         body = body.child(

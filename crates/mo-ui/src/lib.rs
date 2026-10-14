@@ -313,6 +313,24 @@ pub fn panel_window_ready_for_tests(view: &RootView, rows: usize) -> bool {
         .is_some_and(|p| p.list_count == rows && p.window.len() == rows)
 }
 
+/// 测试专用：活动标签页的删除退场状态 `(退场条目数, 进度 0..1)`。
+///
+/// ⌘⌫ 之后条目先进入 180ms 的「收缩 + 下方上顶」动画，时长到才真正
+/// `delete_paths`——这条判据让测试能分开验「按下去立刻进入退场态（数据还在）」
+/// 与「动画走完后真正删除并自动清空退场态」。
+#[doc(hidden)]
+pub fn exit_anim_for_tests(view: &RootView) -> (usize, f32) {
+    let pane_idx = view.active_pane.min(view.panes.len().saturating_sub(1));
+    let Some(pane) = view.panes.get(pane_idx) else {
+        return (0, 0.0);
+    };
+    let panel = pane.panel();
+    (
+        panel.exiting.len(),
+        crate::panel::exit_progress(&panel.exiting),
+    )
+}
+
 /// 测试专用：已渲染窗口快照每一行的 `(路径, 是否目录)`。
 ///
 /// 坐标派发类测试（应用内拖拽）要先弄清「目录行是第几行」才摆得下鼠标——

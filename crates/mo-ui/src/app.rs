@@ -7707,18 +7707,10 @@ impl RootView {
                 .detach();
             }
             "file.trash" => {
-                let app = self.app();
-                let this = cx.entity().clone();
-                cx.spawn(async move |_weak, cx| {
-                    // 远程删除可能真失败（连接断了 / 没权限）：必须回显，
-                    // 否则用户只看到「条目还在」，以为没删掉是因为没点上。
-                    if let Err(e) = app.delete_selection().await {
-                        this.update(cx, |v, cx| {
-                            v.notice(format!("删除失败：{e}"), None, cx);
-                        });
-                    }
-                })
-                .detach();
+                // 走退场动画版删除：先按 selection 口径取路径，再播收缩 + 上顶，
+                // 动画结束才真正删除。直接删会让下方瞬间跳变，失去访达那种
+                // 「被删行缩小、下方上顶」的过渡。
+                self.trash_with_animation(cx);
             }
             "list.rename" => {
                 self.open_rename(cx);
@@ -9193,6 +9185,126 @@ impl RootView {
         self.header_cells_owner = (pane, tab);
     }
 
+    /// 「删除」的动画版入口（⌘⌫ / Delete 键位与右键菜单「移到废纸篓」共用）。
+    ///
+    /// 先按 `AppState::selection_paths` 的口径取路径（与旧 `delete_selection`
+    /// 完全一致：无选中则聚焦项），再交给 [`Self::begin_exit_animation`] 播动画。
+    /// 取路径是异步的（要读 app 侧目录模型），所以整体走 spawn。
+    pub(crate) fn trash_with_animation(&mut self, cx: &mut Context<Self>) {
+        let app = self.app();
+        let this = cx.entity().clone();
+        cx.spawn(async move |_weak, cx| {
+            let paths = app.selection_paths().await;
+            if paths.is_empty() {
+                return;
+            }
+            // 视图已切走 / 窗口已关：update 失败即无声跳过（删除也随之取消，
+            // 与旧行为一致——旧代码同样在 spawn 里删，视图切换后照常执行；
+            // 这里保守一点：取到路径就一定会删，不让快捷键「静默吞掉」）。
+            this.update(cx, |v, cx| v.begin_exit_animation(&paths, cx));
+        })
+        .detach();
+    }
+
+    /// 为当前面板启动删除退场动画（参考访达：被删行高度缩小、下方内容上顶）。
+    ///
+    /// `paths` 是**即将真正删除**的路径快照，由调用方按 `AppState::selection_paths`
+    /// 的口径先取好（与旧 `delete_selection` 完全一致：无选中则聚焦项）。动画期间
+    /// 数据不动，三个视图各自播放「收缩 + 下方上顶」；时长到才提交
+    /// `AppState::delete_paths`，失败则弹提示并清掉退场态（否则条目会一直占着
+    /// 收缩后的空槽）。
+    ///
+    /// 同一面板已有退场动画在进行时**直接返回**：180ms 内连按删除只认第一次，
+    /// 否则同一条目会被两条计时器各删一次，第二次报「删除失败」的假错误。
+    pub(crate) fn begin_exit_animation(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        use crate::panel::{ExitingItem, ViewMode, DELETE_ANIM_MS};
+
+        if paths.is_empty() {
+            return;
+        }
+        let pane = self.active_pane.min(self.panes.len().saturating_sub(1));
+        let tab = self.panes[pane].active;
+        let view_mode = match self.panel_at(pane, tab) {
+            Some(p) => p.view_mode,
+            None => return,
+        };
+        // 动画进行中：忽略本次删除（见方法文档）。
+        if self
+            .panel_at(pane, tab)
+            .is_some_and(|p| !p.exiting.is_empty())
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut exits: Vec<ExitingItem> = Vec::with_capacity(paths.len());
+        {
+            let Some(panel) = self.panel_at(pane, tab) else {
+                return;
+            };
+            let start = panel.window_start;
+            for p in paths {
+                // 列表 / 网格：在窗口快照里按路径定标（列表 = 含组头行的行号，
+                // 网格 / 画廊 = 数据下标），渲染端据此算「下方谁该上顶、上顶几格」。
+                // 列视图用不到（填 0）；快照里找不到（极少见：刚刷过）填 usize::MAX
+                // ——它永远不算在任何人头上，也不会挡住别的退场项。
+                let index = if matches!(view_mode, ViewMode::Columns) {
+                    0
+                } else {
+                    panel
+                        .window
+                        .iter()
+                        .position(|r| r.entry().is_some_and(|e| e.path == *p))
+                        .map(|k| start + k)
+                        .unwrap_or(usize::MAX)
+                };
+                exits.push(ExitingItem {
+                    started_at: now,
+                    duration_ms: DELETE_ANIM_MS,
+                    paths: vec![p.clone()],
+                    index,
+                });
+            }
+        }
+        if let Some(panel) = self.panel_at_mut(pane, tab) {
+            panel.exiting = exits;
+        }
+        cx.notify();
+        // 动画期「每帧重绘」由渲染路径自己请求（见 `RootView::render` 里那句
+        // `request_animation_frame`），这里只等时长到点。**必须用 gpui 的
+        // `background_executor().timer`，不能自己用 `std::time::Instant` 计时**：
+        // headless 测试用的是可控时钟（`advance_clock`），真实时间与 GPUI 时钟
+        // 不一致，拿真实时间算的等待会让删除在测试里永远不发生。
+        let app = self.app();
+        let paths: Vec<PathBuf> = paths.to_vec();
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(DELETE_ANIM_MS))
+                .await;
+            let result = app.delete_paths(paths.clone()).await;
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            this.update(cx, |v, cx| {
+                // 失败也要清退场态：否则条目永远占着收缩后的空槽。
+                v.clear_exiting(pane, tab, &paths);
+                if let Err(err) = &result {
+                    v.notice(format!("删除失败：{err}"), None, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 清除指定面板的退场动画项（动画结束、真正删除完成后调用）。
+    /// 按路径比对：列视图的 `LightEntry` 没有 id 字段，路径是三视图共用的命中键。
+    pub(crate) fn clear_exiting(&mut self, pane: usize, tab: usize, paths: &[PathBuf]) {
+        if let Some(panel) = self.panel_at_mut(pane, tab) {
+            panel
+                .exiting
+                .retain(|e| !e.paths.iter().any(|p| paths.contains(p)));
+        }
+    }
+
     /// prepaint 回写列表内容区 bounds（窗口坐标），供框选折算行下标与
     /// 「斑马纹铺满一屏」算行数。值变化时返回 `true`（调用方借此 notify，
     /// 让下一帧用上新高度；高度不变时通知会造成每帧重绘）。
@@ -10413,16 +10525,8 @@ impl RootView {
                 }
             }
             A::Trash => {
-                let app = self.app();
-                let this = cx.entity().clone();
-                cx.spawn(async move |_weak, cx| {
-                    if let Err(e) = app.delete_selection().await {
-                        this.update(cx, |v, cx| {
-                            v.notice(format!("删除失败：{e}"), None, cx);
-                        });
-                    }
-                })
-                .detach();
+                // 与 ⌘⌫ 同一条链路：先取路径再播退场动画，动画结束才真正删除。
+                self.trash_with_animation(cx);
             }
             A::RevealInFileManager => {
                 let app = self.app();
@@ -10822,6 +10926,17 @@ impl Render for RootView {
                 // 这里（拿到容器宽度 `per_pane_w`）才算得出来——渲染前写回 panel，
                 // 定位路径读它（幂等缓存，不触发重绘，同 `list_origin` 那条约定）。
                 self.sync_grid_cols(per_pane_w);
+                // 删除退场动画要靠 GPUI 自己重绘才会动：进度是按 `started_at`
+                // 现算的，但没人催帧就停在第一帧。这里在动画还没走完（进度 < 1）
+                // 时每帧再要一帧，走完自动停——三视图共用这一处，列视图也覆盖到。
+                // 少了这句，⌘⌫ 之后画面会僵在「第一帧」直到下一个外部事件。
+                if self.panes.iter().any(|p| {
+                    p.tabs.iter().any(|t| {
+                        !t.exiting.is_empty() && crate::panel::exit_progress(&t.exiting) < 1.0
+                    })
+                }) {
+                    window.request_animation_frame();
+                }
                 for i in 0..visible_panes {
                     row = row.child(render_pane(self, i, &entity, per_pane_w));
                 }
@@ -11525,6 +11640,7 @@ fn render_pane(view: &RootView, pane_idx: usize, entity: &Entity<RootView>, avai
                         panel.diff.as_deref(),
                         renaming,
                         drag_target,
+                        &panel.exiting,
                     )
                     .into_any_element()
                 }

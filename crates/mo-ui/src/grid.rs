@@ -11,7 +11,7 @@ use gpui_kit::*;
 use mo_core::{Entry, MetadataState, ThumbnailState};
 
 use crate::listing::{self, Zoom, BUFFER};
-use crate::panel::ViewMode;
+use crate::panel::{exit_progress, ViewMode};
 
 /// 网格内容四周的留白（与 `columns_for` 里扣掉的 24pt 对得上）。
 const PAD: f32 = 12.0;
@@ -47,6 +47,17 @@ pub fn render(
     // `uniform_list` 的行高是靠渲染一行量出来的，三处各算各的就会行行重叠。
     let height = zoom.row_height(mode);
     let entity_c = entity.clone();
+    // 单元宽度：从滚动句柄上一帧量到的列表内容宽反推（行是 `cols` 个等分
+    // flex_1 + 6px 间距）。删除退场动画要把「后面的格子往左挪一格、行尾的
+    // 格子绕到上一行行尾」，没有这个宽度就算不出水平位移。首帧可能还没有
+    // （列表还没画过），那时只做垂直位移。
+    let cell_w = {
+        let st = scroll.0.borrow();
+        st.last_item_size.map(|s| {
+            let w = f32::from(s.item.width);
+            ((w - (cols as f32 - 1.0) * 6.0) / cols as f32).max(1.0)
+        })
+    };
 
     let list = uniform_list("mo-grid", row_count, move |range, _window, cx| {
         let need_start = range.start.saturating_mul(cols).saturating_sub(BUFFER);
@@ -77,6 +88,9 @@ pub fn render(
         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
         // 这一帧真的画出来的、还等着缩略图的单元——行渲染完统一派发（见下方注释）。
         let mut want_thumbs: Vec<Entry> = Vec::new();
+        // 删除退场动画进度（0..1，无动画为 0）：被删格收缩与其余格「按删除后的
+        // 新槽位滑动」共用同一个值（与列表视图同一份 `panel::exit_progress`）。
+        let prog = exit_progress(&panel.exiting);
         for r in range.clone() {
             let mut row = div().flex().flex_row().w_full().h(px(height)).gap(px(6.0));
             for c in 0..cols {
@@ -84,6 +98,32 @@ pub fn render(
                 if idx >= count {
                     break;
                 }
+                // 这一格该往哪挪：新下标 = 原下标 - 「排在它前面被删掉的格子数」。
+                // 同行内往左一格；行首格绕到上一行行尾（斜向）。t=1 时恰好落在
+                // 真实删除后的槽位上，与 uniform_list 的重排无缝衔接。
+                let rise = if prog > 0.0 {
+                    panel.exiting.iter().filter(|e| e.index < idx).count()
+                } else {
+                    0
+                };
+                let slide = |el: Stateful<Div>, old_idx: usize| -> Stateful<Div> {
+                    if rise == 0 {
+                        return el;
+                    }
+                    let new_idx = old_idx - rise;
+                    let dx = ((new_idx % cols) as f32 - (old_idx % cols) as f32)
+                        * cell_w.unwrap_or(0.0)
+                        * prog;
+                    let dy = ((new_idx / cols) as f32 - (old_idx / cols) as f32) * height * prog;
+                    let mut el = el.relative();
+                    if dx != 0.0 {
+                        el = el.left(px(dx));
+                    }
+                    if dy != 0.0 {
+                        el = el.top(px(dy));
+                    }
+                    el
+                };
                 let Some(mo_app::WindowRow::Entry(entry)) =
                     panel.window.get(idx.wrapping_sub(panel.window_start))
                 else {
@@ -91,7 +131,7 @@ pub fn render(
                     // 的骨架格，尺寸 / 圆角 / 内边距与 `cell()` 完全一致，别让网格在
                     // 数据到达前后跳一下。与列表视图的占位行同一条约定：不画 `…`。
                     // ⚠️ 同样要有唯一 ID（多个格子同时缺数据，a11y NodeId 会撞）。
-                    row = row.child(
+                    row = row.child(slide(
                         div()
                             .id(format!("grid-ph-{pane}-{tab}-{idx}"))
                             .flex()
@@ -105,9 +145,12 @@ pub fn render(
                             .rounded(px(6.0))
                             .bg(crate::theme::zebra())
                             .debug_selector(move || format!("mo-grid-ph-{idx}")),
-                    );
+                        idx,
+                    ));
                     continue;
                 };
+                // 是否正在退场：按路径命中（三视图共用的命中键）。
+                let is_exit = prog > 0.0 && panel.exiting.iter().any(|e| e.paths[0] == entry.path);
                 if matches!(entry.thumbnail, ThumbnailState::Idle) && entry.supports_thumbnail() {
                     want_thumbs.push(entry.clone());
                 }
@@ -119,7 +162,7 @@ pub fn render(
                     entry,
                     zoom.icon_slot(mode),
                 );
-                row = row.child(cell(
+                let mut cell_el = cell(
                     entry,
                     mode,
                     zoom,
@@ -138,7 +181,20 @@ pub fn render(
                     // 拖拽落点高亮（§42）：目录格 + 这一格正是悬停认领的那条路径。
                     matches!(entry.kind, mo_core::EntryKind::Directory)
                         && drop_target.as_deref() == Some(entry.path.as_path()),
-                ));
+                );
+                if is_exit {
+                    // 被删格：**格盒仍是 row 的直接 flex 子**（flex_1 不变，
+                    // uniform_list 行高靠第 0 行量，行盒不能缩），只把格子自己的
+                    // 高度收到 0 + 淡出，`overflow_hidden` 裁掉图标 / 名字。
+                    // t=1 时其余格已滑到各自新槽位，与真实删除后的布局重合。
+                    cell_el = cell_el
+                        .h(px(height * (1.0 - prog)))
+                        .opacity(1.0 - prog)
+                        .overflow_hidden();
+                } else {
+                    cell_el = slide(cell_el, idx);
+                }
+                row = row.child(cell_el);
             }
             rows.push(row.into_any_element());
         }

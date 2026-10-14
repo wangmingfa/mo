@@ -5,7 +5,7 @@ use mo_core::{Entry, SortDir, SortKey, ThumbnailState};
 
 use crate::list_columns::{ColId, ColumnLayout};
 use crate::listing::BUFFER;
-use crate::panel::ViewMode;
+use crate::panel::{exit_progress, ViewMode};
 use crate::RootView;
 
 /// 表头单元格之间的水平间距（必须与数据行的 `gap` 一致，否则列会错位）。
@@ -355,6 +355,10 @@ pub fn render(
             // 只对**真实行**判断窗口覆盖；下标 ≥ count 的补足行没有数据可取，
             // 参与判断会让这条日志每帧都冒出来。
             let real_end = range.end.min(count);
+            // 删除退场动画进度（0..1，无动画为 0）：被删行收缩与下方行上顶共用
+            // 同一个值（`panel::exit_progress` 由 `started_at` 现算，帧循环由
+            // `RootView::begin_exit_animation` 的 16ms 节拍驱动）。
+            let prog = exit_progress(&panel.exiting);
             if range.start < real_end
                 && (range.start..real_end).any(|i| {
                     panel
@@ -371,6 +375,28 @@ pub fn render(
                 );
             }
             for i in range.clone() {
+                // 退场上顶量：下标小于 i 的退场项个数 = 这一行该往上顶几格。
+                // `uniform_list` 逐索引绝对定位条目（`prepaint_at(item_origin)`），
+                // 且唯一裁剪是列表级 ContentMask——所以行内容用相对定位（top 负偏移）
+                // 上顶只移自己、不推移下方条目的布局，也不会被自己槽位裁掉。
+                // t=1 时下方恰好落在真实删除后的布局上，动画与重排无缝衔接。
+                let rise = if prog > 0.0 {
+                    panel.exiting.iter().filter(|e| e.index < i).count()
+                } else {
+                    0
+                };
+                let shift_up = |el: AnyElement| -> AnyElement {
+                    if rise > 0 {
+                        div()
+                            .relative()
+                            .top(px(-24.0 * rise as f32 * prog))
+                            .h_full()
+                            .child(el)
+                            .into_any_element()
+                    } else {
+                        el
+                    }
+                };
                 let offset = i.wrapping_sub(panel.window_start);
                 let Some(row) = panel.window.get(offset) else {
                     // 窗口还没补上这一行（刚切目录、快速滚动、快照落地前）：画一条
@@ -388,7 +414,7 @@ pub fn render(
                     // 通常同时有多条占位行；不给行 ID 的话它们会共享同一条元素 ID
                     // 路径 → 相同的 a11y NodeId → 辅助功能开启时 panic（启动快照未
                     // 回填满屏占位行，正是崩溃现场）。
-                    rows.push(
+                    rows.push(shift_up(
                         div()
                             .id(format!("file-ph-{pane}-{tab}-{i}"))
                             .flex()
@@ -407,7 +433,7 @@ pub fn render(
                             // 断言「有底色、无内容、行高与数据行一致」。
                             .debug_selector(move || format!("mo-file-ph-{i}"))
                             .into_any_element(),
-                    );
+                    ));
                     continue;
                 };
                 // 分组头行（仅分组开启的列表视图会有）：固定斑马底 + 弱化小字，
@@ -417,7 +443,7 @@ pub fn render(
                     let mo_app::WindowRow::Header(key) = row else {
                         unreachable!("窗口行非条目即组头");
                     };
-                    rows.push(
+                    rows.push(shift_up(
                         div()
                             .id(format!("file-hd-{pane}-{tab}-{i}"))
                             .flex()
@@ -436,9 +462,13 @@ pub fn render(
                                     .child(text!(group_title(*key))),
                             )
                             .into_any_element(),
-                    );
+                    ));
                     continue;
                 };
+
+                // 是否正在退场：按路径命中（三视图共用的命中键）。退场行在下面
+                // push 处把内容原地收缩 + 淡出，槽位仍占着（数据要等动画结束才删）。
+                let is_exit = prog > 0.0 && panel.exiting.iter().any(|e| e.paths[0] == entry.path);
 
                 let id = entry.id;
                 let entry_path = entry.path.clone();
@@ -727,23 +757,39 @@ pub fn render(
                     entry,
                     crate::listing::icon_slot(ViewMode::List),
                 );
-                rows.push(
-                    row.child(crate::file_item::view(
-                        entry,
-                        selected,
-                        tag_color,
-                        &row_cols,
-                        system_icon,
-                        &contributed_kinds,
-                        provider_kind.as_deref(),
-                        // 行内改名中且正是这一行：名称格换输入框。
-                        view.inline_rename
-                            .as_ref()
-                            .filter(|p| **p == entry.path)
-                            .and(view.inline_rename_input.as_ref()),
-                    ))
-                    .into_any_element(),
+                let content = crate::file_item::view(
+                    entry,
+                    selected,
+                    tag_color,
+                    &row_cols,
+                    system_icon,
+                    &contributed_kinds,
+                    provider_kind.as_deref(),
+                    // 行内改名中且正是这一行：名称格换输入框。
+                    view.inline_rename
+                        .as_ref()
+                        .filter(|p| **p == entry.path)
+                        .and(view.inline_rename_input.as_ref()),
                 );
+                let el: AnyElement = if is_exit {
+                    // 被删行：**行盒恒 24px**（`uniform_list` 只量第 0 行高，行盒一缩
+                    // 全列表都缩），内层把整行（含选中蓝底 / 斑马底）一起收缩到 0 +
+                    // 淡出，`overflow_hidden` 裁掉溢出。t=1 时这一行恰好「消失」，
+                    // 而下方行已上顶到各自的新位置——与真实删除后的布局逐像素重合。
+                    div()
+                        .h(px(24.0))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h(px(24.0 * (1.0 - prog)))
+                                .opacity(1.0 - prog)
+                                .child(row.child(content)),
+                        )
+                        .into_any_element()
+                } else {
+                    row.child(content).into_any_element()
+                };
+                rows.push(shift_up(el));
             }
             // 缩略图：这一帧看得见的、还等着的那几行，统一派发。
             //
