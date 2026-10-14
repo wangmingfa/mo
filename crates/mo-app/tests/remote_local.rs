@@ -1672,7 +1672,7 @@ fn journal_records_a_batch_and_clears_it_when_ops_finish() {
     let journal = PinnedJournal::at("e2a");
 
     let app = tab(&Arc::new(SessionRegistry::new()));
-    runtime().block_on(async {
+    let ids = runtime().block_on(async {
         let outcome = app
             .transfer_between(
                 vec![root.join("src/a.txt"), root.join("src/b.txt")],
@@ -1682,20 +1682,35 @@ fn journal_records_a_batch_and_clears_it_when_ops_finish() {
                 false,
             )
             .await;
-        let ids = match outcome {
-            mo_app::TransferOutcome::Started(ids) => ids,
+        match outcome {
+            mo_app::TransferOutcome::Started(ids) => {
+                assert_eq!(ids.len(), 2);
+                ids
+            }
             _ => panic!("本地复制没有冲突应直接提交"),
-        };
-        assert_eq!(ids.len(), 2);
+        }
     });
+    // 只统计本用例自己提交的批次：journal 目录是进程级单槽，并行套件里别的
+    // transfer_between 也会往当前 pin 的目录写，盘上可能混进别的批次（测试隔离
+    // race，非产品问题）。按本用例拿到的 ids 精确筛出自己的批次再断言。
     let on_disk = journal.on_disk();
-    assert_eq!(on_disk.len(), 1, "一批一账");
-    assert_eq!(on_disk[0].ids.len(), 2, "批内两个操作都应在册");
+    let mine: Vec<_> = on_disk
+        .iter()
+        .filter(|b| b.ids.as_slice() == ids.as_slice())
+        .cloned()
+        .collect();
+    assert_eq!(mine.len(), 1, "一批一账（仅统计本用例提交的批次）");
+    assert_eq!(mine[0].ids.len(), 2, "批内两个操作都应在册");
 
-    // 操作完成后逐 id 摘除；摘空整批出列（轮询等后台任务跑完）。
+    // 操作完成后逐 id 摘除；摘空整批出列（轮询等后台任务跑完）。同样只盯自己的批次。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if journal.on_disk().is_empty() {
+        let mine: Vec<_> = journal
+            .on_disk()
+            .into_iter()
+            .filter(|b| b.ids.as_slice() == ids.as_slice())
+            .collect();
+        if mine.is_empty() {
             break;
         }
         assert!(
@@ -1738,7 +1753,14 @@ fn recover_transfers_resubmits_a_journal_batch() {
 
     let app = tab(&Arc::new(SessionRegistry::new()));
     let pending = mo_app::AppState::pending_transfers();
-    assert_eq!(pending.len(), 1, "预置的批次应作为待处置弹出来");
+    // 只盯本用例的 keep.txt 批次：并行套件里别的 transfer_between 可能往当前 pin 的
+    // 目录写，盘上 / 桶里可能混进别的批次（测试隔离 race，非产品问题）。
+    let pending_mine: Vec<_> = pending
+        .iter()
+        .filter(|b| b.paths.iter().any(|p| p == &root.join("src/keep.txt")))
+        .cloned()
+        .collect();
+    assert_eq!(pending_mine.len(), 1, "预置的批次应作为待处置弹出来");
     let report = runtime().block_on(async { app.recover_transfers(pending).await });
     assert_eq!(report.submitted_batches, 1);
     assert_eq!(report.submitted_items, 1);
@@ -1748,10 +1770,15 @@ fn recover_transfers_resubmits_a_journal_batch() {
         "恢复 = 按原描述重跑，文件要真的到位"
     );
 
-    // 重跑的复制自己挂了新账，完成出列后账面清空。
+    // 重跑的复制自己挂了新账，完成出列后账面清空。只盯本用例的 keep.txt 批次。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if journal.on_disk().is_empty() {
+        let mine: Vec<_> = journal
+            .on_disk()
+            .into_iter()
+            .filter(|b| b.paths.iter().any(|p| p == &root.join("src/keep.txt")))
+            .collect();
+        if mine.is_empty() {
             break;
         }
         assert!(
@@ -1787,9 +1814,21 @@ fn recover_keeps_the_batch_when_the_endpoint_cannot_connect() {
 
     let app = tab(&Arc::new(SessionRegistry::new()));
     let pending = mo_app::AppState::pending_transfers();
-    assert_eq!(pending.len(), 1);
+    // 只盯本用例的 sftp://127.0.0.1:1 批次：并行套件里别的 transfer_between 可能
+    // 往当前 pin 的目录写，盘上 / 桶里可能混进别的批次（测试隔离 race，非产品问题）。
+    let pending_mine: Vec<_> = pending
+        .iter()
+        .filter(|b| b.src_ep.as_deref() == Some("sftp://127.0.0.1:1"))
+        .cloned()
+        .collect();
+    assert_eq!(pending_mine.len(), 1);
     let report = runtime().block_on(async { app.recover_transfers(pending).await });
     assert_eq!(report.submitted_batches, 0, "连不上就不该提交");
     assert_eq!(report.needs_login.len(), 1, "回执要点名哪个批次没恢复成");
-    assert_eq!(journal.on_disk().len(), 1, "留在册：登录后可再次恢复");
+    let mine: Vec<_> = journal
+        .on_disk()
+        .into_iter()
+        .filter(|b| b.src_ep.as_deref() == Some("sftp://127.0.0.1:1"))
+        .collect();
+    assert_eq!(mine.len(), 1, "留在册：登录后可再次恢复");
 }
