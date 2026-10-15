@@ -511,6 +511,67 @@ fn trash_defers_the_delete_until_the_collapse_animation_ends(cx: &mut TestAppCon
     let _ = std::fs::remove_dir_all(&rig.base);
 }
 
+/// 删除**中间行**时，下方行应在动画期间「上顶」（相对定位负偏移），与访达同款。
+/// 这是 `relative().top()` 负偏移是否在 `uniform_list` 逐索引绝对定位下生效的硬判据
+/// ——只量收缩高度（前一个测试）测不出这一项。
+#[gpui_kit::test]
+fn trash_rises_rows_below(cx: &mut TestAppContext) {
+    let rig = Rig::new("trash-rise");
+    let (mut vcx, window) = open_in_view(&rig, 4, "view-mode-list", None, "mo-file-row-0", cx);
+    // 选中间行（index 1，保证下方还有行可上顶；不赌排序，先确认行数够）。
+    let row_count = window
+        .update(cx, |root, _w, _cx| mo_ui::panel_row_paths_for_tests(root))
+        .expect("读行")
+        .len();
+    assert!(row_count >= 3, "测试需要 >=3 行，实际 {row_count}");
+    click_at(&mut vcx, &format!("mo-file-row-1"));
+
+    cx.simulate_keystrokes(window.into(), TRASH_KEY);
+    for _ in 0..100 {
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.render_frame(cx));
+        let n = window
+            .update(cx, |root, _w, _cx| mo_ui::exit_anim_for_tests(root))
+            .expect("读退场态")
+            .0;
+        if n > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let exit_idx = window
+        .update(cx, |root, _w, _cx| mo_ui::exit_index_for_tests(root))
+        .expect("读退场下标")
+        .expect("应有一个退场项");
+    assert_eq!(exit_idx, 1, "中间行删除，退场项应在 index 1");
+    window
+        .update(cx, |root, _w, _cx| {
+            mo_ui::set_exit_elapsed_for_tests(root, 90)
+        })
+        .expect("拨退场进度");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+
+    let exit_sel: &'static str = Box::leak(format!("mo-file-row-{exit_idx}").into_boxed_str());
+    let below_sel: &'static str =
+        Box::leak(format!("mo-file-row-{}", exit_idx + 1).into_boxed_str());
+    let eb = vcx
+        .debug_bounds(exit_sel)
+        .expect("量退场行（中间行）bounds");
+    let bb = vcx
+        .debug_bounds(below_sel)
+        .expect("量下方行 bounds（应已上顶）");
+    let gap = f32::from(bb.origin.y) - f32::from(eb.origin.y);
+    // 无上顶时下方行与退场行永远差整 24px（行高）；有上顶时半路差应明显 < 24。
+    // 这是 `relative().top()` 负偏移挂在「root 的子元素」上才生效的硬判据——
+    // 直接挂在 root 上会被 uniform_list 的 prepaint_at 定位抹掉。
+    assert!(
+        gap < 18.0,
+        "下方行 gap={gap}（应 < 24，证明它在上顶）；若 ==24 说明 relative().top() 没生效"
+    );
+    let _ = std::fs::remove_dir_all(&rig.base);
+}
+
 /// 选择整替的另一半：深层列的条目不在主目录模型里——点它之后 app 选择必须是
 /// **空**（宁空勿误伤），而点第 0 列的行能命中（选择数 1）。
 #[gpui_kit::test]

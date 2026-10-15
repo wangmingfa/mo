@@ -377,9 +377,13 @@ pub fn render(
             for i in range.clone() {
                 // 退场上顶量：下标小于 i 的退场项个数 = 这一行该往上顶几格。
                 // `uniform_list` 逐索引绝对定位条目（`prepaint_at(item_origin)`），
-                // 且唯一裁剪是列表级 ContentMask——所以行内容用相对定位（top 负偏移）
+                // 且唯一裁剪是列表级 ContentMask——所以行内容用绝对定位（top 负偏移）
                 // 上顶只移自己、不推移下方条目的布局，也不会被自己槽位裁掉。
                 // t=1 时下方恰好落在真实删除后的布局上，动画与重排无缝衔接。
+                //
+                // ⚠️ 必须 `absolute()` 而不是 `relative()`：本 gpui 版本只在
+                // `Position::Absolute` 时把 `inset` 写进 taffy 布局，`relative()`
+                // 的 inset 被忽略——先前用 `relative()` 导致「只缩高、不上顶」。
                 let rise = if prog > 0.0 {
                     panel.exiting.iter().filter(|e| e.index < i).count()
                 } else {
@@ -387,11 +391,20 @@ pub fn render(
                 };
                 let shift_up = |el: AnyElement| -> AnyElement {
                     if rise > 0 {
+                        // 外层 `div` 是被 uniform_list 当 root 布局的（`layout_as_root`
+                        // + `prepaint_at(item_origin)`），它自身的 `position`/`inset`/
+                        // 负 margin 都被忽略（root 没有包含块、自己的偏移恒为 0）。
+                        // 偏移必须加在「子元素」上：内层 `div` 以 root 为包含块，
+                        // `relative().top()` 负偏移才能生效——这正是网格视图 `slide`
+                        // 的做法（偏移加在 cell 这种子元素上）。t=1 时下方恰好落回
+                        // 真实删除后的布局上，动画与重排无缝衔接。
                         div()
-                            .relative()
-                            .top(px(-24.0 * rise as f32 * prog))
-                            .h_full()
-                            .child(el)
+                            .child(
+                                div()
+                                    .relative()
+                                    .top(px(-24.0 * rise as f32 * prog))
+                                    .child(el),
+                            )
                             .into_any_element()
                     } else {
                         el
