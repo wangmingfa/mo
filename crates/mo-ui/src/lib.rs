@@ -331,6 +331,36 @@ pub fn exit_anim_for_tests(view: &RootView) -> (usize, f32) {
     )
 }
 
+/// 测试专用：活动窗格退场项里**第一个**的下标（`ExitingItem::index`）。
+///
+/// 量行高要用「正在退场的那一行」的 `debug_selector`（下标是动态的），
+/// 没有这个辅助函数就得在测试里赌「退场项是第 0 行」。
+#[doc(hidden)]
+pub fn exit_index_for_tests(view: &RootView) -> Option<usize> {
+    let pane_idx = view.active_pane.min(view.panes.len().saturating_sub(1));
+    let pane = view.panes.get(pane_idx)?;
+    pane.panel().exiting.first().map(|e| e.index)
+}
+
+/// 测试专用：把活动窗格退场动画的**起点往回拨** `elapsed_ms`——等价于
+/// 「动画已经走了 `elapsed_ms` 毫秒」。
+///
+/// 进度由 `started_at.elapsed()`（**真实时间**）现算，headless 里没法把动画停在
+/// 半路去量布局，只能倒推起点。配合 [`exit_anim_for_tests`] 读回真实进度，
+/// 断言可以写成「高度 == 满高 × (1 - 进度)」，既确定又精确——不必用 sleep 撞
+/// 运气（撞不到中段就是 flaky）。动画的清场定时器走的是**可控时钟**，
+/// 本函数只挪进度、不会让删除提前发生。
+#[doc(hidden)]
+pub fn set_exit_elapsed_for_tests(view: &mut RootView, elapsed_ms: u64) {
+    let pane_idx = view.active_pane.min(view.panes.len().saturating_sub(1));
+    let Some(pane) = view.panes.get_mut(pane_idx) else {
+        return;
+    };
+    for e in &mut pane.panel_mut().exiting {
+        e.started_at = std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms);
+    }
+}
+
 /// 测试专用：已渲染窗口快照每一行的 `(路径, 是否目录)`。
 ///
 /// 坐标派发类测试（应用内拖拽）要先弄清「目录行是第几行」才摆得下鼠标——

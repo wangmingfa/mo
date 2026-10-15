@@ -464,6 +464,26 @@ fn trash_defers_the_delete_until_the_collapse_animation_ends(cx: &mut TestAppCon
         "动画没走完就删了：删除应推迟到退场动画结束"
     );
 
+    // ①b 退场动画**真的在缩小行高**（不是只淡出）：把进度拨到一半再量正在退场那
+    // 一行的高度，应落在 (0, 24) 中间值——证实行盒确实在收缩、下方才会跟着上顶。
+    let exit_idx = window
+        .update(cx, |root, _w, _cx| mo_ui::exit_index_for_tests(root))
+        .expect("读退场下标")
+        .expect("应有一个退场项");
+    window
+        .update(cx, |root, _w, _cx| {
+            mo_ui::set_exit_elapsed_for_tests(root, 90);
+        })
+        .expect("拨退场进度");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.render_frame(cx));
+    let sel: &'static str = Box::leak(format!("mo-file-row-{exit_idx}").into_boxed_str());
+    let half_h = f32::from(vcx.debug_bounds(sel).expect("量退场行高").size.height);
+    assert!(
+        half_h > 1.0 && half_h < 23.0,
+        "退场动画应把行高从 24 缩到中间值（量到 {half_h}），不是只淡出"
+    );
+
     // ② 推过动画时长 → 真正删除 + 自动清空退场态。
     assert!(
         wait_gone_with_frames(&mut vcx, &rig.here.join("note.txt")),

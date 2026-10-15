@@ -772,18 +772,24 @@ pub fn render(
                         .and(view.inline_rename_input.as_ref()),
                 );
                 let el: AnyElement = if is_exit {
-                    // 被删行：**行盒恒 24px**（`uniform_list` 只量第 0 行高，行盒一缩
-                    // 全列表都缩），内层把整行（含选中蓝底 / 斑马底）一起收缩到 0 +
-                    // 淡出，`overflow_hidden` 裁掉溢出。t=1 时这一行恰好「消失」，
-                    // 而下方行已上顶到各自的新位置——与真实删除后的布局逐像素重合。
+                    // 被删行：**条目根盒恒 24px**——`uniform_list` 的行高由第 0 条量出
+                    // （`measure_item` 取 `item_to_measure_index`，默认 0，可用高度是
+                    // `MinContent`），根盒一缩整份列表的行高都跟着缩。所以固定的是最
+                    // 外层这一格，**真正缩高的是行本身**（`row` 带着选中蓝底 / 斑马底，
+                    // 底色跟着缩才看得见「高度缩小」）。
+                    //
+                    // ⚠️ `overflow_hidden` 必须挂在**正在缩的那个元素**上：先前挂在
+                    // 外面这层恒 24px 的壳上，壳体高度 = 行内容高度，等于没裁——行盒
+                    // 从头到尾 24px，肉眼只剩 opacity 在变（用户真机反馈「只有淡出，
+                    // 没有高度缩小」）。t=1 时行高 0、下方行已上顶到各自新槽位，与真实
+                    // 删除后的布局逐像素重合。
                     div()
                         .h(px(24.0))
-                        .overflow_hidden()
                         .child(
-                            div()
-                                .h(px(24.0 * (1.0 - prog)))
+                            row.h(px(24.0 * (1.0 - prog)))
+                                .overflow_hidden()
                                 .opacity(1.0 - prog)
-                                .child(row.child(content)),
+                                .child(content),
                         )
                         .into_any_element()
                 } else {
